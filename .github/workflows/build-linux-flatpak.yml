@@ -1,0 +1,143 @@
+name: Build Linux Flatpak
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      preset:
+        required: false
+        type: string
+        default: linux64-deploy
+      checkout_ref:
+        required: false
+        type: string
+        default: ""
+        description: "Git ref to checkout (branch, tag, or SHA). Leaves empty for default."
+  workflow_dispatch:
+    inputs:
+      preset:
+        type: choice
+        description: "CMake preset for Linux"
+        options:
+          - linux64-deploy
+          - linux64-testing
+        default: linux64-deploy
+
+jobs:
+  build-linux-flatpak:
+    name: ${{ matrix.game.id }}@${{ inputs.preset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        game:
+          - id: generalsxzh
+            value: GeneralsMD
+            target: z_generals
+            output: GeneralsXZH
+            log_suffix: zh
+          - id: generalsx
+            value: Generals
+            target: g_generals
+            output: GeneralsX
+            log_suffix: generals
+
+    steps:
+      # GeneralsX @build GitHubCopilot 08/05/2026 Use Node 24 compatible GitHub Actions major versions to remove runner deprecation warnings.
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Populate Git Info for Sandboxed Build
+        run: |
+          echo "GENERALS_GIT_OVERRIDE_TSTAMP=$(git log -1 --format=%ct 2>/dev/null || echo '0')" >> $GITHUB_ENV
+          echo "GENERALS_GIT_OVERRIDE_TAG=$(git describe --tags --exact-match 2>/dev/null || echo '')" >> $GITHUB_ENV
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update -qq
+          # GeneralsX @bugfix GitHubCopilot 14/04/2026 Ensure eu-strip/eu-elfcompress are available for flatpak-builder debuginfo finalization.
+          sudo apt-get install -y -qq --no-install-recommends \
+            git \
+            ca-certificates \
+            python3 \
+            flatpak \
+            flatpak-builder \
+            elfutils
+
+      - name: Install Flatpak Runtime
+        run: |
+          flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak --user install -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+
+      - name: Cache flatpak-builder state
+        uses: actions/cache@v5
+        with:
+          path: .flatpak-builder
+          key: flatpak-builder-${{ runner.os }}-${{ inputs.preset }}-${{ hashFiles('flatpak/com.fbraz3.GeneralsX.yml', 'flatpak/com.fbraz3.GeneralsXZH.yml', 'scripts/build/linux/build-linux-flatpak.sh', 'cmake/lzhl.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            flatpak-builder-${{ runner.os }}-${{ inputs.preset }}-
+
+      - name: Build Flatpak Bundle
+        env:
+          NGMP_DEFAULT_HOST: ${{ secrets.NGMP_DEFAULT_HOST }}
+          NGMP_SERVER_HOST: ${{ secrets.NGMP_DEFAULT_HOST }}
+          NGMP_SERVER_PORT: ${{ secrets.NGMP_SERVER_PORT }}
+          NGMP_USE_SSL: ${{ secrets.NGMP_USE_SSL }}
+          NGMP_WEB_PORTAL_URL: ${{ secrets.NGMP_WEB_PORTAL_URL }}
+          NGMP_MOTD_URL: ${{ secrets.NGMP_MOTD_URL }}
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          bash ./scripts/build/linux/build-linux-flatpak.sh "${{ inputs.preset }}" "${{ matrix.game.value }}" 2>&1 | tee "logs/build_flatpak_${{ matrix.game.log_suffix }}.log"
+
+      - name: Locate generated Flatpak bundle
+        id: bundle
+        run: |
+          EXPECTED="build/linux-x86_64-${{ matrix.game.output }}.flatpak"
+
+          if [ -f "${EXPECTED}" ]; then
+            echo "path=${EXPECTED}" >> "$GITHUB_OUTPUT"
+            echo "Found expected bundle: ${EXPECTED}"
+            exit 0
+          fi
+
+          # GeneralsX @bugfix Meeseeks 14/09/2026 Resolve Flatpak path dynamically and normalize to canonical expected filename.
+          CANDIDATE=$(find build -maxdepth 2 -type f -name "*${{ matrix.game.output }}*.flatpak" | head -1)
+          if [ -z "${CANDIDATE}" ] || [ ! -f "${CANDIDATE}" ]; then
+            echo "ERROR: Flatpak bundle not found for ${{ matrix.game.id }}"
+            find build -maxdepth 3 -type f -name "*.flatpak" || true
+            exit 1
+          fi
+
+          if [ "${CANDIDATE}" != "${EXPECTED}" ]; then
+            echo "Renaming candidate ${CANDIDATE} to expected filename: ${EXPECTED}"
+            mv "${CANDIDATE}" "${EXPECTED}"
+          fi
+
+          echo "path=${EXPECTED}" >> "$GITHUB_OUTPUT"
+          echo "Using bundle: ${EXPECTED}"
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-linux-flatpak-${{ matrix.game.id }}-${{ inputs.preset }}
+          path: logs/
+          retention-days: 7
+
+      - name: Upload Flatpak Bundle
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64-${{ matrix.game.output }}.flatpak
+          path: ${{ steps.bundle.outputs.path }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error

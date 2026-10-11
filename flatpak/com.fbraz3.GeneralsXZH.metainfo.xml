@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.storm996.GeneralRefresh</id>
+  <name>General Refresh</name>
+  <summary>Cross-platform port of Generals Zero Hour</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <description>
+    <p>
+      General Refresh is a native Linux, macOS, and Windows port of Command &amp; Conquer:
+      Generals Zero Hour using SDL3, DXVK, and OpenAL.
+    </p>
+    <p>
+      This Flatpak package expects original game assets to be available in user data paths.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.storm996.GeneralRefresh.desktop</launchable>
+  <url type="homepage">https://github.com/Storm996/General-Refresh</url>
+  <project_license>GPL-2.0-or-later</project_license>
+</component>

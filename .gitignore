@@ -1,0 +1,163 @@
+# Ignore everything starting with dot, except specific files.
+.*
+!.editorconfig
+!.gitignore
+!.gitattributes
+!.github
+!.devin
+!.gitmodules
+!.coderabbit.yaml
+
+*.user
+*.ncb
+/build*
+nbproject/
+project/
+doxygen/
+*.a
+*.o
+CMakeCache.txt
+CMakeFiles
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+*.so*
+CPackConfig.cmake
+CPackSourceConfig.cmake
+*.spec
+*.ncb
+*.sdf
+*.suo
+*.sln
+*.vcxproj*
+*.vcproj
+.cproject
+.project
+*~
+!*.exe
+*.lastbuildstate
+*.unsuccessfulbuild
+*.tlog
+*.idb
+*.cd
+*.tmp
+*.bak
+thumbs.db
+/CMakeUserPresets.json
+/.cache
+.clang-format
+/Dependencies/MaxSDK/maxsdk
+/tmp/
+
+## AI assistant config (user-specific)
+/.claude/
+/CLAUDE.md
+
+## IntelliJ, CLion, etc.
+/.idea
+
+# IntelliJ-style CMake bits
+cmake-build-*/
+
+## Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+
+## Python
+__pycache__/
+*.pyc
+
+## Build Logs (generated during development)
+/logs/
+GeneralsMD/logs/
+Generals/logs/
+
+# vcpkg artifacts (generated dependencies)
+/vcpkg_installed/
+
+# Release bundles
+GeneralsX-macos-*.zip
+GeneralsXZH-macos-*.zip
+GeneralsX-linux-*.tar.gz
+GeneralsXZH-linux-*.tar.gz
+
+# flatpak build files (exclude staging/build dirs but track scripts and manifests)
+.flatpak-builder/
+flatpak/staging/
+flatpak/*.flatpak
+
+#tmp and log files on root folder
+logs_*.zip
+*.log
+/cmake/ngmp_env.cmake
+references/GameClient/
+references/GameServer/
+
+# ===== General-Refresh: private workspace exclusions (2026-10-11) =====
+# Task/validation folders. These contain tens of thousands of AI validation
+# images and working files that must never enter the repository.
+/T0 编译工具/
+/T0 语言编辑器/
+/T1 big 解析器/
+/T2 模型清单解析器/
+/T3/
+/T3-0 法线贴图引擎对接/
+/T5 AO烘焙工具/
+/T6 贴图AI高清化/
+/T7 着色器系统启用/
+/T8 模型几何现代化/
+/AI升级/
+/光影升级/
+/地图升级/
+/模型升级/
+/渲染器现代化调研/
+/现代化指挥系统/
+/界面升级/
+/GeneralsZH/
+/work_tmp/
+/_bigtest_out/
+
+# Dependency/build caches
+/.vcpkg/
+/vcpkg_installed/
+/manual_dl/
+/dist/
+/dist-generals/
+
+# Private agent workspace data (wiki.json etc.)
+/.devin/
+
+# Root-level private/Chinese-only docs and local scripts
+/中文简体计划.md
+/交接记忆.md
+/任务拆分与调度表.md
+/建模与法线贴图改造计划书.md
+/进度.md
+/高帧率渲染改造.md
+/GamePath.md
+/.editorconfig.~#0
+/build_vcpkg.bat
+/build_win32.bat
+/configure_vcpkg.bat
+/configure_win32.bat
+/configure_win32_vcpkg.bat
+/_run_build.bat
+/_run_configure.bat
+/fetch_deps.ps1
+/launch.ps1
+/stlport.diff
+
+# Global image backstop: validation/AI-generated images must never enter the
+# repository, even if a future task folder forgets its own ignore rule. The
+# engine-required assets and project icons below are explicitly re-included.
+*.png
+*.jpg
+*.jpeg
+*.dds
+*.tga
+!assets/**
+!flatpak/**
+!Core/Libraries/Source/WWVegas/WW3D2/RequiredAssets/**
+!Core/Tools/W3DView/Res/**

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=General Refresh
+Comment=Command & Conquer: Generals Zero Hour cross-platform port with high frame rate support
+Icon=com.storm996.GeneralRefresh
+Type=Application
+Categories=Game;StrategyGame;
+StartupNotify=true
+Terminal=false

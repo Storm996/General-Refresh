@@ -1,0 +1,1018 @@
+/*
+**	Command & Conquer Generals(tm)
+**	Copyright 2025 Electronic Arts Inc.
+**
+**	This program is free software: you can redistribute it and/or modify
+**	it under the terms of the GNU General Public License as published by
+**	the Free Software Foundation, either version 3 of the License, or
+**	(at your option) any later version.
+**
+**	This program is distributed in the hope that it will be useful,
+**	but WITHOUT ANY WARRANTY; without even the implied warranty of
+**	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+**	GNU General Public License for more details.
+**
+**	You should have received a copy of the GNU General Public License
+**	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+////////////////////////////////////////////////////////////////////////////////
+//																																						//
+//  (c) 2001-2003 Electronic Arts Inc.																				//
+//																																						//
+////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////
+// FILE: WOLWelcomeMenu.cpp
+// Author: Chris Huybregts, November 2001
+// Description: Lan Lobby Menu
+///////////////////////////////////////////////////////////////////////////////////////
+
+// INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
+#include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+
+#include "gamespy/peer/peer.h"
+
+#include "Common/GameEngine.h"
+#include "Common/AudioEventRTS.h"
+#include "Common/GameAudio.h"
+#include "Common/GameSpyMiscPreferences.h"
+#include "Common/CustomMatchPreferences.h"
+#include "Common/GlobalData.h"
+#include "Common/UserPreferences.h"
+
+#include "GameClient/AnimateWindowManager.h"
+#include "GameClient/Display.h"
+#include "GameClient/WindowLayout.h"
+#include "GameClient/Gadget.h"
+#include "GameClient/GameText.h"
+#include "GameClient/Shell.h"
+#include "GameClient/KeyDefs.h"
+#include "GameClient/GameWindowManager.h"
+#include "GameClient/GadgetListBox.h"
+#include "GameClient/GadgetTextEntry.h"
+#include "GameClient/GadgetStaticText.h"
+#include "GameClient/MessageBox.h"
+#include "GameClient/GameWindowTransitions.h"
+
+#include "GameNetwork/FirewallHelper.h"
+#include "GameNetwork/GameSpyOverlay.h"
+
+#include "GameNetwork/GameSpy/BuddyDefs.h"
+#include "GameNetwork/GameSpy/BuddyThread.h"
+#include "GameNetwork/GameSpy/PeerDefs.h"
+#include "GameNetwork/GameSpy/PeerThread.h"
+#include "GameNetwork/GameSpy/PersistentStorageDefs.h"
+#include "GameNetwork/GameSpy/PersistentStorageThread.h"
+#include "GameNetwork/GameSpy/ThreadUtils.h"
+#include "GameNetwork/GameSpy/MainMenuUtils.h"
+#include "GameNetwork/WOLBrowser/WebBrowser.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <SDL3/SDL.h>
+#endif
+
+#include <map>
+#include <string>
+
+// PRIVATE DATA ///////////////////////////////////////////////////////////////////////////////////
+static Bool isShuttingDown = FALSE;
+static Bool buttonPushed = FALSE;
+static const char *nextScreen = nullptr;
+
+// GeneralsX @feature fbraz3 03/09/2026 Map MOTD listbox rows to clickable URLs
+static std::map<Int, std::string> s_motdRowUrls;
+
+// GeneralsX @refactor fbraz3 08/09/2026 Platform URL opening (ShellExecute on Windows, SDL_OpenURL on POSIX)
+static void OpenBrowserURL(const std::string& url)
+{
+#if defined(_WIN32)
+	ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+	SDL_OpenURL(url.c_str());
+#endif
+}
+
+// GeneralsX @feature fbraz3 03/09/2026 Parse raw URLs or Markdown links [text](url) from MOTD line
+static std::string ExtractURLFromLine(std::string& inOutText)
+{
+	// Check for Markdown link: [display text](http://... or https://...)
+	size_t openBracket = inOutText.find('[');
+	size_t closeBracket = (openBracket != std::string::npos) ? inOutText.find(']', openBracket + 1) : std::string::npos;
+	if (openBracket != std::string::npos && closeBracket != std::string::npos &&
+		closeBracket + 1 < inOutText.length() && inOutText[closeBracket + 1] == '(')
+	{
+		size_t openParen = closeBracket + 1;
+		size_t closeParen = inOutText.find(')', openParen + 1);
+		if (closeParen != std::string::npos)
+		{
+			std::string url = inOutText.substr(openParen + 1, closeParen - openParen - 1);
+			if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)
+			{
+				std::string displayText = inOutText.substr(openBracket + 1, closeBracket - openBracket - 1);
+				inOutText = inOutText.substr(0, openBracket) + displayText + inOutText.substr(closeParen + 1);
+				return url;
+			}
+		}
+	}
+
+	// Check for raw URL: http:// or https://
+	size_t pos = inOutText.find("http://");
+	if (pos == std::string::npos)
+		pos = inOutText.find("https://");
+	if (pos == std::string::npos)
+		return "";
+
+	size_t end = pos;
+	while (end < inOutText.length() && !std::isspace(static_cast<unsigned char>(inOutText[end])) &&
+		   inOutText[end] != '"' && inOutText[end] != '\'' && inOutText[end] != '<' && inOutText[end] != '>' &&
+		   inOutText[end] != '`')
+	{
+		end++;
+	}
+	while (end > pos && (inOutText[end - 1] == '.' || inOutText[end - 1] == ',' ||
+						 inOutText[end - 1] == ')' || inOutText[end - 1] == ']' ||
+						 inOutText[end - 1] == ';'))
+	{
+		end--;
+	}
+	return inOutText.substr(pos, end - pos);
+}
+
+// window ids ------------------------------------------------------------------------------
+static NameKeyType parentWOLWelcomeID = NAMEKEY_INVALID;
+static NameKeyType buttonBackID = NAMEKEY_INVALID;
+static NameKeyType buttonQuickMatchID = NAMEKEY_INVALID;
+static NameKeyType buttonLobbyID = NAMEKEY_INVALID;
+static NameKeyType buttonBuddiesID = NAMEKEY_INVALID;
+static NameKeyType buttonLadderID = NAMEKEY_INVALID;
+static NameKeyType buttonMyInfoID = NAMEKEY_INVALID;
+
+static NameKeyType listboxInfoID = NAMEKEY_INVALID;
+static NameKeyType buttonOptionsID = NAMEKEY_INVALID;
+// Window Pointers ------------------------------------------------------------------------
+static GameWindow *parentWOLWelcome = nullptr;
+static GameWindow *buttonBack = nullptr;
+static GameWindow *buttonQuickMatch = nullptr;
+static GameWindow *buttonLobby = nullptr;
+static GameWindow *buttonBuddies = nullptr;
+static GameWindow *buttonLadder = nullptr;
+static GameWindow *buttonMyInfo = nullptr;
+static GameWindow *buttonbuttonOptions = nullptr;
+static WindowLayout *welcomeLayout = nullptr;
+static GameWindow *listboxInfo = nullptr;
+
+static GameWindow *staticTextServerName = nullptr;
+static GameWindow *staticTextLastUpdated = nullptr;
+
+static GameWindow *staticTextLadderWins = nullptr;
+static GameWindow *staticTextLadderLosses = nullptr;
+static GameWindow *staticTextLadderRank = nullptr;
+static GameWindow *staticTextLadderPoints = nullptr;
+static GameWindow *staticTextLadderDisconnects = nullptr;
+
+static GameWindow *staticTextHighscoreWins = nullptr;
+static GameWindow *staticTextHighscoreLosses = nullptr;
+static GameWindow *staticTextHighscoreRank = nullptr;
+static GameWindow *staticTextHighscorePoints = nullptr;
+
+static UnicodeString gServerName;
+static Bool s_welcomeAudioPlayed = FALSE;
+void updateServerDisplay(UnicodeString serverName)
+{
+	if (staticTextServerName)
+	{
+		GadgetStaticTextSetText(staticTextServerName, serverName);
+	}
+	gServerName = serverName;
+}
+
+/*
+void updateLocalPlayerScores(AsciiString name, const WOL::Ladder *ladder, const WOL::Highscore *highscore)
+{
+	if (ladder)
+	{
+		AsciiString a;
+		UnicodeString u;
+
+		a.format("%d", ladder->wins);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextLadderWins, u);
+
+		a.format("%d", ladder->losses);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextLadderLosses, u);
+
+		a.format("%d", ladder->rank);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextLadderRank, u);
+
+		a.format("%d", ladder->points);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextLadderPoints, u);
+
+		a.format("%d", ladder->disconnects);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextLadderDisconnects, u);
+	}
+	if (highscore)
+	{
+		AsciiString a;
+		UnicodeString u;
+
+		a.format("%d", highscore->wins);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextHighscoreWins, u);
+
+		a.format("%d", highscore->losses);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextHighscoreLosses, u);
+
+		a.format("%d", highscore->rank);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextHighscoreRank, u);
+
+		a.format("%d", highscore->points);
+		u.translate(a);
+		GadgetStaticTextSetText(staticTextHighscorePoints, u);
+	}
+}
+*/
+
+
+static void enableControls( Bool state )
+{
+	if (buttonQuickMatch)
+		buttonQuickMatch->winEnable(state);
+	if (buttonLobby)
+		buttonLobby->winEnable(state);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** This is called when a shutdown is complete for this menu */
+//-------------------------------------------------------------------------------------------------
+static void shutdownComplete( WindowLayout *layout )
+{
+
+	isShuttingDown = FALSE;
+
+	// hide the layout
+	layout->hide( TRUE );
+
+	// our shutdown is complete
+	TheShell->shutdownComplete( layout, (nextScreen != nullptr) );
+
+	if (nextScreen != nullptr)
+	{
+		TheShell->push(nextScreen);
+	}
+	else
+	{
+		s_welcomeAudioPlayed = FALSE;
+	}
+
+	nextScreen = nullptr;
+
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Handle Num Players Online data */
+//-------------------------------------------------------------------------------------------------
+
+static Int lastNumPlayersOnline = 0;
+
+static UnsignedByte grabUByte(const char *s)
+{
+	char tmp[5] = "0xff";
+	tmp[2] = s[0];
+	tmp[3] = s[1];
+	UnsignedByte b = strtol(tmp, nullptr, 16);
+	return b;
+}
+
+static void updateNumPlayersOnline()
+{
+	GameWindow *playersOnlineWindow = TheWindowManager->winGetWindowFromId(
+		nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextNumPlayersOnline") );
+
+	if (playersOnlineWindow)
+	{
+		UnicodeString valStr;
+		valStr.format(TheGameText->fetch("GUI:NumPlayersOnline"), lastNumPlayersOnline);
+		GadgetStaticTextSetText(playersOnlineWindow, valStr);
+	}
+
+	if (listboxInfo && TheGameSpyInfo)
+	{
+		s_motdRowUrls.clear();
+		GadgetListBoxReset(listboxInfo);
+		AsciiString aLine;
+		UnicodeString line;
+		AsciiString aMotd = TheGameSpyInfo->getMOTD();
+		UnicodeString headingStr;
+		headingStr.format(TheGameText->fetch("MOTD:NumPlayersHeading"), lastNumPlayersOnline);
+
+		while (headingStr.nextToken(&line, L"\n"))
+		{
+			if (line.getCharAt(line.getLength()-1) == '\r')
+				line.removeLastChar();	// there is a trailing '\r'
+
+			line.trim();
+
+			if (line.isEmpty())
+			{
+				line = L" ";
+			}
+
+			GadgetListBoxAddEntryText(listboxInfo, line, GameSpyColor[GSCOLOR_MOTD_HEADING], -1, -1);
+		}
+		GadgetListBoxAddEntryText(listboxInfo, L" ", GameSpyColor[GSCOLOR_MOTD_HEADING], -1, -1);
+
+		while (aMotd.nextToken(&aLine, "\n"))
+		{
+			if (aLine.getCharAt(aLine.getLength()-1) == '\r')
+				aLine.removeLastChar();	// there is a trailing '\r'
+
+			aLine.trim();
+
+			if (aLine.isEmpty())
+			{
+				aLine = " ";
+			}
+
+			Color c = GameSpyColor[GSCOLOR_MOTD];
+			bool hasCustomColor = false;
+			if (aLine.startsWith("\\\\"))
+			{
+				aLine = aLine.str()+1;
+			}
+			else if (aLine.startsWith("\\") && aLine.getLength() > 9)
+			{
+				// take out the hex value from strings starting as "\ffffffffText"
+				UnsignedByte a, r, g, b;
+				a = grabUByte(aLine.str()+1);
+				r = grabUByte(aLine.str()+3);
+				g = grabUByte(aLine.str()+5);
+				b = grabUByte(aLine.str()+7);
+				c = GameMakeColor(r, g, b, a);
+				DEBUG_LOG(("MOTD line '%s' has color %X", aLine.str(), c));
+				aLine = aLine.str() + 9;
+				hasCustomColor = true;
+			}
+
+			// GeneralsX @feature fbraz3 03/09/2026 Detect clickable URL or Markdown link in MOTD
+			std::string rawLine(aLine.str());
+			std::string detectedUrl = ExtractURLFromLine(rawLine);
+			if (!detectedUrl.empty())
+			{
+				if (!hasCustomColor)
+				{
+					c = GameMakeColor(100, 180, 255, 255); // Link highlight blue
+				}
+				aLine = rawLine.c_str();
+			}
+
+			line = UnicodeString(MultiByteToWideCharSingleLine(aLine.str()).c_str());
+
+			Int row = GadgetListBoxAddEntryText(listboxInfo, line, c, -1, -1);
+			if (!detectedUrl.empty() && row >= 0)
+			{
+				s_motdRowUrls[row] = detectedUrl;
+			}
+		}
+	}
+}
+
+void HandleNumPlayersOnline( Int numPlayersOnline )
+{
+	lastNumPlayersOnline = numPlayersOnline;
+#if !defined(SAGE_USE_NGMP)
+	if (lastNumPlayersOnline < 1)
+		lastNumPlayersOnline = 1;
+#else
+	// GeneralsX @tweak fbraz3 20/09/2026 Allow 0 players online for NGMP statistics
+	if (lastNumPlayersOnline < 0)
+		lastNumPlayersOnline = 0;
+#endif
+	updateNumPlayersOnline();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Handle Overall Stats data */
+//-------------------------------------------------------------------------------------------------
+
+static OverallStats s_statsUSA, s_statsChina, s_statsGLA;
+
+OverallStats::OverallStats()
+{
+	for (Int i=0; i<STATS_MAX; ++i)
+	{
+		wins[i] = losses[i] = 0;
+	}
+}
+
+static UnicodeString calcPercent(const OverallStats& stats, Int n, UnicodeString sideStr)
+{
+	// per side percentage of total wins
+	Real winPercentUSA   = s_statsUSA.wins[n]*100/INT_TO_REAL(max(1, s_statsUSA.wins[n]+s_statsUSA.losses[n])); // 0.0f - 100.0f
+	Real winPercentChina = s_statsChina.wins[n]*100/INT_TO_REAL(max(1, s_statsChina.wins[n]+s_statsChina.losses[n])); // 0.0f - 100.0f
+	Real winPercentGLA   = s_statsGLA.wins[n]*100/INT_TO_REAL(max(1, s_statsGLA.wins[n]+s_statsGLA.losses[n])); // 0.0f - 100.0f
+	Real thisWinPercent  = stats.wins[n]*100/INT_TO_REAL(max(1, stats.wins[n]+stats.losses[n])); // 0.0f - 100.0f
+	Real totalWinPercent = winPercentUSA + winPercentChina + winPercentGLA;
+
+	Real val = thisWinPercent*100/max(1.0f,totalWinPercent);
+
+	UnicodeString s;
+	s.format(TheGameText->fetch("GUI:PerSideWinPercentage"), REAL_TO_INT(val), sideStr.str());
+
+	/*
+	Int totalDenominator = s_statsUSA.wins[n] + s_statsChina.wins[n] + s_statsGLA.wins[n];
+	if (!totalDenominator)
+		totalDenominator = 1;
+
+	UnicodeString s;
+	s.format(TheGameText->fetch("GUI:PerSideWinPercentage"), REAL_TO_INT(stats.wins[n]*100/totalDenominator), sideStr.str());
+	*/
+	return s;
+}
+
+static void updateOverallStats()
+{
+	UnicodeString usa, china, gla;
+	GameWindow *win;
+
+	usa = calcPercent(s_statsUSA, STATS_LASTWEEK, TheGameText->fetch("SIDE:America"));
+	china = calcPercent(s_statsChina, STATS_LASTWEEK, TheGameText->fetch("SIDE:China"));
+	gla = calcPercent(s_statsGLA, STATS_LASTWEEK, TheGameText->fetch("SIDE:GLA"));
+	DEBUG_LOG(("Last Week: %ls %ls %ls", usa.str(), china.str(), gla.str()));
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextUSALastWeek") );
+	GadgetStaticTextSetText(win, usa);
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextChinaLastWeek") );
+	GadgetStaticTextSetText(win, china);
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextGLALastWeek") );
+	GadgetStaticTextSetText(win, gla);
+
+	usa = calcPercent(s_statsUSA, STATS_TODAY, TheGameText->fetch("SIDE:America"));
+	china = calcPercent(s_statsChina, STATS_TODAY, TheGameText->fetch("SIDE:China"));
+	gla = calcPercent(s_statsGLA, STATS_TODAY, TheGameText->fetch("SIDE:GLA"));
+	DEBUG_LOG(("Today: %ls %ls %ls", usa.str(), china.str(), gla.str()));
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextUSAToday") );
+	GadgetStaticTextSetText(win, usa);
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextChinaToday") );
+	GadgetStaticTextSetText(win, china);
+	win = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextGLAToday") );
+	GadgetStaticTextSetText(win, gla);
+}
+
+void HandleOverallStats( const OverallStats& USA, const OverallStats& China, const OverallStats& GLA )
+{
+	s_statsUSA = USA;
+	s_statsChina = China;
+	s_statsGLA = GLA;
+	updateOverallStats();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Handle player stats */
+//-------------------------------------------------------------------------------------------------
+
+void UpdateLocalPlayerStats()
+{
+
+	GameWindow *welcomeParent = TheWindowManager->winGetWindowFromId( nullptr, NAMEKEY("WOLWelcomeMenu.wnd:WOLWelcomeMenuParent") );
+
+	if (welcomeParent)
+	{
+		PopulatePlayerInfoWindows( "WOLWelcomeMenu.wnd" );
+	}
+	else
+	{
+		PopulatePlayerInfoWindows( "WOLQuickMatchMenu.wnd" );
+	}
+}
+
+static Bool raiseMessageBoxes = FALSE;
+//-------------------------------------------------------------------------------------------------
+/** Initialize the WOL Welcome Menu */
+//-------------------------------------------------------------------------------------------------
+void WOLWelcomeMenuInit( WindowLayout *layout, void *userData )
+{
+	nextScreen = nullptr;
+	buttonPushed = FALSE;
+	isShuttingDown = FALSE;
+
+	welcomeLayout = layout;
+
+	//TheWOL->reset();
+
+	parentWOLWelcomeID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:WOLWelcomeMenuParent" );
+	buttonBackID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonBack" );
+	parentWOLWelcome = TheWindowManager->winGetWindowFromId( nullptr, parentWOLWelcomeID );
+	buttonBack = TheWindowManager->winGetWindowFromId( nullptr,  buttonBackID);
+	buttonOptionsID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonOptions" );
+	buttonbuttonOptions = TheWindowManager->winGetWindowFromId( nullptr,  buttonOptionsID);
+	listboxInfoID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:InfoListbox" );
+
+	listboxInfo = TheWindowManager->winGetWindowFromId( nullptr,  listboxInfoID);
+
+	staticTextServerName = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextServerName" ));
+	staticTextLastUpdated = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextLastUpdated" ));
+
+	staticTextLadderWins = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextLadderWins" ));
+	staticTextLadderLosses = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextLadderLosses" ));
+	staticTextLadderPoints = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextLadderPoints" ));
+	staticTextLadderRank = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextLadderRank" ));
+	staticTextLadderDisconnects = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextDisconnects" ));
+
+	staticTextHighscoreWins = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextHighscoreWins" ));
+	staticTextHighscoreLosses = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextHighscoreLosses" ));
+	staticTextHighscorePoints = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextHighscorePoints" ));
+	staticTextHighscoreRank = TheWindowManager->winGetWindowFromId( parentWOLWelcome,
+		TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:StaticTextHighscoreRank" ));
+
+	if (staticTextServerName)
+	{
+		GadgetStaticTextSetText(staticTextServerName, gServerName);
+	}
+
+	GameWindow *staticTextTitle = TheWindowManager->winGetWindowFromId(parentWOLWelcome, NAMEKEY("WOLWelcomeMenu.wnd:StaticTextTitle"));
+	if (staticTextTitle && TheGameSpyInfo)
+	{
+		UnicodeString title;
+		title.format(TheGameText->fetch("GUI:WOLWelcome"), TheGameSpyInfo->getLocalBaseName().str());
+		GadgetStaticTextSetText(staticTextTitle, title);
+	}
+
+	// Clear some defaults
+	/*
+	UnicodeString questionMark = L"?";
+	GadgetStaticTextSetText(staticTextLastUpdated, questionMark);
+	GadgetStaticTextSetText(staticTextLadderWins, questionMark);
+	GadgetStaticTextSetText(staticTextLadderLosses, questionMark);
+	GadgetStaticTextSetText(staticTextLadderPoints, questionMark);
+	GadgetStaticTextSetText(staticTextLadderRank, questionMark);
+	GadgetStaticTextSetText(staticTextLadderDisconnects, questionMark);
+	GadgetStaticTextSetText(staticTextHighscoreWins, questionMark);
+	GadgetStaticTextSetText(staticTextHighscoreLosses, questionMark);
+	GadgetStaticTextSetText(staticTextHighscorePoints, questionMark);
+	GadgetStaticTextSetText(staticTextHighscoreRank, questionMark);
+	*/
+
+	//DEBUG_ASSERTCRASH(listboxInfo, ("No control found!"));
+
+	buttonQuickMatchID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonQuickMatch" );
+	buttonQuickMatch = TheWindowManager->winGetWindowFromId( parentWOLWelcome, buttonQuickMatchID );
+
+	buttonLobbyID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonCustomMatch" );
+	buttonLobby = TheWindowManager->winGetWindowFromId( parentWOLWelcome, buttonLobbyID );
+
+	buttonBuddiesID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonBuddies" );
+	buttonBuddies = TheWindowManager->winGetWindowFromId( parentWOLWelcome, buttonBuddiesID );
+
+	buttonMyInfoID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonMyInfo" );
+	buttonMyInfo = TheWindowManager->winGetWindowFromId( parentWOLWelcome, buttonMyInfoID );
+
+	buttonLadderID = TheNameKeyGenerator->nameToKey( "WOLWelcomeMenu.wnd:ButtonLadder" );
+	buttonLadder = TheWindowManager->winGetWindowFromId( parentWOLWelcome, buttonLadderID );
+
+	if (TheFirewallHelper == nullptr) {
+		TheFirewallHelper = createFirewallHelper();
+	}
+	if (TheFirewallHelper->detectFirewall() == TRUE) {
+		// don't need to detect firewall, already been done.
+		delete TheFirewallHelper;
+		TheFirewallHelper = nullptr;
+	}
+	/*
+
+	if (TheGameSpyChat && TheGameSpyChat->isConnected())
+	{
+		const char *keys[3] = { "locale", "wins", "losses" };
+		char valueStrings[3][20];
+		char *values[3] = { valueStrings[0], valueStrings[1], valueStrings[2] };
+		snprintf(values[0], 20, "%s", TheGameSpyPlayerInfo->getLocale().str());
+		snprintf(values[1], 20, "%d", TheGameSpyPlayerInfo->getWins());
+		snprintf(values[2], 20, "%d", TheGameSpyPlayerInfo->getLosses());
+		peerSetGlobalKeys(TheGameSpyChat->getPeer(), 3, (const char **)keys, (const char **)values);
+		peerSetGlobalWatchKeys(TheGameSpyChat->getPeer(), GroupRoom,   3, keys, PEERFalse);
+		peerSetGlobalWatchKeys(TheGameSpyChat->getPeer(), StagingRoom, 3, keys, PEERFalse);
+	}
+	*/
+
+//	// animate controls
+//	TheShell->registerWithAnimateManager(buttonQuickMatch, WIN_ANIMATION_SLIDE_LEFT, TRUE, 800);
+//	TheShell->registerWithAnimateManager(buttonLobby, WIN_ANIMATION_SLIDE_LEFT, TRUE, 600);
+//	//TheShell->registerWithAnimateManager(nullptr, WIN_ANIMATION_SLIDE_LEFT, TRUE, 400);
+//	TheShell->registerWithAnimateManager(buttonBuddies, WIN_ANIMATION_SLIDE_LEFT, TRUE, 200);
+//	//TheShell->registerWithAnimateManager(nullptr, WIN_ANIMATION_SLIDE_LEFT, TRUE, 1);
+//	TheShell->registerWithAnimateManager(buttonBack, WIN_ANIMATION_SLIDE_BOTTOM, TRUE, 1);
+
+	// Show Menu
+	layout->hide( FALSE );
+
+	// Set Keyboard to Main Parent
+	TheWindowManager->winSetFocus( parentWOLWelcome );
+
+	enableControls( TheGameSpyInfo->gotGroupRoomList() );
+	TheShell->showShellMap(TRUE);
+
+	updateNumPlayersOnline();
+	updateOverallStats();
+
+	UpdateLocalPlayerStats();
+
+	GameSpyMiscPreferences cPref;
+	if (cPref.getLocale() < LOC_MIN || cPref.getLocale() > LOC_MAX)
+	{
+		GameSpyOpenOverlay(GSOVERLAY_LOCALESELECT);
+	}
+
+	raiseMessageBoxes = TRUE;
+	TheTransitionHandler->setGroup("WOLWelcomeMenuFade");
+
+	// GeneralsX @feature Play classic "Welcome to Generals Online" voice line once per login session
+	if (!s_welcomeAudioPlayed && !GameSpyIsOverlayOpen(GSOVERLAY_LOCALESELECT) && TheAudio)
+	{
+		AudioEventRTS welcomeSound("WelcomeToGeneralsOnline");
+		TheAudio->addAudioEvent(&welcomeSound);
+		s_welcomeAudioPlayed = TRUE;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** WOL Welcome Menu shutdown method */
+//-------------------------------------------------------------------------------------------------
+void WOLWelcomeMenuShutdown( WindowLayout *layout, void *userData )
+{
+	listboxInfo = nullptr;
+	s_motdRowUrls.clear();
+
+	delete TheFirewallHelper;
+	TheFirewallHelper = nullptr;
+
+	isShuttingDown = TRUE;
+
+	// if we are shutting down for an immediate pop, skip the animations
+	Bool popImmediate = *(Bool *)userData;
+	if( popImmediate )
+	{
+
+		shutdownComplete( layout );
+		return;
+
+	}
+
+	TheShell->reverseAnimatewindow();
+	TheTransitionHandler->reverse("WOLWelcomeMenuFade");
+
+
+	RaiseGSMessageBox();
+}
+
+
+//-------------------------------------------------------------------------------------------------
+/** WOL Welcome Menu update method */
+//-------------------------------------------------------------------------------------------------
+void WOLWelcomeMenuUpdate( WindowLayout * layout, void *userData)
+{
+	// We'll only be successful if we've requested to
+	if(isShuttingDown && TheShell->isAnimFinished() && TheTransitionHandler->isFinished())
+		shutdownComplete(layout);
+
+	if (raiseMessageBoxes)
+	{
+		RaiseGSMessageBox();
+		raiseMessageBoxes = FALSE;
+	}
+
+	if (TheFirewallHelper != nullptr)
+	{
+		if (TheFirewallHelper->behaviorDetectionUpdate())
+		{
+			TheWritableGlobalData->m_firewallBehavior = TheFirewallHelper->getFirewallBehavior();
+
+			TheFirewallHelper->writeFirewallBehavior();
+
+			TheFirewallHelper->flagNeedToRefresh(FALSE); // 2/19/03 BGC, we're done, so we don't need to refresh the NAT anymore.
+
+			// we are now done with the firewall helper
+			delete TheFirewallHelper;
+			TheFirewallHelper = nullptr;
+		}
+	}
+
+	// GeneralsX @feature Play classic "Welcome to Generals Online" once locale overlay is closed
+	if (!isShuttingDown && !buttonPushed && !s_welcomeAudioPlayed && !GameSpyIsOverlayOpen(GSOVERLAY_LOCALESELECT) && TheAudio)
+	{
+		AudioEventRTS welcomeSound("WelcomeToGeneralsOnline");
+		TheAudio->addAudioEvent(&welcomeSound);
+		s_welcomeAudioPlayed = TRUE;
+	}
+
+	if (TheShell->isAnimFinished() && !buttonPushed && TheGameSpyPeerMessageQueue)
+	{
+		HandleBuddyResponses();
+		HandlePersistentStorageResponses();
+
+		Int allowedMessages = TheGameSpyInfo->getMaxMessagesPerUpdate();
+		Bool sawImportantMessage = FALSE;
+		PeerResponse resp;
+		while (allowedMessages-- && !sawImportantMessage && TheGameSpyPeerMessageQueue->getResponse( resp ))
+		{
+			switch (resp.peerResponseType)
+			{
+			case PeerResponse::PEERRESPONSE_GROUPROOM:
+				{
+					GameSpyGroupRoom room;
+					room.m_groupID = resp.groupRoom.id;
+					room.m_maxWaiting = resp.groupRoom.maxWaiting;
+					room.m_name = resp.groupRoomName.c_str();
+					room.m_translatedName = L"TEST";
+					room.m_numGames = resp.groupRoom.numGames;
+					room.m_numPlaying = resp.groupRoom.numPlaying;
+					room.m_numWaiting = resp.groupRoom.numWaiting;
+					TheGameSpyInfo->addGroupRoom( room );
+					if (room.m_groupID == 0)
+					{
+						enableControls( TRUE );
+					}
+				}
+				break;
+			case PeerResponse::PEERRESPONSE_JOINGROUPROOM:
+				{
+					sawImportantMessage = TRUE;
+					enableControls( TRUE );
+					if (resp.joinGroupRoom.ok)
+					{
+						//buttonPushed = TRUE;
+						TheGameSpyInfo->setCurrentGroupRoom(resp.joinGroupRoom.id);
+						//GSMessageBoxOk( TheGameText->fetch("GUI:GSErrorTitle"), TheGameText->fetch("GUI:GSGroupRoomJoinOK") );
+
+						buttonPushed = TRUE;
+						nextScreen = "Menus/WOLCustomLobby.wnd";
+						TheShell->pop();
+						//TheShell->push( "Menus/WOLCustomLobby.wnd" );
+					}
+					else
+					{
+						GSMessageBoxOk( TheGameText->fetch("GUI:GSErrorTitle"), TheGameText->fetch("GUI:GSGroupRoomJoinFail") );
+					}
+				}
+				break;
+			case PeerResponse::PEERRESPONSE_DISCONNECT:
+				{
+					sawImportantMessage = TRUE;
+					UnicodeString title, body;
+					AsciiString disconMunkee;
+					disconMunkee.format("GUI:GSDisconReason%d", resp.discon.reason);
+					title = TheGameText->fetch( "GUI:GSErrorTitle" );
+					body = TheGameText->fetch( disconMunkee );
+					GameSpyCloseAllOverlays();
+					GSMessageBoxOk( title, body );
+					TheShell->pop();
+				}
+				break;
+			}
+		}
+	}
+
+}
+
+//-------------------------------------------------------------------------------------------------
+/** WOL Welcome Menu input callback */
+//-------------------------------------------------------------------------------------------------
+WindowMsgHandledType WOLWelcomeMenuInput( GameWindow *window, UnsignedInt msg,
+																			 WindowMsgData mData1, WindowMsgData mData2 )
+{
+	switch( msg )
+	{
+
+		// --------------------------------------------------------------------------------------------
+		case GWM_CHAR:
+		{
+			UnsignedByte key = mData1;
+			UnsignedByte state = mData2;
+			if (buttonPushed)
+				break;
+
+			switch( key )
+			{
+
+				// ----------------------------------------------------------------------------------------
+				case KEY_ESC:
+				{
+
+					//
+					// send a simulated selected event to the parent window of the
+					// back/exit button
+					//
+					if( BitIsSet( state, KEY_STATE_UP ) )
+					{
+						TheWindowManager->winSendSystemMsg( window, GBM_SELECTED,
+																							(WindowMsgData)buttonBack, buttonBackID );
+
+					}
+
+					// don't let key fall through anywhere else
+					return MSG_HANDLED;
+
+				}
+
+			}
+
+		}
+
+	}
+
+	return MSG_IGNORED;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** WOL Welcome Menu window system callback */
+//-------------------------------------------------------------------------------------------------
+WindowMsgHandledType WOLWelcomeMenuSystem( GameWindow *window, UnsignedInt msg,
+														 WindowMsgData mData1, WindowMsgData mData2 )
+{
+	UnicodeString txtInput;
+
+	switch( msg )
+	{
+
+
+		case GWM_CREATE:
+			{
+
+				break;
+			}
+
+		case GWM_DESTROY:
+			{
+				break;
+			}
+
+		case GWM_INPUT_FOCUS:
+			{
+				// if we're givin the opportunity to take the keyboard focus we must say we want it
+				if( mData1 == TRUE )
+					*(Bool *)mData2 = TRUE;
+
+				return MSG_HANDLED;
+			}
+
+		// GeneralsX @feature fbraz3 03/09/2026 Open MOTD link in system browser on row click
+		case GLM_SELECTED:
+			{
+				GameWindow *control = (GameWindow *)mData1;
+				Int controlID = control ? control->winGetWindowId() : NAMEKEY_INVALID;
+				Int selected = (Int)mData2;
+
+				if (controlID == listboxInfoID && selected >= 0)
+				{
+					auto it = s_motdRowUrls.find(selected);
+					if (it != s_motdRowUrls.end() && !it->second.empty())
+					{
+						fprintf(stderr, "[WOLWelcomeMenu] Opening MOTD URL: %s\n", it->second.c_str());
+						fflush(stderr);
+						OpenBrowserURL(it->second);
+						GadgetListBoxSetSelected(listboxInfo, -1);
+					}
+				}
+				break;
+			}
+
+		case GBM_SELECTED:
+			{
+				if (buttonPushed)
+					break;
+
+				GameWindow *control = (GameWindow *)mData1;
+				Int controlID = control->winGetWindowId();
+
+				if ( controlID == buttonBackID )
+				{
+					//DEBUG_ASSERTCRASH(TheGameSpyChat->getPeer(), ("No GameSpy Peer object!"));
+					//TheGameSpyChat->disconnectFromChat();
+
+					PeerRequest req;
+					req.peerRequestType = PeerRequest::PEERREQUEST_LOGOUT;
+					TheGameSpyPeerMessageQueue->addRequest( req );
+					BuddyRequest breq;
+					breq.buddyRequestType = BuddyRequest::BUDDYREQUEST_LOGOUT;
+					TheGameSpyBuddyMessageQueue->addRequest( breq );
+
+					DEBUG_LOG(("Tearing down GameSpy from WOLWelcomeMenuSystem(GBM_SELECTED)"));
+					TearDownGameSpy();
+
+					/*
+					if (TheGameSpyChat->getPeer())
+					{
+						peerDisconnect(TheGameSpyChat->getPeer());
+					}
+					*/
+
+					buttonPushed = TRUE;
+
+					TheShell->pop();
+
+					/// @todo: log out instead of disconnecting
+					//TheWOL->addCommand( WOL::WOLCOMMAND_LOGOUT );
+					/**
+					closeAllOverlays();
+					TheShell->pop();
+					delete TheWOL;
+					TheWOL = nullptr;
+					delete TheWOLGame;
+					TheWOLGame = nullptr;
+					**/
+
+				}
+				else if (controlID == buttonOptionsID)
+				{
+					GameSpyOpenOverlay( GSOVERLAY_OPTIONS );
+				}
+				else if (controlID == buttonQuickMatchID)
+				{
+					GameSpyMiscPreferences mPref;
+					if ((TheDisplay->getWidth() != DEFAULT_DISPLAY_WIDTH || TheDisplay->getHeight() != DEFAULT_DISPLAY_HEIGHT) && mPref.getQuickMatchResLocked())
+					{
+						GSMessageBoxOk(TheGameText->fetch("GUI:GSErrorTitle"), TheGameText->fetch("GUI:QuickMatch800x600"));
+					}
+					else
+					{
+						buttonPushed = TRUE;
+						nextScreen = "Menus/WOLQuickMatchMenu.wnd";
+						TheShell->pop();
+					}
+				}
+				else if (controlID == buttonMyInfoID )
+				{
+					SetLookAtPlayer(TheGameSpyInfo->getLocalProfileID(), TheGameSpyInfo->getLocalName());
+					GameSpyToggleOverlay(GSOVERLAY_PLAYERINFO);
+				}
+				else if (controlID == buttonLobbyID)
+				{
+					//TheGameSpyChat->clearGroupRoomList();
+					//peerListGroupRooms(TheGameSpyChat->getPeer(), ListGroupRoomsCallback, nullptr, PEERTrue);
+					TheGameSpyInfo->joinBestGroupRoom();
+					enableControls( FALSE );
+
+
+					/*
+					TheWOL->setScreen(WOL::WOLAPI_MENU_CUSTOMLOBBY);
+					TheWOL->setGameMode(WOL::WOLTYPE_CUSTOM);
+					TheWOL->setState( WOL::WOLAPI_LOBBY );
+					TheWOL->addCommand( WOL::WOLCOMMAND_REFRESH_CHANNELS );
+					*/
+				}
+				else if (controlID == buttonBuddiesID)
+				{
+					GameSpyToggleOverlay( GSOVERLAY_BUDDY );
+					/*
+					Bool joinedRoom = FALSE;
+					ClearGroupRoomList();
+					peerJoinTitleRoom(TheGameSpyChat->getPeer(), JoinRoomCallback, &joinedRoom, PEERTrue);
+					if (joinedRoom)
+					{
+						GameSpyUsingGroupRooms = FALSE;
+						GameSpyCurrentGroupRoomID = 0;
+						TheShell->pop();
+						TheShell->push("Menus/WOLCustomLobby.wnd");
+					}
+					else
+					{
+						GameSpyCurrentGroupRoomID = 0;
+						GSMessageBoxOk(L"Oops", L"Unable to join title room", nullptr);
+					}
+					*/
+				}
+				else if (controlID == buttonLadderID)
+				{
+					TheShell->push("Menus/WOLLadderScreen.wnd");
+				}
+				break;
+			}
+
+		case GEM_EDIT_DONE:
+			{
+				break;
+			}
+		default:
+			return MSG_IGNORED;
+
+	}
+
+	return MSG_HANDLED;
+}
