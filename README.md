@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/License-GPLv3-yellow" alt="GPLv3">
 </p>
 
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 ---
 
 ## 🧭 What is this?
