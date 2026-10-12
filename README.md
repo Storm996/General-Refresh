@@ -67,6 +67,7 @@ Beyond high frame rate, the following are **already implemented and playable**:
 - 🗺️ **Mission map support** — expanded handling for mission/custom maps.
 - 🧩 **Mission UI rework** — the mission briefing / selection interface has been redesigned.
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
+- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — removing the capacity bottleneck for larger maps, HD assets and heavy particle loads. (Since Microsoft never shipped a 64-bit Direct3D8 runtime, we achieve this via DXVK's x64 `d3d8.dll` shim that translates D3D8 to Vulkan at runtime.)
 
 ---
 
@@ -74,9 +75,10 @@ Beyond high frame rate, the following are **already implemented and playable**:
 
 What we are actively building and planning next:
 
-1. 🧮 **Native 64-bit build system** — moving fully to a 64-bit toolchain to lift the legacy 32-bit process ceilings, **unlocking usable system RAM and VRAM** for larger maps, HD assets and heavy particle loads.
-2. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
-3. 🤖 **AI-driven opponents** — adding **artificial-intelligence-powered battle AI** to bring a wider variety of AI personalities and play styles to Skirmish and beyond.
+1. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
+2. 🤖 **AI-driven opponents** — adding **artificial-intelligence-powered battle AI** to bring a wider variety of AI personalities and play styles to Skirmish and beyond.
+3. ✨ **Renderer modernization** — porting the `DX8Wrapper` from Direct3D8 to **Direct3D9** to lift the programmable-shader ceiling from `ps_1_4` to `ps_3_0`, unlocking multi-light forward shading, HDR and high-quality bloom; with a **native Vulkan / D3D11 backend** as the long-term goal.
+4. 🔊 **Audio & video backend modernization** — completing the 64-bit platform layer by moving to **MiniAudio / OpenAL (x64)** audio and **FFmpeg** for intro/cutscene playback.
 
 ---
 
