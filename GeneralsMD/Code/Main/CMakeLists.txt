@@ -7,19 +7,28 @@ add_executable(z_generals WIN32)
 set_target_properties(z_generals PROPERTIES OUTPUT_NAME GeneralRefresh)
 
 # GeneralsX @build BenderAI 13/02/2026 Windows-specific libraries
+# GeneralsX @build d3d9 port 12/10/2026 no d3d8 import library on any Windows target: DX8Wrapper::Init
+# loads d3d9.dll at runtime and resolves Direct3DCreate9 through GetProcAddress, so nothing imports
+# from d3d8.lib any more (the 32-bit branch used to link it purely out of the legacy VC6 recipe).
+# dinput8/dxguid are DirectInput (keyboard/mouse) and stay required: cmake/dx8.cmake feeds the 64-bit
+# link step the Windows SDK um/x64 copies by full path through d3d8lib, while 32-bit picks the
+# bare names up from min-dx8-sdk's x86 import libraries.
 if(WIN32)
     target_link_libraries(z_generals PRIVATE
         binkloader
         comctl32
         core_debug
-        d3d8
-        dinput8
-        dxguid
         imm32
         milesloader
         vfw32
         winmm
     )
+    if(NOT (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+        target_link_libraries(z_generals PRIVATE
+            dinput8
+            dxguid
+        )
+    endif()
 endif()
 
 # Cross-platform core libraries

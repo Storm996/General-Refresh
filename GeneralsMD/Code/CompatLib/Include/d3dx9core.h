@@ -9,9 +9,23 @@
 #endif
 
 // Now d3d8.h can find DWORD, FLOAT, UINT, etc.
-#include <d3d8.h>
+#include <d3d9.h>
 
 #define D3DX_DEFAULT                     UINT_MAX
+
+// GeneralsX @build d3d9 port 12/10/2026 - minimal buffer object returned by the D3DXAssembleShader
+// shim: it now wraps D3DCompile's DXBC output (or the compiler's error text) so the DX8-shaped
+// callers keep working. Defined before the extern "C" block so the shader-assembly prototype below
+// can name LPD3DXBUFFER.
+struct ID3DXBuffer
+{
+	virtual void* STDMETHODCALLTYPE GetBufferPointer() = 0;
+	virtual SIZE_T STDMETHODCALLTYPE GetBufferSize() = 0;
+	virtual HRESULT STDMETHODCALLTYPE QueryInterface(void* /*REFIID*/, void** ppvObject) { *ppvObject = nullptr; return E_NOINTERFACE; }
+	virtual ULONG STDMETHODCALLTYPE AddRef() = 0;
+	virtual ULONG STDMETHODCALLTYPE Release() = 0;
+};
+typedef ID3DXBuffer *LPD3DXBUFFER;
 
 #ifdef __cplusplus
 extern "C"
@@ -33,14 +47,14 @@ typedef enum eD3DXFilters
 HRESULT WINAPID3DXGetErrorStringA(HRESULT hr, LPSTR pBuffer, UINT BufferLen);
 
 HRESULT WINAPI
-D3DXCreateTexture(LPDIRECT3DDEVICE8 pDevice,
+D3DXCreateTexture(LPDIRECT3DDEVICE9 pDevice,
 	UINT Width,
 	UINT Height,
 	UINT MipLevels,
 	DWORD Usage,
 	D3DFORMAT Format,
 	D3DPOOL Pool,
-	LPDIRECT3DTEXTURE8 *ppTexture);
+	LPDIRECT3DTEXTURE9 *ppTexture);
 
 typedef enum _D3DXIMAGE_FILEFORMAT
 {
@@ -69,7 +83,7 @@ typedef struct D3DXIMAGE_INFO
 
 HRESULT WINAPI
 D3DXCreateTextureFromFileExA(
-	LPDIRECT3DDEVICE8 pDevice,
+	LPDIRECT3DDEVICE9 pDevice,
 	LPCSTR pSrcFile,
 	UINT Width,
 	UINT Height,
@@ -84,14 +98,14 @@ D3DXCreateTextureFromFileExA(
 	D3DXIMAGE_INFO *pSrcInfo,
 	PALETTEENTRY *pPalette,
 
-	LPDIRECT3DTEXTURE8 *ppTexture);
+	LPDIRECT3DTEXTURE9 *ppTexture);
 
 HRESULT WINAPI
 D3DXLoadSurfaceFromSurface(
-	LPDIRECT3DSURFACE8 pDestSurface,
+	LPDIRECT3DSURFACE9 pDestSurface,
 	CONST PALETTEENTRY *pDestPalette,
 	CONST RECT *pDestRect,
-	LPDIRECT3DSURFACE8 pSrcSurface,
+	LPDIRECT3DSURFACE9 pSrcSurface,
 	CONST PALETTEENTRY *pSrcPalette,
 	CONST RECT *pSrcRect,
 	DWORD Filter,
@@ -106,24 +120,24 @@ D3DXGetErrorStringA(
 // Taken and adopted from Wine 3.21
 HRESULT WINAPI
 D3DXFilterTexture(
-	LPDIRECT3DBASETEXTURE8 pBaseTexture,
+	LPDIRECT3DBASETEXTURE9 pBaseTexture,
 	CONST PALETTEENTRY *pPalette,
 	UINT SrcLevel,
 	DWORD Filter);
 
 HRESULT WINAPI
 D3DXCreateCubeTexture(
-	LPDIRECT3DDEVICE8 pDevice,
+	LPDIRECT3DDEVICE9 pDevice,
 	UINT Size,
 	UINT MipLevels,
 	DWORD Usage,
 	D3DFORMAT Format,
 	D3DPOOL Pool,
-	LPDIRECT3DCUBETEXTURE8 *ppCubeTexture);
+	LPDIRECT3DCUBETEXTURE9 *ppCubeTexture);
 
 HRESULT WINAPI
 D3DXCreateVolumeTexture(
-	LPDIRECT3DDEVICE8 pDevice,
+	LPDIRECT3DDEVICE9 pDevice,
 	UINT Width,
 	UINT Height,
 	UINT Depth,
@@ -131,22 +145,17 @@ D3DXCreateVolumeTexture(
 	DWORD Usage,
 	D3DFORMAT Format,
 	D3DPOOL Pool,
-	LPDIRECT3DVOLUMETEXTURE8 *ppVolumeTexture);
+	LPDIRECT3DVOLUMETEXTURE9 *ppVolumeTexture);
 
-typedef struct D3DXBUFFER *LPD3DXBUFFER;
+// ID3DXBuffer/LPD3DXBUFFER are defined above (before the extern "C" block).
 
+// Compiles HLSL through the system D3DCompile. The source must carry a
+// "// d3d-target: vs_2_0|ps_2_0|..." directive and may override the default "main" entry point
+// with "// d3d-entry: <name>". Returns the DXBC blob for CreateVertexShader/CreatePixelShader.
 HRESULT WINAPI
 D3DXAssembleShader(
 	LPCVOID pSrcData,
 	UINT SrcDataLen,
-	DWORD Flags,
-	LPD3DXBUFFER *ppConstants,
-	LPD3DXBUFFER *ppCompiledShader,
-	LPD3DXBUFFER *ppCompilationErrors);
-
-HRESULT WINAPI
-D3DXAssembleShaderFromFileA(
-	LPCSTR pSrcFile,
 	DWORD Flags,
 	LPD3DXBUFFER *ppConstants,
 	LPD3DXBUFFER *ppCompiledShader,

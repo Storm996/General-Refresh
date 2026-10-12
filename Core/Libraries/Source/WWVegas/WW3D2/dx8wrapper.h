@@ -46,7 +46,8 @@
 // GeneralsX @build BenderAI 10/02/2026
 // Use angle brackets (not quotes) to skip local d3d8.h stub and get DXVK headers
 // DXVK's d3d8.h includes d3d8types.h internally - no manual includes needed
-#include <d3d8.h>
+#include <d3d9.h>
+#include <stdio.h>	// GeneralsX @test d3d9 port 12/10/2026 temporary _Copy_DX8_Rects trace, remove with it
 #include "WWMath/matrix4.h"
 #include "statistics.h"
 #include "WWLib/wwstring.h"
@@ -60,6 +61,11 @@
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
 #include "WW3D2/vertmaterial.h"
+
+// GeneralsX @build d3d9 port 11/10/2026 - D3D9 removed D3DVSD_REG token macros; vertex declarations
+// are D3DVERTEXELEMENT9 arrays. SDK only provides D3DDECL_END(), so this helper builds one element:
+// { Stream, Offset, Type, Method, Usage, UsageIndex } with explicit byte offset (D3D9 requires it).
+#define D3DDECL_USAGE(type, usage, usage_index, offset) { 0, (WORD)(offset), (BYTE)(type), D3DDECLMETHOD_DEFAULT, (BYTE)(usage), (BYTE)(usage_index) }
 
 /*
 ** Registry value names
@@ -207,7 +213,7 @@ struct RenderStateStruct
 	ShaderClass shader;
 	VertexMaterialClass* material;
 	TextureBaseClass * Textures[MAX_TEXTURE_STAGES];
-	D3DLIGHT8 Lights[4];
+	D3DLIGHT9 Lights[4];
 	bool LightEnable[4];
   //unsigned lightsHash;
 	// GeneralsX @refactor BenderAI 10/02/2026
@@ -311,7 +317,7 @@ public:
 
 	static void Clear(bool clear_color, bool clear_z_stencil, const Vector3 &color, float dest_alpha=0.0f, float z=1.0f, unsigned int stencil=0);
 
-	static void	Set_Viewport(CONST D3DVIEWPORT8* pViewport);
+	static void	Set_Viewport(CONST D3DVIEWPORT9* pViewport);
 
 	static void Set_Vertex_Buffer(const VertexBufferClass* vb, unsigned stream=0);
 	static void Set_Vertex_Buffer(const DynamicVBAccessClass& vba);
@@ -323,7 +329,7 @@ public:
 	static void Set_Render_State(const RenderStateStruct& state);
 	static void Release_Render_State();
 
-	static void Set_DX8_Material(const D3DMATERIAL8* mat);
+	static void Set_DX8_Material(const D3DMATERIAL9* mat);
 
 	static void Set_Gamma(float gamma,float bright,float contrast,bool calibrate=true,bool uselimit=true);
 
@@ -346,16 +352,19 @@ public:
 	// GeneralsX @bugfix BenderAI 13/02/2026 Matrix4x4 for GLM compatibility (fighter19 pattern)
 	static void _Get_DX8_Transform(D3DTRANSFORMSTATETYPE transform, Matrix4x4& m);
 
-	static void Set_DX8_Light(int index,D3DLIGHT8* light);
+	static void Set_DX8_Light(int index,D3DLIGHT9* light);
 	static void Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value);
 	static void Set_DX8_Clip_Plane(DWORD Index, CONST float* pPlane);
 	static void Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURESTAGESTATETYPE state, unsigned value);
-	static void Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture8* texture);
+	// GeneralsX @build d3d9 port 11/10/2026 D3DSAMP_* values alias D3DTSS_* numerically in D3D9;
+	// sampler states must reach the driver through SetSamplerState, so they get their own cache path.
+	static void Set_DX8_Sampler_State(unsigned stage, D3DSAMPLERSTATETYPE state, unsigned value);
+	static void Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture9* texture);
 	static void Set_Light_Environment(LightEnvironmentClass* light_env);
 	static LightEnvironmentClass* Get_Light_Environment() { return Light_Environment; }
 	static void Set_Fog(bool enable, const Vector3 &color, float start, float end);
 
-	static WWINLINE const D3DLIGHT8& Peek_Light(unsigned index);
+	static WWINLINE const D3DLIGHT9& Peek_Light(unsigned index);
 	static WWINLINE bool Is_Light_Enabled(unsigned index);
 
 	static bool Validate_Device();
@@ -366,7 +375,7 @@ public:
 	static void Get_Shader(ShaderClass& shader);
 	static void Set_Texture(unsigned stage,TextureBaseClass* texture);
 	static void Set_Material(const VertexMaterialClass* material);
-	static void Set_Light(unsigned index,const D3DLIGHT8* light);
+	static void Set_Light(unsigned index,const D3DLIGHT9* light);
 	static void Set_Light(unsigned index,const LightClass &light);
 
 	static void Apply_Render_State_Changes();	// Apply deferred render state changes (will be called automatically by Draw...)
@@ -392,7 +401,7 @@ public:
 	** Resources
 	*/
 
-	static IDirect3DVolumeTexture8* _Create_DX8_Volume_Texture
+	static IDirect3DVolumeTexture9* _Create_DX8_Volume_Texture
 	(
 		unsigned int width,
 		unsigned int height,
@@ -402,7 +411,7 @@ public:
 		D3DPOOL pool=D3DPOOL_MANAGED
 	);
 
-	static IDirect3DCubeTexture8* _Create_DX8_Cube_Texture
+	static IDirect3DCubeTexture9* _Create_DX8_Cube_Texture
 	(
 		unsigned int width,
 		unsigned int height,
@@ -413,7 +422,7 @@ public:
 	);
 
 
-	static IDirect3DTexture8* _Create_DX8_ZTexture
+	static IDirect3DTexture9* _Create_DX8_ZTexture
 	(
 		unsigned int width,
 		unsigned int height,
@@ -423,7 +432,7 @@ public:
 	);
 
 
-	static IDirect3DTexture8 * _Create_DX8_Texture
+	static IDirect3DTexture9 * _Create_DX8_Texture
 	(
 		unsigned int width,
 		unsigned int height,
@@ -432,19 +441,19 @@ public:
 		D3DPOOL pool=D3DPOOL_MANAGED,
 		bool rendertarget=false
 	);
-	static IDirect3DTexture8 * _Create_DX8_Texture(const char *filename, MipCountType mip_level_count);
-	static IDirect3DTexture8 * _Create_DX8_Texture(IDirect3DSurface8 *surface, MipCountType mip_level_count);
+	static IDirect3DTexture9 * _Create_DX8_Texture(const char *filename, MipCountType mip_level_count);
+	static IDirect3DTexture9 * _Create_DX8_Texture(IDirect3DSurface9 *surface, MipCountType mip_level_count);
 
-	static IDirect3DSurface8 * _Create_DX8_Surface(unsigned int width, unsigned int height, WW3DFormat format);
-	static IDirect3DSurface8 * _Create_DX8_Surface(const char *filename);
-	static IDirect3DSurface8 * _Get_DX8_Front_Buffer();
+	static IDirect3DSurface9 * _Create_DX8_Surface(unsigned int width, unsigned int height, WW3DFormat format);
+	static IDirect3DSurface9 * _Create_DX8_Surface(const char *filename);
+	static IDirect3DSurface9 * _Get_DX8_Front_Buffer();
 	static SurfaceClass * _Get_DX8_Back_Buffer(unsigned int num=0);
 
 	static void _Copy_DX8_Rects(
-			IDirect3DSurface8* pSourceSurface,
+			IDirect3DSurface9* pSourceSurface,
 			CONST RECT* pSourceRectsArray,
 			UINT cRects,
-			IDirect3DSurface8* pDestinationSurface,
+			IDirect3DSurface9* pDestinationSurface,
 			CONST POINT* pDestPointsArray
 	);
 
@@ -453,7 +462,7 @@ public:
 	static unsigned int Get_Free_Texture_RAM();
 
 	static unsigned _Get_Main_Thread_ID() { return _MainThreadID; }
-	static const D3DADAPTER_IDENTIFIER8& Get_Current_Adapter_Identifier() { return CurrentAdapterIdentifier; }
+	static const D3DADAPTER_IDENTIFIER9& Get_Current_Adapter_Identifier() { return CurrentAdapterIdentifier; }
 
 	/*
 	** Statistics
@@ -495,20 +504,20 @@ public:
 	**
 	**	swap_chain_ptr->Present (nullptr, nullptr, nullptr, nullptr);
 	**
-	**	DX8Wrapper::Set_Render_Target ((IDirect3DSurface8 *)nullptr);
+	**	DX8Wrapper::Set_Render_Target ((IDirect3DSurface9 *)nullptr);
 	**
 	*/
-	static IDirect3DSwapChain8 *	Create_Additional_Swap_Chain (HWND render_window);
+	static IDirect3DSwapChain9 *	Create_Additional_Swap_Chain (HWND render_window);
 
 	/*
 	** Render target interface. If render target format is WW3D_FORMAT_UNKNOWN, current display format is used.
 	*/
 	static TextureClass *	Create_Render_Target (int width, int height, WW3DFormat format = WW3D_FORMAT_UNKNOWN);
 
-	static void					Set_Render_Target (IDirect3DSurface8 *render_target, bool use_default_depth_buffer = false);
-	static void					Set_Render_Target (IDirect3DSurface8* render_target, IDirect3DSurface8* dpeth_buffer);
+	static void					Set_Render_Target (IDirect3DSurface9 *render_target, bool use_default_depth_buffer = false);
+	static void					Set_Render_Target (IDirect3DSurface9* render_target, IDirect3DSurface9* dpeth_buffer);
 
-	static void					Set_Render_Target (IDirect3DSwapChain8 *swap_chain);
+	static void					Set_Render_Target (IDirect3DSwapChain9 *swap_chain);
 	static bool					Is_Render_To_Texture() { return IsRenderToTexture; }
 
 	// Platform display size provider — set by SDL3 layer at init
@@ -542,8 +551,13 @@ public:
 	// shader system updates KJM v
 	static void Apply_Default_State();
 
-	static void Set_Vertex_Shader(DWORD vertex_shader);
-	static void Set_Pixel_Shader(DWORD pixel_shader);
+	// GeneralsX @build d3d9 port 11/10/2026 D3D9 shader handles are interface pointers, so they are
+	// carried as UINT_PTR (a DWORD would truncate x64 pointers). FVF and declaration paths are split
+	// out because D3D9 removed the D3D8 combined FVF-as-shader convention.
+	static void Set_Vertex_Shader(UINT_PTR vertex_shader);
+	static void Set_Vertex_FVF(DWORD fvf);
+	static void Set_Vertex_Declaration(IDirect3DVertexDeclaration9* decl);
+	static void Set_Pixel_Shader(UINT_PTR pixel_shader);
 
 	static void Set_Vertex_Shader_Constant(int reg, const void* data, int count);
 	static void Set_Pixel_Shader_Constant(int reg, const void* data, int count);
@@ -558,8 +572,8 @@ public:
 
 
 
-	static IDirect3DDevice8* _Get_D3D_Device8() { return D3DDevice; }
-	static IDirect3D8* _Get_D3D8() { return D3DInterface; }
+	static IDirect3DDevice9* _Get_D3D_Device8() { return D3DDevice; }
+	static IDirect3D9* _Get_D3D8() { return D3DInterface; }
 	/// Returns the display format - added by TR for video playback - not part of W3D
 	static WW3DFormat	getBackBufferFormat();
 	static bool Reset_Device(bool reload_assets=true);
@@ -571,10 +585,13 @@ public:
 
 	static const char* Get_DX8_Render_State_Name(D3DRENDERSTATETYPE state);
 	static const char* Get_DX8_Texture_Stage_State_Name(D3DTEXTURESTAGESTATETYPE state);
+	// GeneralsX @build d3d9 port 11/10/2026 - sampler state name tables (D3DSAMP_* split out of D3DTSS_* in D3D9)
+	static const char* Get_DX8_Sampler_State_Name(D3DSAMPLERSTATETYPE state);
 	static unsigned Get_DX8_Render_State(D3DRENDERSTATETYPE state) { return RenderStates[state]; }
 
 	// Names of the specific values of render states and texture stage states
 	static void Get_DX8_Texture_Stage_State_Value_Name(StringClass& name, D3DTEXTURESTAGESTATETYPE state, unsigned value);
+	static void Get_DX8_Sampler_State_Value_Name(StringClass& name, D3DSAMPLERSTATETYPE state, unsigned value);
 	static void Get_DX8_Render_State_Value_Name(StringClass& name, D3DRENDERSTATETYPE state, unsigned value);
 
 	static const char* Get_DX8_Texture_Address_Name(unsigned value);
@@ -687,8 +704,10 @@ protected:
 	static D3DMATRIX						old_prj;
 
 	// shader system updates KJM v
-	static DWORD							Vertex_Shader;
-	static DWORD							Pixel_Shader;
+	// GeneralsX @build d3d9 port 11/10/2026 handles are D3D9 interface pointers stored losslessly
+	static UINT_PTR						Vertex_Shader;
+	static UINT_PTR						Pixel_Shader;
+	static IDirect3DVertexDeclaration9*	Vertex_Declaration;
 
 	static Vector4							Vertex_Shader_Constants[MAX_VERTEX_SHADER_CONSTANTS];
 	static Vector4							Pixel_Shader_Constants[MAX_PIXEL_SHADER_CONSTANTS];
@@ -705,8 +724,10 @@ protected:
 
 	static bool								world_identity;
 	static unsigned						RenderStates[256];
-	static unsigned						TextureStageStates[MAX_TEXTURE_STAGES][32];
-	static IDirect3DBaseTexture8 *	Textures[MAX_TEXTURE_STAGES];
+	// GeneralsX @build d3d9 port 11/10/2026 D3DTSS_CONSTANT=32 needs index 32; sampler states cached separately
+	static unsigned						TextureStageStates[MAX_TEXTURE_STAGES][33];
+	static unsigned						SamplerStates[MAX_TEXTURE_STAGES][16];
+	static IDirect3DBaseTexture9 *	Textures[MAX_TEXTURE_STAGES];
 
 	// These fog settings are constant for all objects in a given scene,
 	// unlike the matching renderstates which vary based on shader settings.
@@ -720,15 +741,15 @@ protected:
 
 	static DX8Caps*						CurrentCaps;
 
-	static D3DADAPTER_IDENTIFIER8		CurrentAdapterIdentifier;
+	static D3DADAPTER_IDENTIFIER9		CurrentAdapterIdentifier;
 
-	static IDirect3D8 *					D3DInterface;			//d3d8;
-	static IDirect3DDevice8 *			D3DDevice;				//d3ddevice8;
+	static IDirect3D9 *					D3DInterface;			//d3d8;
+	static IDirect3DDevice9 *			D3DDevice;				//d3ddevice8;
 
-	static IDirect3DSurface8 *			CurrentRenderTarget;
-	static IDirect3DSurface8 *			CurrentDepthBuffer;
-	static IDirect3DSurface8 *			DefaultRenderTarget;
-	static IDirect3DSurface8 *			DefaultDepthBuffer;
+	static IDirect3DSurface9 *			CurrentRenderTarget;
+	static IDirect3DSurface9 *			CurrentDepthBuffer;
+	static IDirect3DSurface9 *			DefaultRenderTarget;
+	static IDirect3DSurface9 *			DefaultDepthBuffer;
 
 	static unsigned							DrawPolygonLowBoundLimit;
 
@@ -744,11 +765,11 @@ protected:
 	static int								s_bbW, s_bbH;
 	static int								s_dstX, s_dstY, s_dstW, s_dstH;
 	static float							s_pixelDensity;
-	static IDirect3DTexture8*			s_offscreenTex;
-	static IDirect3DSurface8*			s_offscreenSurf;
-	static IDirect3DSurface8*			s_depthSurf;
-	static IDirect3DSurface8*			s_savedBackbuffer;
-	static IDirect3DSurface8*			s_savedDepth;
+	static IDirect3DTexture9*			s_offscreenTex;
+	static IDirect3DSurface9*			s_offscreenSurf;
+	static IDirect3DSurface9*			s_depthSurf;
+	static IDirect3DSurface9*			s_savedBackbuffer;
+	static IDirect3DSurface9*			s_savedDepth;
 
 	static bool								Pillarbox_Setup(int gameW, int gameH);
 	static void								Pillarbox_Cleanup();
@@ -767,26 +788,49 @@ protected:
 };
 
 // shader system updates KJM v
-WWINLINE void DX8Wrapper::Set_Vertex_Shader(DWORD vertex_shader)
+// GeneralsX @build d3d9 port 11/10/2026 - D3D9 splits D3D8's combined FVF/shader handle:
+// Set_Vertex_Shader now takes an IDirect3DVertexShader9* (stored as UINT_PTR), while fixed
+// function vertex formats go through Set_Vertex_FVF (SetFVF). Callers that previously passed
+// FVF constants must switch to Set_Vertex_FVF.
+WWINLINE void DX8Wrapper::Set_Vertex_Shader(UINT_PTR vertex_shader)
 {
-#if 0 //(gth) some code is bypassing this accessor function so we can't count on this variable...
-	// may be incorrect if shaders are created and destroyed dynamically
-	if (Vertex_Shader==vertex_shader) return;
-#endif
-
 	Vertex_Shader=vertex_shader;
-	DX8CALL(SetVertexShader(Vertex_Shader));
+	DX8CALL(SetVertexShader(reinterpret_cast<IDirect3DVertexShader9*>(vertex_shader)));
 }
 
-WWINLINE void DX8Wrapper::Set_Pixel_Shader(DWORD pixel_shader)
+// GeneralsX @build d3d9 port 12/10/2026 - measured contract (native d3d9 and DXVK 2.6 agree; the
+// standalone setfvfprobe tool in the port-notes folder records it): SetFVF does NOT unbind a custom
+// vertex shader the way D3D8's single FVF-or-shader handle implied. D3D9 keeps the vertex format and
+// the vertex shader as two orthogonal states, so a custom shader stays active until
+// Set_Vertex_Shader(0) is called.
+// Fixed-function batches are unaffected because a FVF-bound shader only matters while a custom
+// shader is explicitly installed - and every path that installs one (dot3, trees, sea waves) must
+// therefore unbind it in its own restore pair. Clearing here instead would strip the dot3 vertex
+// shader mid-batch: Apply_Render_State_Changes re-asserts the buffer FVF on every draw
+// (dx8wrapper.cpp:2740), which is also why W3DTreeBuffer.cpp:1722 rebinds after applying state.
+WWINLINE void DX8Wrapper::Set_Vertex_FVF(DWORD fvf)
+{
+	DX8CALL(SetFVF(fvf));
+}
+
+WWINLINE void DX8Wrapper::Set_Vertex_Declaration(IDirect3DVertexDeclaration9* decl)
+{
+	if (Vertex_Declaration==decl) return;
+	Vertex_Declaration=decl;
+	DX8CALL(SetVertexDeclaration(decl));
+}
+
+WWINLINE void DX8Wrapper::Set_Pixel_Shader(UINT_PTR pixel_shader)
 {
 	// may be incorrect if shaders are created and destroyed dynamically
 	if (Pixel_Shader==pixel_shader) return;
 
 	Pixel_Shader=pixel_shader;
-	DX8CALL(SetPixelShader(Pixel_Shader));
+	DX8CALL(SetPixelShader(reinterpret_cast<IDirect3DPixelShader9*>(pixel_shader)));
 }
 
+// GeneralsX @build d3d9 port 11/10/2026 - DXVK upstream confirms D3D8's ConstantCount here is
+// already a Vector4 count, identical to SetVertexShaderConstantF/SetPixelShaderConstantF semantics.
 WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, int count)
 {
 	int memsize=sizeof(Vector4)*count;
@@ -795,7 +839,7 @@ WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, 
 	if (memcmp(data, &Vertex_Shader_Constants[reg],memsize)==0) return;
 
 	memcpy(&Vertex_Shader_Constants[reg],data,memsize);
-	DX8CALL(SetVertexShaderConstant(reg,data,count));
+	DX8CALL(SetVertexShaderConstantF(reg,static_cast<const float*>(data),count));
 }
 
 WWINLINE void DX8Wrapper::Set_Pixel_Shader_Constant(int reg, const void* data, int count)
@@ -806,7 +850,7 @@ WWINLINE void DX8Wrapper::Set_Pixel_Shader_Constant(int reg, const void* data, i
 	if (memcmp(data, &Pixel_Shader_Constants[reg],memsize)==0) return;
 
 	memcpy(&Pixel_Shader_Constants[reg],data,memsize);
-	DX8CALL(SetPixelShaderConstant(reg,data,count));
+	DX8CALL(SetPixelShaderConstantF(reg,static_cast<const float*>(data),count));
 }
 // shader system updates KJM ^
 // GeneralsX @refactor BenderAI 10/02/2026 - fighter19 pattern Matrix4x4 parameter not D3DMATRIX
@@ -886,7 +930,7 @@ WWINLINE void DX8Wrapper::Set_Ambient(const Vector3& color)
 //
 // ----------------------------------------------------------------------------
 
-WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL8* mat)
+WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL9* mat)
 {
 	DX8_RECORD_MATERIAL_CHANGE();
 	WWASSERT(mat);
@@ -894,7 +938,7 @@ WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL8* mat)
 	DX8CALL(SetMaterial(mat));
 }
 
-WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT8* light)
+WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT9* light)
 {
 	if (light) {
 		DX8_RECORD_LIGHT_CHANGE();
@@ -962,7 +1006,29 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURE
 	DX8_RECORD_TEXTURE_STAGE_STATE_CHANGE();
 }
 
-WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture8* texture)
+// GeneralsX @build d3d9 port 11/10/2026 - D3D9 sampler states (filters, addresses, LOD bias) are a
+// separate device API with their own numeric space aliasing D3DTSS_*; route them to SetSamplerState.
+WWINLINE void DX8Wrapper::Set_DX8_Sampler_State(unsigned stage, D3DSAMPLERSTATETYPE state, unsigned value)
+{
+  	if (stage >= MAX_TEXTURE_STAGES)
+  	{	DX8CALL(SetSamplerState( stage, state, value ));
+  		return;
+  	}
+
+	if (SamplerStates[stage][(unsigned int)state]==value) return;
+
+#ifdef DEBUG_LOGGING
+	if (WW3D::Is_Snapshot_Activated()) {
+		SNAPSHOT_SAY(("DX8 - SetSamplerState(stage: %d, state: %d, value: %d)", stage, (int)state, value));
+	}
+#endif
+
+	SamplerStates[stage][(unsigned int)state]=value;
+	DX8CALL(SetSamplerState( stage, state, value ));
+	DX8_RECORD_TEXTURE_STAGE_STATE_CHANGE();
+}
+
+WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTexture9* texture)
 {
   	if (stage >= MAX_TEXTURE_STAGES)
   	{	DX8CALL(SetTexture(stage, texture));
@@ -980,20 +1046,313 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture(unsigned int stage, IDirect3DBaseTextu
 	DX8_RECORD_TEXTURE_CHANGE();
 }
 
+// GeneralsX @build d3d9 port 11/10/2026 - D3D9 removed CopyRects. Full-surface copies of render
+// targets/back buffers use GetRenderTargetData (the destination must then be a system-memory
+// plain surface); rect-list copies go through UpdateSurface.
+// GeneralsX @bugfix d3d9 port 12/10/2026 System-memory sources (font glyph atlas surfaces in
+// Render2DSentenceClass) are copied via LockRect/staging-texture paths: DXVK's
+// GetRenderTargetData access-violates when the source is not a render target.
+// GeneralsX @bugfix d3d9 port 12/10/2026 Real pixel size of a locked rectangle. The callers of
+// _Copy_DX8_Rects hand over 1- and 2-byte formats too (font glyph atlases are L8/A8 class, W3DSmudge
+// and the shroud use A4R4G4B4), so the previous "A4R4G4B4 or 4 bytes" guess read several times further
+// than the source row and faulted inside memcpy while the shell map was loading. Block-compressed,
+// paletted-depth and unknown formats report 0, which makes the copy sites refuse the CPU path instead
+// of inventing a stride.
+WWINLINE UINT DX8_Format_Bytes_Per_Pixel(D3DFORMAT format)
+{
+	switch (format) {
+	case D3DFMT_A8R8G8B8:
+	case D3DFMT_X8R8G8B8:
+	case D3DFMT_A8B8G8R8:
+	case D3DFMT_X8B8G8R8:
+	case D3DFMT_A2B10G10R10:
+	case D3DFMT_A2R10G10B10:
+	case D3DFMT_X8L8V8U8:
+	case D3DFMT_A16B16G16R16:
+		return 4;
+	case D3DFMT_R8G8B8:
+		return 3;
+	case D3DFMT_R5G6B5:
+	case D3DFMT_X1R5G5B5:
+	case D3DFMT_A1R5G5B5:
+	case D3DFMT_A4R4G4B4:
+	case D3DFMT_X4R4G4B4:
+	case D3DFMT_A8R3G3B2:
+	case D3DFMT_A8P8:
+	case D3DFMT_A8L8:
+	case D3DFMT_V8U8:
+	case D3DFMT_L6V5U5:
+	case D3DFMT_G16R16:
+		return 2;
+	case D3DFMT_L8:
+	case D3DFMT_A8:
+	case D3DFMT_P8:
+	case D3DFMT_A4L4:
+	case D3DFMT_R3G3B2:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+// GeneralsX @bugfix d3d9 port 12/10/2026 Single row-copy primitive for the legal CPU routes below.
+// A lock whose pitch cannot hold the row, or a format whose pixel size is unknown, is reported as a
+// refusal so the caller can pick another route - copying anyway is what corrupted the heap.
+// The bounded stderr trace is temporary diagnostics for the shell-map crash hunt; delete before merge.
+WWINLINE bool DX8_Copy_Locked_Rect_Rows(
+	const D3DLOCKED_RECT& destinationLock,
+	const D3DLOCKED_RECT& sourceLock,
+	UINT rows,
+	UINT columns,
+	D3DFORMAT format,
+	const char* route)
+{
+	static Int s_traceCount = 0;
+	const UINT bytesPerPixel = DX8_Format_Bytes_Per_Pixel(format);
+	const UINT rowBytes = columns * bytesPerPixel;
+	const bool acceptable = bytesPerPixel != 0 && rows != 0 && columns != 0
+		&& destinationLock.Pitch > 0 && sourceLock.Pitch > 0
+		&& (UINT)destinationLock.Pitch >= rowBytes && (UINT)sourceLock.Pitch >= rowBytes;
+
+	if (s_traceCount < 64) {
+		++s_traceCount;
+		fprintf(stderr, "[COPYRECTS] %s fmt=0x%X bpp=%u %ux%u dstPitch=%d srcPitch=%d ok=%d\n",
+			route, (unsigned)format, bytesPerPixel, columns, rows,
+			destinationLock.Pitch, sourceLock.Pitch, acceptable ? 1 : 0);
+		fflush(stderr);
+	}
+
+	if (!acceptable) {
+		return false;
+	}
+	for (UINT row = 0; row < rows; ++row) {
+		memcpy((unsigned char*)destinationLock.pBits + (INT_PTR)row * destinationLock.Pitch,
+			(const unsigned char*)sourceLock.pBits + (INT_PTR)row * sourceLock.Pitch,
+			rowBytes);
+	}
+	return true;
+}
+
 WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
-  IDirect3DSurface8* pSourceSurface,
+  IDirect3DSurface9* pSourceSurface,
   CONST RECT* pSourceRectsArray,
   UINT cRects,
-  IDirect3DSurface8* pDestinationSurface,
+  IDirect3DSurface9* pDestinationSurface,
   CONST POINT* pDestPointsArray
 )
 {
-	DX8CALL(CopyRects(
-  pSourceSurface,
-  pSourceRectsArray,
-  cRects,
-  pDestinationSurface,
-  pDestPointsArray));
+	if (cRects == 0) {
+		DX8_RECORD_DX8_CALLS();
+
+		// GeneralsX @bugfix d3d9 port 12/10/2026 Emulate DX8 CopyRects faithfully:
+		// - system-memory source (font glyph atlas surfaces) copies through a system-memory
+		//   staging texture, because D3D9 forbids LockRect on D3DPOOL_DEFAULT texture levels and
+		//   DXVK's GetRenderTargetData access-violates when the source is not a render target.
+		// - render-target sources keep the GetRenderTargetData path (destination must then be a
+		//   system-memory plain surface, as all such callers create it).
+		D3DSURFACE_DESC srcDesc;
+		ZeroMemory(&srcDesc, sizeof(srcDesc));
+		DX8_ErrorCode(pSourceSurface->GetDesc(&srcDesc));
+
+		D3DSURFACE_DESC dstDesc;
+		ZeroMemory(&dstDesc, sizeof(dstDesc));
+		DX8_ErrorCode(pDestinationSurface->GetDesc(&dstDesc));
+
+		if (srcDesc.Pool == D3DPOOL_SYSTEMMEM) {
+			if (dstDesc.Pool == D3DPOOL_SYSTEMMEM) {
+				D3DLOCKED_RECT srcLock;
+				HRESULT hr = pSourceSurface->LockRect(&srcLock, nullptr, D3DLOCK_READONLY);
+				if (SUCCEEDED(hr)) {
+					D3DLOCKED_RECT dstLock;
+					hr = pDestinationSurface->LockRect(&dstLock, nullptr, 0);
+					if (SUCCEEDED(hr)) {
+						DX8_Copy_Locked_Rect_Rows(dstLock, srcLock,
+							srcDesc.Height < dstDesc.Height ? srcDesc.Height : dstDesc.Height,
+							srcDesc.Width < dstDesc.Width ? srcDesc.Width : dstDesc.Width,
+							dstDesc.Format, "sysmem->sysmem");
+						pDestinationSurface->UnlockRect();
+					}
+					pSourceSurface->UnlockRect();
+				}
+				if (FAILED(hr)) {
+					WWDEBUG_SAY(("_Copy_DX8_Rects system-memory copy failed, hr = 0x%08X", hr));
+				}
+				return;
+			}
+
+			IDirect3DTexture9* dstTexture = nullptr;
+			if (FAILED(pDestinationSurface->GetContainer(__uuidof(IDirect3DTexture9), (void**)&dstTexture)) || dstTexture == nullptr) {
+				WWDEBUG_SAY(("_Copy_DX8_Rects: system-memory source has a non-texture destination"));
+				return;
+			}
+			// GeneralsX @bugfix d3d9 port 12/10/2026 The upload path depends on the destination pool:
+			// D3D9 forbids UpdateSurface/UpdateTexture into a D3DPOOL_MANAGED texture (DXVK answers
+			// D3DERR_INVALIDCALL, verified with an isolated d3d9 probe), so managed destinations are
+			// filled by locking the texture level and copying bytes. DEFAULT destinations go through
+			// a system-memory staging texture + device UpdateTexture, which the probe verified for
+			// A4R4G4B4 and X8R8G8B8.
+			IDirect3DSurface9* dstLevel = nullptr;
+			HRESULT hr = dstTexture->GetSurfaceLevel(0, &dstLevel);
+			if (SUCCEEDED(hr)) {
+				const UINT copyRows = srcDesc.Height < dstDesc.Height ? srcDesc.Height : dstDesc.Height;
+				const UINT copyColumns = srcDesc.Width < dstDesc.Width ? srcDesc.Width : dstDesc.Width;
+				if (dstDesc.Pool == D3DPOOL_MANAGED) {
+					D3DLOCKED_RECT srcLock;
+					hr = pSourceSurface->LockRect(&srcLock, nullptr, D3DLOCK_READONLY);
+					if (SUCCEEDED(hr)) {
+						D3DLOCKED_RECT dstLock;
+						hr = dstLevel->LockRect(&dstLock, nullptr, 0);
+						if (SUCCEEDED(hr)) {
+							DX8_Copy_Locked_Rect_Rows(dstLock, srcLock, copyRows, copyColumns,
+								dstDesc.Format, "sysmem->managed-level");
+							dstLevel->UnlockRect();
+						}
+						pSourceSurface->UnlockRect();
+					}
+				} else {
+					DWORD dstLevels = dstTexture->GetLevelCount();
+					IDirect3DTexture9* stageTexture = nullptr;
+					IDirect3DSurface9* stageLevel = nullptr;
+					hr = _Get_D3D_Device8()->CreateTexture(dstDesc.Width, dstDesc.Height, dstLevels, 0,
+					                                       dstDesc.Format, D3DPOOL_SYSTEMMEM, &stageTexture, nullptr);
+					if (SUCCEEDED(hr)) {
+						hr = stageTexture->GetSurfaceLevel(0, &stageLevel);
+					}
+					if (SUCCEEDED(hr)) {
+						D3DLOCKED_RECT srcLock;
+						hr = pSourceSurface->LockRect(&srcLock, nullptr, D3DLOCK_READONLY);
+						if (SUCCEEDED(hr)) {
+							D3DLOCKED_RECT stageLock;
+							hr = stageLevel->LockRect(&stageLock, nullptr, 0);
+							if (SUCCEEDED(hr)) {
+								const bool staged = DX8_Copy_Locked_Rect_Rows(stageLock, srcLock, copyRows, copyColumns,
+									dstDesc.Format, "sysmem->staging-texture");
+								stageLevel->UnlockRect();
+								if (staged) {
+									hr = _Get_D3D_Device8()->UpdateTexture(stageTexture, dstTexture);
+								}
+							}
+							pSourceSurface->UnlockRect();
+						}
+					}
+					if (stageLevel) {
+						stageLevel->Release();
+					}
+					if (stageTexture) {
+						stageTexture->Release();
+					}
+				}
+			}
+			if (FAILED(hr)) {
+				WWDEBUG_SAY(("_Copy_DX8_Rects system-memory to texture upload failed, hr = 0x%08X", hr));
+			}
+			if (dstLevel) {
+				dstLevel->Release();
+			}
+			dstTexture->Release();
+			return;
+		}
+
+		HRESULT hr = _Get_D3D_Device8()->GetRenderTargetData(pSourceSurface, pDestinationSurface);
+		if (FAILED(hr)) {
+			// Source is not a render target (e.g. plain offscreen surface): plain copy works too.
+			DX8CALL(UpdateSurface(pSourceSurface, nullptr, pDestinationSurface, nullptr));
+		}
+		return;
+	}
+
+	// GeneralsX @bugfix d3d9 port 12/10/2026 The rect list needs the same pool reasoning as the
+	// full-surface path above, and D3D9 is stricter here than DX8's CopyRects ever was. Measured on
+	// native d3d9 and DXVK 2.6 with the standalone rectcopyprobe in the port-notes folder - the two
+	// stacks agree on every row:
+	//   UpdateSurface   SYSTEMMEM -> DEFAULT            OK   (the only pair it accepts)
+	//   UpdateSurface   SYSTEMMEM -> MANAGED/SYSTEMMEM  D3DERR_INVALIDCALL
+	//   UpdateSurface   DEFAULT -> anything             D3DERR_INVALIDCALL
+	//   StretchRect     DEFAULT -> DEFAULT              OK only when the destination has
+	//                                                   D3DUSAGE_RENDERTARGET; a plain (usage 0)
+	//                                                   DEFAULT texture level is refused
+	//   LockRect(rect)  MANAGED/SYSTEMMEM               OK, and pBits names the rect origin
+	//   GetRenderTargetData  RT / DEFAULT|RT level / back buffer -> SYSTEMMEM plain   OK
+	// So a GPU-side source either stays on the GPU (StretchRect into a render-target destination,
+	// which is what W3DSmudge's background texture is) or is staged into system memory first
+	// (the profiler path, whose destination is a lockable plain surface).
+	D3DSURFACE_DESC rectSrcDesc;
+	ZeroMemory(&rectSrcDesc, sizeof(rectSrcDesc));
+	DX8_ErrorCode(pSourceSurface->GetDesc(&rectSrcDesc));
+
+	D3DSURFACE_DESC rectDstDesc;
+	ZeroMemory(&rectDstDesc, sizeof(rectDstDesc));
+	DX8_ErrorCode(pDestinationSurface->GetDesc(&rectDstDesc));
+
+	IDirect3DSurface9* stagedSource = pSourceSurface;
+	IDirect3DSurface9* stagingSurface = nullptr;
+	if (rectSrcDesc.Pool != D3DPOOL_SYSTEMMEM && rectDstDesc.Pool != D3DPOOL_DEFAULT) {
+		const HRESULT stageHr = _Get_D3D_Device8()->CreateOffscreenPlainSurface(
+			rectSrcDesc.Width, rectSrcDesc.Height, rectSrcDesc.Format, D3DPOOL_SYSTEMMEM, &stagingSurface, nullptr);
+		if (SUCCEEDED(stageHr) && stagingSurface != nullptr) {
+			const HRESULT readHr = _Get_D3D_Device8()->GetRenderTargetData(pSourceSurface, stagingSurface);
+			if (SUCCEEDED(readHr)) {
+				stagedSource = stagingSurface;
+			} else {
+				WWDEBUG_SAY(("_Copy_DX8_Rects staging readback failed, hr = 0x%08X", readHr));
+				stagingSurface->Release();
+				stagingSurface = nullptr;
+			}
+		}
+	}
+
+	const BOOL lockableDestination = (rectDstDesc.Pool == D3DPOOL_MANAGED || rectDstDesc.Pool == D3DPOOL_SYSTEMMEM);
+
+	for (UINT r = 0; r < cRects; ++r) {
+		const RECT& src = pSourceRectsArray[r];
+		const POINT dst = pDestPointsArray ? pDestPointsArray[r] : POINT{ 0, 0 };
+		const LONG rectWidth = src.right - src.left;
+		const LONG rectHeight = src.bottom - src.top;
+		HRESULT hr = D3D_OK;
+
+		if (rectWidth <= 0 || rectHeight <= 0) {
+			continue;
+		}
+
+		if (rectSrcDesc.Pool != D3DPOOL_SYSTEMMEM && stagedSource == pSourceSurface && rectDstDesc.Pool == D3DPOOL_DEFAULT) {
+			// GPU to GPU, no round trip: pBits cannot be taken from a DEFAULT surface.
+			const RECT dstRect = { dst.x, dst.y, (LONG)(dst.x + rectWidth), (LONG)(dst.y + rectHeight) };
+			hr = _Get_D3D_Device8()->StretchRect(pSourceSurface, &src, pDestinationSurface, &dstRect, D3DTEXF_NONE);
+		} else if (lockableDestination) {
+			// GeneralsX @bugfix d3d9 port 12/10/2026 DX8 CopyRects never clamped, so a caller whose
+			// destination point plus rect runs past the destination edge used to overflow the locked
+			// buffer. The copy is trimmed to the destination instead, which keeps the visible region
+			// correct and the memory intact.
+			const LONG columns = (LONG)rectDstDesc.Width - dst.x;
+			const LONG rows = (LONG)rectDstDesc.Height - dst.y;
+			const LONG copyColumns = rectWidth < columns ? rectWidth : (columns > 0 ? columns : 0);
+			const LONG copyRows = rectHeight < rows ? rectHeight : (rows > 0 ? rows : 0);
+			D3DLOCKED_RECT srcLock;
+			hr = stagedSource->LockRect(&srcLock, &src, D3DLOCK_READONLY);
+			if (SUCCEEDED(hr)) {
+				const RECT dstRect = { dst.x, dst.y, (LONG)(dst.x + rectWidth), (LONG)(dst.y + rectHeight) };
+				D3DLOCKED_RECT dstLock;
+				hr = pDestinationSurface->LockRect(&dstLock, &dstRect, 0);
+				if (SUCCEEDED(hr)) {
+					if (!DX8_Copy_Locked_Rect_Rows(dstLock, srcLock, (UINT)copyRows, (UINT)copyColumns,
+							rectDstDesc.Format, "rects")) {
+						hr = D3DERR_INVALIDCALL;
+					}
+					pDestinationSurface->UnlockRect();
+				}
+				stagedSource->UnlockRect();
+			}
+		} else {
+			hr = _Get_D3D_Device8()->UpdateSurface(stagedSource, &src, pDestinationSurface, &dst);
+		}
+
+		DX8_RECORD_DX8_CALLS();
+		DX8_ErrorCode(hr);
+	}
+
+	if (stagingSurface) {
+		stagingSurface->Release();
+	}
 }
 
 WWINLINE Vector4 DX8Wrapper::Convert_Color(unsigned color)
@@ -1280,7 +1639,11 @@ WWINLINE void DX8Wrapper::Set_DX8_ZBias(int zbias)
 	if (zbias<0) zbias=0;
 	ZBias=zbias;
 
-	if (!Get_Current_Caps()->Support_ZBias() && ZNear!=ZFar) {
+	// GeneralsX @build d3d9 port 11/10/2026 - D3D9 removed D3DRS_ZBIAS; the projection-matrix
+	// emulation (already used for hardware without ZBias caps) is now the only path. Callers keep
+	// the same visual result for perspective projections; degenerate ZNear==ZFar passes (2D/UI,
+	// where Z testing is off) intentionally skip the bias.
+	if (ZNear!=ZFar) {
 		// GeneralsX @refactor BenderAI 10/02/2026
 		// Changed D3DMATRIX → Matrix4x4 to match ProjectionMatrix type change
 		Matrix4x4 tmp=ProjectionMatrix;
@@ -1289,9 +1652,6 @@ WWINLINE void DX8Wrapper::Set_DX8_ZBias(int zbias)
 		tmp_zbias*=1.0f / (ZFar - ZNear);
 		tmp[2][2]-=tmp_zbias*tmp[3][2];
 		DX8CALL(SetTransform(D3DTS_PROJECTION,(D3DMATRIX*)&tmp));
-	}
-	else {
-		Set_DX8_Render_State (D3DRS_ZBIAS, ZBias);
 	}
 }
 
@@ -1382,7 +1742,7 @@ WWINLINE void DX8Wrapper::Get_Transform(D3DTRANSFORMSTATETYPE transform, Matrix4
 	}
 }
 
-WWINLINE const D3DLIGHT8& DX8Wrapper::Peek_Light(unsigned index)
+WWINLINE const D3DLIGHT9& DX8Wrapper::Peek_Light(unsigned index)
 {
 	return render_state.Lights[index];
 }
@@ -1525,7 +1885,7 @@ WWINLINE RenderStateStruct& RenderStateStruct::operator= (const RenderStateStruc
 		}
 
 
-    //lightsHash = flimby((char*)(&Lights[0]), sizeof(D3DLIGHT8)-1 );
+    //lightsHash = flimby((char*)(&Lights[0]), sizeof(D3DLIGHT9)-1 );
 
 	}
 

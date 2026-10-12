@@ -45,8 +45,8 @@
 
 #include "WWLib/win.h"
 // GeneralsX @build fbraz 10/02/2026 Include D3D8 headers on Linux (DXVK provides)
-#include <d3d8types.h>
-#include <d3dx8math.h>
+#include <d3d9types.h>
+#include <d3dx9math.h>
 
 /***********************************************************************************************
  * Matrix4x4::Multiply -- Multiply two Matrix4x4's together                                        *

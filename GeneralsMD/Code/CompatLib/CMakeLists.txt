@@ -4,10 +4,29 @@
 # GeneralsX @bugfix felipebraz 02/03/2026 - Build real d3dx8 STATIC on Linux too (D3DXGetFVFVertexSize / D3DXLoadSurfaceFromSurface required for link)
 # d3dx8 is a math/texture helper stub; core game code doesn't require it
 if((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8) OR APPLE OR (UNIX AND NOT APPLE))
+# GeneralsX @build d3d9 port 11/10/2026 - d3dx8 sources renamed to d3dx9 (D3D9 shim)
 list(APPEND SOURCE_D3DX_COMPAT
-    d3dx8_compat.cpp
-    d3dx8math.cpp
+    d3dx9_compat.cpp
+    d3dx9math.cpp
 )
+
+# GeneralsX @build win64 11/10/2026 - On MSVC, the Include/windows.h wrapper (a Linux-only
+# redirection shim for DXVK) would shadow the real SDK windows.h via /I order and its own
+# #pragma once would make every #include <windows.h> a no-op, breaking all Win32 typedefs.
+# Expose a copy of the include dir WITHOUT the wrapper on Windows; keep the original elsewhere.
+if(WIN32)
+    set(COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/Include_win")
+    file(MAKE_DIRECTORY "${COMPAT_INCLUDE_DIR}")
+    file(GLOB COMPAT_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Include/*.h")
+    foreach(hdr ${COMPAT_HEADERS})
+        get_filename_component(hdr_name ${hdr} NAME)
+        if(NOT hdr_name STREQUAL "windows.h")
+            configure_file("${hdr}" "${COMPAT_INCLUDE_DIR}/${hdr_name}" COPYONLY)
+        endif()
+    endforeach()
+else()
+    set(COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Include")
+endif()
 
 list(TRANSFORM SOURCE_D3DX_COMPAT PREPEND "Source/")
 
@@ -23,19 +42,52 @@ if(NOT SAGE_USE_GLM)
     message(FATAL_ERROR "GLM is required for d3dx8 compatibility layer")
 endif()
 
-find_package(glm CONFIG REQUIRED)
-target_link_libraries(d3dx8 PUBLIC glm::glm)
+# GeneralsX @build win64 11/10/2026 - Non-vcpkg fallback: fetch header-only GLM/GLI
+# via FetchContent when no vcpkg toolchain provides the config packages (win64 minimal path).
+find_package(glm CONFIG QUIET)
+if(glm_FOUND)
+    target_link_libraries(d3dx8 PUBLIC glm::glm)
+else()
+    message(STATUS "glm config not found - fetching header-only GLM via FetchContent (non-vcpkg build)")
+    include(FetchContent)
+    FetchContent_Declare(
+        glm_fetch
+        GIT_REPOSITORY https://github.com/g-truc/glm.git
+        GIT_TAG        1.0.1
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Populate(glm_fetch)
+    add_library(glm_headers INTERFACE)
+    target_include_directories(glm_headers INTERFACE ${glm_fetch_SOURCE_DIR})
+    target_compile_definitions(glm_headers INTERFACE GLM_ENABLE_EXPERIMENTAL)
+    target_link_libraries(d3dx8 PUBLIC glm_headers)
+endif()
 
 # GeneralsX @build felipebraz 20/06/2025 GLI causes make_vec4 ambiguity with Apple Clang - only link on Windows
 if(NOT APPLE)
-    find_package(gli CONFIG REQUIRED)
-    target_link_libraries(d3dx8 PUBLIC gli)
+    find_package(gli CONFIG QUIET)
+    if(gli_FOUND)
+        target_link_libraries(d3dx8 PUBLIC gli)
+    else()
+        message(STATUS "gli config not found - fetching header-only GLI via FetchContent (non-vcpkg build)")
+        include(FetchContent)
+        FetchContent_Declare(
+            gli_fetch
+            GIT_REPOSITORY https://github.com/g-truc/gli.git
+            GIT_TAG        master
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_Populate(gli_fetch)
+        add_library(gli_headers INTERFACE)
+        target_include_directories(gli_headers INTERFACE ${gli_fetch_SOURCE_DIR})
+        target_link_libraries(d3dx8 PUBLIC gli_headers)
+    endif()
 endif()
 
 # d3dx8 needs bittype.h from WWLib for Win32 types (DWORD, BYTE, UINT, etc.)
 # Add only WWLib directory (not full core_wwcommon to avoid d3d8.h conflicts from WWAudio)
 target_include_directories(d3dx8 PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/Include
+    ${COMPAT_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WWLib
 )
 

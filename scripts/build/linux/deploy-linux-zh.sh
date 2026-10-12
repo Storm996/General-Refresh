@@ -76,9 +76,14 @@ cp -v "${BINARY_SRC}" "${RUNTIME_DIR}/GeneralRefresh"
 chmod +x "${RUNTIME_DIR}/GeneralRefresh"
 
 # Copy DXVK libraries
+# GeneralsX @build d3d9 port 12/10/2026 - DX8Wrapper now loads libdxvk_d3d9 at runtime, so d3d9 is
+# the required library; the D3D8 shim is only needed by legacy D3D8 builds and stays optional.
 echo "  Copying DXVK libraries..."
-cp -v "${DXVK_LIB_DIR}"/libdxvk_d3d8.so* "${RUNTIME_DIR}/"
-cp -v "${DXVK_LIB_DIR}"/libdxvk_d3d9.so* "${RUNTIME_DIR}/" 2>/dev/null || true
+if ! cp -v "${DXVK_LIB_DIR}"/libdxvk_d3d9.so* "${RUNTIME_DIR}/"; then
+	echo "  ERROR: libdxvk_d3d9.so not found in ${DXVK_LIB_DIR}. Build DXVK first."
+	exit 1
+fi
+cp -v "${DXVK_LIB_DIR}"/libdxvk_d3d8.so* "${RUNTIME_DIR}/" 2>/dev/null || echo "  (libdxvk_d3d8.so absent - only required for legacy D3D8 builds)"
 
 # Copy SDL3 and SDL3_image libraries (for cursor loading and window management)
 if compgen -G "${SDL3_LIB_DIR}/libSDL3.so*" > /dev/null; then

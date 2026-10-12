@@ -78,22 +78,41 @@ END_MESSAGE_MAP()
 #define PREVIEW_WIDTH 128
 #define PREVIEW_HEIGHT 128
 
-static UnsignedByte * saveSurface(IDirect3DSurface8 *surface)
+static UnsignedByte * saveSurface(IDirect3DSurface9 *surface)
 {
 	D3DSURFACE_DESC desc;
-	IDirect3DSurface8 *tempSurface;
 
 	surface->GetDesc(&desc);
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
-	HRESULT hr=m_pDev->CreateImageSurface(  desc.Width,desc.Height,desc.Format, &tempSurface);
-
-	hr=m_pDev->CopyRects(surface,nullptr,0,tempSurface,nullptr);
-
+	// GeneralsX @build d3d9 port 12/10/2026 - D3D8's CreateImageSurface/CopyRects are gone in D3D9.
+	// A managed-pool surface can be locked directly; a default-pool one needs a system-memory
+	// staging plain surface filled by UpdateSurface (render targets by GetRenderTargetData).
 	D3DLOCKED_RECT lrect;
-
-	DX8_ErrorCode(tempSurface->LockRect(&lrect,nullptr,D3DLOCK_READONLY));
+	IDirect3DSurface9 *tempSurface = nullptr;
+	HRESULT hr=surface->LockRect(&lrect,nullptr,D3DLOCK_READONLY);
+	if (FAILED(hr)) {
+		hr=m_pDev->CreateOffscreenPlainSurface(desc.Width,desc.Height,desc.Format,D3DPOOL_SYSTEMMEM,&tempSurface,nullptr);
+		if (SUCCEEDED(hr)) {
+			if (desc.Usage & D3DUSAGE_RENDERTARGET) {
+				hr=m_pDev->GetRenderTargetData(surface,tempSurface);
+			} else {
+				hr=m_pDev->UpdateSurface(surface,nullptr,tempSurface,nullptr);
+			}
+		}
+		if (SUCCEEDED(hr)) {
+			hr=tempSurface->LockRect(&lrect,nullptr,D3DLOCK_READONLY);
+		}
+		DX8_ErrorCode(hr);
+		if (FAILED(hr)) {
+			if (tempSurface) {
+				tempSurface->Release();
+			}
+			return nullptr;
+		}
+	}
+	const bool lockedSource=(tempSurface==nullptr);
 
 	unsigned int x,y,index,index2,width,height;
 
@@ -128,6 +147,13 @@ static UnsignedByte * saveSurface(IDirect3DSurface8 *surface)
 	targ.YFlip();
 
 	targ.Save("ObjectPreview.tga",TGAF_IMAGE,false);
+
+	if (lockedSource) {
+		surface->UnlockRect();
+	} else if (tempSurface) {
+		tempSurface->UnlockRect();
+		tempSurface->Release();
+	}
 
 	return nullptr;
 
@@ -174,7 +200,12 @@ static UnsignedByte * saveSurface(IDirect3DSurface8 *surface)
 			}
 	}
 
-	tempSurface->Release();
+	if (lockedSource) {
+		surface->UnlockRect();
+	} else if (tempSurface) {
+		tempSurface->UnlockRect();
+		tempSurface->Release();
+	}
 
 	return bgraImage;
 #endif
@@ -248,7 +279,7 @@ static UnsignedByte * generatePreview( const ThingTemplate *tt )
 			WW3D::End_Render(false);
 
 			// Change the rendertarget back to the main backbuffer
-			DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+			DX8Wrapper::Set_Render_Target((IDirect3DSurface9 *)nullptr);
 
 			SurfaceClass *surface = objectTexture->Get_Surface_Level();
 			UnsignedByte *data = saveSurface(surface->Peek_D3D_Surface());

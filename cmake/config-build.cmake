@@ -130,6 +130,14 @@ if(SAGE_USE_MINIAUDIO)
     message(STATUS "MiniAudio audio backend enabled")
 endif()
 
+# GeneralsX @build win64 11/10/2026 Expose FFmpeg availability as a compile definition so backends
+# that optionally decode audio via FFmpeg (MiniAudioManager) can fall back to native decoding when
+# FFmpeg is not built in (e.g. the minimal win64 build). Linux/macOS keep FFmpeg ON and are
+# unaffected. The MiniAudioManager FFmpeg path is only compiled when this macro is defined.
+if(RTS_BUILD_OPTION_FFMPEG)
+    target_compile_definitions(core_config INTERFACE SAGE_HAVE_FFMPEG)
+endif()
+
 # GeneralsX @feature BenderAI 21/04/2026 Update check compile definition
 if(SAGE_UPDATE_CHECK)
     target_compile_definitions(core_config INTERFACE SAGE_UPDATE_CHECK)

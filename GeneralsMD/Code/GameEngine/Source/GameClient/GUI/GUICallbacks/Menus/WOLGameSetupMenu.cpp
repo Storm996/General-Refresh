@@ -65,7 +65,11 @@
 #include "GameNetwork/NAT.h"
 #include "GameNetwork/GUIUtil.h"
 #include "GameNetwork/GameSpy/GSConfig.h"
+// GeneralsX @build win64 11/10/2026 The NGMP umbrella header pulls in libcurl, so it must stay
+// behind the feature switch like every other menu does (see WOLWelcomeMenu.cpp, ScoreScreen.cpp).
+#if defined(SAGE_USE_NGMP)
 #include "GameNetwork/GeneralsOnline/NGMP_interfaces.h"
+#endif
 
 void WOLDisplaySlotList();
 
@@ -1564,7 +1568,11 @@ void InitWOLGameGadgets()
 		comboBoxPlayerTemplateID[i] = TheNameKeyGenerator->nameToKey( tmpString );
 		comboBoxPlayerTemplate[i] = TheWindowManager->winGetWindowFromId( parentWOLGameSetup, comboBoxPlayerTemplateID[i] );
 		DEBUG_ASSERTCRASH(comboBoxPlayerTemplate[i], ("Could not find the comboBoxPlayerTemplate[%d]",i ));
+		#if defined(SAGE_USE_NGMP)
 		Bool allowObs = TheNGMPGame ? TheNGMPGame->getAllowObservers() : (TheGameSpyInfo && TheGameSpyInfo->getCurrentStagingRoom() ? TheGameSpyInfo->getCurrentStagingRoom()->getAllowObservers() : TRUE);
+		#else
+		Bool allowObs = (TheGameSpyInfo && TheGameSpyInfo->getCurrentStagingRoom() ? TheGameSpyInfo->getCurrentStagingRoom()->getAllowObservers() : TRUE);
+		#endif
 		PopulatePlayerTemplateComboBox(i, comboBoxPlayerTemplate, theGameInfo, allowObs );
 
 		// add tooltips to the player template combobox and listbox
@@ -3282,7 +3290,11 @@ WindowMsgHandledType WOLGameSetupMenuSystem( GameWindow *window, UnsignedInt msg
 								  myGame->resetAccepted();
 								  if (wasAI ^ isAI)
 								  {
+									  #if defined(SAGE_USE_NGMP)
 									  Bool allowObs = TheNGMPGame ? TheNGMPGame->getAllowObservers() : (TheGameSpyInfo && TheGameSpyInfo->getCurrentStagingRoom() ? TheGameSpyInfo->getCurrentStagingRoom()->getAllowObservers() : TRUE);
+									  #else
+									  Bool allowObs = (TheGameSpyInfo && TheGameSpyInfo->getCurrentStagingRoom() ? TheGameSpyInfo->getCurrentStagingRoom()->getAllowObservers() : TRUE);
+									  #endif
 									  PopulatePlayerTemplateComboBox(i, comboBoxPlayerTemplate, myGame, wasAI && allowObs);
 								  }
 								  if (TheGameSpyInfo) TheGameSpyInfo->setGameOptions();

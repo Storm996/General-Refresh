@@ -306,7 +306,10 @@ bool Debug::SkipNext()
   // do not implement this function inline, we do need
   // a valid frame pointer here!
   unsigned help;
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_WIN64)
+  // GeneralsX @bugfix 11/10/2026 x64: MSVC has no inline asm on x64, use intrinsic
+  help=(unsigned)(uintptr_t)_ReturnAddress();
+#elif defined(_MSC_VER)
   _asm
   {
     mov eax,[ebp+4]   // return address
@@ -434,7 +437,10 @@ bool Debug::AssertDone()
           }
           break;
         case IDRETRY:
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_WIN64)
+          // GeneralsX @bugfix 11/10/2026 x64: no inline asm on x64
+          __debugbreak();
+#elif defined(_MSC_VER)
           _asm int 0x03
 #elif defined(__GNUC__)
           __builtin_trap();
@@ -708,7 +714,10 @@ bool Debug::CrashDone(bool die)
             }
             break;
           case IDRETRY:
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_WIN64)
+            // GeneralsX @bugfix 11/10/2026 x64: no inline asm on x64
+            __debugbreak();
+#elif defined(_MSC_VER)
             _asm int 0x03
 #elif defined(__GNUC__)
             __builtin_trap();

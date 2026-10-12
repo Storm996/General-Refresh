@@ -20,7 +20,7 @@
 #include "w3d_file.h"          // WW3D_FORMAT_U8V8, MIP_LEVELS_1
 #include "WWLib/ffactory.h"
 
-#include "d3d8.h"
+#include "d3d9.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,8 +29,9 @@
 
 namespace DX8NormalMap
 {
-	static unsigned g_VS = 0;
-	static unsigned g_PS = 0;
+	// GeneralsX  d3d9 port 11/10/2026 - D3D9 shader handles are interface pointers (UINT_PTR carries them on x64).
+	static UINT_PTR g_VS = 0;
+	static UINT_PTR g_PS = 0;
 	static bool     g_Enabled = false;      // rule: default OFF
 	static float    g_Strength = 0.8f;      // per-pixel perturbation strength
 
@@ -64,7 +65,7 @@ namespace DX8NormalMap
 	static const char* g_LastDiffuse = nullptr;
 	static TextureClass* g_CachedNormal = nullptr;
 
-	void Install(unsigned vs_handle, unsigned ps_handle)
+	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle)
 	{
 		g_VS = vs_handle;
 		g_PS = ps_handle;
@@ -232,10 +233,17 @@ namespace DX8NormalMap
 		return true;
 	}
 
-	void Restore(unsigned fvf)
+	void Restore(UINT_PTR fvf)
 	{
 		DX8Wrapper::Set_Pixel_Shader(0);
-		DX8Wrapper::Set_Vertex_Shader(fvf);
+		// GeneralsX @bugfix Qoder 12/10/2026 - D3D9 keeps the vertex shader bound across SetFVF
+		// (measured on native d3d9 and DXVK 2.6), unlike D3D8 where the FVF/shader handle were one
+		// slot. Without this the dot3 vertex shader stayed installed for the next batch, whose
+		// stale c0..c3 WVP / c4 light constants distorted its vertices.
+		DX8Wrapper::Set_Vertex_Shader(0);
+		// GeneralsX @build d3d9 port 11/10/2026 - D3D9 splits FVF from shader binding: the
+		// fixed-pipeline format must go through Set_Vertex_FVF (SetFVF), not Set_Vertex_Shader.
+		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);
 		DX8Wrapper::Set_Texture(1, nullptr);
 	}
 }

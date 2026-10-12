@@ -56,7 +56,7 @@
 #include "WWMath/vector2i.h"
 #include "colorspace.h"
 #include "WWLib/bound.h"
-#include <d3dx8.h>
+#include <d3dx9.h>
 
 void Convert_Pixel(Vector3 &rgb, const SurfaceClass::SurfaceDescription &sd, const unsigned char * pixel)
 {
@@ -181,7 +181,7 @@ SurfaceClass::SurfaceClass(const char *filename):
 	SurfaceFormat=desc.Format;
 }
 
-SurfaceClass::SurfaceClass(IDirect3DSurface8 *d3d_surface)	:
+SurfaceClass::SurfaceClass(IDirect3DSurface9 *d3d_surface)	:
 	D3DSurface (nullptr)
 {
 	Attach (d3d_surface);
@@ -708,7 +708,7 @@ void SurfaceClass::Get_Pixel(Vector3 &rgb, int x, int y, LockedSurfacePtr pBits,
  * HISTORY:                                                                                    *
  *   3/27/2001  pds : Created.                                                                 *
  *=============================================================================================*/
-void SurfaceClass::Attach (IDirect3DSurface8 *surface)
+void SurfaceClass::Attach (IDirect3DSurface9 *surface)
 {
 	Detach ();
 	D3DSurface = surface;

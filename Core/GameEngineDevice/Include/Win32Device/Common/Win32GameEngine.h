@@ -36,7 +36,17 @@
 #include "GameClient/ParticleSys.h"
 #include "GameLogic/GameLogic.h"
 #include "GameNetwork/NetworkInterface.h"
+// GeneralsX @build win64 11/10/2026 Miles mss32.dll is 32-bit only and cannot be loaded by a
+// 64-bit process, so the win64 build selects the cross-platform MiniAudio backend instead.
+// The two manager headers declare colliding global externs (MAX_* provider caps, PlayingAudio,
+// etc.), so exactly one may be included per translation unit: MiniAudio when SAGE_USE_MINIAUDIO
+// is ON, otherwise the legacy Miles backend. MiniAudioManager.h is only compiled when the flag is
+// set (see cmake/miniaudio.cmake / Core/GameEngineDevice/CMakeLists.txt).
+#ifdef SAGE_USE_MINIAUDIO
+#include "MiniAudioDevice/MiniAudioManager.h"
+#else
 #include "MilesAudioDevice/MilesAudioManager.h"
+#endif
 #include "Win32Device/Common/Win32BIGFileSystem.h"
 #include "Win32Device/Common/Win32LocalFileSystem.h"
 #include "W3DDevice/Common/W3DModuleFactory.h"
@@ -111,7 +121,16 @@ inline Radar *Win32GameEngine::createRadar(Bool dummy)
 inline WebBrowser *Win32GameEngine::createWebBrowser() { return NEW CComObject<W3DWebBrowser>; }
 inline AudioManager *Win32GameEngine::createAudioManager(Bool dummy)
 {
+	// GeneralsX @build win64 11/10/2026 On a 64-bit Windows build the Miles Sound System
+	// (mss32.dll) is unavailable (32-bit only) and the loader silently disables audio. Route the
+	// factory to the MiniAudio backend when SAGE_USE_MINIAUDIO is enabled so win64 has sound.
+	// The 32-bit retail path (Miles) is preserved when the flag is OFF.
+#ifdef SAGE_USE_MINIAUDIO
+	(void)dummy;
+	return NEW MiniAudioManager;
+#else
 	if (dummy)
 		return NEW MilesAudioManagerDummy;
 	return NEW MilesAudioManager;
+#endif
 }

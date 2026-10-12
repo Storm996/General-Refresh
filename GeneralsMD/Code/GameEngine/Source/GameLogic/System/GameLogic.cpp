@@ -233,6 +233,15 @@ void setFPMode()
 	#ifdef _WIN32
 	_fpreset();
 
+	// GeneralsX @build d3d9 port 12/10/2026 x64 has no FPU precision-control field (SSE-only): passing _MCW_PC
+	// to _controlfp trips the UCRT ieee.c assert (mask&~(_MCW_DN|_MCW_EM|_MCW_RC))==0 and freezes startup on a
+	// Debug Assertion dialog. Rounding control is the only applicable mask there.
+	#if defined(_M_X64)
+	UnsignedInt curVal = _statusfp();
+	UnsignedInt newVal = curVal;
+	newVal = (newVal & ~_MCW_RC) | (_RC_NEAR & _MCW_RC);
+	_controlfp(newVal, _MCW_RC);
+	#else
 	UnsignedInt curVal = _statusfp();
 	UnsignedInt newVal = curVal;
 	newVal = (newVal & ~_MCW_RC) | (_RC_NEAR & _MCW_RC);
@@ -240,6 +249,7 @@ void setFPMode()
 	newVal = (newVal & ~_MCW_PC) | (_PC_24   & _MCW_PC);
 
 	_controlfp(newVal, _MCW_PC | _MCW_RC);
+	#endif
 	#else
 	fesetenv(FE_DFL_ENV);
 	feclearexcept(FE_ALL_EXCEPT);

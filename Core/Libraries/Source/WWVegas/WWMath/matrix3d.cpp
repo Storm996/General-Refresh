@@ -67,8 +67,8 @@
 
 #include "WWLib/win.h"
 // GeneralsX @build fbraz 10/02/2026 Include D3D8 headers on Linux/macOS (DXVK provides)
-#include <d3d8types.h>
-#include <d3dx8math.h>
+#include <d3d9types.h>
+#include <d3dx9math.h>
 
 // some static matrices which are sometimes useful
 const Matrix3D Matrix3D::Identity

@@ -63,11 +63,30 @@
 #include "GameLogic/FPUControl.h"
 
 #include "Common/file.h"
+// GeneralsX @build win64 11/10/2026 decodeFileToPcmSound uses std::vector<uint8_t> and fixed-width
+// int types unconditionally (it is the no-FFmpeg path). Previously <vector> was only pulled in via
+// the FFmpeg-gated block, so include it here to keep the win64 minimal build self-contained.
+#include <vector>
+#include <cstdint>
+#include <chrono>
+
+// GeneralsX diag: wall-clock timestamps (ms since process start) for audio lifecycle logging.
+// Temporary diagnostic aid; remove together with the [MAUDIO-T]/[MAUDIO-*] stderr probes.
+static double MAudioNowMs(void)
+{
+	static const auto s_epoch = std::chrono::steady_clock::now();
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s_epoch).count();
+}
+// GeneralsX @build win64 11/10/2026 FFmpeg is only pulled in when the build actually has it.
+// Without SAGE_HAVE_FFMPEG (minimal win64) MiniAudioManager decodes via miniaudio's native
+// WAV/MP3/FLAC/Vorbis decoders instead (see playAudioEvent).
+#ifdef SAGE_HAVE_FFMPEG
 #include "VideoDevice/FFmpeg/FFmpegFile.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
+#endif
 
 #ifdef _INTERNAL
 //#pragma optimize("", off)
@@ -127,12 +146,11 @@ void MiniAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FILE
 {
 	std::list<PlayingAudio *>::iterator it;
 
-	Coord3D lookPos;
-	TheTacticalView->getPosition(&lookPos);
+	Coord3D lookPos = TheTacticalView->getPosition();
 	lookPos.z = TheTerrainLogic->getGroundHeight(lookPos.x, lookPos.y);
 	const Coord3D *mikePos = TheAudio->getListenerPosition();
 	Coord3D distanceVector = TheTacticalView->get3DCameraPosition();
-	distanceVector.sub(mikePos);
+	distanceVector.sub(*mikePos);
 
 	if (dd)
 	{
@@ -142,7 +160,9 @@ void MiniAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FILE
 		dd->printf("Speech: %s    ", (isOn(AudioAffect_Speech) ? "Yes" : "No"));
 		dd->printf("Music: %s\n", (isOn(AudioAffect_Music) ? "Yes" : "No"));
 		dd->printf("Channels Available: ");
-		dd->printf("%d Sounds    ", m_sound->getAvailableSamples());
+		// GeneralsX @build d3d9 port 11/10/2026 - Miles SoundManager::getAvailableSamples has no
+		// MiniAudio equivalent; report the active playback count so this debug line compiles.
+		dd->printf("%d Sounds    ", (Int)m_playingSounds.size());
 		dd->printf("Volume: ");
 		dd->printf("Sound: %d    ", REAL_TO_INT(m_soundVolume * 100.0f));
 		dd->printf("3DSound: %d    ", REAL_TO_INT(m_sound3DVolume * 100.0f));
@@ -163,7 +183,7 @@ void MiniAudioManager::audioDebugDisplay(DebugDisplayInterface *dd, void *, FILE
 			if (!playing || !playing->m_audioEventRTS) continue;
 			AsciiString fn = playing->m_audioEventRTS->getFilename();
 			fn = fn.reverseFind('\\') + 1;
-			Real volume = 100.0f * getEffectiveVolume(playing->m_audioEventRTS);
+			Real volume = 100.0f * getEffectiveVolume(playing->m_audioEventRTS.Peek());
 			dd->printf("%2d: %-20s - (%s) Volume: %d\n", i++,
 				playing->m_audioEventRTS->getEventName().str(), fn.str(), REAL_TO_INT(volume));
 		}
@@ -202,6 +222,7 @@ void MiniAudioManager::reset()
 #endif
 
 	AudioManager::reset();
+	fprintf(stderr, "[MAUDIO-T %.0fms RESET\n", MAudioNowMs()); fflush(stderr);
 	stopAllAudioImmediately();
 	// GeneralsX @bugfix coolswood 18/07/2026 Restart sound groups in reset() to fix silent audio after loadGame.
 	// stopAllAudioImmediately() releases individual PlayingAudio entries but does not touch the four
@@ -236,6 +257,7 @@ void MiniAudioManager::stopAudio(AudioAffect which)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-T %.0fms GROUPSTOP which=%d\n", MAudioNowMs(), (int)which); fflush(stderr);
 	if (BitIsSet(which, AudioAffect_Sound))
 		ma_sound_group_stop(&m_soundGroup);
 	if (BitIsSet(which, AudioAffect_Sound3D))
@@ -251,6 +273,7 @@ void MiniAudioManager::pauseAudio(AudioAffect which)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-T %.0fms GROUPPAUSE which=%d\n", MAudioNowMs(), (int)which); fflush(stderr);
 	if (BitIsSet(which, AudioAffect_Sound))
 		ma_sound_group_stop(&m_soundGroup);
 	if (BitIsSet(which, AudioAffect_Sound3D))
@@ -266,6 +289,7 @@ void MiniAudioManager::resumeAudio(AudioAffect which)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-T %.0fms GROUPRESUME which=%d\n", MAudioNowMs(), (int)which); fflush(stderr);
 	if (BitIsSet(which, AudioAffect_Sound))
 		ma_sound_group_start(&m_soundGroup);
 	if (BitIsSet(which, AudioAffect_Sound3D))
@@ -289,6 +313,143 @@ void MiniAudioManager::stopAllAmbientsBy(Object *obj)
 //-------------------------------------------------------------------------------------------------
 void MiniAudioManager::stopAllAmbientsBy(Drawable *draw)
 {
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @bugfix Antigravity 11/10/2026 win64 (no-FFmpeg) sound/music decode.
+// The minimal win64 build has no FFmpeg, so playAudioEvent previously decoded every sample through
+// miniaudio's native *streaming* file decoder via ma_sound_init_from_file() over the game's BIG VFS.
+// That streaming path is exactly what Linux/macOS avoid by pre-decoding with FFmpeg: on MP3 it stalls
+// partway through the track (music suddenly goes silent) and leaves a stuck decoder worker whose
+// thread ma_engine_uninit() then joins at shutdown, hanging the exit. Here we read the whole file
+// into memory through the engine VFS and decode it to PCM with miniaudio's synchronous in-memory
+// decoder (ma_decoder_init_memory), then wrap that PCM in an audio buffer backed by a data-source
+// sound -- no background decoder thread. This mirrors the FFmpeg branch above and fixes both the
+// mid-track music dropout and the freeze-on-exit. Returns TRUE with *outSound/*outBuffer populated.
+static Bool decodeFileToPcmSound(ma_engine *engine, const char *path, ma_uint32 flags,
+	ma_sound_group *group, ma_sound **outSound, ma_audio_buffer **outBuffer)
+{
+	*outSound = NULL;
+	*outBuffer = NULL;
+
+	File *file = TheFileSystem->openFile(path);
+	fprintf(stderr, "[MAUDIO-T %.0fms DECBEG '%s'\n", MAudioNowMs(), path);
+	fflush(stderr);
+	if (!file) {
+		fprintf(stderr, "[MAUDIO-T %.0fms DECOPENFAIL '%s'\n", MAudioNowMs(), path);
+		fflush(stderr);
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - failed to open '%s'\n", path));
+		return FALSE;
+	}
+
+	// readEntireAndClose() allocates a buffer for the whole entry, reads it, and closes the File. BIG
+	// archive entries are returned as RAMFiles created with deleteOnClose(), so close() also deletes the
+	// File object -- the caller must NOT delete it again (matches SDL3Mouse/DataChunk usage). The
+	// returned char* buffer is caller-owned and freed with delete[].
+	Int fsize = file->size();
+	char *raw = (fsize > 0) ? file->readEntireAndClose() : NULL;
+	if (!raw) {
+		file->close();
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - empty/unreadable '%s'\n", path));
+		return FALSE;
+	}
+
+	// Force s16 output; 0 channels/rate tells the decoder to keep the file's native values.
+	ma_decoder decoder;
+	ma_decoder_config dcfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+	if (ma_decoder_init_memory(raw, (size_t)fsize, &dcfg, &decoder) != MA_SUCCESS) {
+		delete[] raw;
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - decoder init failed for '%s'\n", path));
+		return FALSE;
+	}
+
+	ma_uint32 ch   = decoder.outputChannels;
+	ma_uint32 rate = decoder.outputSampleRate;
+
+	std::vector<uint8_t> pcmData;
+	// Read in fixed-size frame chunks. The buffer MUST be sized framesPerRead * channels samples,
+	// because ma_decoder_read_pcm_frames() counts its request in FRAMES (1 frame = channels s16
+	// samples). A stack buffer of only `framesPerRead` int16_t would overflow 2x for stereo (the
+	// common case for WAV/MP3) and trip the /GS stack cookie -> STATUS_STACK_BUFFER_OVERRUN (0xc0000409).
+	const ma_uint32 framesPerRead = 4096;
+	std::vector<int16_t> frameBuf((size_t)framesPerRead * (ch ? ch : 2));
+	ma_result lastRr = MA_SUCCESS;
+	ma_uint64 lastRead = 0;
+	for (;;) {
+		ma_uint64 framesRead = 0;
+		ma_result rr = ma_decoder_read_pcm_frames(&decoder, frameBuf.data(), framesPerRead, &framesRead);
+		if (framesRead > 0) {
+			const uint8_t *bytes = (const uint8_t *)frameBuf.data();
+			size_t n = (size_t)framesRead * ch * sizeof(int16_t);
+			pcmData.insert(pcmData.end(), bytes, bytes + n);
+		}
+		lastRr = rr; lastRead = framesRead;
+		if (rr != MA_SUCCESS || framesRead == 0) break;
+	}
+	ma_decoder_uninit(&decoder);
+	delete[] raw;
+
+	if (pcmData.empty() || ch == 0 || rate == 0) {
+		fprintf(stderr, "[MAUDIO-DEC] FAIL '%s' fsize=%d ch=%u rate=%u bytes=%zu lastRr=%d lastRead=%llu\n",
+			path, fsize, ch, rate, pcmData.size(), (int)lastRr, (unsigned long long)lastRead);
+		fflush(stderr);
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - no PCM decoded for '%s'\n", path));
+		return FALSE;
+	}
+
+	ma_audio_buffer *audioBuffer = (ma_audio_buffer *)malloc(sizeof(ma_audio_buffer));
+	ma_audio_buffer_config abConfig = ma_audio_buffer_config_init(ma_format_s16, ch,
+		pcmData.size() / ma_get_bytes_per_frame(ma_format_s16, ch),
+		pcmData.data(), NULL);
+	if (ma_audio_buffer_init_copy(&abConfig, audioBuffer) != MA_SUCCESS) {
+		free(audioBuffer);
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - buffer init failed for '%s'\n", path));
+		return FALSE;
+	}
+	audioBuffer->ref.sampleRate = rate;
+
+	ma_sound *sound = (ma_sound *)malloc(sizeof(ma_sound));
+	if (ma_sound_init_from_data_source(engine, audioBuffer, flags, group, sound) != MA_SUCCESS) {
+		ma_audio_buffer_uninit(audioBuffer);
+		free(audioBuffer);
+		free(sound);
+		DEBUG_LOG(("MiniAudio: decodeFileToPcmSound - sound init failed for '%s'\n", path));
+		return FALSE;
+	}
+
+	// GeneralsX diag: fires when miniaudio itself considers the sound finished (data source
+	// exhausted or engine-stopped). Lets us distinguish "miniaudio ended it" from "we released it".
+	ma_sound_set_end_callback(sound, [](void *, ma_sound *) {
+		fprintf(stderr, "[MAUDIO-T %.0fms ENDCALLBACK\n", MAudioNowMs());
+		fflush(stderr);
+	}, NULL);
+
+	*outSound = sound;
+	*outBuffer = audioBuffer;
+	{
+		ma_uint64 frames = pcmData.size() / ma_get_bytes_per_frame(ma_format_s16, ch);
+		// Diagnostics: compare PCM energy at several offsets. If early frames are loud but later
+		// windows are ~0, miniaudio's built-in MP3 decoder emitted silence past a point even though
+		// it produced a full-length frame count (the cursor advances, but there is nothing to hear).
+		const int16_t *sm = (const int16_t *)pcmData.data();
+		size_t totalSamples = pcmData.size() / sizeof(int16_t);
+		auto meanAbs = [&](ma_uint64 frameStart, ma_uint64 frameCount)->double {
+			size_t a = (size_t)frameStart * ch;
+			size_t b = a + (size_t)frameCount * ch;
+			if (b > totalSamples) b = totalSamples;
+			if (a >= b) return -1.0;
+			double acc = 0.0; size_t n = 0;
+			for (size_t i = a; i < b; i++) { acc += (sm[i] < 0 ? -sm[i] : sm[i]); n++; }
+			return n ? acc / (double)n : 0.0;
+		};
+		double e0 = meanAbs(0, rate * 8);
+		double eMid = (frames > rate * 68) ? meanAbs(rate * 60, rate * 8) : -2.0;
+		double eLate = (frames > rate * 158) ? meanAbs(rate * 150, rate * 8) : -2.0;
+		fprintf(stderr, "[MAUDIO-DEC] OK '%s' fsize=%d ch=%u rate=%u frames=%llu dur=%.2fs energy[0-8s]=%.1f [60-68s]=%.1f [150-158s]=%.1f\n",
+			path, fsize, ch, rate, (unsigned long long)frames, rate ? (float)frames / (float)rate : 0.0f, e0, eMid, eLate);
+		fflush(stderr);
+	}
+	return TRUE;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -321,6 +482,9 @@ void MiniAudioManager::playAudioEvent(AudioRequest *req)
 			if (!playing) continue;
 			if (playing->m_audioEventRTS && playing->m_audioEventRTS->getPlayingHandle() == handleToKill)
 			{
+				fprintf(stderr, "[MAUDIO-T %.0fms KILLHANDLE victim='%s' (new='%s')\n", MAudioNowMs(),
+					playing->m_audioEventRTS->getEventName().str(), event->getEventName().str());
+				fflush(stderr);
 				releasePlayingAudio(playing);
 				m_playingSounds.erase(it);
 				break;
@@ -349,6 +513,11 @@ void MiniAudioManager::playAudioEvent(AudioRequest *req)
 		break;
 	}
 
+	// Decode-and-play. When FFmpeg is available (Linux/macOS presets) we decode the file into PCM
+	// ourselves and feed miniaudio, because miniaudio's built-in decoders were observed to hang on
+	// MP3 through the BIG VFS there. Builds without FFmpeg (the minimal win64 build) take the #else
+	// branch below and let miniaudio decode the game's WAV samples/speech and MP3 music natively.
+#ifdef SAGE_HAVE_FFMPEG
 	// Use FFmpeg to decode the file into PCM, then feed to miniaudio.
 	// This avoids miniaudio's built-in decoders which hang on MP3 via VFS.
 	File *file = TheFileSystem->openFile(fileToPlay.str());
@@ -449,6 +618,22 @@ void MiniAudioManager::playAudioEvent(AudioRequest *req)
 		releasePlayingAudio(audio);
 		return;
 	}
+#else
+	// No FFmpeg: read the whole file through the engine VFS and decode it to PCM with miniaudio's
+	// synchronous in-memory decoder (see decodeFileToPcmSound). We deliberately avoid the native
+	// streaming file decoder here because it stalls on MP3 over the BIG VFS (music cuts out) and
+	// leaves a stuck decoder worker that hangs ma_engine_uninit() at shutdown (freeze on exit).
+	// Handles the game's WAV samples/speech and MP3 music with miniaudio's built-in decoders and no
+	// external dependency. m_audioBuffer is owned by the PlayingAudio and released via releasePlayingAudio.
+	ma_audio_buffer *audioBuffer = NULL;
+	ma_sound *sound = NULL;
+	if (!decodeFileToPcmSound(&m_engine, fileToPlay.str(), flags, groupToUse, &sound, &audioBuffer)) {
+		DEBUG_LOG(("MiniAudio: Failed to decode sound: '%s'\n", fileToPlay.str()));
+		releasePlayingAudio(audio);
+		return;
+	}
+	ma_result result = MA_SUCCESS;
+#endif
 
 	// Assign to PlayingAudio before any early returns below
 	audio->m_sound = sound;
@@ -505,6 +690,11 @@ void MiniAudioManager::playAudioEvent(AudioRequest *req)
 		return;
 	}
 
+	fprintf(stderr, "[MAUDIO-T %.0fms STARTED '%s' type=%d file='%s' handle=%d\n", MAudioNowMs(),
+		event->getEventName().str(), (int)info->m_soundType, fileToPlay.str(),
+		(int)event->getPlayingHandle());
+	fflush(stderr);
+
 	m_playingSounds.push_back(audio);
 }
 
@@ -524,6 +714,10 @@ void MiniAudioManager::stopAudioEvent(AudioHandle handle)
 			const AudioEventInfo *stopInfo = audio->m_audioEventRTS->getAudioEventInfo();
 			if (stopInfo && stopInfo->m_soundType == AT_Music)
 			{
+				fprintf(stderr, "[MAUDIO-T %.0fms STOPMUSIC stopAudioEvent(%s) releasing '%s'\n", MAudioNowMs(),
+					handle == AHSV_StopTheMusicFade ? "AHSV_StopTheMusicFade" : "AHSV_StopTheMusic",
+					audio->m_audioEventRTS->getEventName().str());
+				fflush(stderr);
 				if (handle == AHSV_StopTheMusicFade)
 					m_fadingAudio.push_back(audio);
 				else
@@ -570,6 +764,8 @@ void MiniAudioManager::killAudioEventImmediately(AudioHandle audioEvent)
 		if (!audio) continue;
 		if (audio->m_audioEventRTS && audio->m_audioEventRTS->getPlayingHandle() == audioEvent)
 		{
+			fprintf(stderr, "[MAUDIO-T %.0fms KILLIMM handle=%d victim='%s'\n", MAudioNowMs(),
+				(int)audioEvent, audio->m_audioEventRTS->getEventName().str()); fflush(stderr);
 			releasePlayingAudio(audio);
 			m_playingSounds.erase(it);
 			return;
@@ -614,6 +810,22 @@ void MiniAudioManager::releasePlayingAudio(PlayingAudio *release)
 {
 	if (!release) return;
 
+	// GeneralsX diag: single choke point for EVERY removal path. cursor tells us how far the
+	// sound had played when it was released; playing tells us whether miniaudio still considered
+	// it live at that moment.
+	{
+		const char *nm = release->m_audioEventRTS ? release->m_audioEventRTS->getEventName().str() : "(null)";
+		float cur = -1.0f;
+		int pl = -1;
+		if (release->m_sound) {
+			ma_sound_get_cursor_in_seconds(release->m_sound, &cur);
+			pl = (int)ma_sound_is_playing(release->m_sound);
+		}
+		fprintf(stderr, "[MAUDIO-T %.0fms RELEASE '%s' type=%d cursor=%.2fs playing=%d\n",
+			MAudioNowMs(), nm, (int)release->m_type, cur, pl);
+		fflush(stderr);
+	}
+
 	const AudioEventInfo *releaseInfo = release->m_audioEventRTS
 		? release->m_audioEventRTS->getAudioEventInfo() : nullptr;
 
@@ -638,6 +850,8 @@ void MiniAudioManager::stopAllAudioImmediately(void)
 	ScopedFPUGuard fpuGuard;
 	std::list<PlayingAudio *>::iterator it;
 	PlayingAudio *playing;
+	fprintf(stderr, "[MAUDIO-T %.0fms STOPALL playing=%zu fading=%zu stopped=%zu\n", MAudioNowMs(),
+		m_playingSounds.size(), m_fadingAudio.size(), m_stoppedAudio.size()); fflush(stderr);
 
 	for (it = m_playingSounds.begin(); it != m_playingSounds.end(); ) {
 		playing = *it;
@@ -699,6 +913,8 @@ void MiniAudioManager::stopAllSpeech(void)
 
 		if (playing->m_audioEventRTS && playing->m_audioEventRTS->getAudioEventInfo() &&
 			playing->m_audioEventRTS->getAudioEventInfo()->m_soundType == AT_Streaming) {
+			fprintf(stderr, "[MAUDIO-T %.0fms STOPALLSPEECH victim='%s'\n", MAudioNowMs(),
+				playing->m_audioEventRTS->getEventName().str()); fflush(stderr);
 			it = m_playingSounds.erase(it);
 			releasePlayingAudio(playing);
 		}
@@ -860,17 +1076,22 @@ void MiniAudioManager::closeDevice(void)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-CLOSE] enter closeDevice\n"); fflush(stderr);
 	// Stop all audio first to prevent use-after-free in audio callbacks
 	stopAllAudioImmediately();
+	fprintf(stderr, "[MAUDIO-CLOSE] stopAll done, uninit groups\n"); fflush(stderr);
 
 	ma_sound_group_uninit(&m_speechGroup);
 	ma_sound_group_uninit(&m_sound3DGroup);
 	ma_sound_group_uninit(&m_soundGroup);
 	ma_sound_group_uninit(&m_musicGroup);
+	fprintf(stderr, "[MAUDIO-CLOSE] pre ma_engine_uninit\n"); fflush(stderr);
 	ma_engine_uninit(&m_engine);
+	fprintf(stderr, "[MAUDIO-CLOSE] post ma_engine_uninit\n"); fflush(stderr);
 	ma_resource_manager_uninit(&m_resourceManager);
 	ma_context_uninit(&m_context);
 	ma_log_uninit(&m_log);
+	fprintf(stderr, "[MAUDIO-CLOSE] leave closeDevice\n"); fflush(stderr);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1073,6 +1294,12 @@ AudioEventRTS *MiniAudioManager::findLowestPrioritySound(AudioEventRTS *event)
 		if (!itEvent) continue;
 		const AudioEventInfo *itInfo = itEvent->getAudioEventInfo();
 		if (!itInfo) continue;
+		// GeneralsX @bugfix Antigravity 12/10/2026 Only consider 2D/3D sound effects as preemption
+		// victims. In the MiniAudio backend music (AT_Music) and speech (AT_Streaming) share
+		// m_playingSounds with the effects (Miles/OpenAL keep them in separate pools), so without
+		// this filter a crowded effect pool would kill the currently playing music or voiceline
+		// via handleToKill (music cutting out after ~8s in the main menu and mid-speech in-game).
+		if (itInfo->m_soundType != AT_SoundEffect) continue;
 		AudioPriority itPriority = itInfo->m_priority;
 		if (itPriority < priority) {
 			if (!lowestPriorityEvent || lowestPriority > itPriority) {
@@ -1094,7 +1321,13 @@ Bool MiniAudioManager::isPlayingLowerPriority(AudioEventRTS *event) const
 	for (auto it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it) {
 		if (!(*it)->m_audioEventRTS) continue;
 		const AudioEventInfo *info = (*it)->m_audioEventRTS->getAudioEventInfo();
-		if (info && info->m_priority < priority) {
+		// GeneralsX @bugfix Antigravity 12/10/2026 Only preempt 2D/3D sound effects, never music
+		// or speech. GameSounds::canPlayNow() calls this whenever the 2D/3D sample pools are full,
+		// and the returned handleToKill is then killed in playAudioEvent(). Because music and
+		// speech live in the same m_playingSounds list here (unlike the Miles/OpenAL backends),
+		// any higher-priority effect request used to kill the active music track or voiceline,
+		// which is why music cut out after ~8s in the menus and speech died mid-sentence in-game.
+		if (info && info->m_soundType == AT_SoundEffect && info->m_priority < priority) {
 			event->setHandleToKill((*it)->m_audioEventRTS->getPlayingHandle());
 			return true;
 		}
@@ -1141,6 +1374,7 @@ void MiniAudioManager::removePlayingAudio(AsciiString eventName)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-T %.0fms REMOVE '%s'\n", MAudioNowMs(), eventName.str()); fflush(stderr);
 	for (auto it = m_playingSounds.begin(); it != m_playingSounds.end(); ) {
 		PlayingAudio *playing = *it;
 		if (playing && playing->m_audioEventRTS && playing->m_audioEventRTS->getEventName() == eventName) {
@@ -1156,9 +1390,12 @@ void MiniAudioManager::removeAllDisabledAudio(void)
 {
 	// GeneralsX @bugfix meerzulee 19/07/2026 FP env guard for audio entry point (see #215)
 	ScopedFPUGuard fpuGuard;
+	fprintf(stderr, "[MAUDIO-T %.0fms REMOVEDISABLED\n", MAudioNowMs()); fflush(stderr);
 	for (auto it = m_playingSounds.begin(); it != m_playingSounds.end(); ) {
 		PlayingAudio *playing = *it;
 		if (playing && playing->m_audioEventRTS && playing->m_audioEventRTS->getVolume() == 0.0f) {
+			fprintf(stderr, "[MAUDIO-T %.0fms REMOVEDISABLED victim='%s'\n", MAudioNowMs(),
+				playing->m_audioEventRTS->getEventName().str()); fflush(stderr);
 			it = m_playingSounds.erase(it);
 			releasePlayingAudio(playing);
 		}
@@ -1197,9 +1434,37 @@ void MiniAudioManager::processPlayingList(void)
 			continue;
 		}
 
+		// GeneralsX diag: periodically sample long-lived playback to find what cuts it off.
+		{
+			static unsigned long s_tick = 0;
+			if (playing->m_sound) {
+				float cur = 0.0f;
+				ma_sound_get_cursor_in_seconds(playing->m_sound, &cur);
+				Bool qualify = (playing->m_type == PAT_Stream) || (cur > 1.5f);
+				if (qualify && ((s_tick++ % 60) == 0)) {
+					float vol = ma_sound_get_volume(playing->m_sound);
+					int pl = (int)ma_sound_is_playing(playing->m_sound);
+					int gpl = (int)ma_sound_group_is_playing(&m_musicGroup);
+					AsciiString nm = playing->m_audioEventRTS ? playing->m_audioEventRTS->getEventName() : AsciiString::TheEmptyString;
+					fprintf(stderr, "[MAUDIO-T %.0fms LONG tick=%lu type=%d name='%s' cursor=%.2fs playing=%d vol=%.3f musicGroup=%d\n",
+						MAudioNowMs(), s_tick, (int)playing->m_type, nm.str(), cur, pl, vol, gpl);
+					fflush(stderr);
+				}
+			}
+		}
+
 		// Check if sound was explicitly marked to stop
 		if (playing->m_requestStop) {
-			if (playing->m_sound) ma_sound_stop(playing->m_sound);
+			if (playing->m_sound) {
+				if (playing->m_type == PAT_Stream) {
+					float cur = 0.0f;
+					ma_sound_get_cursor_in_seconds(playing->m_sound, &cur);
+					AsciiString nm = playing->m_audioEventRTS ? playing->m_audioEventRTS->getEventName() : AsciiString::TheEmptyString;
+					fprintf(stderr, "[MAUDIO-T %.0fms STOPREQ stream '%s' requestStop at cursor=%.2fs\n", MAudioNowMs(), nm.str(), cur);
+					fflush(stderr);
+				}
+				ma_sound_stop(playing->m_sound);
+			}
 			it = m_playingSounds.erase(it);
 			releasePlayingAudio(playing);
 			continue;
@@ -1207,6 +1472,13 @@ void MiniAudioManager::processPlayingList(void)
 
 		// Check if sound has finished playing
 		if (playing->m_sound && !ma_sound_is_playing(playing->m_sound)) {
+			if (playing->m_type == PAT_Stream) {
+				float cur = 0.0f;
+				ma_sound_get_cursor_in_seconds(playing->m_sound, &cur);
+				AsciiString nm = playing->m_audioEventRTS ? playing->m_audioEventRTS->getEventName() : AsciiString::TheEmptyString;
+				fprintf(stderr, "[MAUDIO-T %.0fms REAP stream '%s' ended at cursor=%.2fs\n", MAudioNowMs(), nm.str(), cur);
+				fflush(stderr);
+			}
 			it = m_playingSounds.erase(it);
 			releasePlayingAudio(playing);
 			continue;
@@ -1248,6 +1520,9 @@ void MiniAudioManager::processFadingList(void)
 		}
 
 		if (playing->m_framesFaded >= getAudioSettings()->m_fadeAudioFrames) {
+			fprintf(stderr, "[MAUDIO-T %.0fms FADEEND '%s' frames=%d\n", MAudioNowMs(),
+				playing->m_audioEventRTS ? playing->m_audioEventRTS->getEventName().str() : "(null)",
+				(int)playing->m_framesFaded); fflush(stderr);
 			playing->m_requestStop = true;
 			it = m_fadingAudio.erase(it);
 			releasePlayingAudio(playing);

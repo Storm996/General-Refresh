@@ -5,7 +5,7 @@
 // On Windows: windows.h → Windows SDK
 #include <windows.h>
 
-#include <d3d8.h>
+#include <d3d9.h>
 
 #ifdef __cplusplus
 extern "C"

@@ -30,3 +30,26 @@
 #if defined(_MSC_VER) && _MSC_VER < 1300
 #include "minidump_subset.h"
 #endif
+
+// GeneralsX @build win64 11/10/2026 The 32-bit dbghelp entry points do not exist on x64 - imagehlp.h
+// aliases the legacy function and structure names onto their *64 counterparts there, but the plain
+// "DWORD" address parameters used by this project's loader shim stay 32-bit wide. These typedefs
+// give the address-sized value types so the same source declares correct signatures on both ABIs.
+#ifdef _WIN64
+	typedef DWORD64 DbghelpAddr;             ///< address / module-base sized value
+	typedef PDWORD64 DbghelpAddrOut;         ///< out parameter for an address-sized value
+	typedef IMAGEHLP_SYMBOL64 DbghelpSymbol; ///< symbol record layout
+	typedef PIMAGEHLP_SYMBOL64 DbghelpSymbolPtr;
+#else
+	typedef DWORD DbghelpAddr;
+	typedef PDWORD DbghelpAddrOut;
+	typedef IMAGEHLP_SYMBOL DbghelpSymbol;
+	typedef PIMAGEHLP_SYMBOL DbghelpSymbolPtr;
+#endif
+
+// GeneralsX @build win64 11/10/2026 Machine type passed to StackWalk for the running process.
+#ifdef _WIN64
+	#define DBGHELP_MACHINE_TYPE IMAGE_FILE_MACHINE_AMD64
+#else
+	#define DBGHELP_MACHINE_TYPE IMAGE_FILE_MACHINE_I386
+#endif

@@ -31,6 +31,30 @@
 #include <windows.h>
 #include <commctrl.h>
 
+// GeneralsX @bugfix 11/10/2026 x64: CONTEXT register names differ between architectures,
+// use accessor macros (same pattern as WWLib/Except.cpp)
+#ifdef _WIN64
+  #define DBG_CTX_IP(c)   ((c)->Rip)
+  #define DBG_CTX_SP(c)   ((c)->Rsp)
+  #define DBG_CTX_BP(c)   ((c)->Rbp)
+  #define DBG_CTX_AX(c)   ((c)->Rax)
+  #define DBG_CTX_BX(c)   ((c)->Rbx)
+  #define DBG_CTX_CX(c)   ((c)->Rcx)
+  #define DBG_CTX_DX(c)   ((c)->Rdx)
+  #define DBG_CTX_SI(c)   ((c)->Rsi)
+  #define DBG_CTX_DI(c)   ((c)->Rdi)
+#else
+  #define DBG_CTX_IP(c)   ((c)->Eip)
+  #define DBG_CTX_SP(c)   ((c)->Esp)
+  #define DBG_CTX_BP(c)   ((c)->Ebp)
+  #define DBG_CTX_AX(c)   ((c)->Eax)
+  #define DBG_CTX_BX(c)   ((c)->Ebx)
+  #define DBG_CTX_CX(c)   ((c)->Ecx)
+  #define DBG_CTX_DX(c)   ((c)->Edx)
+  #define DBG_CTX_SI(c)   ((c)->Esi)
+  #define DBG_CTX_DI(c)   ((c)->Edi)
+#endif
+
 DebugExceptionhandler::DebugExceptionhandler()
 {
   // don't do anything here!
@@ -110,7 +134,7 @@ void DebugExceptionhandler::LogExceptionLocation(Debug &dbg, struct _EXCEPTION_P
   struct _CONTEXT &ctx=*exptr->ContextRecord;
 
   char buf[512];
-  DebugStackwalk::Signature::GetSymbol(ctx.Eip,buf,sizeof(buf));
+  DebugStackwalk::Signature::GetSymbol((unsigned)DBG_CTX_IP(&ctx),buf,sizeof(buf));
   dbg << "Exception occured at\n" << buf << ".";
 }
 
@@ -120,15 +144,15 @@ void DebugExceptionhandler::LogRegisters(Debug &dbg, struct _EXCEPTION_POINTERS 
 
   dbg << Debug::FillChar('0')
       << Debug::Hex()
-      <<  "EAX:" << Debug::Width(8) << ctx.Eax
-      << " EBX:" << Debug::Width(8) << ctx.Ebx
-      << " ECX:" << Debug::Width(8) << ctx.Ecx << "\n"
-      <<  "EDX:" << Debug::Width(8) << ctx.Edx
-      << " ESI:" << Debug::Width(8) << ctx.Esi
-      << " EDI:" << Debug::Width(8) << ctx.Edi << "\n"
-      <<  "EIP:" << Debug::Width(8) << ctx.Eip
-      << " ESP:" << Debug::Width(8) << ctx.Esp
-      << " EBP:" << Debug::Width(8) << ctx.Ebp << "\n"
+      <<  "EAX:" << Debug::Width(8) << DBG_CTX_AX(&ctx)
+      << " EBX:" << Debug::Width(8) << DBG_CTX_BX(&ctx)
+      << " ECX:" << Debug::Width(8) << DBG_CTX_CX(&ctx) << "\n"
+      <<  "EDX:" << Debug::Width(8) << DBG_CTX_DX(&ctx)
+      << " ESI:" << Debug::Width(8) << DBG_CTX_SI(&ctx)
+      << " EDI:" << Debug::Width(8) << DBG_CTX_DI(&ctx) << "\n"
+      <<  "EIP:" << Debug::Width(8) << DBG_CTX_IP(&ctx)
+      << " ESP:" << Debug::Width(8) << DBG_CTX_SP(&ctx)
+      << " EBP:" << Debug::Width(8) << DBG_CTX_BP(&ctx) << "\n"
       <<  "Flags:" << Debug::Bin() << Debug::Width(32) << ctx.EFlags << Debug::Hex() << "\n"
       <<  "CS:" << Debug::Width(4) << ctx.SegCs
       << " DS:" << Debug::Width(4) << ctx.SegDs
@@ -148,6 +172,23 @@ void DebugExceptionhandler::LogFPURegisters(Debug &dbg, struct _EXCEPTION_POINTE
     return;
   }
 
+#ifdef _WIN64
+  // GeneralsX @bugfix 11/10/2026 x64: no x87 FloatSave in CONTEXT, dump MXCSR + XMM low halves
+  dbg << Debug::Bin() << Debug::FillChar('0')
+      << "MxCsr:" << Debug::Width(8) << ctx.MxCsr
+      << Debug::Hex() << "\n";
+  static const unsigned xmmRegs[] = {0,1,2,3,4,5,6,7};
+  for (unsigned k=0;k<sizeof(xmmRegs)/sizeof(xmmRegs[0]);++k)
+  {
+    dbg << Debug::Dec() << "XMM" << xmmRegs[k] << " ";
+    dbg.SetPrefixAndRadix("",16);
+    const BYTE *value=(const BYTE*)&ctx.Xmm0+xmmRegs[k]*16;
+    for (unsigned i=0;i<8;i++)
+      dbg << Debug::Width(2) << value[i];
+    dbg << "\n";
+  }
+  dbg << Debug::FillChar() << Debug::Dec();
+#else
   FLOATING_SAVE_AREA &flt=ctx.FloatSave;
   dbg << Debug::Bin() << Debug::FillChar('0')
       << "CW:" << Debug::Width(16) << (flt.ControlWord&0xffff) << "\n"
@@ -181,6 +222,7 @@ void DebugExceptionhandler::LogFPURegisters(Debug &dbg, struct _EXCEPTION_POINTE
     dbg << "\n";
   }
   dbg << Debug::FillChar() << Debug::Dec();
+#endif
 }
 
 // include exception dialog box
@@ -195,7 +237,8 @@ static char regInfo[1024],verInfo[256];
 // and this saves us from doing a stack walk twice
 static DebugStackwalk::Signature sig;
 
-static BOOL CALLBACK ExceptionDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+// GeneralsX @bugfix 11/10/2026 x64: DLGPROC returns INT_PTR on 64-bit
+static INT_PTR CALLBACK ExceptionDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
   switch(uMsg)
   {
@@ -240,7 +283,7 @@ static BOOL CALLBACK ExceptionDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 
   // address
   struct _CONTEXT &ctx=*exPtrs->ContextRecord;
-  DebugStackwalk::Signature::GetSymbol(ctx.Eip,regInfo,sizeof(regInfo));
+  DebugStackwalk::Signature::GetSymbol((unsigned)DBG_CTX_IP(&ctx),regInfo,sizeof(regInfo));
   SendDlgItemMessage(hWnd,102,WM_SETTEXT,0,(LPARAM)regInfo);
 
   // stack
@@ -396,7 +439,7 @@ LONG __stdcall DebugExceptionhandler::ExceptionFilter(struct _EXCEPTION_POINTERS
   dbg.m_stackWalk.StackWalk(sig,pExPtrs->ContextRecord);
   dbg << sig << "\n";
 
-  dbg << "Bytes around EIP:" << Debug::MemDump::Char(((char *)(pExPtrs->ContextRecord->Eip))-32,80);
+  dbg << "Bytes around EIP:" << Debug::MemDump::Char(((char *)(UINT_PTR)(uintptr_t)DBG_CTX_IP(pExPtrs->ContextRecord))-32,80);
 
   dbg.FlushOutput();
 

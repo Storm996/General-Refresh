@@ -115,6 +115,11 @@ references/GameServer/
 /渲染器现代化调研/
 /现代化指挥系统/
 /界面升级/
+/引擎改造/
+/T0 编译工具 64位/
+/PS升级/
+/PS3.0升级调研/
+/docs/WORKDIR/support/IDE_IMPORTS/
 /GeneralsZH/
 /work_tmp/
 /_bigtest_out/
@@ -161,3 +166,12 @@ references/GameServer/
 !flatpak/**
 !Core/Libraries/Source/WWVegas/WW3D2/RequiredAssets/**
 !Core/Tools/W3DView/Res/**
+
+# GeneralsX @build d3d9 port 12/10/2026 - transient build/dxvk artifacts and
+# Windows reserved-name junk produced during local renderer work.
+*.obj
+/dxvk_tmp.dll
+/nul
+*smoke_stderr.txt
+*smoke_stdout.txt
+*buildimports.txt

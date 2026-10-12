@@ -33,6 +33,12 @@
 
 #pragma once
 
+// GeneralsX @build d3d9 port 11/10/2026 - forward declarations so this header compiles in any
+// include order; the real definitions come from <d3d9.h> pulled in by WW3D2/dx8wrapper.h.
+struct _D3DVERTEXELEMENT9;
+typedef struct _D3DVERTEXELEMENT9 D3DVERTEXELEMENT9;
+struct IDirect3DPixelShader9;
+
 #include "WW3D2/texture.h"
 enum FilterTypes CPP_11(: Int);
 enum FilterModes CPP_11(: Int);
@@ -94,7 +100,10 @@ public:
 	///Return last activated shader.
 	static ShaderTypes getCurrentShader() {return m_currentShader;}
 	/// Loads a .vso file and creates a vertex shader for it
-	static HRESULT LoadAndCreateD3DShader(const char* strFilePath, const DWORD* pDeclaration, DWORD Usage, Bool ShaderType, DWORD* pHandle);
+	// GeneralsX @build d3d9 port 11/10/2026 - declaration is a D3DVERTEXELEMENT9 array and the
+	// output handle is an IDirect3D{Vertex,Pixel}Shader9* (void** here) in D3D9; DX8 DWORD handles
+	// and token arrays no longer exist.
+	static HRESULT LoadAndCreateD3DShader(const char* strFilePath, const D3DVERTEXELEMENT9* pDeclaration, DWORD Usage, Bool ShaderType, void** pHandle);
 
 	static Bool testMinimumRequirements(ChipsetType *videoChipType, CpuType *cpuType, Int *cpuFreq, MemValueType *numRAM, Real *intBenchIndex, Real *floatBenchIndex, Real *memBenchIndex);
 	static StaticGameLODLevel getGPUPerformanceIndex();
@@ -108,8 +117,8 @@ public:
 	// Support routines for filter methods.
 	static Bool canRenderToTexture() { return (m_oldRenderSurface && m_newRenderSurface);}
 	static void startRenderToTexture(); ///< Sets render target to texture.
-	static IDirect3DTexture8 * endRenderToTexture(); ///< Ends render to texture, & returns texture.
-	static IDirect3DTexture8 * getRenderTexture();	///< returns last used render target texture
+	static IDirect3DTexture9 * endRenderToTexture(); ///< Ends render to texture, & returns texture.
+	static IDirect3DTexture9 * getRenderTexture();	///< returns last used render target texture
 	static Bool isRenderingToTexture() {return m_renderingToTexture; }
 	static void drawViewport(Int color);	///<draws 2 triangles covering the current tactical viewport
 	// GeneralsX @feature 05/10/2026 Bloom post-processing filter global toggle.
@@ -129,10 +138,10 @@ protected:
 	static FilterTypes m_currentFilter; ///< Last filter that was set.
 	// Info for a render to texture surface for special effects.
 	static Bool m_renderingToTexture;
-	static IDirect3DSurface8 *m_oldRenderSurface;	///<previous render target
-	static IDirect3DTexture8 *m_renderTexture;		///<texture into which rendering will be redirected.
-	static IDirect3DSurface8 *m_newRenderSurface;	///<new render target inside m_renderTexture
-	static IDirect3DSurface8 *m_oldDepthSurface;	///<previous depth buffer surface
+	static IDirect3DSurface9 *m_oldRenderSurface;	///<previous render target
+	static IDirect3DTexture9 *m_renderTexture;		///<texture into which rendering will be redirected.
+	static IDirect3DSurface9 *m_newRenderSurface;	///<new render target inside m_renderTexture
+	static IDirect3DSurface9 *m_oldDepthSurface;	///<previous depth buffer surface
 
 
 };
@@ -191,7 +200,7 @@ protected:
 ///converts viewport to black & white.
 class ScreenBWFilter : public W3DFilterInterface
 {
-	DWORD	m_dwBWPixelShader;		///<D3D handle to pixel shader which tints texture to black & white.
+	IDirect3DPixelShader9*	m_dwBWPixelShader;		///<D3D9 pixel shader interface which tints texture to black & white (was DX8 DWORD handle).
 public:
 	virtual Int init() override;			///<perform any one time initialization and validation
 	virtual Int shutdown() override;		///<release resources used by shader

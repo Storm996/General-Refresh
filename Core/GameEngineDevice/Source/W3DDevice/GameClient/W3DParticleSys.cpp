@@ -34,6 +34,7 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DSmudge.h"
 #include "W3DDevice/GameClient/W3DSnow.h"
+#include "W3DDevice/GameClient/W3DGrassBuffer.h"
 #include "WW3D2/camera.h"
 
 
@@ -412,6 +413,13 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	//Draw any particles belonging to weather effects
 	if (TheSnowManager)
 		((W3DSnowManager *)TheSnowManager)->render(rinfo);
+
+	// GeneralsX @feature Qoder 11/10/2026 Real 3D grass layer: terrain-driven crossed
+	// quads scattered on TERRAIN_GRASS cells near the camera. Render-side only, mounted
+	// next to the weather pass so it inherits the same view/proj and device lifecycle.
+	if (!TheGrassBuffer)
+		TheGrassBuffer = new W3DGrassBuffer;
+	TheGrassBuffer->render(rinfo);
 
 	//Now process screen smudges which are particles that distort the background behind them.
 	if(TheSmudgeManager)

@@ -48,6 +48,9 @@ class WeatherSetting : public Overridable
 		Real	m_snowVelocity;			///<used to set speed at which snow falls (world units/sec).
 		Bool    m_usePointSprites;		///<used to disable hardware point-sprite support.
 		Bool	m_snowEnabled;			///<enable/disable snow on the map.
+		// GeneralsX @feature Qoder 11/10/2026 Grass layer options (reuse the weather INI block).
+		Bool	m_grassEnabled;				///<enable/disable the 3D grass layer (on by default).
+		Real	m_grassDensity;				///<percent of qualifying grass cells that grow a clump (0..100).
 
 	public:
 		WeatherSetting()
@@ -63,6 +66,9 @@ class WeatherSetting : public Overridable
 			m_snowVelocity=4;
 			m_usePointSprites=TRUE;
 			m_snowEnabled=FALSE;
+			// GeneralsX: grass layer is on by default; density is a modest scatter.
+			m_grassEnabled=TRUE;
+			m_grassDensity=35.0f;
 			m_snowMaxPointSize=64.0f;
 			m_snowMinPointSize=0.0f;
 		}

@@ -45,15 +45,21 @@
 // Windows type stubs
 #if !defined(_WIN32)
     #define HANDLE void*
-    typedef unsigned char  U8;
-    typedef signed char    S8;
-    typedef unsigned short U16;
-    typedef signed short   S16;
-    typedef unsigned int   U32;
-    typedef signed int     S32;
-    typedef float          F32;
-    typedef double         F64;
 #endif
+
+// GeneralsX @build win64 11/10/2026 The WW integral typedefs (U8..F64) were historically only
+// defined for the !defined(_WIN32) OpenAL/MiniAudio stub path, because every Windows build used
+// the real Miles SDK (mss.h) which provided them. Now that a 64-bit Windows build also routes
+// through this stub (mss.h is not included), define them unconditionally. Redefining a typedef to
+// the same underlying type is legal in C++11, so this stays safe even if another header agrees.
+typedef unsigned char  U8;
+typedef signed char    S8;
+typedef unsigned short U16;
+typedef signed short   S16;
+typedef unsigned int   U32;
+typedef signed int     S32;
+typedef float          F32;
+typedef double         F64;
 
 // Miles Sound System type stubs (not including callback typedefs - those are defined in AudioEvents.h)
 typedef void* HDIGDRIVER;
@@ -64,6 +70,11 @@ typedef void* H3DPOBJECT;
 typedef void* HTIMER;
 
 // Wave format stub
+// GeneralsX @build win64 11/10/2026 WWAudio.h references LPWAVEFORMAT in a public method signature
+// (Open_2D_Device), so the stub must exist on every platform that routes through MilesStub.h, now
+// including 64-bit Windows. The win64 build compiles with WIN32_LEAN_AND_MEAN, so the SDK does not
+// pull mmsystem/mmreg and there is no WAVEFORMAT redefinition clash. TUs that do include miniaudio.h
+// (which owns the real WAVEFORMAT) never include this stub header.
 typedef struct {
     U16 wFormatTag;
     U16 nChannels;

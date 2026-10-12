@@ -45,7 +45,7 @@
 #include "WW3D2/dx8renderer.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/GameClient/HeightMap.h"
-#include "d3dx8math.h"
+#include "d3dx9math.h"
 #include "Common/GlobalData.h"
 #include "Common/OptionPreferences.h"	// GeneralsX @feature 10/10/2026 shadow S1/S2 knobs (Options.ini, outside m_iniCRC)
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
@@ -86,8 +86,8 @@ W3DProjectedShadowManager *TheW3DProjectedShadowManager=nullptr;	//global single
 ProjectedShadowManager	*TheProjectedShadowManager;				//global singleton with simpler interface.
 extern const FrustumClass *shadowCameraFrustum;	//defined in W3DShadow.
 ///@todo: Externs from volumetric shadow renderer - these need to be moved into W3DBufferManager
-extern LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D;		///<D3D vertex buffer
-extern LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D;	///<D3D index buffer
+extern LPDIRECT3DVERTEXBUFFER9 shadowVertexBufferD3D;		///<D3D vertex buffer
+extern LPDIRECT3DINDEXBUFFER9	shadowIndexBufferD3D;	///<D3D index buffer
 extern int nShadowVertsInBuf;	//model vetices in vertex buffer
 extern int nShadowStartBatchVertex;
 extern int nShadowIndicesInBuf;	//model vetices in vertex buffer
@@ -105,8 +105,8 @@ struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
 
 #define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
 
-LPDIRECT3DVERTEXBUFFER8 shadowDecalVertexBufferD3D=nullptr;		///<D3D vertex buffer
-LPDIRECT3DINDEXBUFFER8	shadowDecalIndexBufferD3D=nullptr;	///<D3D index buffer
+LPDIRECT3DVERTEXBUFFER9 shadowDecalVertexBufferD3D=nullptr;		///<D3D vertex buffer
+LPDIRECT3DINDEXBUFFER9	shadowDecalIndexBufferD3D=nullptr;	///<D3D index buffer
 int nShadowDecalVertsInBuf=0;	//model vetices in vertex buffer
 int nShadowDecalStartBatchVertex=0;
 int nShadowDecalIndicesInBuf=0;	//model vetices in vertex buffer
@@ -306,7 +306,7 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 		fprintf(stderr, "[SHADOWS] render target: requested %d, created %d\n", requestedSize, m_renderTargetSize);
 	fflush(stderr);
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	DEBUG_ASSERTCRASH(m_pDev, ("Trying to ReAcquireResources on W3DProjectedShadowManager without device"));
 	DEBUG_ASSERTCRASH(shadowDecalIndexBufferD3D == nullptr && shadowDecalIndexBufferD3D == nullptr, ("ReAcquireResources not released in W3DProjectedShadowManager"));
@@ -317,7 +317,8 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 		D3DUSAGE_WRITEONLY|D3DUSAGE_DYNAMIC,
 		D3DFMT_INDEX16,
 		D3DPOOL_DEFAULT,
-		&shadowDecalIndexBufferD3D
+		&shadowDecalIndexBufferD3D,
+		nullptr
 	)))
 		return FALSE;
 
@@ -331,7 +332,8 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			D3DUSAGE_WRITEONLY|D3DUSAGE_DYNAMIC,
 			0,
 			D3DPOOL_DEFAULT,
-			&shadowDecalVertexBufferD3D
+			&shadowDecalVertexBufferD3D,
+			nullptr
 		)))
 			return FALSE;
 	}
@@ -407,7 +409,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		Real mapScaleInv=1.0f/MAP_XY_FACTOR;
 		SHADOW_VOLUME_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+		LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		if (!m_pDev)	return 0;
 
@@ -435,13 +437,13 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{
 			//flush the buffer by drawing the contents and re-locking again
-			if (shadowVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_VOLUME_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_VOLUME_VERTEX),(void**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
 				return 0;
 			nShadowVertsInBuf=0;
 			nShadowStartBatchVertex=0;
 		}
 		else
-		{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_VOLUME_VERTEX),numVerts*sizeof(SHADOW_VOLUME_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowVertexBufferD3D->Lock(nShadowVertsInBuf*sizeof(SHADOW_VOLUME_VERTEX),numVerts*sizeof(SHADOW_VOLUME_VERTEX), (void**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return 0;
 		}
 
@@ -469,13 +471,13 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
 		{
 			//flush the buffer by drawing the contents and re-locking again
-			if (shadowIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowIndexBufferD3D->Lock(0,numIndex*sizeof(short),(void**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
 				return 0;
 			nShadowIndicesInBuf=0;
 			nShadowStartBatchIndex=0;
 		}
 		else
-		{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (void**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return 0;
 		}
 
@@ -527,12 +529,12 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 
 		shadowIndexBufferD3D->Unlock();
 
-		m_pDev->SetIndices(shadowIndexBufferD3D,nShadowStartBatchVertex);
+		m_pDev->SetIndices(shadowIndexBufferD3D);
 
 		m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
 
-		m_pDev->SetStreamSource(0,shadowVertexBufferD3D,sizeof(SHADOW_VOLUME_VERTEX));
-		m_pDev->SetVertexShader(SHADOW_VOLUME_FVF);
+		m_pDev->SetStreamSource(0,shadowVertexBufferD3D,0,sizeof(SHADOW_VOLUME_VERTEX));
+		m_pDev->SetFVF(SHADOW_VOLUME_FVF);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 
@@ -555,7 +557,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 		{
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,numVerts,nShadowStartBatchIndex,numPolys);
+			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowStartBatchVertex,0,numVerts,nShadowStartBatchIndex,numPolys);
 		}
 
 		m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
@@ -740,7 +742,7 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 		return;
 	}
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 	if (!m_pDev)	return;	//no D3D Device to render
 
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
@@ -783,11 +785,11 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 */
 
 
-	m_pDev->SetIndices(shadowDecalIndexBufferD3D,nShadowDecalStartBatchVertex);
+	m_pDev->SetIndices(shadowDecalIndexBufferD3D);
 	m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
 
-	m_pDev->SetStreamSource(0,shadowDecalVertexBufferD3D,sizeof(SHADOW_DECAL_VERTEX));
-	m_pDev->SetVertexShader(SHADOW_DECAL_FVF);
+	m_pDev->SetStreamSource(0,shadowDecalVertexBufferD3D,0,sizeof(SHADOW_DECAL_VERTEX));
+	m_pDev->SetFVF(SHADOW_DECAL_FVF);
 
 //Hard Shadows using stencil
 /*	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_ZERO);
@@ -808,7 +810,7 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 	{
 		Debug_Statistics::Record_DX8_Polys_And_Vertices(nShadowDecalPolysInBatch,nShadowDecalVertsInBatch,ShaderClass::_PresetOpaqueShader);
-		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,nShadowDecalVertsInBatch,nShadowDecalStartBatchIndex,nShadowDecalPolysInBatch);
+		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowDecalStartBatchVertex,0,nShadowDecalVertsInBatch,nShadowDecalStartBatchIndex,nShadowDecalPolysInBatch);
 	}
 
 //	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
@@ -874,7 +876,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+		LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		if (!m_pDev)	return;	//no D3D Device to render
 
@@ -1067,7 +1069,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		{
 			//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
-			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(void**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
 				return;
 
 			nShadowDecalStartBatchVertex=0;
@@ -1076,7 +1078,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			nShadowDecalVertsInBuf=0;
 		}
 		else
-		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (void**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
 
@@ -1142,7 +1144,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
 
-			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(void**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
 				return;
 
 			nShadowDecalStartBatchIndex=0;
@@ -1151,7 +1153,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			nShadowDecalIndicesInBuf=0;
 		}
 		else
-		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (void**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
 
@@ -1215,7 +1217,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 
 	if (TheTerrainRenderObject)
 	{
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+		LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		if (!m_pDev)	return;	//no D3D Device to render
 
@@ -1243,7 +1245,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		{
 			//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
-			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(unsigned char**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowDecalVertexBufferD3D->Lock(0,numVerts*sizeof(SHADOW_DECAL_VERTEX),(void**)&pvVertices,D3DLOCK_DISCARD) != D3D_OK)
 				return;
 
 			nShadowDecalStartBatchVertex=0;
@@ -1252,7 +1254,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			nShadowDecalVertsInBuf=0;
 		}
 		else
-		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (unsigned char**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (void**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
 
@@ -1306,7 +1308,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0],shadow->m_type);
 
-			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(unsigned char**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
+			if (shadowDecalIndexBufferD3D->Lock(0,numIndex*sizeof(short),(void**)&pvIndices,D3DLOCK_DISCARD) != D3D_OK)
 				return;
 
 			nShadowDecalStartBatchIndex=0;
@@ -1315,7 +1317,7 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			nShadowDecalIndicesInBuf=0;
 		}
 		else
-		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (unsigned char**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (void**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
 

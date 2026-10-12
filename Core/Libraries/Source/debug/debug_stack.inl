@@ -31,6 +31,36 @@ DBGHELP(SymSetOptions,
         DWORD,
         (DWORD SymOptions))
 
+// GeneralsX @bugfix 11/10/2026 The legacy 32-bit-only dbghelp entry points (StackWalk,
+// SymFunctionTableAccess, SymGetModuleBase, SymGetSymFromAddr, SymGetLineFromAddr) are
+// not exported by dbghelp.dll on x64; use the 64-bit variants there.
+#if defined(_WIN64)
+DBGHELP(StackWalk64,
+        BOOL,
+        (DWORD MachineType, HANDLE hProcess, HANDLE hThread, LPSTACKFRAME64 StackFrame,
+        LPVOID ContextRecord, PREAD_PROCESS_MEMORY_ROUTINE64 ReadMemoryRoutine,
+        PFUNCTION_TABLE_ACCESS_ROUTINE64 FunctionTableAccessRoutine,
+        PGET_MODULE_BASE_ROUTINE64 GetModuleBaseRoutine,
+        PTRANSLATE_ADDRESS_ROUTINE TranslateAddress))
+
+DBGHELP(SymFunctionTableAccess64,
+        LPVOID,
+        (HANDLE hProcess, DWORD64 AddrBase))
+
+DBGHELP(SymGetModuleBase64,
+        DWORD64,
+        (HANDLE hProcess, DWORD64 qwAddr))
+
+DBGHELP(SymGetSymFromAddr64,
+        BOOL,
+        (HANDLE hProcess, DWORD64 Address, PDWORD64 Displacement,
+        PIMAGEHLP_SYMBOL Symbol))
+
+DBGHELP(SymGetLineFromAddr64,
+        BOOL,
+        (HANDLE hProcess, DWORD64 dwAddr, PDWORD64 pdwDisplacement,
+        PIMAGEHLP_LINE Line))
+#else
 DBGHELP(StackWalk,
         BOOL,
         (DWORD MachineType, HANDLE hProcess, HANDLE hThread, LPSTACKFRAME StackFrame,
@@ -56,6 +86,7 @@ DBGHELP(SymGetLineFromAddr,
         BOOL,
         (HANDLE hProcess, DWORD dwAddr, PDWORD pdwDisplacement,
         PIMAGEHLP_LINE Line))
+#endif
 
 // keep this always as last entry
 DBGHELP(SymCleanup,

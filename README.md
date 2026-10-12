@@ -22,6 +22,12 @@
 
 ---
 
+## 🆕 What's New (Oct 2026)
+
+**The renderer has been ported from Direct3D 8 to Direct3D 9.** The `DX8Wrapper` core now drives the modern `IDirect3D9` / `IDirect3DDevice9` interfaces, loaded at runtime straight from `d3d9.dll`. This lifts the programmable-shader ceiling from `ps_1_4` toward `ps_3_0` and unlocks multi-light forward shading, HDR and bloom-class effects for upcoming passes — while preserving the exact fixed-pipeline / texture-stage behaviour, so gameplay, LAN and replays stay bit-for-bit faithful. The native 64-bit Windows client now runs entirely on the D3D9 path.
+
+---
+
 ## 🧭 What is this?
 
 **General Refresh** is a derivative of the excellent **[GeneralsX](https://github.com/fbraz3/GeneralsX)** project — a modern, open-source re-port of *Command & Conquer: Generals* and *Zero Hour*. We build directly on top of that foundation and take it one big step further on the **frame-rate front**.
@@ -68,6 +74,7 @@ Beyond high frame rate, the following are **already implemented and playable**:
 - 🧩 **Mission UI rework** — the mission briefing / selection interface has been redesigned.
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
 - 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — removing the capacity bottleneck for larger maps, HD assets and heavy particle loads. (Since Microsoft never shipped a 64-bit Direct3D8 runtime, we achieve this via DXVK's x64 `d3d8.dll` shim that translates D3D8 to Vulkan at runtime.)
+- 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
 
 ---
 
@@ -77,7 +84,7 @@ What we are actively building and planning next:
 
 1. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
 2. 🤖 **AI-driven opponents** — adding **artificial-intelligence-powered battle AI** to bring a wider variety of AI personalities and play styles to Skirmish and beyond.
-3. ✨ **Renderer modernization** — porting the `DX8Wrapper` from Direct3D8 to **Direct3D9** to lift the programmable-shader ceiling from `ps_1_4` to `ps_3_0`, unlocking multi-light forward shading, HDR and high-quality bloom; with a **native Vulkan / D3D11 backend** as the long-term goal.
+3. ✨ **Next-gen rendering effects** — with the Direct3D9 port now shipped, building the multi-light forward shading, HDR and high-quality bloom passes it unlocked, and pursuing a **native Vulkan / D3D11 backend** as the long-term goal.
 4. 🔊 **Audio & video backend modernization** — completing the 64-bit platform layer by moving to **MiniAudio / OpenAL (x64)** audio and **FFmpeg** for intro/cutscene playback.
 
 ---

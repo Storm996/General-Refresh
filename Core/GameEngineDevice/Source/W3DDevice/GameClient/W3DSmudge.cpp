@@ -129,44 +129,75 @@ void W3DSmudgeManager::ReAcquireResources()
 	}
 }
 
+/*Bytes-per-pixel for a surface format (D3D9 dropped D3DSURFACE_DESC::Size/BitsPerPixel).*/
+static unsigned smudgeFormatBytesPerPixel(D3DFORMAT format)
+{
+	switch (format)
+	{
+	case D3DFMT_A8R8G8B8:
+	case D3DFMT_X8R8G8B8:
+	case D3DFMT_A8B8G8R8:
+	case D3DFMT_X8B8G8R8:
+	case D3DFMT_A2R10G10B10:
+	case D3DFMT_A2B10G10R10:
+	case D3DFMT_G16R16:
+	case D3DFMT_R32F:
+		return 4;
+	case D3DFMT_R5G6B5:
+	case D3DFMT_X1R5G5B5:
+	case D3DFMT_A1R5G5B5:
+	case D3DFMT_A4R4G4B4:
+	case D3DFMT_G16R16F:
+		return 2;
+	case D3DFMT_R8G8B8:
+		return 3;
+	case D3DFMT_L8:
+	case D3DFMT_A8:
+	case D3DFMT_P8:
+		return 1;
+	default:
+		return 4;
+	}
+}
+
 /*Copies a portion of the current render target into a specified buffer*/
 Int copyRect(unsigned char *buf, Int bufSize, int oX, int oY, int width, int height)
 {
- 	IDirect3DSurface8 *surface=nullptr;	///<previous render target
- 	IDirect3DSurface8 *tempSurface=nullptr;
+ 	IDirect3DSurface9 *surface=nullptr;	///<previous render target
+ 	IDirect3DSurface9 *tempSurface=nullptr;
 	Int result = 0;
 	HRESULT hr = S_OK;
 
- 	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+ 	LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	if (!m_pDev)
 		goto error;
 
- 	m_pDev->GetRenderTarget(&surface);
+ 	m_pDev->GetRenderTarget(0,&surface);
 
 	if (!surface)
 		goto error;
 
  	D3DSURFACE_DESC desc;
 
+	// GeneralsX @build d3d9 port: declare non-initialized locals up front so the gotos below stay
+	// legal C++ (a goto may not jump forward over an initialized declaration).
+	unsigned int bpp;
+	Int rowBytes;
+	Int copyBytes;
+	Int y;
+
  	surface->GetDesc(&desc);
 
-	RECT srcRect;
-	srcRect.left=oX;
-	srcRect.top=oY;
-	srcRect.right=oX+width;
-	srcRect.bottom=oY+height;
-
-	POINT dstPoint;
-	dstPoint.x=0;
-	dstPoint.y=0;
-
- 	hr=m_pDev->CreateImageSurface(  width, height, desc.Format, &tempSurface);
+	// GeneralsX @build d3d9 port 11/10/2026 - D3D8's CreateImageSurface/CopyRects don't exist in D3D9.
+	// Read the full render target into a SYSTEMMEM surface via GetRenderTargetData, then extract the
+	// requested rectangle row by row using the locked pitch.
+	hr=m_pDev->CreateOffscreenPlainSurface(  desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &tempSurface, nullptr);
 
 	if (hr != S_OK)
 		goto error;
 
- 	hr=m_pDev->CopyRects(surface,&srcRect,1,tempSurface,&dstPoint);
+	hr=m_pDev->GetRenderTargetData(surface,tempSurface);
 
 	if (hr != S_OK)
 		goto error;
@@ -178,15 +209,42 @@ Int copyRect(unsigned char *buf, Int bufSize, int oX, int oY, int width, int hei
 	if (hr != S_OK)
 		goto error;
 
- 	tempSurface->GetDesc(&desc);
+	bpp = smudgeFormatBytesPerPixel(desc.Format);
 
-	if (desc.Size < bufSize)
-		bufSize = desc.Size;
+	//clamp the requested rect to the surface
+	if (oX < 0) { width += oX; oX = 0; }
+	if (oY < 0) { height += oY; oY = 0; }
+	if (oX + width > (int)desc.Width) width = (int)desc.Width - oX;
+	if (oY + height > (int)desc.Height) height = (int)desc.Height - oY;
+	if (width <= 0 || height <= 0 || lrect.pBits == nullptr)
+	{
+		tempSurface->UnlockRect();
+		goto error;
+	}
 
-	memcpy(buf,lrect.pBits,bufSize);
-	result = bufSize;
+	rowBytes = width*(Int)bpp;
+	copyBytes = rowBytes*height;
+	if (copyBytes > bufSize)
+	{
+		copyBytes = bufSize;
+		result = copyBytes;
+	}
+	else
+		result = copyBytes;
 
-	tempSurface->UnlockRect();
+	for (y = 0; y < height; y++)
+	{
+		Int bytesThisRow = rowBytes;
+		if (y*rowBytes + bytesThisRow > copyBytes)
+			bytesThisRow = copyBytes - y*rowBytes;
+		if (bytesThisRow <= 0)
+			break;
+		memcpy(buf + y*rowBytes,
+			(const unsigned char*)lrect.pBits + (oY + y)*(Int)lrect.Pitch + oX*(Int)bpp,
+			bytesThisRow);
+	}
+
+ 	tempSurface->UnlockRect();
 
 error:
 	if (surface)
@@ -206,7 +264,7 @@ Bool W3DSmudgeManager::testHardwareSupport()
 	{
 		//we have not done the test yet.
 
-		IDirect3DTexture8 *backTexture=W3DShaderManager::getRenderTexture();
+		IDirect3DTexture9 *backTexture=W3DShaderManager::getRenderTexture();
 		if (!backTexture || !W3DShaderManager::isRenderingToTexture())
 		{
 			// TheSuperHackers @bugfix When Render-To-Texture is disabled globally, we fallback
@@ -261,11 +319,11 @@ Bool W3DSmudgeManager::testHardwareSupport()
 		v[2].color = UNIQUE_COLOR;
 		v[3].color = UNIQUE_COLOR;
 
-		LPDIRECT3DDEVICE8 pDev=DX8Wrapper::_Get_D3D_Device8();
+		LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		//draw polygons like this is very inefficient but for only 2 triangles, it's
 		//not worth bothering with index/vertex buffers.
-		pDev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
 		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
@@ -456,12 +514,12 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 
 	DX8Wrapper::Set_Texture(0,m_backgroundTexture);
 	//Need these states in case texture is non-power-of-2
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSW, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MIPFILTER, D3DTEXF_NONE);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSW, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 	DX8Wrapper::Set_Material(vmat);
 	REF_PTR_RELEASE(vmat);

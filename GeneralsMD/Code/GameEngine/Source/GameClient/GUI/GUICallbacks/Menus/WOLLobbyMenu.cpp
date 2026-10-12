@@ -69,7 +69,12 @@
 #include "GameNetwork/GameSpy/PersistentStorageThread.h"
 #include "GameNetwork/GameSpy/LobbyUtils.h"
 #include "GameNetwork/RankPointValue.h"
+// GeneralsX @build win64 11/10/2026 The NGMP umbrella header pulls in libcurl, so it must stay
+// behind the feature switch like every other menu does (see WOLWelcomeMenu.cpp, ScoreScreen.cpp).
+#if defined(SAGE_USE_NGMP)
 #include "GameNetwork/GeneralsOnline/NGMP_interfaces.h"
+#endif
+#include <chrono> // GeneralsX @build win64 11/10/2026 LobbyChatSlowmodeAllowsSend() uses std::chrono directly
 
 void refreshGameList( Bool forceRefresh = FALSE );
 void refreshPlayerList( Bool forceRefresh = FALSE );
@@ -209,12 +214,14 @@ Bool handleLobbySlashCommands(UnicodeString uText)
 	else if (token == "me" && uText.getLength()>4)
 	{
 		UnicodeString msg = UnicodeString(uText.str() + 4); // skip the /me
+#if defined(SAGE_USE_NGMP)
 		NGMP_OnlineServices_RoomsInterface* pRoomsInterface = NGMP_OnlineServicesManager::GetInterface<NGMP_OnlineServices_RoomsInterface>();
 		if (pRoomsInterface != nullptr)
 		{
 			pRoomsInterface->SendChatMessageToCurrentRoom(msg, true);
 		}
 		else
+#endif
 		{
 			TheGameSpyInfo->sendChat(UnicodeString(uText.str()+4), TRUE, listboxLobbyPlayers);
 		}
@@ -223,11 +230,15 @@ Bool handleLobbySlashCommands(UnicodeString uText)
 	else if (token == "help" || token == "commands")
 	{
 		GadgetListBoxAddEntryText(listboxLobbyChat, UnicodeString(L"The following commands are available:"), GameSpyColor[GSCOLOR_CHAT_NORMAL], -1, -1);
+#if defined(SAGE_USE_NGMP)
 		GadgetListBoxAddEntryText(listboxLobbyChat, UnicodeString(L"/name <value> - Changes your display name - Example: /name General Granger"), GameSpyColor[GSCOLOR_CHAT_NORMAL], -1, -1);
+#endif
 		GadgetListBoxAddEntryText(listboxLobbyChat, UnicodeString(L"/forcerelay - Forces relay-only connections (changes your CRC to isolate)"), GameSpyColor[GSCOLOR_CHAT_NORMAL], -1, -1);
 		GadgetListBoxAddEntryText(listboxLobbyChat, UnicodeString(L"/allowrelay - Resets relay mode back to normal"), GameSpyColor[GSCOLOR_CHAT_NORMAL], -1, -1);
 		return TRUE; // was a slash command
 	}
+#if defined(SAGE_USE_NGMP)
+	// GeneralsX @build win64 11/10/2026 Display name changes only exist on the NGMP backend
 	else if ((token == "name" && uText.getLength() > 6) || (token == "nick" && uText.getLength() > 6))
 	{
 		UnicodeString newName(uText.str() + 6); // skip the /name or nick
@@ -247,6 +258,7 @@ Bool handleLobbySlashCommands(UnicodeString uText)
 		
 		return TRUE; // was a slash command
 	}
+#endif
 	// GeneralsX @feature fbraz3 16/08/2026 Relay toggle slash commands for troubleshooting
 	else if (token == "forcerelay")
 	{
@@ -1027,6 +1039,7 @@ void PopulateLobbyPlayerListbox()
 #endif
 }
 
+#if defined(SAGE_USE_NGMP)
 void NGMP_WOLLobbyMenu_CreateLobbyCallback(bool bSuccess)
 {
 	buttonPushed = true;
@@ -1067,17 +1080,20 @@ void NGMP_WOLLobbyMenu_JoinLobbyCallback(EJoinLobbyResult result)
 		GSMessageBoxOk(TheGameText->fetch("GUI:JoinFailedDefault"), s);
 	}
 }
+#endif
 
 //-------------------------------------------------------------------------------------------------
 /** Initialize the WOL Lobby Menu */
 //-------------------------------------------------------------------------------------------------
 void WOLLobbyMenuInit( WindowLayout *layout, void *userData )
 {
+#if defined(SAGE_USE_NGMP)
 	NGMP_OnlineServices_LobbyInterface* pLobbyInterface = NGMP_OnlineServicesManager::GetInterface<NGMP_OnlineServices_LobbyInterface>();
 	if (pLobbyInterface != nullptr)
 	{
 		pLobbyInterface->LeaveCurrentLobby();
 	}
+#endif
 
 	nextScreen = nullptr;
 	buttonPushed = false;
@@ -1131,6 +1147,9 @@ void WOLLobbyMenuInit( WindowLayout *layout, void *userData )
 	// Show Menu
 	layout->hide( FALSE );
 
+#if defined(SAGE_USE_NGMP)
+	// GeneralsX @build win64 11/10/2026 pLobbyInterface is already declared at the top of this
+	// function (LeaveCurrentLobby block); redeclaring it here breaks the NGMP=ON build.
 	NGMP_OnlineServices_RoomsInterface* pRoomsInterface = NGMP_OnlineServicesManager::GetInterface<NGMP_OnlineServices_RoomsInterface>();
 	if (pLobbyInterface != nullptr && pRoomsInterface != nullptr)
 	{
@@ -1146,17 +1165,20 @@ void WOLLobbyMenuInit( WindowLayout *layout, void *userData )
 				refreshPlayerList(false);
 			});
 	}
+#endif
 
 	GrabWindowInfo();
 
 	// animate controls
 //	TheShell->registerWithAnimateManager(parent, WIN_ANIMATION_SLIDE_TOP, TRUE);
 	TheShell->showShellMap(TRUE);
+#if defined(SAGE_USE_NGMP)
 	if (TheNGMPGame != nullptr)
 	{
 		TheNGMPGame->reset();
 	}
 	else
+#endif
 	{
 		TheGameSpyGame->reset();
 	}
@@ -1223,6 +1245,7 @@ static void shutdownComplete( WindowLayout *layout )
 //-------------------------------------------------------------------------------------------------
 void WOLLobbyMenuShutdown( WindowLayout *layout, void *userData )
 {
+#if defined(SAGE_USE_NGMP)
 	NGMP_OnlineServices_LobbyInterface* pLobbyInterface = NGMP_OnlineServicesManager::GetInterface<NGMP_OnlineServices_LobbyInterface>();
 	if (pLobbyInterface != nullptr)
 	{
@@ -1239,6 +1262,7 @@ void WOLLobbyMenuShutdown( WindowLayout *layout, void *userData )
 		pRoomsInterface->DeregisterForChatCallback();
 		pRoomsInterface->DeregisterForRosterNeedsRefreshCallback();
 	}
+#endif
 
 	CustomMatchPreferences pref;
 //	GameWindow *slider = TheWindowManager->winGetWindowFromId(parent, sliderChatAdjustID);

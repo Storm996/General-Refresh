@@ -44,9 +44,9 @@
 #include "WW3D2/scene.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/light.h"
-#include "d3dx8math.h"
-// GeneralsX @bugfix BenderAI 13/02/2026 Include d3dx8core.h for LPD3DXBUFFER
-#include "d3dx8core.h"
+#include "d3dx9math.h"
+// GeneralsX @bugfix BenderAI 13/02/2026 Include d3dx9core.h for LPD3DXBUFFER
+#include "d3dx9core.h"
 #include "WWLib/simplevec.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/matinfo.h"
@@ -230,8 +230,8 @@ void WaterRenderObjClass::setupJbaWaterShader()
 	if (!m_riverAlphaEdge->Is_Initialized())
 		m_riverAlphaEdge->Init();
 	DX8Wrapper::_Get_D3D_Device8()->SetTexture(3,m_riverAlphaEdge->Peek_D3D_Texture());
-	DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	DX8Wrapper::Set_DX8_Sampler_State(3,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+	DX8Wrapper::Set_DX8_Sampler_State(3,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, 0);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_TEXCOORDINDEX, 1);
@@ -247,14 +247,14 @@ void WaterRenderObjClass::setupJbaWaterShader()
 			m_waterNoiseTexture->Init();
 		DX8Wrapper::_Get_D3D_Device8()->SetTexture(2,m_waterNoiseTexture->Peek_D3D_Texture());
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(1,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(1,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
 		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
 		// Two output coordinates are used.
 		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(2,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(2,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
 		// GeneralsX @bugfix BenderAI 13/02/2026 Matrix4x4 for GLM compatibility (fighter19 pattern)
 		Matrix4x4 curView;
@@ -271,16 +271,16 @@ void WaterRenderObjClass::setupJbaWaterShader()
 		DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, destMatrix);
 
 	}
-	m_pDev->SetTextureStageState( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 1, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 2, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 3, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 3, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 2, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
 	if (m_riverWaterPixelShader){
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstant(0,   D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
+		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0,   (const float*)D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
 		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_riverWaterPixelShader);
 	}
 }
@@ -358,8 +358,8 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_indexBufferD3D=nullptr;
 	m_vertexBufferD3DOffset=0;
 
-	m_dwWavePixelShader=0;
-	m_dwWaveVertexShader=0;
+	m_dwWavePixelShader = nullptr;
+	m_dwWaveVertexShader = nullptr;
 	m_meshData=nullptr;
 	m_meshDataSize = 0;
 	m_meshInMotion = FALSE;
@@ -382,9 +382,8 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_whiteTexture=nullptr;
 	m_waterNoiseTexture=nullptr;
 	m_riverAlphaEdge=nullptr;
-	m_waterPixelShader=0;		///<D3D handle to pixel shader.
-	m_riverWaterPixelShader=0;		///<D3D handle to pixel shader.
-	m_trapezoidWaterPixelShader=0;		///<D3D handle to pixel shader.
+	m_riverWaterPixelShader = nullptr;		///<D3D handle to pixel shader.
+	m_trapezoidWaterPixelShader = nullptr;		///<D3D handle to pixel shader.
 	m_waterSparklesTexture=nullptr;
 	m_riverXOffset=0;
 	m_riverYOffset=0;
@@ -439,7 +438,7 @@ RenderObjClass *	 WaterRenderObjClass::Clone() const
 /** Copies raw bits from pBumpSrc (a regular grayscale texture) into a D3D
 	*   bump-map format. */
 //-------------------------------------------------------------------------------------------------
-HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE8 *pTex, TextureClass *pBumpSource)
+HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE9 *pTex, TextureClass *pBumpSource)
 {
     SurfaceClass::SurfaceDescription    d3dsd;
 	SurfaceClass * surf;
@@ -671,7 +670,8 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 			usage,
 			fvf,
 			pool,
-			&m_vertexBufferD3D
+			&m_vertexBufferD3D,
+			nullptr
 		)))
 			return hr;
 	}
@@ -686,7 +686,7 @@ HRESULT WaterRenderObjClass::generateVertexBuffer( Int sizeX, Int sizeY, Int ver
 	(
 		0,
 		m_numVertices*sizeof(SEA_PATCH_VERTEX),
-		(BYTE**)&pVertices,
+		(void**)&pVertices,
 		0//D3DLOCK_DISCARD
 	)))
 		return hr;
@@ -736,7 +736,8 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 		D3DUSAGE_WRITEONLY,
 		D3DFMT_INDEX16,
 		D3DPOOL_MANAGED,
-		&m_indexBufferD3D
+		&m_indexBufferD3D,
+		nullptr
 	)))
 		return hr;
 
@@ -744,7 +745,7 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 	(
 		0,
 		m_numIndices*sizeof(WORD),
-		(BYTE**)&pIndices,
+		(void**)&pIndices,
 		0
 	)))
 		return hr;
@@ -830,30 +831,52 @@ void WaterRenderObjClass::ReleaseResources()
 		m_waterTrackSystem->ReleaseResources();
 
 	if (m_dwWavePixelShader)
-		m_pDev->DeletePixelShader(m_dwWavePixelShader);
+		m_dwWavePixelShader->Release();
 
 	if (m_dwWaveVertexShader)
-		m_pDev->DeleteVertexShader(m_dwWaveVertexShader);
-
-	if (m_waterPixelShader)
-		m_pDev->DeletePixelShader(m_waterPixelShader);
+		m_dwWaveVertexShader->Release();
 
 	if (m_trapezoidWaterPixelShader)
-		m_pDev->DeletePixelShader(m_trapezoidWaterPixelShader);
+		m_trapezoidWaterPixelShader->Release();
 
 	if (m_riverWaterPixelShader)
-		m_pDev->DeletePixelShader(m_riverWaterPixelShader);
+		m_riverWaterPixelShader->Release();
 
-	m_dwWavePixelShader=0;
-	m_dwWaveVertexShader=0;
-	m_waterPixelShader = 0;
-	m_trapezoidWaterPixelShader=0;
-	m_riverWaterPixelShader=0;
+	m_dwWavePixelShader = nullptr;
+	m_dwWaveVertexShader = nullptr;
+	m_trapezoidWaterPixelShader = nullptr;
+	m_riverWaterPixelShader = nullptr;
 }
 
 //-------------------------------------------------------------------------------------------------
 /** (Re)allocates all W3D assets after a reset.. */
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @build d3d9 port 12/10/2026 - compile an inline HLSL pixel shader and bind it to the
+// device, printing the compiler reason on failure. DEBUG_LOG is compiled out in Release builds, so
+// this uses stderr directly; without it a rejected source would silently leave the water on the
+// fixed-function path.
+#ifdef _WIN32
+static void CompileWaterPixelShader(const char* name, const char* source, IDirect3DPixelShader9** shaderOut)
+{
+	LPD3DXBUFFER compiledShader = nullptr;
+	LPD3DXBUFFER compileError = nullptr;
+	IDirect3DPixelShader9* shader = nullptr;
+
+	HRESULT hr = D3DXAssembleShader(source, (UINT)strlen(source), 0, nullptr, &compiledShader, &compileError);
+	if (SUCCEEDED(hr) && compiledShader != nullptr)
+		hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((const DWORD*)compiledShader->GetBufferPointer(), &shader);
+	if (compiledShader) compiledShader->Release();
+
+	const char* reason = (FAILED(hr) && compileError && compileError->GetBufferPointer())
+		? (const char*)compileError->GetBufferPointer() : "";
+	fprintf(stderr, "[WATER] %s pixel shader hr=0x%08X handle=%p %s\n", name, (unsigned)hr, (void*)shader, reason);
+	fflush(stderr);
+
+	if (compileError) compileError->Release();
+	*shaderOut = SUCCEEDED(hr) ? shader : nullptr;
+}
+#endif // _WIN32
+
 void WaterRenderObjClass::ReAcquireResources()
 {
 	HRESULT hr;
@@ -900,20 +923,19 @@ void WaterRenderObjClass::ReAcquireResources()
 			return;
 
 		//shader decleration
-		DWORD Declaration[]=
+		D3DVERTEXELEMENT9 Declaration[]=
 		{
-			(D3DVSD_STREAM(0)),
-			(D3DVSD_REG(0, D3DVSDT_FLOAT3)), // Position
-			(D3DVSD_REG(1, D3DVSDT_D3DCOLOR)), // Diffuse
-			(D3DVSD_REG(2, D3DVSDT_FLOAT2)), // Bump map texture
-			(D3DVSD_END())
+			D3DDECL_USAGE(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0), // Position
+			D3DDECL_USAGE(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0, 12), // Diffuse
+			D3DDECL_USAGE(D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD, 0, 16), // Bump map texture
+			D3DDECL_END()
 		};
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, &m_dwWavePixelShader);
+		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, (void**)&m_dwWavePixelShader);
 		if (FAILED(hr))
 			return;
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, &m_dwWaveVertexShader);
+		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, (void**)&m_dwWaveVertexShader);
 		if (FAILED(hr))
 			return;
 
@@ -928,52 +950,49 @@ void WaterRenderObjClass::ReAcquireResources()
 	{
 		// GeneralsX @bugfix BenderAI 13/02/2026 Runtime shader compilation Windows-only (stubbed on Linux)
 #ifdef _WIN32
-		// GeneralsX @bugfix BenderAI 13/02/2026 LPD3DXBUFFER instead of ID3DXBuffer for compat
-		LPD3DXBUFFER compiledShader;
-		const char *shader =
-			"ps.1.1\n \
-			tex t0 \n\
-			tex t1	\n\
-			tex t2	\n\
-			tex t3\n\
-			mul r0,v0,t0 ; blend vertex color into t0. \n\
-			mul r1, t1, t2 ; mul\n\
-			add r0.rgb, r0, t3\n\
-			+mul r0.a, r0, t3\n\
-			add r0.rgb, r0, r1\n";
-		hr = D3DXAssembleShader( shader, strlen(shader), 0, nullptr, &compiledShader, nullptr);
-		if (hr==0) {
-			hr = 	DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((DWORD*)compiledShader->GetBufferPointer(), &m_riverWaterPixelShader);
-			compiledShader->Release();
-		}
-		shader =
-			"ps.1.1\n \
-			tex t0 \n\
-			tex t1	\n\
-			texbem t2, t1 ; use t1 as env map adjustment on t2.\n\
-			mul r0,v0,t0 ; blend vertex color into t0. \n\
-			mul r1.rgb,t2,c0 ; reduce t2 (environment mapped reflection) by constant\n\
-			add r0.rgb, r0, r1";
-		hr = D3DXAssembleShader( shader, strlen(shader), 0, nullptr, &compiledShader, nullptr);
-		if (hr==0) {
-			hr = 	DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((DWORD*)compiledShader->GetBufferPointer(), &m_waterPixelShader);
-			compiledShader->Release();
-		}
-		shader =
-			"ps.1.1\n \
-			tex t0 ;get water texture\n\
-			tex t1 ;get white highlights on black background\n\
-			tex t2 ;get white highlights with more tiling\n\
-			tex t3	; get black shroud \n\
-			mul r0,v0,t0 ; blend vertex color and alpha into base texture. \n\
-			mad r0.rgb, t1, t2, r0	; blend sparkles and noise \n\
-			mul r0.rgb, r0, t3 ; blend in black shroud \n\
-			;\n";
-		hr = D3DXAssembleShader( shader, strlen(shader), 0, nullptr, &compiledShader, nullptr);
-		if (hr==0) {
-			hr = 	DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((DWORD*)compiledShader->GetBufferPointer(), &m_trapezoidWaterPixelShader);
-			compiledShader->Release();
-		}
+		// GeneralsX @build d3d9 port 12/10/2026 D3D9 has no ps_1_1 assembler, so the two inline water
+		// shaders travel as HLSL and compile through the CompatLib D3DXAssembleShader shim
+		// (d3dcompiler_47!D3DCompile). The DX8 "tex tN" per-stage sampling maps one to one onto
+		// "sampler sN : register(sN)" fed by TEXCOORDn: with fixed-function vertex processing stage N
+		// still emits its own oTn (source UV chosen by D3DTSS_TEXCOORDINDEX, plus the stage's texture
+		// matrix), which is exactly what the setup functions above configure per stage.
+		// The third retail source - the environment-mapped reflection shader built around DX8's
+		// texbem instruction - is gone together with its handle: texbem has no D3D9 equivalent, and
+		// nothing in the tree ever bound m_waterPixelShader to the device, so it was dead code.
+		CompileWaterPixelShader("river",
+			"// d3d-target: ps_2_0\n"
+			"sampler s0 : register(s0);\n"                 // river texture
+			"sampler s1 : register(s1);\n"                 // sparkles
+			"sampler s2 : register(s2);\n"                 // noise
+			"sampler s3 : register(s3);\n"                 // alpha edge shroud
+			"float4 main(float4 vertexColor : COLOR0,\n"
+			"            float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1,\n"
+			"            float2 uv2 : TEXCOORD2, float2 uv3 : TEXCOORD3) : COLOR\n"
+			"{\n"
+			"    float4 base = vertexColor * tex2D(s0, uv0);\n"     // blend vertex color into t0
+			"    float4 shroud = tex2D(s3, uv3);\n"
+			"    float3 sparkles = (tex2D(s1, uv1) * tex2D(s2, uv2)).rgb;\n"
+			"    float3 rgb = base.rgb + shroud.rgb + sparkles;\n"
+			"    return float4(rgb, base.a * shroud.a);\n"          // river-edge alpha darkens the additive blend
+			"}\n",
+			&m_riverWaterPixelShader);
+
+		CompileWaterPixelShader("trapezoid",
+			"// d3d-target: ps_2_0\n"
+			"sampler s0 : register(s0);\n"                 // water texture
+			"sampler s1 : register(s1);\n"                 // white highlights on black background
+			"sampler s2 : register(s2);\n"                 // white highlights with more tiling
+			"sampler s3 : register(s3);\n"                 // black shroud
+			"float4 main(float4 vertexColor : COLOR0,\n"
+			"            float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1,\n"
+			"            float2 uv2 : TEXCOORD2, float2 uv3 : TEXCOORD3) : COLOR\n"
+			"{\n"
+			"    float4 base = vertexColor * tex2D(s0, uv0);\n"     // blend vertex color and alpha into base texture
+			"    float3 rgb = (tex2D(s1, uv1) * tex2D(s2, uv2)).rgb + base.rgb;\n"   // sparkles and noise
+			"    rgb *= tex2D(s3, uv3).rgb;\n"                       // blend in black shroud
+			"    return float4(rgb, base.a);\n"
+			"}\n",
+			&m_trapezoidWaterPixelShader);
 #endif // _WIN32 - Runtime shader compilation
 	}
 
@@ -1530,7 +1549,7 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	WW3D::End_Render(false);
 
 	// Change the rendertarget back to the main backbuffer
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface9 *)nullptr);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1655,8 +1674,8 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 				inv *=clipMatrix;
 
 				// Change texture wrapping mode to 'clamp' for texture stage 1
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+				DX8Wrapper::Set_DX8_Sampler_State( 1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+				DX8Wrapper::Set_DX8_Sampler_State( 1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
 				// Use CameraSpace vertices as input to matrix and use texture wrap mode from stage 1
 				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION|1);
@@ -1667,8 +1686,8 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, inv);
 
 				// Disable bilinear filtering
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+				DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+				DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 
 				// Pass stage 0 texture data untouched(by modulating with white)
 				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );	//stage 1 texture
@@ -1866,27 +1885,27 @@ Matrix4x4 matProj, matView, matWW3D;
 	m_pDev->SetTextureStageState( 3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	m_pDev->SetTextureStageState( 3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|3);
 
-//	m_pDev->SetTextureStageState( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-//	m_pDev->SetTextureStageState( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-//	m_pDev->SetTextureStageState( 0, D3DTSS_MIPFILTER, D3DTEXF_POINT );
+//	m_pDev->SetSamplerState( 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+//	m_pDev->SetSamplerState( 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+//	m_pDev->SetSamplerState( 0, D3DSAMP_MIPFILTER, D3DTEXF_POINT );
 
-//	m_pDev->SetTextureStageState( 1, D3DTSS_MINFILTER, D3DTEXF_POINT );
-//	m_pDev->SetTextureStageState( 1, D3DTSS_MAGFILTER, D3DTEXF_POINT );
-//	m_pDev->SetTextureStageState( 1, D3DTSS_MIPFILTER, D3DTEXF_NONE );
+//	m_pDev->SetSamplerState( 1, D3DSAMP_MINFILTER, D3DTEXF_POINT );
+//	m_pDev->SetSamplerState( 1, D3DSAMP_MAGFILTER, D3DTEXF_POINT );
+//	m_pDev->SetSamplerState( 1, D3DSAMP_MIPFILTER, D3DTEXF_NONE );
 	//end of default setup
 
-	m_pDev->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	m_pDev->SetTextureStageState(0, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	m_pDev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+	m_pDev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 	m_pDev->SetRenderState( D3DRS_WRAP0, D3DWRAP_U | D3DWRAP_V);
 
-	m_pDev->SetTextureStageState(1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	m_pDev->SetTextureStageState(1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+	m_pDev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	m_pDev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
 	m_pDev->SetTexture( 0, m_pBumpTexture[(Int)m_fBumpFrame]);
 #ifdef MIPMAP_BUMP_TEXTURE
-	m_pDev->SetTextureStageState( 0, D3DTSS_MIPFILTER, D3DTEXF_POINT );
-	m_pDev->SetTextureStageState( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MIPFILTER, D3DTEXF_POINT );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
 #endif
 	m_pDev->SetTextureStageState( 1, D3DTSS_BUMPENVMAT00, F2DW(m_fBumpScale) );
 	m_pDev->SetTextureStageState( 1, D3DTSS_BUMPENVMAT01, F2DW(0.0f) );
@@ -1908,11 +1927,11 @@ Matrix4x4 matProj, matView, matWW3D;
 	mat._31 = 0.0f; mat._32 = 0.0f; mat._33 = 0.0f;   mat._34=1.0f;
 	mat._41 = 0.0f; mat._42 = 0.0f; mat._43 = 0.0f;   mat._44=1.0f;
 
-	m_pDev->SetVertexShaderConstant(CV_TEXPROJ_0, &mat, 4);
+	m_pDev->SetVertexShaderConstantF(CV_TEXPROJ_0, (const float*)&mat, 4);
 
 	// Setup constants
-	m_pDev->SetVertexShaderConstant(CV_ZERO,   D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f), 1);
-	m_pDev->SetVertexShaderConstant(CV_ONE,    D3DXVECTOR4(1.0f, 1.0f, 1.0f, 1.0f), 1);
+	m_pDev->SetVertexShaderConstantF(CV_ZERO,   (const float*)D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f), 1);
+	m_pDev->SetVertexShaderConstantF(CV_ONE,    (const float*)D3DXVECTOR4(1.0f, 1.0f, 1.0f, 1.0f), 1);
 
 	m_pDev->SetVertexShader(m_dwWaveVertexShader);
 	m_pDev->SetPixelShader(m_dwWavePixelShader);
@@ -1938,8 +1957,8 @@ Matrix4x4 matProj, matView, matWW3D;
 	patchMatrix._33=PATCH_SCALE;
 	patchMatrix._44=1.0f;
 
-	m_pDev->SetStreamSource(0,m_vertexBufferD3D,sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX));
-	m_pDev->SetIndices(m_indexBufferD3D,0);
+	m_pDev->SetStreamSource(0,m_vertexBufferD3D,0,sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX));
+	m_pDev->SetIndices(m_indexBufferD3D);
 
 	for (startY=patchY=(seaBox.Center.Y-seaBox.Extent.Y)/(PATCH_WIDTH*PATCH_SCALE); (patchY*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.Y+seaBox.Extent.Y); patchY++)
 	{
@@ -1956,9 +1975,9 @@ Matrix4x4 matProj, matView, matWW3D;
 			D3DXMatrixMultiply((D3DXMATRIX*)&matWorldViewProj, (D3DXMATRIX*)&matTemp, (D3DXMATRIX*)&matProj);
 			//matrices must be transposed before loading into vertex shader registers
 			D3DXMatrixTranspose((D3DXMATRIX*)&matWorldViewProj, (D3DXMATRIX*)&matWorldViewProj);
-			m_pDev->SetVertexShaderConstant(CV_WORLDVIEWPROJ_0, &matWorldViewProj, 4);	//pass transform matrix into shader
+			m_pDev->SetVertexShaderConstantF(CV_WORLDVIEWPROJ_0, (const float*)&matWorldViewProj, 4);	//pass transform matrix into shader
 
-			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,0,m_numVertices,0,m_numIndices);
+			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,m_vertexBufferD3DOffset,0,m_numVertices,0,m_numIndices);
 		}
 	}
 //	m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
@@ -1973,8 +1992,8 @@ Matrix4x4 matProj, matView, matWW3D;
 	m_pDev->SetTextureStageState( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
 	m_pDev->SetRenderState(D3DRS_ZWRITEENABLE , TRUE);
 
-	m_pDev->SetTextureStageState(1, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	m_pDev->SetTextureStageState(1, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	m_pDev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+	m_pDev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
 	m_pDev->SetRenderState( D3DRS_WRAP0, 0);	//turn off texture wrapping
 
@@ -1989,8 +2008,13 @@ Matrix4x4 matProj, matView, matWW3D;
 	DX8Wrapper::_Set_DX8_Transform(D3DTS_VIEW, matView);
 	DX8Wrapper::_Set_DX8_Transform(D3DTS_PROJECTION, matProj);
 
-	m_pDev->SetPixelShader(0);	//turn off pixel shader
-	m_pDev->SetVertexShader(DX8_FVF_XYZDUV1);	//turn off custom vertex shader
+	m_pDev->SetPixelShader(nullptr);	//turn off pixel shader
+	// GeneralsX @bugfix Qoder 12/10/2026 - the DX8 comment "SetFVF turns off the custom vertex
+	// shader" is false on D3D9: measured on native d3d9 and DXVK 2.6, SetFVF leaves the wave vertex
+	// shader bound, so every later batch (terrain, trees, shadows) would be transformed by the wave
+	// shader's constants. Unbind it explicitly.
+	m_pDev->SetVertexShader(nullptr);
+	m_pDev->SetFVF(DX8_FVF_XYZDUV1);
 
 	DX8Wrapper::Invalidate_Cached_Render_States();
 
@@ -1999,8 +2023,8 @@ Matrix4x4 matProj, matView, matWW3D;
 		//do second pass to apply the shroud on water plane
 		W3DShaderManager::setTexture(0,TheTerrainRenderObject->getShroud()->getShroudTexture());
 		W3DShaderManager::setShader(W3DShaderManager::ST_SHROUD_TEXTURE, 0);
-		m_pDev->SetStreamSource(0,m_vertexBufferD3D,sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX));
-		m_pDev->SetIndices(m_indexBufferD3D,0);
+		m_pDev->SetStreamSource(0,m_vertexBufferD3D,0,sizeof(WaterRenderObjClass::SEA_PATCH_VERTEX));
+		m_pDev->SetIndices(m_indexBufferD3D);
 		for (startY=patchY=(seaBox.Center.Y-seaBox.Extent.Y)/(PATCH_WIDTH*PATCH_SCALE); (patchY*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.Y+seaBox.Extent.Y); patchY++)
 		{
 			for (startX=patchX=(seaBox.Center.X-seaBox.Extent.X)/(PATCH_WIDTH*PATCH_SCALE); (patchX*PATCH_WIDTH*PATCH_SCALE)<(seaBox.Center.X+seaBox.Extent.X); patchX++)
@@ -2014,7 +2038,7 @@ Matrix4x4 matProj, matView, matWW3D;
 
 				DX8Wrapper::_Set_DX8_Transform(D3DTS_WORLD, matTemp);
 
-				m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,0,m_numVertices,0,m_numIndices);
+				m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,m_vertexBufferD3DOffset,0,m_numVertices,0,m_numIndices);
 			}
 		}
 		W3DShaderManager::resetShader(W3DShaderManager::ST_SHROUD_TEXTURE);
@@ -2330,13 +2354,13 @@ void WaterRenderObjClass::renderWaterMesh()
 	if (m_vertexBufferD3DOffset < m_numVertices)
 	{
 		//we have room in current VB, append new verts
-		if(m_vertexBufferD3D->Lock(m_vertexBufferD3DOffset*sizeof(MaterMeshVertexFormat),mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_NOOVERWRITE) != D3D_OK)
+		if(m_vertexBufferD3D->Lock(m_vertexBufferD3DOffset*sizeof(MaterMeshVertexFormat),mx*my*sizeof(MaterMeshVertexFormat),(void**)&vb,D3DLOCK_NOOVERWRITE) != D3D_OK)
 			return;
 	}
 	else
 	{
 		//ran out of room in last VB, request a substitute VB.
-		if(m_vertexBufferD3D->Lock(0,mx*my*sizeof(MaterMeshVertexFormat),(unsigned char**)&vb,D3DLOCK_DISCARD) != D3D_OK)
+		if(m_vertexBufferD3D->Lock(0,mx*my*sizeof(MaterMeshVertexFormat),(void**)&vb,D3DLOCK_DISCARD) != D3D_OK)
 			return;
 		m_vertexBufferD3DOffset=0;	//reset start of page to first vertex
 	}
@@ -2440,9 +2464,9 @@ void WaterRenderObjClass::renderWaterMesh()
 
 //	m_pDev->SetRenderState(D3DRS_ZFUNC,D3DCMP_ALWAYS);	//used to display grid under map.
 
-	m_pDev->SetIndices(m_indexBufferD3D,m_vertexBufferD3DOffset);
-	m_pDev->SetStreamSource(0,m_vertexBufferD3D,sizeof(MaterMeshVertexFormat));
-	m_pDev->SetVertexShader(WATER_MESH_FVF);
+	m_pDev->SetIndices(m_indexBufferD3D);
+	m_pDev->SetStreamSource(0,m_vertexBufferD3D,0,sizeof(MaterMeshVertexFormat));
+	m_pDev->SetFVF(WATER_MESH_FVF);
 
 
 	if (TheTerrainRenderObject->getShroud() && !m_trapezoidWaterPixelShader)
@@ -2461,18 +2485,18 @@ void WaterRenderObjClass::renderWaterMesh()
 		//Shroud shader uses z-compare of EQUAL which wouldn't work on water because it doesn't
 		//write to the zbuffer.  Change to LESSEQUAL.
 		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,0,mx*my,0,m_numIndices-2);
+		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,m_vertexBufferD3DOffset,0,mx*my,0,m_numIndices-2);
 		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ZFUNC, D3DCMP_EQUAL);
 		W3DShaderManager::resetShader(W3DShaderManager::ST_SHROUD_TEXTURE);
 	}
 	else
-		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,0,mx*my,0,m_numIndices-2);
+		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,m_vertexBufferD3DOffset,0,mx*my,0,m_numIndices-2);
 
 	Debug_Statistics::Record_DX8_Polys_And_Vertices(m_numIndices-2,mx*my,ShaderClass::_PresetOpaqueShader);
 
 //	m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
 
-	if (m_trapezoidWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(0);
+	if (m_trapezoidWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);
 
 	m_vertexBufferD3DOffset += mx*my;	//advance past vertices already in buffer
 
@@ -2957,7 +2981,7 @@ void WaterRenderObjClass::drawRiverWater(PolygonTrigger *pTrig)
 		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
 	}
 
-	if (m_riverWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(0);
+	if (m_riverWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);
 
 	//restore blend mode to what W3D expects.
 	if (TheWaterTransparency->m_additiveBlend)
@@ -3033,14 +3057,14 @@ void WaterRenderObjClass::setupFlatWaterShader()
 
 		DX8Wrapper::_Get_D3D_Device8()->SetTexture(2,m_waterNoiseTexture->Peek_D3D_Texture());
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(1,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(1,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
 		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
 		// Two output coordinates are used.
 		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(2,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+		DX8Wrapper::Set_DX8_Sampler_State(2,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
 		// GeneralsX @bugfix BenderAI 13/02/2026 Matrix4x4 for GLM compatibility (fighter19 pattern)
 		Matrix4x4 curView;
@@ -3057,14 +3081,14 @@ void WaterRenderObjClass::setupFlatWaterShader()
 		DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, destMatrix);
 
 	}
-	m_pDev->SetTextureStageState( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 1, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 2, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
-	m_pDev->SetTextureStageState( 2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 2, D3DSAMP_MINFILTER, D3DTEXF_LINEAR );
+	m_pDev->SetSamplerState( 2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR );
 	if (m_trapezoidWaterPixelShader){
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstant(0,   D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
+		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0,   (const float*)D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
 		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_trapezoidWaterPixelShader);
 	}
 }
@@ -3348,7 +3372,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
 	}
 
-	if (m_riverWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(0);
+	if (m_riverWaterPixelShader) DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);
 	//Restore alpha blend to default values since we may have changed them to feather edges.
 	if (!TheWaterTransparency->m_additiveBlend)
 	{	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA );

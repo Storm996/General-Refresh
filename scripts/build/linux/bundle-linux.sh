@@ -98,9 +98,10 @@ cp "${BINARY_SRC}" "${BUNDLE_DIR}/GeneralsX"
 chmod +x "${BUNDLE_DIR}/GeneralsX"
 
 # DXVK libraries
+# GeneralsX @build d3d9 port 12/10/2026 - d3d9 is the library the renderer loads; d3d8 is legacy.
 echo "  + DXVK libraries"
-cp "${DXVK_LIB_DIR}"/libdxvk_d3d8.so* "${BUNDLE_DIR}/" 2>/dev/null || echo "    (WARNING: libdxvk_d3d8.so not found)"
-cp "${DXVK_LIB_DIR}"/libdxvk_d3d9.so* "${BUNDLE_DIR}/" 2>/dev/null || true
+cp "${DXVK_LIB_DIR}"/libdxvk_d3d9.so* "${BUNDLE_DIR}/" 2>/dev/null || echo "    (WARNING: libdxvk_d3d9.so not found - required by the D3D9 renderer)"
+cp "${DXVK_LIB_DIR}"/libdxvk_d3d8.so* "${BUNDLE_DIR}/" 2>/dev/null || echo "    (libdxvk_d3d8.so absent - only needed by legacy D3D8 builds)"
 
 # SDL3 and SDL3_image libraries
 echo "  + SDL3 libraries"

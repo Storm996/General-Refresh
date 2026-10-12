@@ -148,6 +148,11 @@ chmod +x "${APPDIR}/usr/bin/GeneralsX"
 cp "${GAMESPY_LIB}" "${APPDIR}/usr/lib/"
 copy_optional_libs "${DXVK_LIB_DIR}" "libdxvk_d3d8.so*"
 copy_optional_libs "${DXVK_LIB_DIR}" "libdxvk_d3d9.so*"
+# GeneralsX @build d3d9 port 12/10/2026 - the renderer loads libdxvk_d3d9 at runtime, so it is the
+# library that must ship; warn loudly when the DXVK build did not provide it.
+if ! compgen -G "${APPDIR}/usr/lib/libdxvk_d3d9.so*" > /dev/null; then
+    echo "WARNING: libdxvk_d3d9.so was not bundled; the D3D9 renderer will not start." >&2
+fi
 copy_optional_libs "${SDL3_LIB_DIR}" "libSDL3.so*"
 copy_optional_libs "${SDL3_IMAGE_LIB_DIR}" "libSDL3_image.so*"
 copy_optional_libs "${OPENAL_LIB_DIR}" "libopenal.so*"

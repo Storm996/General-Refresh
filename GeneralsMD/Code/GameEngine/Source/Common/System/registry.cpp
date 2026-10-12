@@ -329,7 +329,17 @@ Bool  getStringFromRegistry(HKEY root, AsciiString path, AsciiString key, AsciiS
 	unsigned long type;
 	int returnValue;
 
-	if ((returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ, &handle )) == ERROR_SUCCESS)
+	// GeneralsX @build win64 11/10/2026 Retail/Steam installs are 32-bit, so their InstallPath /
+	// Language / Version values live in the WOW6432Node (32-bit) registry view. A 64-bit build
+	// must request that view explicitly; otherwise it reads an empty 64-bit key and falls back
+	// to defaults (language "english"), which makes every localized texture path miss -> magenta.
+	// KEY_WOW64_32KEY is a harmless no-op for a 32-bit build. Fall back to the default view if the
+	// 32-bit view has no such key (e.g. a native 64-bit-patched install).
+	returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ | KEY_WOW64_32KEY, &handle );
+	if (returnValue != ERROR_SUCCESS) {
+		returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ, &handle );
+	}
+	if (returnValue == ERROR_SUCCESS)
 	{
 		returnValue = RegQueryValueEx(handle, key.str(), nullptr, &type, (unsigned char *) &buffer, &size);
 		RegCloseKey( handle );
@@ -352,7 +362,12 @@ Bool getUnsignedIntFromRegistry(HKEY root, AsciiString path, AsciiString key, Un
 	unsigned long type;
 	int returnValue;
 
-	if ((returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ, &handle )) == ERROR_SUCCESS)
+	// GeneralsX @build win64 11/10/2026 Read the 32-bit (WOW6432Node) view first (see above).
+	returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ | KEY_WOW64_32KEY, &handle );
+	if (returnValue != ERROR_SUCCESS) {
+		returnValue = RegOpenKeyEx( root, path.str(), 0, KEY_READ, &handle );
+	}
+	if (returnValue == ERROR_SUCCESS)
 	{
 		returnValue = RegQueryValueEx(handle, key.str(), nullptr, &type, (unsigned char *) &buffer, &size);
 		RegCloseKey( handle );
@@ -375,7 +390,13 @@ Bool setStringInRegistry( HKEY root, AsciiString path, AsciiString key, AsciiStr
 	int size;
 	char lpClass[] = "REG_NONE";
 
-	if ((returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &handle, nullptr )) == ERROR_SUCCESS)
+	// GeneralsX @build win64 11/10/2026 Write to the same 32-bit (WOW6432Node) view we read from so
+	// settings round-trip on a 64-bit build; KEY_WOW64_32KEY is a no-op for 32-bit builds.
+	returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE | KEY_WOW64_32KEY, nullptr, &handle, nullptr );
+	if (returnValue != ERROR_SUCCESS) {
+		returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &handle, nullptr );
+	}
+	if (returnValue == ERROR_SUCCESS)
 	{
 		type = REG_SZ;
 		size = val.getLength()+1;
@@ -394,7 +415,13 @@ Bool setUnsignedIntInRegistry( HKEY root, AsciiString path, AsciiString key, Uns
 	int size;
 	char lpClass[] = "REG_NONE";
 
-	if ((returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &handle, nullptr )) == ERROR_SUCCESS)
+	// GeneralsX @build win64 11/10/2026 Write to the same 32-bit (WOW6432Node) view we read from so
+	// settings round-trip on a 64-bit build; KEY_WOW64_32KEY is a no-op for 32-bit builds.
+	returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE | KEY_WOW64_32KEY, nullptr, &handle, nullptr );
+	if (returnValue != ERROR_SUCCESS) {
+		returnValue = RegCreateKeyEx( root, path.str(), 0, lpClass, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &handle, nullptr );
+	}
+	if (returnValue == ERROR_SUCCESS)
 	{
 		type = REG_DWORD;
 		size = 4;

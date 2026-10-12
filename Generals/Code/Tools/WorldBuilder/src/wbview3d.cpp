@@ -93,7 +93,7 @@
 #include "ImpassableOptions.h"
 
 
-#include <d3dx8.h>
+#include <d3dx9.h>
 
 
 // ----------------------------------------------------------------------------
@@ -517,7 +517,7 @@ void WbView3d::ReAcquireResources()
 		TheTerrainRenderObject->loadRoadsAndBridges(nullptr,FALSE);
 		TheTerrainRenderObject->worldBuilderUpdateBridgeTowers( m_assetManager, m_scene );
 	}
-	IDirect3DDevice8* pDev = DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* pDev = DX8Wrapper::_Get_D3D_Device8();
 	if (pDev) {
 
 //		CDC* pDC = GetDC();
@@ -2179,7 +2179,7 @@ void WbView3d::initWW3D()
 			}
 		}
 
-		IDirect3DDevice8* pDev = DX8Wrapper::_Get_D3D_Device8();
+		IDirect3DDevice9* pDev = DX8Wrapper::_Get_D3D_Device8();
 		if (pDev) {
 
 //			CDC* pDC = GetDC();

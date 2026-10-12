@@ -31,14 +31,15 @@ namespace
 
 typedef BOOL (WINAPI *SymInitialize_t)(HANDLE hProcess, PCSTR UserSearchPath, BOOL fInvadeProcess);
 typedef BOOL (WINAPI *SymCleanup_t)(HANDLE hProcess);
-typedef DWORD (WINAPI *SymLoadModule_t)(HANDLE hProcess, HANDLE hFile, PCSTR ImageName,
-	PCSTR ModuleName, DWORD BaseOfDll, DWORD SizeOfDll);
-typedef DWORD (WINAPI *SymGetModuleBase_t)(HANDLE hProcess, DWORD dwAddr);
-typedef BOOL (WINAPI *SymUnloadModule_t)(HANDLE hProcess, DWORD BaseOfDll);
-typedef BOOL (WINAPI *SymGetSymFromAddr_t)(HANDLE hProcess, DWORD dwAddr, PDWORD pdwDisplacement, PIMAGEHLP_SYMBOL Symbol);
-typedef BOOL (WINAPI *SymGetLineFromAddr_t)(HANDLE hProcess, DWORD dwAddr, PDWORD pdwDisplacement, PIMAGEHLP_LINE Line);
+// GeneralsX @build win64 11/10/2026 Address-sized types so these match the *64 dbghelp exports on x64
+typedef DbghelpAddr (WINAPI *SymLoadModule_t)(HANDLE hProcess, HANDLE hFile, PCSTR ImageName,
+	PCSTR ModuleName, DbghelpAddr BaseOfDll, DWORD SizeOfDll);
+typedef DbghelpAddr (WINAPI *SymGetModuleBase_t)(HANDLE hProcess, DbghelpAddr dwAddr);
+typedef BOOL (WINAPI *SymUnloadModule_t)(HANDLE hProcess, DbghelpAddr BaseOfDll);
+typedef BOOL (WINAPI *SymGetSymFromAddr_t)(HANDLE hProcess, DbghelpAddr dwAddr, DbghelpAddrOut pdwDisplacement, DbghelpSymbolPtr Symbol);
+typedef BOOL (WINAPI *SymGetLineFromAddr_t)(HANDLE hProcess, DbghelpAddr dwAddr, DbghelpAddrOut pdwDisplacement, PIMAGEHLP_LINE Line);
 typedef DWORD (WINAPI *SymSetOptions_t)(DWORD SymOptions);
-typedef PVOID (WINAPI *SymFunctionTableAccess_t)(HANDLE hProcess, DWORD AddrBase);
+typedef PVOID (WINAPI *SymFunctionTableAccess_t)(HANDLE hProcess, DbghelpAddr AddrBase);
 typedef BOOL (WINAPI *StackWalk_t)(DWORD MachineType, HANDLE hProcess, HANDLE hThread, LPSTACKFRAME StackFrame,
 	PVOID ContextRecord, PREAD_PROCESS_MEMORY_ROUTINE ReadMemoryRoutine,
 	PFUNCTION_TABLE_ACCESS_ROUTINE FunctionTableAccessRoutine, PGET_MODULE_BASE_ROUTINE GetModuleBaseRoutine,
@@ -92,24 +93,41 @@ public:
 	~ScopedLock() { Lock.get().unlock(); }
 };
 
-#define DBGHELP_RESOLVE(name) \
-	name##Ptr = reinterpret_cast<name##_t>(::GetProcAddress(Module, #name))
+// Resolves one dbghelp entry point into a function pointer of its own type.
+template<typename T>
+static void resolveInto(T& out, LPCSTR exportName)
+{
+	out = reinterpret_cast<T>(::GetProcAddress(Module, exportName));
+}
 
 static void resolveAll()
 {
-	DBGHELP_RESOLVE(SymInitialize);
-	DBGHELP_RESOLVE(SymCleanup);
-	DBGHELP_RESOLVE(SymLoadModule);
-	DBGHELP_RESOLVE(SymGetModuleBase);
-	DBGHELP_RESOLVE(SymUnloadModule);
-	DBGHELP_RESOLVE(SymGetSymFromAddr);
-	DBGHELP_RESOLVE(SymGetLineFromAddr);
-	DBGHELP_RESOLVE(SymSetOptions);
-	DBGHELP_RESOLVE(SymFunctionTableAccess);
-	DBGHELP_RESOLVE(StackWalk);
-	DBGHELP_RESOLVE(MiniDumpWriteDump);
+	// These exports have the same name and address-sized signature on both ABIs.
+	resolveInto(SymInitializePtr, "SymInitialize");
+	resolveInto(SymCleanupPtr, "SymCleanup");
+	resolveInto(SymSetOptionsPtr, "SymSetOptions");
+	resolveInto(MiniDumpWriteDumpPtr, "MiniDumpWriteDump");
+
+	// GeneralsX @build win64 11/10/2026 The address walking and symbol lookup exports only exist
+	// under their *64 names on x64; the legacy 32-bit names are not usable in a 64-bit process.
+#ifdef _WIN64
+	resolveInto(SymLoadModulePtr, "SymLoadModule64");
+	resolveInto(SymGetModuleBasePtr, "SymGetModuleBase64");
+	resolveInto(SymUnloadModulePtr, "SymUnloadModule64");
+	resolveInto(SymGetSymFromAddrPtr, "SymGetSymFromAddr64");
+	resolveInto(SymGetLineFromAddrPtr, "SymGetLineFromAddr64");
+	resolveInto(SymFunctionTableAccessPtr, "SymFunctionTableAccess64");
+	resolveInto(StackWalkPtr, "StackWalk64");
+#else
+	resolveInto(SymLoadModulePtr, "SymLoadModule");
+	resolveInto(SymGetModuleBasePtr, "SymGetModuleBase");
+	resolveInto(SymUnloadModulePtr, "SymUnloadModule");
+	resolveInto(SymGetSymFromAddrPtr, "SymGetSymFromAddr");
+	resolveInto(SymGetLineFromAddrPtr, "SymGetLineFromAddr");
+	resolveInto(SymFunctionTableAccessPtr, "SymFunctionTableAccess");
+	resolveInto(StackWalkPtr, "StackWalk");
+#endif
 }
-#undef DBGHELP_RESOLVE
 
 static void freeResources()
 {
@@ -297,12 +315,12 @@ BOOL WINAPI SymCleanup(
 	return FALSE;
 }
 
-DWORD WINAPI SymLoadModule(
+DbghelpAddr WINAPI SymLoadModule(
 	HANDLE hProcess,
 	HANDLE hFile,
 	PCSTR ImageName,
 	PCSTR ModuleName,
-	DWORD BaseOfDll,
+	DbghelpAddr BaseOfDll,
 	DWORD SizeOfDll)
 {
 	ScopedLock lock;
@@ -313,9 +331,9 @@ DWORD WINAPI SymLoadModule(
 	return 0;
 }
 
-DWORD WINAPI SymGetModuleBase(
+DbghelpAddr WINAPI SymGetModuleBase(
 	HANDLE hProcess,
-	DWORD dwAddr)
+	DbghelpAddr dwAddr)
 {
 	ScopedLock lock;
 
@@ -327,7 +345,7 @@ DWORD WINAPI SymGetModuleBase(
 
 BOOL WINAPI SymUnloadModule(
 	HANDLE hProcess,
-	DWORD BaseOfDll)
+	DbghelpAddr BaseOfDll)
 {
 	ScopedLock lock;
 
@@ -339,9 +357,9 @@ BOOL WINAPI SymUnloadModule(
 
 BOOL WINAPI SymGetSymFromAddr(
 	HANDLE hProcess,
-	DWORD dwAddr,
-	PDWORD pdwDisplacement,
-	PIMAGEHLP_SYMBOL Symbol)
+	DbghelpAddr dwAddr,
+	DbghelpAddrOut pdwDisplacement,
+	DbghelpSymbolPtr Symbol)
 {
 	ScopedLock lock;
 
@@ -353,8 +371,8 @@ BOOL WINAPI SymGetSymFromAddr(
 
 BOOL WINAPI SymGetLineFromAddr(
 	HANDLE hProcess,
-	DWORD dwAddr,
-	PDWORD pdwDisplacement,
+	DbghelpAddr dwAddr,
+	DbghelpAddrOut pdwDisplacement,
 	PIMAGEHLP_LINE Line)
 {
 	ScopedLock lock;
@@ -378,7 +396,7 @@ DWORD WINAPI SymSetOptions(
 
 PVOID WINAPI SymFunctionTableAccess(
 	HANDLE hProcess,
-	DWORD AddrBase)
+	DbghelpAddr AddrBase)
 {
 	ScopedLock lock;
 

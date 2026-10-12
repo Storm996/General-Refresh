@@ -44,7 +44,7 @@
 #include "WWLib/always.h"
 // GeneralsX @refactor BenderAI 10/02/2026
 // Removed platform guards - DXVK provides d3d8.h on Linux
-#include <d3d8.h>
+#include <d3d9.h>
 #include "WWDebug/wwdebug.h"
 
 class StringClass;

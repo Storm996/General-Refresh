@@ -22,7 +22,8 @@ namespace DX8NormalMap
 {
 	// Called by the device layer after it successfully assembles+creates VS/PS: passing handles marks them
 	// available (still requires the opt-in switch to actually mount).
-	void Install(unsigned vs_handle, unsigned ps_handle);
+	// GeneralsX @build d3d9 port 11/10/2026 - handles are D3D9 interface pointers carried as UINT_PTR.
+	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
 	// Master switch (driven by command line -normalmap / INI). When OFF, Apply is never called.
 	void Set_Enabled(bool on);
@@ -49,5 +50,5 @@ namespace DX8NormalMap
 	void Set_Global_Fallback_Light(const Vector3& world_dir, const Vector3& ambient);
 
 	// Restore the fixed pipeline after drawing (FVF + no PS).
-	void Restore(unsigned fvf);
+	void Restore(UINT_PTR fvf);
 }

@@ -33,7 +33,8 @@ public:
 private:
 	bool ShouldReuseLastCapture(UnsignedInt currentTimeMs) const;
 
-	DWORD m_swizzleShader = 0;
+	// GeneralsX @build d3d9 port 11/10/2026 - D3D9 pixel shaders are interface pointers, not DWORD handles.
+	struct IDirect3DPixelShader9 *m_swizzleShader = nullptr;
 	UnsignedInt m_lastCaptureTimeMs = 0;
 	UnsignedInt m_lastCaptureHeight = 0;
 	std::vector<UnsignedByte> m_lastCapturePixels;

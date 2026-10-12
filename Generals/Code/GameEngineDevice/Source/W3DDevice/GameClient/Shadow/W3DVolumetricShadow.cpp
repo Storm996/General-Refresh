@@ -48,7 +48,7 @@
 #include "WW3D2/meshmdl.h"
 #include "Lib/BaseType.h"
 #include "W3DDevice/GameClient/HeightMap.h"
-#include "d3dx8math.h"
+#include "d3dx9math.h"
 #include "Common/GlobalData.h"
 #include "Common/DrawModule.h"
 #include "W3DDevice/GameClient/W3DVolumetricShadow.h"
@@ -103,8 +103,8 @@ struct SHADOW_STATIC_VOLUME_VERTEX	//vertex structure passed to D3D
 	#define SHADOW_DYNAMIC_VOLUME_FVF	D3DFVF_XYZ
 #endif
 
-LPDIRECT3DVERTEXBUFFER8 shadowVertexBufferD3D=nullptr;		///<D3D vertex buffer
-LPDIRECT3DINDEXBUFFER8	shadowIndexBufferD3D=nullptr;	///<D3D index buffer
+IDirect3DVertexBuffer9* shadowVertexBufferD3D=nullptr;		///<D3D vertex buffer
+IDirect3DIndexBuffer9*	shadowIndexBufferD3D=nullptr;	///<D3D index buffer
 int nShadowVertsInBuf=0;	//model vetices in vertex buffer
 int nShadowStartBatchVertex=0;
 int nShadowIndicesInBuf=0;	//model vetices in vertex buffer
@@ -121,7 +121,7 @@ static Real beX;
 static Real beY;
 static Real beZ;
 
-static LPDIRECT3DVERTEXBUFFER8 lastActiveVertexBuffer=nullptr;
+static IDirect3DVertexBuffer9* lastActiveVertexBuffer=nullptr;
 
 /** A simple structure to hold random geometry (vertices, polygons, etc.).  We'll use this
 * to store shadow volumes. */
@@ -1257,7 +1257,7 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 	Int numVerts, numPolys, numIndex;
 
 	//Get D3D Device used by W3D for quicker access.
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	if (!m_pDev)
 		return;
@@ -1317,7 +1317,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	UnsignedShort *pvIndices;
 
 	//Get D3D Device used by W3D for quicker access.
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	if (!m_pDev)
 		return;
@@ -1456,7 +1456,7 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 	static Vector3 verts[8];
 
 	//Get D3D Device used by W3D for quicker access.
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	if (!m_pDev)
 		return;
@@ -1556,7 +1556,7 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 	m_pDev->SetTransform(D3DTS_WORLD,&dxmWorld);
 
 	m_pDev->SetStreamSource(0,shadowVertexBufferD3D,sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX));
-	m_pDev->SetVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
+	m_pDev->SetFVF(SHADOW_DYNAMIC_VOLUME_FVF);
 
 	m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,0,numVerts,nShadowStartBatchIndex,numPolys);
 
@@ -3270,7 +3270,7 @@ void W3DVolumetricShadow::resetSilhouette( Int meshIndex )
 // ============================================================================
 void W3DVolumetricShadowManager::renderStencilShadows()
 {
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	if (!m_pDev)
 		return;	//need device to render anything.
@@ -3297,7 +3297,7 @@ void W3DVolumetricShadowManager::renderStencilShadows()
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	m_pDev->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+	m_pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 
 	// Use alpha blending to draw the transparent shadow
     m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
@@ -3357,7 +3357,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 	if (m_shadowList && TheGlobalData->m_useShadowVolumes)
 	{
 
-		LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+		IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		if (!m_pDev)
 			return;	//need device to render anything.
@@ -3439,7 +3439,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
 		m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
 
-		m_pDev->SetVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
+		m_pDev->SetFVF(SHADOW_DYNAMIC_VOLUME_FVF);
 
 		m_pDev->SetRenderState(D3DRS_CULLMODE,D3DCULL_CW);
 //		m_pDev->SetRenderState(D3DRS_ZBIAS,1);	///@todo: See if this helps or makes things worse.
@@ -3474,7 +3474,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		}
 
 		// Set vertex format to that used by static shadow volumes
-		m_pDev->SetVertexShader(W3DBufferManager::getDX8Format(W3DBufferManager::VBM_FVF_XYZ));
+		m_pDev->SetFVF(W3DBufferManager::getDX8Format(W3DBufferManager::VBM_FVF_XYZ));
 
 		//Empty queue of static shadow volumes to render.
 		W3DBufferManager::W3DVertexBuffer *nextVb;
@@ -3510,7 +3510,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			}
 		}
 
-		m_pDev->SetVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
+		m_pDev->SetFVF(SHADOW_DYNAMIC_VOLUME_FVF);
 		//flush any dynamic shadow volumes
 		shadowDynamicTask=m_dynamicShadowVolumesToRender;
 		while (shadowDynamicTask)
@@ -3679,7 +3679,7 @@ Bool W3DVolumetricShadowManager::ReAcquireResources()
 {
 	ReleaseResources();
 
-	LPDIRECT3DDEVICE8 m_pDev=DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 	DEBUG_ASSERTCRASH(m_pDev, ("Trying to ReAcquireResources on W3DVolumetricShadowManager without device"));
 

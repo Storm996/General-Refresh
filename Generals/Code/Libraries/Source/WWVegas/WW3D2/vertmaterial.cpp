@@ -57,7 +57,7 @@ class DynD3DMATERIAL8
 {
 	W3DMPO_CODE(DynD3DMATERIAL8)
 public:
-	D3DMATERIAL8 Mat;
+	D3DMATERIAL9 Mat;
 };
 #define Material				(&MaterialDyn->Mat)
 #define SRCMATPTR(src)	(&(src)->MaterialDyn->Mat)
@@ -94,9 +94,9 @@ VertexMaterialClass::VertexMaterialClass():
 #ifdef DYN_MAT8
 	MaterialDyn=W3DNEW DynD3DMATERIAL8;
 #else
-	MaterialOld=W3DNEW D3DMATERIAL8;
+	MaterialOld=W3DNEW D3DMATERIAL9;
 #endif
-	memset(Material,0,sizeof(D3DMATERIAL8));
+	memset(Material,0,sizeof(D3DMATERIAL9));
 	Set_Ambient(1.0f,1.0f,1.0f);
 	Set_Diffuse(1.0f,1.0f,1.0f);
 
@@ -135,9 +135,9 @@ VertexMaterialClass::VertexMaterialClass(const VertexMaterialClass & src) :
 #ifdef DYN_MAT8
 	MaterialDyn=W3DNEW DynD3DMATERIAL8;
 #else
-	MaterialOld=W3DNEW D3DMATERIAL8;
+	MaterialOld=W3DNEW D3DMATERIAL9;
 #endif
-	memcpy(Material, SRCMATPTR(&src), sizeof(D3DMATERIAL8));
+	memcpy(Material, SRCMATPTR(&src), sizeof(D3DMATERIAL9));
 }
 
 void VertexMaterialClass::Make_Unique()
@@ -207,7 +207,7 @@ unsigned long VertexMaterialClass::Compute_CRC() const
 // don't include the name when determining whether two vertex materials match
 //	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(Name.Peek_Buffer()),sizeof(char)*strlen(Name),crc);
 
-	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(Material),sizeof(D3DMATERIAL8),crc);
+	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(Material),sizeof(D3DMATERIAL9),crc);
 	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&Flags),sizeof(Flags),crc);
 	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&DiffuseColorSource),sizeof(DiffuseColorSource),crc);
 	crc = CRC_Memory(reinterpret_cast<const unsigned char *>(&AmbientColorSource),sizeof(AmbientColorSource),crc);
@@ -924,7 +924,7 @@ void VertexMaterialClass::Apply() const
 void VertexMaterialClass::Apply_Null()
 {
 	int i;
-	static D3DMATERIAL8 default_settings =
+	static D3DMATERIAL9 default_settings =
 	{
 		{ 1.0f, 1.0f, 1.0f, 1.0f },	// diffuse
 		{ 1.0f, 1.0f, 1.0f, 1.0f },	// ambient

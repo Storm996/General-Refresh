@@ -6,9 +6,9 @@
 #else
 #include "windows_compat.h"
 #endif
-#include "d3dx8core.h"
+#include "d3dx9core.h"
 
-#include "d3dx8math.h"
+#include "d3dx9math.h"
 
 #if defined(__has_include) && __has_include("gmath.h")
 #if defined(__clang__)

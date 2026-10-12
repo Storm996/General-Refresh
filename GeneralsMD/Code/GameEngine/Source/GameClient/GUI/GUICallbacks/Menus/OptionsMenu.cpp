@@ -77,6 +77,7 @@
 
 #include "WW3D2/ww3d.h"
 #include "WW3D2/texturefilter.h"
+#include "WW3D2/dx8normalmap.h"	// GeneralsX @feature 11/10/2026 dot3 normal-mapping toggle
 
 // This is for non-RC builds only!!!
 #define VERBOSE_VERSION L"Release"
@@ -192,6 +193,10 @@ static GameWindow *   checkNoDynamicLod   = nullptr;
 
 static NameKeyType    checkUnlockFpsID = NAMEKEY_INVALID;
 static GameWindow *   checkUnlockFps   = nullptr;
+
+// GeneralsX @feature 11/10/2026 dot3 normal-mapping user toggle (on/off), default ON.
+static NameKeyType    checkNormalMappingID = NAMEKEY_INVALID;
+static GameWindow *   checkNormalMapping   = nullptr;
 
 // GeneralsX @feature 05/10/2026 User selectable global render FPS limit (30 / 60 / no limit).
 static NameKeyType    comboBoxMaxFpsLimitID = NAMEKEY_INVALID;
@@ -352,6 +357,9 @@ static void setDefaults()
 		//
 		GadgetCheckBoxSetChecked( checkUnlockFps, !TheGlobalData->m_useFpsLimit);
 
+		if (checkNormalMapping)
+			GadgetCheckBoxSetChecked( checkNormalMapping, TheGlobalData->m_useNormalMapping );
+
 		//-------------------------------------------------------------------------------------------------
  		// Heat Effects
 		//
@@ -490,6 +498,16 @@ static void saveOptions()
 			// GeneralsX @feature 05/10/2026 Apply immediately so the change is visible without a restart.
 			TheFramePacer->setFramesPerSecondLimit(fpsLimit);
 		}
+	}
+
+	//-------------------------------------------------------------------------------------------------
+	// Normal mapping toggle (GeneralsX @feature 11/10/2026): persist to Options.ini + apply immediately.
+	if (checkNormalMapping)
+	{
+		Bool nmOn = GadgetCheckBoxIsChecked( checkNormalMapping );
+		TheWritableGlobalData->m_useNormalMapping = nmOn;
+		(*pref)["UseNormalMapping"] = nmOn ? "yes" : "no";
+		DX8NormalMap::Set_Enabled( nmOn != FALSE );
 	}
 
 	//-------------------------------------------------------------------------------------------------
@@ -1081,6 +1099,14 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	checkUnlockFpsID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckUnlockFPS" );
 	checkUnlockFps   = TheWindowManager->winGetWindowFromId( nullptr, checkUnlockFpsID);
 
+	checkNormalMappingID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckNormalMapping" );
+	checkNormalMapping   = TheWindowManager->winGetWindowFromId( nullptr, checkNormalMappingID);
+	if (checkNormalMapping)
+	{
+		// GeneralsX @feature 11/10/2026 Chinese label set in code (u-escapes avoid .wnd localization strings).
+		GadgetCheckBoxSetText( checkNormalMapping, UnicodeString(L"\u6cd5\u7ebf\u8d34\u56fe") );
+	}
+
 	// GeneralsX @feature 05/10/2026 Max render FPS limit combo box. The entries are added
 	// here in code, so the .wnd layout file stays free of localized strings.
 	comboBoxMaxFpsLimitID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ComboBoxMaxFpsLimit" );
@@ -1095,11 +1121,13 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 
 	// GeneralsX @feature 05/10/2026 Label text is set here in code so the .wnd layout file stays
 	// free of localized strings.
+	// GeneralsX @tweak 11/10/2026 Localized label to Chinese ("Max Frame Rate"), written with
+	// \u escapes to stay immune to source-codepage issues (MSVC 936).
 	staticTextMaxFpsLimitID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:StaticTextMaxFpsLimit" );
 	staticTextMaxFpsLimit   = TheWindowManager->winGetWindowFromId( nullptr, staticTextMaxFpsLimitID );
 	if (staticTextMaxFpsLimit)
 	{
-		GadgetStaticTextSetText( staticTextMaxFpsLimit, UnicodeString(L"Max FPS") );
+		GadgetStaticTextSetText( staticTextMaxFpsLimit, UnicodeString(L"\u6700\u5927\u5e27\u7387") );
 	}
 
 	checkBuildingOcclusionID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckBehindBuilding" );
@@ -1336,6 +1364,9 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	GadgetCheckBoxSetChecked( checkHeatEffects, TheGlobalData->m_useHeatEffects);
 
 	GadgetCheckBoxSetChecked( checkUnlockFps, !TheGlobalData->m_useFpsLimit);
+
+	if (checkNormalMapping)
+		GadgetCheckBoxSetChecked( checkNormalMapping, TheGlobalData->m_useNormalMapping );
 
 	//-------------------------------------------------------------------------------------------------
 	// Max render FPS limit

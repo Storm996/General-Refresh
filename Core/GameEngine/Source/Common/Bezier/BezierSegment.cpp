@@ -28,7 +28,7 @@
 #include "Common/BezFwdIterator.h"
 
 #ifdef _WIN32
-#include <d3dx8math.h>
+#include <d3dx9math.h>
 #elif defined(SAGE_USE_GLM)
 #include <glm/glm.hpp>
 #else

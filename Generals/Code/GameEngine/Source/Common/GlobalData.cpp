@@ -113,6 +113,7 @@ GlobalData* GlobalData::m_theOriginal = nullptr;
 	{ "DownwindAngle",							INI::parseReal,				nullptr,			offsetof( GlobalData, m_downwindAngle ) },
 	{ "UseShadowVolumes",						INI::parseBool,				nullptr,			offsetof( GlobalData, m_useShadowVolumes ) },
 	{ "UseShadowDecals",						INI::parseBool,				nullptr,			offsetof( GlobalData, m_useShadowDecals ) },
+	{ "UseNormalMapping",						INI::parseBool,				nullptr,			offsetof( GlobalData, m_useNormalMapping ) },
 	{ "TextureReductionFactor",			INI::parseInt,				nullptr,			offsetof( GlobalData, m_textureReductionFactor ) },
 	{ "UseBehindBuildingMarker",		INI::parseBool,				nullptr,			offsetof( GlobalData, m_enableBehindBuildingMarkers ) },
 	{ "WaterPositionX",							INI::parseReal,				nullptr,			offsetof( GlobalData, m_waterPositionX ) },
@@ -678,6 +679,7 @@ GlobalData::GlobalData()
 	m_downwindAngle = ( -0.785f );//Northeast!
 	m_useShadowVolumes = FALSE;
 	m_useShadowDecals = FALSE;
+	m_useNormalMapping = FALSE;	// GeneralsX @feature 11/10/2026 Normal mapping defaults OFF (dot3 path still has unresolved bugs); user can enable via the options-menu toggle.
 	m_textureReductionFactor = -1;
 	m_enableBehindBuildingMarkers = TRUE;
 	m_scriptDebug = FALSE;

@@ -17,8 +17,9 @@ if [[ ! -f "${GAME_BINARY}" ]]; then
 fi
 
 # Check if DXVK library is deployed
-if [[ ! -f "${GAME_DIR}/libdxvk_d3d8.so" ]]; then
-    echo "❌ ERROR: DXVK library not found in ${GAME_DIR}"
+# GeneralsX @build d3d9 port 12/10/2026 - the renderer loads libdxvk_d3d9, not the D3D8 shim.
+if [[ ! -f "${GAME_DIR}/libdxvk_d3d9.so" ]]; then
+    echo "❌ ERROR: libdxvk_d3d9.so not found in ${GAME_DIR}"
     echo "Run deploy first: ./scripts/build/linux/deploy-linux.sh"
     exit 1
 fi

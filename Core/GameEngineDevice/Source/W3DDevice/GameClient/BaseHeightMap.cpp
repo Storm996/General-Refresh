@@ -54,7 +54,7 @@
 #include <WW3D2/coltest.h>
 #include <WW3D2/rinfo.h>
 #include <WW3D2/camera.h>
-#include <d3dx8core.h>
+#include <d3dx9core.h>
 
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -70,6 +70,7 @@
 #include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DTerrainTracks.h"
+#include "W3DDevice/GameClient/W3DGrassBuffer.h"
 #include "W3DDevice/GameClient/W3DBibBuffer.h"
 #include "W3DDevice/GameClient/W3DPropBuffer.h"
 #include "W3DDevice/GameClient/W3DTreeBuffer.h"
@@ -428,6 +429,10 @@ void BaseHeightMapRenderObjClass::ReleaseResources()
 	if (TheSnowManager)
 		((W3DSnowManager *)TheSnowManager)->ReleaseResources();
 
+	// GeneralsX @feature Qoder 11/10/2026 Grass layer shares the terrain device lifecycle.
+	if (TheGrassBuffer)
+		TheGrassBuffer->ReleaseResources();
+
 	//Release any resources that may be used by custom pixel/vertex shaders
 	W3DShaderManager::shutdown();
 #ifdef DO_ROADS
@@ -479,6 +484,10 @@ void BaseHeightMapRenderObjClass::ReAcquireResources()
 
 	if (TheSnowManager)
 		((W3DSnowManager *)TheSnowManager)->ReAcquireResources();
+
+	// GeneralsX @feature Qoder 11/10/2026 Grass layer: reacquire after device reset.
+	if (TheGrassBuffer)
+		TheGrassBuffer->ReAcquireResources();
 
 	//Waypoint buffers are done dynamically. One line, one node (just rendered multiple times accessing other data).
 	//Internally creates it if needed.

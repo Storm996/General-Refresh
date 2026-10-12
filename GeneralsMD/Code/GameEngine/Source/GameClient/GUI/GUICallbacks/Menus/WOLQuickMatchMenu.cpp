@@ -40,10 +40,14 @@
 #include "GameClient/AnimateWindowManager.h"
 #include "GameClient/WindowLayout.h"
 #include "GameClient/LanguageFilter.h"
+// GeneralsX @build win64 11/10/2026 The NGMP headers pull in libcurl, so they must stay behind
+// the feature switch like every other menu does (see WOLWelcomeMenu.cpp, ScoreScreen.cpp).
+#if defined(SAGE_USE_NGMP)
 #include "GameNetwork/GeneralsOnline/OnlineServices_Manager.h"
 #include "GameNetwork/GeneralsOnline/OnlineServices_LobbyInterface.h"
 #include "GameNetwork/GeneralsOnline/NGMP_Helpers.h"
 #include "GameNetwork/GeneralsOnline/NGMPGame.h"
+#endif
 #include "Common/GlobalData.h"
 #include "GameClient/Gadget.h"
 #include "GameClient/GameText.h"

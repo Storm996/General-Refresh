@@ -92,6 +92,9 @@ static Int packCampMission( Int campIdx, Int misIdx )
 // GeneralsX @feature Qoder 07/10/2026 Only the three flagship campaigns are offered;
 // challenge maps and training missions are intentionally excluded to match the request.
 // Note: the engine lower-cases INI block names at parse time, so compare case-insensitively.
+// GeneralsX @feature Qoder 07/10/2026 Also surface the migrated original Generals campaigns
+// (loose Data\INI\Campaign\GeneralsCampaigns.ini), which are namespaced with a GEN_ prefix to
+// avoid colliding with ZH's own USA/GLA/China/TRAINING campaigns.
 static Bool isMainCampaign( const Campaign *camp )
 {
 	if( !camp )
@@ -99,7 +102,11 @@ static Bool isMainCampaign( const Campaign *camp )
 
 	return camp->m_name.compareNoCase( "USA" ) == 0
 		|| camp->m_name.compareNoCase( "China" ) == 0
-		|| camp->m_name.compareNoCase( "GLA" ) == 0;
+		|| camp->m_name.compareNoCase( "GLA" ) == 0
+		|| camp->m_name.compareNoCase( "GEN_USA" ) == 0
+		|| camp->m_name.compareNoCase( "GEN_GLA" ) == 0
+		|| camp->m_name.compareNoCase( "GEN_China" ) == 0
+		|| camp->m_name.compareNoCase( "GEN_TRAINING" ) == 0;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -113,6 +120,18 @@ static UnicodeString campaignDisplayName( const Campaign *camp )
 		disp = TheGameText->fetch( camp->m_campaignNameLabel, &exists );
 	if( !exists || disp.isEmpty() )
 		disp.translate( camp->m_name );
+
+	// GeneralsX @feature Qoder 07/10/2026 Tag the migrated Generals campaigns so they read as
+	// "【将军原版】<name>" and stay visually distinct from the native ZH campaigns in the list.
+	// The label itself is shared with ZH (CAMPAIGN:USA etc.), so the prefix is applied here.
+	// Wide-char escapes keep this source free of code-page-dependent literals.
+	if( camp->m_name.startsWithNoCase( "GEN_" ) )
+	{
+		UnicodeString prefixed( L"\u3010\u5c06\u519b\u539f\u7248\u3011" );
+		prefixed.concat( disp );
+		return prefixed;
+	}
+
 	return disp;
 }
 

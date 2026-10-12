@@ -156,6 +156,7 @@ public:
 	Bool m_useCloudPlane;
 	Bool m_useShadowVolumes;
 	Bool m_useShadowDecals;
+	Bool m_useNormalMapping;	// GeneralsX @feature 11/10/2026 User toggle for dot3 normal mapping (default ON).
 	Int  m_textureReductionFactor;	//how much to cut texture resolution: 2 is half, 3 is quarter, etc.
 	Bool m_enableBehindBuildingMarkers;
 	Real m_waterPositionX;

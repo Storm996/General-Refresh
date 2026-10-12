@@ -269,21 +269,25 @@ echo "  + libgamespy"
 cp "${GAMESPY_LIB}" "${LIB_DIR}/"
 
 # DXVK
-if [[ ! -f "${DXVK_D3D9_LIB}" || ! -f "${DXVK_D3D8_LIB}" ]]; then
-    echo "ERROR: Required DXVK dylibs were not found in expected locations:"
+# GeneralsX @build d3d9 port 12/10/2026 - the renderer loads libdxvk_d3d9, so that is the required
+# dylib; the D3D8 shim stays optional so a DXVK build without src/d3d8 still bundles.
+if [[ ! -f "${DXVK_D3D9_LIB}" ]]; then
+    echo "ERROR: Required DXVK d3d9 dylib was not found in expected locations:"
     echo "  d3d9 install: ${DXVK_D3D9_LIB_INSTALL}"
-    echo "  d3d8 install: ${DXVK_D3D8_LIB_INSTALL}"
     echo "  d3d9 meson:   ${DXVK_D3D9_LIB_MESON}"
-    echo "  d3d8 meson:   ${DXVK_D3D8_LIB_MESON}"
     echo "Build DXVK first: cmake --build build/macos-vulkan --target dxvk_d3d8_install"
     exit 1
 fi
 echo "  + libdxvk_d3d9"
 cp "${DXVK_D3D9_LIB}" "${LIB_DIR}/libdxvk_d3d9.0.dylib"
 ln -sf libdxvk_d3d9.0.dylib "${LIB_DIR}/libdxvk_d3d9.dylib"
-echo "  + libdxvk_d3d8"
-cp "${DXVK_D3D8_LIB}" "${LIB_DIR}/libdxvk_d3d8.0.dylib"
-ln -sf libdxvk_d3d8.0.dylib "${LIB_DIR}/libdxvk_d3d8.dylib"
+if [[ -f "${DXVK_D3D8_LIB}" ]]; then
+    echo "  + libdxvk_d3d8 (legacy D3D8 shim)"
+    cp "${DXVK_D3D8_LIB}" "${LIB_DIR}/libdxvk_d3d8.0.dylib"
+    ln -sf libdxvk_d3d8.0.dylib "${LIB_DIR}/libdxvk_d3d8.dylib"
+else
+    echo "  (libdxvk_d3d8 not built - only needed by legacy D3D8 builds)"
+fi
 
 # SagePatch (optional, gated by RTS_BUILD_OPTION_SAGE_PATCH at configure time).
 SAGE_PATCH_LIB="${BUILD_DIR}/Patches/SagePatch/libsage_patch.dylib"

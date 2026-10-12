@@ -63,41 +63,44 @@ BOOL WINAPI SymInitialize(
 BOOL WINAPI SymCleanup(
 	HANDLE hProcess);
 
-DWORD WINAPI SymLoadModule(
+DWORD WINAPI SymSetOptions(
+	DWORD SymOptions);
+
+// GeneralsX @build win64 11/10/2026 Address-sized parameters and records (DbghelpAddr family) so
+// the signatures match the *64 dbghelp entry points that the legacy names alias to on x64.
+DbghelpAddr WINAPI SymLoadModule(
 	HANDLE hProcess,
 	HANDLE hFile,
 	PCSTR ImageName,
 	PCSTR ModuleName,
-	DWORD BaseOfDll,
+	DbghelpAddr BaseOfDll,
 	DWORD SizeOfDll);
 
-DWORD WINAPI SymGetModuleBase(
+DbghelpAddr WINAPI SymGetModuleBase(
 	HANDLE hProcess,
-	DWORD dwAddr);
+	DbghelpAddr dwAddr);
 
 BOOL WINAPI SymUnloadModule(
 	HANDLE hProcess,
-	DWORD BaseOfDll);
+	DbghelpAddr BaseOfDll);
 
 BOOL WINAPI SymGetSymFromAddr(
 	HANDLE hProcess,
-	DWORD dwAddr,
-	PDWORD pdwDisplacement,
-	PIMAGEHLP_SYMBOL Symbol);
+	DbghelpAddr dwAddr,
+	DbghelpAddrOut pdwDisplacement,
+	DbghelpSymbolPtr Symbol);
 
 BOOL WINAPI SymGetLineFromAddr(
 	HANDLE hProcess,
-	DWORD dwAddr,
-	PDWORD pdwDisplacement,
+	DbghelpAddr dwAddr,
+	DbghelpAddrOut pdwDisplacement,
 	PIMAGEHLP_LINE Line);
-
-DWORD WINAPI SymSetOptions(
-	DWORD SymOptions);
 
 PVOID WINAPI SymFunctionTableAccess(
 	HANDLE hProcess,
-	DWORD AddrBase);
+	DbghelpAddr AddrBase);
 
+// The frame and routine types below are the ones imagehlp.h maps to the 64-bit variants on x64.
 BOOL WINAPI StackWalk(
 	DWORD MachineType,
 	HANDLE hProcess,

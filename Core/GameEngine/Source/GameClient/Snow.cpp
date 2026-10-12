@@ -118,6 +118,9 @@ const FieldParse WeatherSetting::m_weatherSettingFieldParseTable[] =
 	{ "SnowVelocity",							INI::parseReal,nullptr,			offsetof( WeatherSetting, m_snowVelocity ) },
 	{ "SnowPointSprites",						INI::parseBool,nullptr,			offsetof( WeatherSetting, m_usePointSprites ) },
 	{ "SnowEnabled",							INI::parseBool,nullptr,			offsetof( WeatherSetting, m_snowEnabled ) },
+	// GeneralsX @feature Qoder 11/10/2026 Grass layer toggles (same weather INI block).
+	{ "GrassEnabled",							INI::parseBool,nullptr,			offsetof( WeatherSetting, m_grassEnabled ) },
+	{ "GrassDensity",							INI::parseReal,nullptr,			offsetof( WeatherSetting, m_grassDensity ) },
 	{ nullptr, nullptr, nullptr, 0 },
 };
 
