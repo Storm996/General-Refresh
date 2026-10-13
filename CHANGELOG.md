@@ -5,6 +5,17 @@ All notable changes to this project are tracked here by date.
 
 ---
 
+## 2026-10-14
+
+### ✨ 新增 / Added
+
+- 💡 **逐像素光照（L2，几何法线 Gouraud / Blinn-Phong）** —— 战场单位光照从逐顶点升级为逐像素：读取批次自身的光照环境（最多 4 盏方向光），用世界空间几何法线逐像素计算漫反射与 Blinn-Phong 高光，明暗交界更锐利；默认开启，`GENERALSX_GEOMNORMAL=0` 回退逐顶点。
+  *Per-pixel lighting (L2, geometric-normal Gouraud / Blinn-Phong) — battlefield lighting upgraded from per-vertex to per-pixel: reads each batch's own light environment (up to 4 directional lights) and evaluates diffuse plus Blinn-Phong specular per pixel with world-space geometric normals; enabled by default, `GENERALSX_GEOMNORMAL=0` falls back to per-vertex.*
+- 🌗 **出厂光照定案（L1）** —— 环境底光默认压至 0.5 增强明暗对比（`GENERALSX_AMBIENT_SCALE` 可调）；冷色天空补光默认关闭（`GENERALSX_FILL_LIGHT=1` 开启）；太阳主光增益旋钮 `GENERALSX_KEY_GAIN`。
+  *Shipping light rig (L1) — ambient floor scaled to 0.5 by default for stronger contrast (`GENERALSX_AMBIENT_SCALE`); sky fill light off by default (`GENERALSX_FILL_LIGHT=1` enables); sun gain knob `GENERALSX_KEY_GAIN`.*
+- 📸 **截屏链路修复** —— MSAA + DXVK 下改用 `GetFrontBufferData`，截图包含完整 HUD。
+  *Screenshot path fix — switched to `GetFrontBufferData` under MSAA + DXVK so screenshots include the full HUD.*
+
 ## 2026-10-13
 
 ### ✨ 新增 / Added
