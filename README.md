@@ -46,11 +46,10 @@ The following are **already implemented and playable**:
 
 - 🖱️ **RA3-style unit selection panel** — when multiple units are selected, the bottom-left panel groups them by unit type with a live per-type count (e.g. *Overlord Tank x2*, *Battlemaster Tank x2*). Clicking one type icon selects every unit of that type at once, which makes commanding large mixed armies dramatically easier.
 - 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
-- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM**. (Since Microsoft never shipped a 64-bit Direct3D8 runtime, this is achieved via DXVK's x64 `d3d8.dll` shim that translates D3D8 to Vulkan at runtime.)
+- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — no 32-bit D3D8 shims needed anymore: the Direct3D9 renderer runs on the native 64-bit runtime.
 - 🏎️ **High-frame-rate gameplay** — the battle itself now runs smooth: unit locomotion, steering, turret aiming, weapon fire and animation are interpolated at the display refresh rate in Skirmish, Campaign and cinematic views — all as a presentation-layer improvement on top of the unchanged deterministic simulation, so online play, LAN and replays stay bit-for-bit faithful.
-- 🧱 **Normal-mapped (dot3) rendering** — a tangent-space dot3 normal-mapping path is wired into the W3D renderer, giving surfaces real per-pixel lighting depth. *Experimental and user-toggleable:* it is **OFF by default** (still being hardened) and can be enabled live from **Options → the "Normal Mapping" checkbox** without a restart.
+- 🧱 **Normal-mapped (dot3) rendering** — a tangent-space dot3 normal-mapping path is wired into the W3D renderer, giving surfaces real per-pixel lighting depth. It can be toggled live from **Options → the "Normal Mapping" checkbox** without a restart.
 - 🎨 **Texture repaints / upscaling** — unit and terrain artwork has been re-painted and upscaled through an AI-assisted texture pipeline, replacing blurry low-res retail textures with crisper, higher-detail maps.
-- 🗺️ **Mission map support** — expanded handling for mission/custom maps.
 - 🧩 **Mission UI rework** — the mission briefing / selection interface has been redesigned.
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
 - 🔊 **Audio & video backend modernization** — shipped together with the 64-bit switch: audio moved fully from the 32-bit Miles engine to **MiniAudio / OpenAL (x64)**, and intro/cutscene video is decoded by **FFmpeg**, completing the 64-bit platform layer.
@@ -64,6 +63,7 @@ What we are actively building and planning next:
 1. ✨ **Lighting upgrade** — normal maps, softened shadows, bloom and per-pixel multi-light shading are all implemented on the development branch and will ship with the next update; a **native Vulkan / D3D11 backend** remains the long-term goal.
 2. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
 3. 🤖 **AI-driven opponents** — adding **artificial-intelligence-powered battle AI** to bring a wider variety of AI personalities and play styles to Skirmish and beyond.
+4. 🗺️ **Mission map support** — expanded handling for mission/custom maps.
 
 ---
 

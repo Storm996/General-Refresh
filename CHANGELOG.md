@@ -22,8 +22,8 @@ All notable changes to this project are tracked here by date.
 
 - 🎇 **Direct3D 9 渲染器** —— `DX8Wrapper` 核心从 Direct3D 8 完整端口到 Direct3D 9，运行期从 `d3d9.dll` 动态加载；固定管线行为与回放兼容性保持不变。
   *Direct3D9 renderer — `DX8Wrapper` ported from D3D8 to modern D3D9, loaded at runtime; fixed-pipeline behaviour and replay compatibility unchanged.*
-- 🖥️ **原生 64 位构建正式交付** —— Windows x64 客户端（DXVK x64 垫片）标记为已交付特性，突破 32 位进程 2GB/4GB 地址空间墙。
-  *Native 64-bit build shipped — Windows x64 client (via DXVK x64 shim) promoted to shipped; breaks the 32-bit 2GB/4GB address-space ceiling.*
+- 🖥️ **原生 64 位构建正式交付** —— Windows x64 客户端标记为已交付特性，突破 32 位进程 2GB/4GB 地址空间墙。
+  *Native 64-bit build shipped — Windows x64 client promoted to shipped; breaks the 32-bit 2GB/4GB address-space ceiling.*
 - 🔊 **音视频后端现代化** —— 随 64 位切换一同完成：音频从 32 位 Miles 转向 **MiniAudio / OpenAL（x64）**，过场动画由 **FFmpeg** 解码播放。
   *Audio & video backend modernization — shipped together with the 64-bit switch: audio moved from 32-bit Miles to MiniAudio / OpenAL (x64), video decoded by FFmpeg.*
 
@@ -37,6 +37,5 @@ The repository was created; these features shipped with the initial import:
 - 🏎️ 高帧率游戏体验（单位运动 / 转向 / 开火按显示刷新率插值）
 - 🧱 法线贴图（dot3）渲染
 - 🎨 AI 辅助贴图重绘 / 超分
-- 🗺️ 任务地图支持
 - 🧩 任务界面改版
 - 🎬 主菜单直接进入任意任务
