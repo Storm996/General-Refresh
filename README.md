@@ -75,6 +75,7 @@ Beyond high frame rate, the following are **already implemented and playable**:
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
 - 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — removing the capacity bottleneck for larger maps, HD assets and heavy particle loads. (Since Microsoft never shipped a 64-bit Direct3D8 runtime, we achieve this via DXVK's x64 `d3d8.dll` shim that translates D3D8 to Vulkan at runtime.)
 - 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
+- 🖱️ **RA3-style unit selection panel** — when multiple units are selected, the bottom-left panel now groups them by unit type with a live per-type count (e.g. *Overlord Tank x2*, *Battlemaster Tank x2*). Clicking one type icon selects every unit of that type at once, which makes commanding large mixed armies dramatically easier — a small change in code, a big quality-of-life win for the command system.
 
 ---
 
