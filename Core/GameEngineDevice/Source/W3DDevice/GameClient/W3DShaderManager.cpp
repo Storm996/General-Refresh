@@ -103,7 +103,11 @@ protected:
 static W3DFilterInterface *W3DFilters[FT_MAX];
 static W3DShaderInterface *W3DShaders[W3DShaderManager::ST_MAX];
 static Int W3DShadersPassCount[W3DShaderManager::ST_MAX];	//number of passes for each of the above shaders
-TextureClass *W3DShaderManager::m_Textures[8];
+// GeneralsX @feature PS3.0 batch7 13/10/2026 the stage table has to cover every sampler the wrapper can
+// bind, otherwise setTexture(8..15) from a ps_3_0 shader writes past the array.
+static_assert(SHADER_TEXTURE_STAGES == MAX_TEXTURE_STAGES,
+	"W3DShaderManager stage table must match the DX8Wrapper sampler cache size");
+TextureClass *W3DShaderManager::m_Textures[SHADER_TEXTURE_STAGES];
 W3DShaderManager::ShaderTypes W3DShaderManager::m_currentShader;
 FilterTypes W3DShaderManager::m_currentFilter=FT_NULL_FILTER; ///< Last filter that was set.
 Int W3DShaderManager::m_currentShaderPass;
@@ -115,8 +119,11 @@ Int64 W3DShaderManager::m_driverVersion;
 Bool W3DShaderManager::m_renderingToTexture = false;
 IDirect3DSurface9 *W3DShaderManager::m_oldRenderSurface=nullptr;	///<previous render target
 IDirect3DTexture9 *W3DShaderManager::m_renderTexture=nullptr;		///<texture into which rendering will be redirected.
-IDirect3DSurface9 *W3DShaderManager::m_newRenderSurface=nullptr;	///<new render target inside m_renderTexture
+IDirect3DSurface9 *W3DShaderManager::m_newRenderSurface=nullptr;	///<surface the filters sample from
 IDirect3DSurface9 *W3DShaderManager::m_oldDepthSurface=nullptr;	///<previous depth buffer surface
+// GeneralsX @bugfix Storm996 12/10/2026 offscreen target pair bound while rendering to texture
+IDirect3DSurface9 *W3DShaderManager::m_rttColorSurface=nullptr;
+IDirect3DSurface9 *W3DShaderManager::m_rttDepthSurface=nullptr;
 /*===========================================================================================*/
 /*=========      Screen Shaders	=============================================================*/
 /*===========================================================================================*/
@@ -425,6 +432,7 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	const Real u0=(Real)(xpos)/dispW;			const Real v0=(Real)(ypos)/dispH;
 	const Real u1=(Real)(xpos+width)/dispW;		const Real v1=(Real)(ypos+height)/dispH;
 
+
 	// Pass 0: copy the scene texture straight to the back buffer.
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1 );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
@@ -508,6 +516,154 @@ W3DFilterInterface *ScreenBWFilterList[]=
 	nullptr
 };
 
+// GeneralsX @feature PS3.0 batch4 12/10/2026 -------------------------------------------------
+// Runtime-compiled monochrome screen filter, and the pilot for the tier-gated shader path.
+//
+// Why the asset alone is not enough: dist/shaders/monochrome.pso is Direct3D 8 microcode - the file
+// starts 01 01 FF FF, i.e. a ps_1_1 DX8 shader blob. DXVK's d3d9 backend translates those blobs, which
+// is why the effect worked on Linux/macOS and under the old d3d8 shim, but a D3D9 shader object needs a
+// DXBC/FXS container (see the native-d3d9 probe output probe_native.txt under the engine-rework
+// work folder: only the HLSL profiles compile and create there),
+// so the DX8 blob is the wrong format for the ported path. ScreenBWFilter::init() therefore kept
+// loading nothing on Windows and the black & white mission effect silently dropped to
+// ScreenBWFilterDOT3's two-pass fixed-function approximation. The asset path is kept first (zero
+// regression where it already works) and the HLSL source below is the fallback that makes the
+// pixel-shader path exist on every D3D9 device.
+//
+// The math reproduces both the retail effect and that fixed-function fallback: the fallback's
+// D3DTA_TFACTOR 0x80A5CA8E dot3 is exactly BT.601 luma (0.294/0.584/0.114 after the [-1,1] decode),
+// the fade is the lerp weight, and the tint is the per-channel multiplier. ScreenBWFilter::set() already
+// feeds c0/c1/c2 in that order, so no C++-side constant changes are needed.
+//
+// ps_3_0 vs ps_2_0: the arithmetic is identical on purpose. What this batch validates is the plumbing
+// every later batch depends on - tier-gated profile selection, compile through the CompatLib
+// D3DXAssembleShader shim (d3dcompiler!D3DCompile), CreatePixelShader acceptance, and the constants
+// travelling through DX8Wrapper::Set_Pixel_Shader_Constant's new budget-checked path.
+//
+// Windows-only, same as the dot3 and water runtime assembly paths: the D3DXAssembleShader shim is only
+// linked into the Windows build, and on Linux/macOS the .pso asset path above already works through
+// DXVK's d3d9 backend, so those platforms keep exactly the behaviour they have today.
+//=============================================================================
+// GeneralsX @feature PS3.0 batch7 13/10/2026 -------------------------------------------------------------------------
+// The profile a runtime-compiled shader should be emitted for, taken from the caps-derived tier ladder
+// (getShaderModelTier) so a call site cannot drift away from the -shadermodel cap or the user's setting.
+// nullptr means "below ps_2_0/vs_2_0": the HLSL dialect these sources are written in is not available,
+// and the caller must stay on its fixed-function or shipped-asset route.
+const char* W3DShaderManager::getPixelShaderProfile()
+{
+	switch (getShaderModelTier())
+	{
+		case DC_GENERIC_PIXEL_SHADER_3_0:	return "ps_3_0";
+		case DC_GENERIC_PIXEL_SHADER_2_0:	return "ps_2_0";
+		default:									return nullptr;
+	}
+}
+
+const char* W3DShaderManager::getVertexShaderProfile()
+{
+	switch (getShaderModelTier())
+	{
+		case DC_GENERIC_PIXEL_SHADER_3_0:	return "vs_3_0";
+		case DC_GENERIC_PIXEL_SHADER_2_0:	return "vs_2_0";
+		default:									return nullptr;
+	}
+}
+
+// GeneralsX @feature PS3.0 batch7 13/10/2026 -------------------------------------------------------------------------
+// The one place that turns HLSL text into a device shader. Before this every call site hard-coded its
+// own "// d3d-target:" line, so ps_3_0 - flow control, 32 temporaries, 224 pixel constants - had to be
+// re-decided (or forgotten) per shader, and a device that refused SM3 had no path back down.
+//
+// The source is passed without the target line and the directive is prefixed here, at the tier the caps
+// report, with a single step down the ladder as the retry. Compiling the same source one profile higher
+// is safe by construction (ps_2_0 features are a subset of ps_3_0), so the retry is for a runtime that
+// rejects the newer profile outright, not for source that needs rewriting.
+#ifdef _WIN32
+HRESULT W3DShaderManager::compileShaderAtBestProfile(const char* hlslSource, Bool ShaderType,
+	const char* logTag, const char** outProfile, void** pHandle)
+{
+	if (pHandle) *pHandle=nullptr;
+	if (outProfile) *outProfile=nullptr;
+	if (!hlslSource) return E_INVALIDARG;
+
+	const char* profile=ShaderType ? getVertexShaderProfile() : getPixelShaderProfile();
+	if (!profile)
+	{
+		fprintf(stderr,"%s no HLSL profile available below shader model 2.0\n",logTag?logTag:"[SHADER]");
+		fflush(stderr);
+		return E_FAIL;
+	}
+
+	// ps_3_0 -> ps_2_0, vs_3_0 -> vs_2_0. Anything else is already the floor.
+	const char* retry=(profile[3]=='3') ? (ShaderType ? "vs_2_0" : "ps_2_0") : nullptr;
+
+	// The sources are a few kilobytes; snprintf is bounded on purpose so an over-long shader reports
+	// instead of being silently truncated into a compile error nobody can attribute.
+	char source[16384];
+
+	for (Int attempt=0; attempt<(retry?2:1); ++attempt)
+	{
+		const char* target=(attempt==0) ? profile : retry;
+		Int written=snprintf(source,sizeof(source),"// d3d-target: %s\n%s",target,hlslSource);
+		if (written<0 || (size_t)written>=sizeof(source))
+		{
+			fprintf(stderr,"%s HLSL source does not fit the compile buffer (%d bytes)\n",
+				logTag?logTag:"[SHADER]",written);
+			fflush(stderr);
+			return E_FAIL;
+		}
+
+		LPD3DXBUFFER code=nullptr;
+		LPD3DXBUFFER errors=nullptr;
+		HRESULT hr=D3DXAssembleShader(source,(UINT)strlen(source),0,nullptr,&code,&errors);
+		if (SUCCEEDED(hr) && code!=nullptr)
+		{
+			if (ShaderType)
+				hr=DX8Wrapper::_Get_D3D_Device8()->CreateVertexShader(
+					(const DWORD*)code->GetBufferPointer(),(IDirect3DVertexShader9**)pHandle);
+			else
+				hr=DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader(
+					(const DWORD*)code->GetBufferPointer(),(IDirect3DPixelShader9**)pHandle);
+		}
+
+		const Bool failed=FAILED(hr) || (pHandle && *pHandle==nullptr);
+		if (failed)
+		{
+			fprintf(stderr,"%s %s compile/create failed hr=0x%08X err=%s\n",
+				logTag?logTag:"[SHADER]",target,(unsigned)hr,
+				(errors && errors->GetBufferPointer())?(const char*)errors->GetBufferPointer():"(none)");
+			fflush(stderr);
+		}
+
+		if (errors) errors->Release();
+		if (code) code->Release();
+
+		if (!failed)
+		{
+			if (outProfile) *outProfile=target;
+			return S_OK;
+		}
+		if (pHandle) *pHandle=nullptr;
+	}
+
+	return E_FAIL;
+}
+#endif	// _WIN32
+
+#ifdef _WIN32
+static const char* kMonochromeShaderBody =
+	"sampler Screen : register(s0);\n"
+	"float4 LumaWeights : register(c0);\n"
+	"float4 TintColor   : register(c1);\n"
+	"float4 FadeLevel   : register(c2);\n"
+	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+	"{\n"
+	"    float4 src = tex2D(Screen, uv);\n"
+	"    float3 bw = dot(src.rgb, LumaWeights.rgb) * TintColor.rgb;\n"
+	"    return float4(lerp(src.rgb, bw, FadeLevel.x), src.a);\n"
+	"}\n";
+#endif	// _WIN32
+
 Int ScreenBWFilter::init()
 {
 	Int res;
@@ -538,13 +694,61 @@ Int ScreenBWFilter::init()
 
 			// GeneralsX @bugfix BenderAI 13/02/2026 - Don't crash if monochrome.pso missing (optional effect)
 			//Monochrome pixel shader.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\monochrome.pso", &Declaration[0], 0, false, (void**)&m_dwBWPixelShader);
-			if (FAILED(hr))
+			IDirect3DPixelShader9* shader = nullptr;
+			Bool preferHlsl = false;
+#ifdef _WIN32
+			// GeneralsX @feature PS3.0 batch4 12/10/2026 The shipped container is ps_1_1 microcode, so taking
+			// it whenever it loads leaves the upgraded source unreachable on hardware that can do better. On
+			// a device that accepts ps_3_0 compile the HLSL first and keep the microcode as the fallback.
+			preferHlsl = W3DShaderManager::getShaderModelTier() >= DC_GENERIC_PIXEL_SHADER_3_0;
+#endif // _WIN32
+			if (!preferHlsl)
 			{
-				DEBUG_LOG(("W3DShaderManager: monochrome.pso not found, BW screen filter unavailable"));
+				hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\monochrome.pso", &Declaration[0], 0, false, (void**)&shader);
+				if (FAILED(hr) || shader == nullptr)
+					shader = nullptr;
+			}
+
+			if (shader == nullptr)
+			{
+#ifdef _WIN32
+				// GeneralsX @feature PS3.0 batch4 12/10/2026 either the asset was not usable on this device
+				// (missing from the archive, or a DX8 container D3D9 cannot wrap) or the device can take a
+				// higher profile than the asset was built for.
+				// GeneralsX @feature PS3.0 batch7 13/10/2026 the profile choice and the ps_3_0 -> ps_2_0
+				// retry moved into compileShaderAtBestProfile, so this filter emits whatever the tier ladder
+				// allows instead of carrying its own copy of the ladder.
+				const char* profile = nullptr;
+				void* handle = nullptr;
+				if (SUCCEEDED(W3DShaderManager::compileShaderAtBestProfile(kMonochromeShaderBody, false,
+					"[BWFILTER]", &profile, &handle)))
+				{
+					shader = (IDirect3DPixelShader9*)handle;
+				}
+				if (shader != nullptr)
+				{
+					// Which profile the device actually got is the whole point of the shader-model ladder,
+					// so report it - and say when it was taken ahead of the shipped asset.
+					fprintf(stderr, "[BWFILTER] monochrome pixel shader compiled as %s%s\n", profile,
+						preferHlsl ? " (ahead of the shipped ps_1_1 asset)" : "");
+					fflush(stderr);
+				}
+				else
+				{
+					// Last resort: the microcode we skipped above is still better than no filter at all.
+					hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\monochrome.pso", &Declaration[0], 0, false, (void**)&shader);
+					if (FAILED(hr) || shader == nullptr)
+						shader = nullptr;
+				}
+#endif // _WIN32
+			}
+
+			if (shader == nullptr)
+			{
 				// Monochrome filter is optional - game can run without it
 				return FALSE;
 			}
+			m_dwBWPixelShader = shader;
 
 			W3DFilters[FT_VIEW_BW_FILTER]=&screenBWFilter;
 			DEBUG_LOG(("W3DShaderManager: BW screen filter enabled"));
@@ -614,8 +818,6 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 Int ScreenBWFilter::set(FilterModes mode)
 {
-	HRESULT hr;
-
 	if (mode > FM_NULL_MODE)
 	{
 		//rendering a quad with redirected rendering surface tinted by pixel shader
@@ -667,46 +869,43 @@ Int ScreenBWFilter::set(FilterModes mode)
 		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
 		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
 
-		hr=DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBWPixelShader);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0,   (const float*)D3DXVECTOR4(0.3f, 0.59f, 0.11f, 1.0f), 1);
+		// GeneralsX @refactor PS3.0 batch4 12/10/2026 bind through the wrapper instead of the device so
+		// the shader-handle cache and the constant cache stay coherent (see DX8Wrapper::Set_Pixel_Shader
+		// and the budget guard added in batch 1). Direct device calls here used to leave Pixel_Shader
+		// pointing at a stale handle, which after a device Reset is the same recycled address as some
+		// other shader - the wrapper would then skip the binding the frame actually needs.
+		DX8Wrapper::Set_Pixel_Shader((UINT_PTR)m_dwBWPixelShader);
 
-		D3DXVECTOR4	color(1.0f,1.0f,1.0f,1.0f);	//multiply color
+		const Vector4 lumaWeights(0.3f, 0.59f, 0.11f, 1.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, &lumaWeights, 1);
+
+		Vector4	color(1.0f,1.0f,1.0f,1.0f);	//multiply color
 
 		if (mode == FM_VIEW_BW_BLACK_AND_WHITE)
 		{
 			//back & white mode
-			color.x=1.0f;
-			color.y=1.0f;
-			color.z=1.0f;
+			color.X=1.0f;
+			color.Y=1.0f;
+			color.Z=1.0f;
 		}
 		if (mode == FM_VIEW_BW_RED_AND_WHITE)
 		{
 			//red is on
-			color.x = 1.0f;
-			color.y = 0.0f;
-			color.z = 0.0f;
-			//inverse red is on
-			//red is on
-//			color.x = 0.0f;
-//			color.y = 1.0f;
-//			color.z = 1.0f;
+			color.X = 1.0f;
+			color.Y = 0.0f;
+			color.Z = 0.0f;
 		}
 		if (mode == FM_VIEW_BW_GREEN_AND_WHITE)
 		{
-			color.x = 0.0f;
-			color.y = 1.0f;
-			color.z = 0.0f;
+			color.X = 0.0f;
+			color.Y = 1.0f;
+			color.Z = 0.0f;
 		}
 
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(1,   color, 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(2,	(const float*)D3DXVECTOR4(m_curFadeValue, m_curFadeValue, m_curFadeValue, 1.0f), 1);
-/*		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(2,   (const float*)D3DXVECTOR4(150.0f/255.0f, 150.0f/255.0f, 150.0f/255.0f, 0.0f), 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(3,   (const float*)D3DXVECTOR4((765.0f/450.0f)/3, (765.0f/450.0f)/3, (765.0f/450.0f)/3, 1.0f), 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(4,   (const float*)D3DXVECTOR4(0.5f, 0.5f, 0.5f, 0), 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(5,   (const float*)D3DXVECTOR4((60.0f)/255.0f, (60.0f)/255.0f, (60.0f)/255.0f, 0), 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(6,   (const float*)D3DXVECTOR4((157.0f)/255.0f, (157.0f)/255.0f, (157.0f)/255.0f, 0), 1);
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(7,   (const float*)D3DXVECTOR4((30.0f)/255.0f, (30.0f)/255.0f, (30.0f)/255.0f, 0), 1);
-*/
+		const Vector4 fade(m_curFadeValue, m_curFadeValue, m_curFadeValue, 1.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(1, &color, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(2, &fade, 1);
+
 		return true;
 	}
 	return false;
@@ -714,8 +913,12 @@ Int ScreenBWFilter::set(FilterModes mode)
 
 void ScreenBWFilter::reset()
 {
+	// GeneralsX @refactor PS3.0 batch4 12/10/2026 the texture unbind stays a device call on purpose: the
+	// rendered frame is a bare IDirect3DTexture9 from endRenderToTexture(), never a TextureBaseClass, so
+	// it was never in the wrapper's texture cache for this stage and there is no cached reference to
+	// release. The shader unbind does go through the wrapper, which is what keeps the handle cache right.
 	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);	//turn off pixel shader
+	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -2878,6 +3081,8 @@ W3DShaderManager::W3DShaderManager()
 	m_renderTexture = nullptr;
 	m_newRenderSurface = nullptr;
 	m_oldDepthSurface = nullptr;
+	m_rttColorSurface = nullptr;
+	m_rttDepthSurface = nullptr;
 	m_renderingToTexture = false;
 	Int i;
 	for (i=0; i<W3DShaderManager::ST_MAX; i++)
@@ -2887,7 +3092,7 @@ W3DShaderManager::W3DShaderManager()
 	for (i=0; i<FT_MAX; i++)
 	{	W3DFilters[i]=nullptr;
 	}
-	for (i=0; i<8; i++)
+	for (i=0; i<SHADER_TEXTURE_STAGES; i++)
 	{
 		m_Textures[i]=nullptr;
 	}
@@ -2897,11 +3102,13 @@ W3DShaderManager::W3DShaderManager()
 // GeneralsX @feature T3-0 M3/M4 -------------------------------------------------
 // Runtime HLSL compilation + startup diagnostics for dot3 per-pixel normal lighting.
 //   - Windows-only: the CompatLib D3DXAssembleShader shim drives D3DCompile out of
-//     d3dcompiler_47.dll. D3D9 has no DX8 assembly assembler, so the sources below are HLSL
-//     and each carries its "// d3d-target:" profile directive.
+//     d3dcompiler_47.dll. D3D9 has no DX8 assembly assembler, so the sources below are HLSL and
+//     W3DShaderManager::compileShaderAtBestProfile prefixes each with the "// d3d-target:" line for
+//     the profile the caps ladder reports.
 //   - Requires caps->Support_Dot3().
 //   - Regardless of the opt-in switch, we try to compile+create VS/PS at startup and log the
-//     result to stderr (proving DXVK/GPU accepts vs_2_0 + ps_2_0). On success we Install into
+//     result to stderr (proving DXVK/GPU accepts the emitted profile, vs_3_0/ps_3_0 where the device
+//     reports them and vs_2_0/ps_2_0 otherwise). On success we Install into
 //     the WW3D2-side module; whether it actually mounts is still gated by the DX8NormalMap
 //     default-OFF switch. On failure the handles stay 0 and never mount -> zero regression.
 //
@@ -2926,7 +3133,6 @@ static void InitNormalMapShaders()
 	// emit it as TEXCOORD1, so every surface gets its own light angle (per-face shading) instead of
 	// one constant tangent-space light that made all faces render the same flat darkness.
 	static const char* kVertexShader =
-		"// d3d-target: vs_2_0\n"
 		"float4 c0 : register(c0);\n"
 		"float4 c1 : register(c1);\n"
 		"float4 c2 : register(c2);\n"
@@ -2957,7 +3163,6 @@ static void InitNormalMapShaders()
 	// GENERALSX_NORMALMAP_NOSTAGE1=1 swaps the normal-map sample for a flat (0,0,1) normal:
 	// if buildings still flicker, stage1 binding/sampling is innocent.
 	static const char* kPixelShader =
-		"// d3d-target: ps_2_0\n"
 		"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
 		"sampler s1 : register(s1);\n"                 // tangent-space normal map (stage1, same uv)
 		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
@@ -2982,7 +3187,6 @@ static void InitNormalMapShaders()
 
 	// Diagnostic variant: flat (0,0,1) normal - isolates stage1 sampling as the flicker source.
 	static const char* kPixelShaderNoStage1 =
-		"// d3d-target: ps_2_0\n"
 		"sampler s0 : register(s0);\n"
 		"float4 c1 : register(c1);\n"
 		"float4 c2 : register(c2);\n"
@@ -3006,7 +3210,6 @@ static void InitNormalMapShaders()
 	// unmistakable on screen; meshes without a companion keep their normal fixed-pipeline look.
 	// Selected at device init by GENERALSX_NORMALMAP_RAW=1 (launcher switch, no rebuild).
 	static const char* kPixelShaderRaw =
-		"// d3d-target: ps_2_0\n"
 		"sampler s0 : register(s0);\n"                 // keep the diffuse alpha so alpha-tested surfaces still clip
 		"sampler s1 : register(s1);\n"                 // normal map (stage1)
 		"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
@@ -3033,39 +3236,22 @@ static void InitNormalMapShaders()
 		}
 	}
 
-	HRESULT hr;
-	LPD3DXBUFFER vsCode = nullptr;
-	LPD3DXBUFFER psCode = nullptr;
-	LPD3DXBUFFER vsErr = nullptr;
-	LPD3DXBUFFER psErr = nullptr;
-	// GeneralsX @build d3d9 port 11/10/2026 - D3D9 shader "handles" are interface pointers.
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 the pair is emitted through the shared ladder: on a
+	// device that accepts it this compiles as vs_3_0/ps_3_0 (flow control, 32 temporaries, 224 pixel
+	// constants) and drops back to the previous vs_2_0/ps_2_0 automatically if the runtime refuses the
+	// newer profile. The sources above no longer carry a "// d3d-target:" line because the ladder decides.
 	IDirect3DVertexShader9* vsHandle = nullptr;
 	IDirect3DPixelShader9* psHandle = nullptr;
+	const char* vsProfile = nullptr;
+	const char* psProfile = nullptr;
 
-	hr = D3DXAssembleShader(kVertexShader, (UINT)strlen(kVertexShader), 0, nullptr, &vsCode, &vsErr);
-	if (FAILED(hr)) {
-		fprintf(stderr, "[DOT3] VS assemble FAILED hr=0x%08X err=%s\n", (unsigned)hr,
-			(vsErr && vsErr->GetBufferPointer()) ? (const char*)vsErr->GetBufferPointer() : "(none)");
-	}
-	if (vsErr) vsErr->Release();
-	// GeneralsX @build d3d9 port 11/10/2026 - D3D9 CreateVertexShader dropped the DX8 declaration
-	// and flags parameters (vertex declarations moved to SetVertexDeclaration; the fixed-function
-	// FVF path below is what binds the input layout here).
-	if (SUCCEEDED(hr) && vsCode)
-		hr = DX8Wrapper::_Get_D3D_Device8()->CreateVertexShader((const DWORD*)vsCode->GetBufferPointer(), &vsHandle);
-	if (vsCode) vsCode->Release();
-	fprintf(stderr, "[DOT3] vertex shader create hr=0x%08X handle=%p\n", (unsigned)hr, (void*)vsHandle);
+	HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kVertexShader, true, "[DOT3]", &vsProfile, (void**)&vsHandle);
+	fprintf(stderr, "[DOT3] vertex shader %s hr=0x%08X handle=%p\n",
+		vsProfile ? vsProfile : "not compiled", (unsigned)hr, (void*)vsHandle);
 
-	hr = D3DXAssembleShader(pixelShaderSrc, (UINT)strlen(pixelShaderSrc), 0, nullptr, &psCode, &psErr);
-	if (FAILED(hr)) {
-		fprintf(stderr, "[DOT3] PS assemble FAILED hr=0x%08X err=%s\n", (unsigned)hr,
-			(psErr && psErr->GetBufferPointer()) ? (const char*)psErr->GetBufferPointer() : "(none)");
-	}
-	if (psErr) psErr->Release();
-	if (SUCCEEDED(hr) && psCode)
-		hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((const DWORD*)psCode->GetBufferPointer(), &psHandle);
-	if (psCode) psCode->Release();
-	fprintf(stderr, "[DOT3] pixel shader create hr=0x%08X handle=%p\n", (unsigned)hr, (void*)psHandle);
+	hr = W3DShaderManager::compileShaderAtBestProfile(pixelShaderSrc, false, "[DOT3]", &psProfile, (void**)&psHandle);
+	fprintf(stderr, "[DOT3] pixel shader %s hr=0x%08X handle=%p\n",
+		psProfile ? psProfile : "not compiled", (unsigned)hr, (void*)psHandle);
 	fflush(stderr);
 
 	if (vsHandle != nullptr && psHandle != nullptr) {
@@ -3100,6 +3286,56 @@ static void InitNormalMapShaders()
 #endif // _WIN32
 }
 
+// GeneralsX @bugfix Storm996 12/10/2026 ---------------------------------------------------------------
+// init() is also called from the height-map rebuild path, and a failed SetRenderTarget switches the
+// feature off at runtime, so every path has to drop exactly the same surfaces.
+void W3DShaderManager::releaseRenderToTextureSurfaces()
+{
+	SAFE_RELEASE(m_newRenderSurface);
+	SAFE_RELEASE(m_renderTexture);
+	SAFE_RELEASE(m_oldRenderSurface);
+	SAFE_RELEASE(m_oldDepthSurface);
+	SAFE_RELEASE(m_rttColorSurface);
+	SAFE_RELEASE(m_rttDepthSurface);
+}
+
+enum RttModes
+{
+	RTT_MODE_UNAVAILABLE = 0,	///<no offscreen target: every post-processing filter stays off.
+	RTT_MODE_PLAIN,				///<single-sample offscreen target on a single-sample back buffer.
+	RTT_MODE_OWN_DEPTH,			///<single-sample offscreen target with its own single-sample depth.
+	RTT_MODE_MSAA_RESOLVE,		///<multisampled offscreen target, resolved into the sampled texture.
+};
+
+static const char* Rtt_Mode_Name(Int mode)
+{
+	switch (mode)
+	{
+		case RTT_MODE_PLAIN:			return "plain";
+		case RTT_MODE_OWN_DEPTH:		return "single-sample+own-depth";
+		case RTT_MODE_MSAA_RESOLVE:		return "msaa-resolve";
+		default:						return "unavailable";
+	}
+}
+
+// GeneralsX @bugfix Storm996 12/10/2026 Which of the routes below the device accepted is a hardware
+// question, and it is the first thing to check when a post-processing effect misbehaves. Reported once per
+// state change, because init() re-runs on every height-map rebuild.
+static void Report_Render_To_Texture_Mode(Int mode, UINT width, UINT height, D3DMULTISAMPLE_TYPE samples, UINT quality)
+{
+	static Int lastMode = -1;
+	static UINT lastWidth = 0, lastHeight = 0, lastSamples = 0xFFFFFFFFu, lastQuality = 0xFFFFFFFFu;
+	if (mode == lastMode && width == lastWidth && height == lastHeight && samples == lastSamples && quality == lastQuality)
+		return;
+	lastMode = mode; lastWidth = width; lastHeight = height; lastSamples = samples; lastQuality = quality;
+
+#ifdef _WIN32
+	fprintf(stderr, "[RTT] offscreen target %s for back buffer %ux%u AA x%u q%u\n",
+		Rtt_Mode_Name(mode), width, height, (UINT)samples, quality);
+	fflush(stderr);
+#endif // _WIN32
+}
+
 // W3DShaderManager::init =======================================================
 /** Walk through all shaders and find versions suitable for current hardware */
 //=============================================================================
@@ -3116,45 +3352,77 @@ void W3DShaderManager::init()
 		m_currentChipset = res;	//cache the current chipset.
 
 		//Some of our effects require an offscreen render target, so try creating it here.
-		HRESULT hr=DX8Wrapper::_Get_D3D_Device8()->GetRenderTarget(0,&m_oldRenderSurface);
+		releaseRenderToTextureSurfaces();	//DEFAULT-pool surfaces do not survive a device reset
+		LPDIRECT3DDEVICE9 device=DX8Wrapper::_Get_D3D_Device8();
+		HRESULT hr=device->GetRenderTarget(0,&m_oldRenderSurface);
 
 		if (hr != S_OK || !m_oldRenderSurface)
 			return;
 
 		m_oldRenderSurface->GetDesc(&desc);
-		
-		// TheSuperHackers @bugfix Redirecting rendering to a non-multisampled texture
-		// while using a multisampled depth buffer is an API violation in DX8.
-		if (desc.MultiSampleType == D3DMULTISAMPLE_NONE)
+
+		hr = device->GetDepthStencilSurface(&m_oldDepthSurface);
+		if (hr != S_OK || !m_oldDepthSurface)
 		{
-			hr=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&m_renderTexture,nullptr);
-		}
-		else
-		{
-			// Force failure path to avoid MSAA mismatch
-			hr = E_FAIL;
+			releaseRenderToTextureSurfaces();
+			Report_Render_To_Texture_Mode(RTT_MODE_UNAVAILABLE, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
+			return;
 		}
 
-		if (hr != S_OK)
-		{
-			SAFE_RELEASE(m_oldRenderSurface);
-			m_renderTexture = nullptr;
-		} else {
+		D3DSURFACE_DESC depthDesc;
+		m_oldDepthSurface->GetDesc(&depthDesc);
+
+		// GeneralsX @bugfix PS3.0 batch6 12/10/2026 -------------------------------------------------------
+		// Redirecting the scene into a single-sample texture while the device keeps binding the back
+		// buffer's multisampled depth buffer is the DX8 API violation that made the code below force a
+		// creation failure as soon as the back buffer was multisampled. The cost of that shortcut was
+		// silent: canRenderToTexture() went false for every player with antialiasing enabled and took the
+		// whole filter family with it - default, bloom, monochrome, motion blur and cross-fade. The legal
+		// shape is a color/depth pair that always shares one sample count, so the offscreen target now
+		// brings its own depth buffer instead of borrowing the back buffer's.
+		hr=device->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&m_renderTexture,nullptr);
+		if (hr == S_OK)
 			hr = m_renderTexture->GetSurfaceLevel(0, &m_newRenderSurface);
-			if (hr != S_OK)
+
+		Int mode=RTT_MODE_UNAVAILABLE;
+		if (hr == S_OK)
+		{
+			if (desc.MultiSampleType != D3DMULTISAMPLE_NONE)
 			{
-				SAFE_RELEASE(m_renderTexture);
-				m_newRenderSurface = nullptr;
-			}	else {
-				hr = DX8Wrapper::_Get_D3D_Device8()->GetDepthStencilSurface(&m_oldDepthSurface);
-				if (hr != S_OK)
+				// Preferred route: keep the sample count of the scene render, then resolve it into the
+				// single-sample texture the filters sample. Antialiasing survives the post pass.
+				const DWORD qualities[2] = { desc.MultiSampleQuality, 0 };
+				for (Int attempt=0; attempt<2 && !m_rttColorSurface; ++attempt)
 				{
-					SAFE_RELEASE(m_newRenderSurface);
-					SAFE_RELEASE(m_renderTexture);
-					m_oldDepthSurface = nullptr;
+					if (device->CreateRenderTarget(desc.Width,desc.Height,desc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttColorSurface,nullptr) != S_OK)
+						continue;
+					if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttDepthSurface,nullptr) == S_OK)
+					{
+						mode=RTT_MODE_MSAA_RESOLVE;
+						break;
+					}
+					SAFE_RELEASE(m_rttColorSurface);
+				}
+			}
+
+			if (mode == RTT_MODE_UNAVAILABLE)
+			{
+				// Either the back buffer needs no samples at all, or this device will not give us a
+				// multisampled offscreen target: bind the single-sample texture against a single-sample
+				// depth buffer of its own. The scene loses MSAA for as long as a filter is active, which
+				// is still better than the filter not existing.
+				if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,D3DMULTISAMPLE_NONE,0,FALSE,&m_rttDepthSurface,nullptr) == S_OK)
+				{
+					m_rttColorSurface=m_newRenderSurface;
+					m_rttColorSurface->AddRef();
+					mode = desc.MultiSampleType != D3DMULTISAMPLE_NONE ? RTT_MODE_OWN_DEPTH : RTT_MODE_PLAIN;
 				}
 			}
 		}
+
+		if (mode == RTT_MODE_UNAVAILABLE)
+			releaseRenderToTextureSurfaces();
+		Report_Render_To_Texture_Mode(mode, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
 	}
 
 	W3DShaderInterface **shaders;
@@ -3191,10 +3459,7 @@ void W3DShaderManager::init()
 //=============================================================================
 void W3DShaderManager::shutdown()
 {
-	SAFE_RELEASE(m_newRenderSurface);
-	SAFE_RELEASE(m_renderTexture);
-	SAFE_RELEASE(m_oldRenderSurface);
-	SAFE_RELEASE(m_oldDepthSurface);
+	releaseRenderToTextureSurfaces();
 	m_currentShader = ST_INVALID;
 	m_currentFilter = FT_NULL_FILTER;
 	//release any assets associated with a shader (vertex/pixel shaders, textures, etc.)
@@ -3363,8 +3628,12 @@ void W3DShaderManager::startRenderToTexture()
 {
 	DEBUG_ASSERTCRASH(!m_renderingToTexture, ("Already rendering to texture - cannot nest calls."));
 
-	if (m_renderingToTexture || m_newRenderSurface==nullptr || m_oldDepthSurface==nullptr) return;
-	HRESULT hr = DX8Wrapper::_Get_D3D_Device8()->SetRenderTarget(0,m_newRenderSurface); DX8Wrapper::_Get_D3D_Device8()->SetDepthStencilSurface(m_oldDepthSurface);
+	if (m_renderingToTexture || m_newRenderSurface==nullptr || m_rttColorSurface==nullptr || m_rttDepthSurface==nullptr) return;
+	// GeneralsX @bugfix Storm996 12/10/2026 Bind the offscreen pair created above. The back buffer's depth
+	// buffer is deliberately not touched here: it may be multisampled while the offscreen color is not.
+	HRESULT hr = DX8Wrapper::_Get_D3D_Device8()->SetRenderTarget(0,m_rttColorSurface);
+	if (hr == S_OK)
+		hr = DX8Wrapper::_Get_D3D_Device8()->SetDepthStencilSurface(m_rttDepthSurface);
 
 	// TheSuperHackers @bugfix If SetRenderTarget fails (e.g. due to MSAA forced by driver
 	// profile causing a depth buffer mismatch that D3DSURFACE_DESC doesn't report), permanently
@@ -3372,14 +3641,33 @@ void W3DShaderManager::startRenderToTexture()
 	if (hr != S_OK)
 	{
 		// Permanently disable RTT
-		SAFE_RELEASE(m_newRenderSurface);
-		SAFE_RELEASE(m_renderTexture);
-		SAFE_RELEASE(m_oldRenderSurface);
-		SAFE_RELEASE(m_oldDepthSurface);
+		releaseRenderToTextureSurfaces();
 		return;
 	}
 
+	// GeneralsX @bugfix PS3.0 batch6 13/10/2026 The offscreen depth buffer has to be cleared here. The per-frame
+	// clear (WW3D::Begin_Render) ran against the back buffer before the switch, and the depth that comes with it
+	// stays behind with that back buffer: the pair bound above owns a fresh depth surface, which starts at zero,
+	// so every fragment failed the depth test and the whole scene was discarded. The filters then copied that
+	// empty target back over the viewport, which is what made every 3D surface go black while the 2D GUI -
+	// drawn afterwards, outside the filter - stayed lit. The retail filters never exposed this because with
+	// multisampling on, canRenderToTexture() was false and no filter ran at all.
+	DX8Wrapper::Clear(false, true, Vector3( 0.0f, 0.0f, 0.0f ), 1.0f);
 	m_renderingToTexture = true;
+#ifdef _WIN32
+	// GeneralsX @bugfix Storm996 12/10/2026 The creation-time [RTT] line only says the target exists. This
+	// one says a view actually redirected the scene through it, which is what a filter has to have to work.
+	{
+		static Bool redirectedReported = false;
+		if (!redirectedReported)
+		{
+			redirectedReported = true;
+			fprintf(stderr, "[RTT] scene redirected into the offscreen target (%s)\n",
+				m_rttColorSurface != m_newRenderSurface ? "multisampled, resolved after the scene" : "single-sample");
+			fflush(stderr);
+		}
+	}
+#endif // _WIN32
 	if (TheGlobalData->m_showSoftWaterEdge)
 	{
 		//Soft water edges use frame buffer destination alpha so we must clear it to a known value.
@@ -3417,6 +3705,40 @@ IDirect3DTexture9 *W3DShaderManager::endRenderToTexture()
 	DEBUG_ASSERTCRASH(hr==S_OK, ("Set target failed unexpectedly."));
 	if (hr == S_OK)
 	{
+		// GeneralsX @bugfix Storm996 12/10/2026 A multisampled surface is not sampler-readable, so the scene
+		// we just drew into m_rttColorSurface has to be resolved into the texture below. This runs after the
+		// back buffer is current again because a surface bound as render target cannot be a StretchRect source.
+		if (m_rttColorSurface != m_newRenderSurface)
+		{
+			hr = DX8Wrapper::_Get_D3D_Device8()->StretchRect(m_rttColorSurface,nullptr,m_newRenderSurface,nullptr,D3DTEXF_NONE);
+			if (hr != S_OK)
+			{
+#ifdef _WIN32
+				static Bool reported=false;
+				if (!reported) {
+					reported=true;
+					fprintf(stderr, "[RTT] resolve into the sampled texture failed (0x%lX); post-processing keeps the un-resolved frame\n",(unsigned long)hr);
+					fflush(stderr);
+				}
+#endif // _WIN32
+				// The filters still sample whatever the previous resolve left in the texture. Failing the
+				// frame here would leave m_renderingToTexture stuck and disable the feature anyway.
+				hr = S_OK;
+			}
+			else
+			{
+#ifdef _WIN32
+				// One line per run is enough to prove the multisampled path is not just created but used.
+				static Bool resolveReported=false;
+				if (!resolveReported) {
+					resolveReported=true;
+					fprintf(stderr, "[RTT] multisampled scene resolved into the sampled texture\n");
+					fflush(stderr);
+				}
+#endif // _WIN32
+			}
+		}
+
 		//assume render target texture will be in stage 0.  Most hardware has "conditional" support for
 		//non-power-of-2 textures so we must force some required states:
 		DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
@@ -3451,12 +3773,134 @@ enum GraphicsVenderID CPP_11(: Int)
 	for coding around specific driver bugs.
  */
 //=============================================================================
-ChipsetType W3DShaderManager::getChipset()
+// GeneralsX @feature PS3.0 batch2 12/10/2026 ---------------------------------------------------------------
+// The shader-model ceiling the user asked for, as a tier. One table serves both -shadermodel and the
+// GENERALSX_SHADERMODEL environment variable, so the two channels cannot drift apart. Returns DC_MAX
+// for "no ceiling requested" (auto/0/empty) and sets *recognized=false for a token we do not know -
+// silently ignoring a typo would change the render tier without any visible trace.
+// 1.3 maps onto the 1.1 tier: there is no 1.3 tier, and a ceiling must never hand out features the
+// user withheld.
+static ChipsetType ShaderModelCapToTier(const char* text, Bool* recognized)
 {
-	//check if globaldata has an override for current chipset
-	if (TheGlobalData && TheGlobalData->m_chipSetType != DC_UNKNOWN)
-		return (ChipsetType)TheGlobalData->m_chipSetType;
+	if (recognized) *recognized=false;
+	if (!text || !*text) {
+		if (recognized) *recognized=true;
+		return DC_MAX;
+	}
 
+	char lower[32];
+	Int i=0;
+	for (; text[i] && i<31; ++i) {
+		char c=text[i];
+		lower[i]=(c>='A' && c<='Z')?(char)(c+('a'-'A')):c;
+	}
+	lower[i]='\0';
+
+	if (!strcmp(lower,"auto") || !strcmp(lower,"0")) {
+		*recognized=true;
+		return DC_MAX;
+	}
+	if (!strcmp(lower,"1.1") || !strcmp(lower,"11") || !strcmp(lower,"1.3") || !strcmp(lower,"13")) {
+		*recognized=true;
+		return DC_GENERIC_PIXEL_SHADER_1_1;
+	}
+	if (!strcmp(lower,"1.4") || !strcmp(lower,"14")) {
+		*recognized=true;
+		return DC_GENERIC_PIXEL_SHADER_1_4;
+	}
+	if (!strcmp(lower,"2.0") || !strcmp(lower,"2") || !strcmp(lower,"20")) {
+		*recognized=true;
+		return DC_GENERIC_PIXEL_SHADER_2_0;
+	}
+	if (!strcmp(lower,"3.0") || !strcmp(lower,"3") || !strcmp(lower,"30")) {
+		*recognized=true;
+		return DC_GENERIC_PIXEL_SHADER_3_0;
+	}
+	return DC_MAX;
+}
+
+// GeneralsX @feature PS3.0 batch2 12/10/2026 The ceiling can only lower the detected tier, never
+// raise it: a request for 3.0 on a device that reports 2.0 stays on 2.0. Command line wins over the
+// environment variable.
+static ChipsetType applyShaderModelCap(ChipsetType detected)
+{
+	const char* requested=nullptr;
+	static const char* s_envCap=getenv("GENERALSX_SHADERMODEL");
+
+	if (TheGlobalData && !TheGlobalData->m_shaderModelCap.isEmpty())
+		requested=TheGlobalData->m_shaderModelCap.str();
+	else if (s_envCap && *s_envCap)
+		requested=s_envCap;
+	if (!requested)
+		return detected;
+
+	Bool recognized=false;
+	ChipsetType cap=ShaderModelCapToTier(requested,&recognized);
+	if (!recognized) {
+		static Bool s_warned=false;
+		if (!s_warned) {
+			s_warned=true;
+			fprintf(stderr,"[SHADERMODEL] Ignored unknown shader model '%s' "
+				"(use 1.1, 1.4, 2.0, 3.0 or auto)\n",requested);
+			fflush(stderr);
+		}
+		return detected;
+	}
+	if (cap==DC_MAX || detected<=cap)
+		return detected;
+
+	static ChipsetType s_reportedCap=DC_MAX;
+	if (s_reportedCap!=cap) {
+		s_reportedCap=cap;
+		fprintf(stderr,"[SHADERMODEL] Tier capped: hardware tier %d -> requested tier %d\n",
+			(int)detected,(int)cap);
+		fflush(stderr);
+	}
+	return cap;
+}
+
+// GeneralsX @feature PS3.0 batch2 12/10/2026 ---------------------------------------------------------
+// The generic capability ladder: the pixel-shader model the device reports, gated by how many texture
+// stages a shader of that model can actually use. Deliberately a single function with two callers (the
+// legacy chipset classifier below, and getShaderModelTier) so the two can never disagree about what
+// ps_3_0 requires.
+//
+// Comparing the reported (major,minor) pair as integers: the code this replaced printed "1.10" through
+// sprintf and read it back with %f, which turns shader model 1.10 into 1.1 and 2.10 into 2.1 - and it
+// could not express 3.0 at all because the ladder stopped at DC_GENERIC_PIXEL_SHADER_2_0.
+static ChipsetType ShaderModelTierFromCaps()
+{
+	ChipsetType chip=DC_UNKNOWN;
+	const DX8Caps* caps=DX8Wrapper::Get_Current_Caps();
+
+	if (caps)
+	{
+		Int maxTextures=caps->Get_Max_Simultaneous_Textures();
+		Int psMajor=caps->Get_Pixel_Shader_Major_Version();
+		Int psMinor=caps->Get_Pixel_Shader_Minor_Version();
+
+		if (maxTextures >= 4)
+		{	if (psMajor > 1 || (psMajor == 1 && psMinor >= 1))
+				chip=DC_GENERIC_PIXEL_SHADER_1_1;
+			if (psMajor > 1 || (psMajor == 1 && psMinor >= 4))
+				chip=DC_GENERIC_PIXEL_SHADER_1_4;
+			if (maxTextures >= 8 && psMajor >= 2)
+				chip=DC_GENERIC_PIXEL_SHADER_2_0;
+			// ps_3_0 unlocks flow control, 32 temporaries and 224 pixel constants. Both runtimes
+			// measured in the port report 3.0 (native d3d9 and DXVK 2.6), so this is the tier the SM3
+			// render paths gate on.
+			if (maxTextures >= 8 && psMajor >= 3)
+				chip=DC_GENERIC_PIXEL_SHADER_3_0;
+		}
+	}
+
+	return chip;
+}
+
+// GeneralsX @feature PS3.0 batch2 12/10/2026 Detection split out of getChipset() so every return
+// path - the vendor-id matches included - goes through the shader-model ceiling.
+ChipsetType W3DShaderManager::detectChipsetTier()
+{
 	ChipsetType chip=DC_UNKNOWN;
 	IDirect3D9* d3d8Interface=DX8Wrapper::_Get_D3D8();
 
@@ -3517,26 +3961,79 @@ ChipsetType W3DShaderManager::getChipset()
 		}
 
 		//None of the vendor specific ID's matched so use generic means to classify the card
-		Int maxTextures=DX8Wrapper::Get_Current_Caps()->Get_Max_Simultaneous_Textures();
-		Real pixelShaderVersion;
-
-		char buf[256];
-
-		//Convert version to Real
-		sprintf(buf,"%d.%d",DX8Wrapper::Get_Current_Caps()->Get_Pixel_Shader_Major_Version(),DX8Wrapper::Get_Current_Caps()->Get_Pixel_Shader_Minor_Version());
-		sscanf(buf,"%f",&pixelShaderVersion);
-
-		if (maxTextures >= 4)
-		{	if (pixelShaderVersion >= 1.1f)
-				chip=DC_GENERIC_PIXEL_SHADER_1_1;
-			if (pixelShaderVersion >= 1.4f)
-				chip=DC_GENERIC_PIXEL_SHADER_1_4;
-			if (maxTextures >= 8 && pixelShaderVersion >= 2.0f)
-				chip=DC_GENERIC_PIXEL_SHADER_2_0;
-		}
+		chip=ShaderModelTierFromCaps();
 	}
 
 	return chip;
+}
+
+// GeneralsX @feature PS3.0 batch2 12/10/2026 ---------------------------------------------------------
+// One-time console record of both tier answers. Until now the engine picked them silently, so "the SM3
+// paths are not running" was indistinguishable from "the tier ladder is broken" without a debugger -
+// and the first run on real hardware needed exactly that distinction. Throttled by value, not by
+// count: a mid-session change (a cap being applied late, a chipset override) is worth a line.
+static const char* Chipset_Tier_Name(ChipsetType tier)
+{
+	switch (tier)
+	{
+		case DC_UNKNOWN:						return "unknown";
+		case DC_GENERIC_PIXEL_SHADER_1_1:		return "ps_1_1";
+		case DC_GENERIC_PIXEL_SHADER_1_4:		return "ps_1_4";
+		case DC_GENERIC_PIXEL_SHADER_2_0:		return "ps_2_0";
+		case DC_GENERIC_PIXEL_SHADER_3_0:		return "ps_3_0";
+		default:								return "vendor-chipset";
+	}
+}
+
+static void Report_Shader_Tiers(ChipsetType legacy, ChipsetType shaderModel)
+{
+	static ChipsetType s_loggedLegacy=DC_MAX, s_loggedShaderModel=DC_MAX;
+	if (s_loggedLegacy==legacy && s_loggedShaderModel==shaderModel)
+		return;
+	s_loggedLegacy=legacy;
+	s_loggedShaderModel=shaderModel;
+
+	const DX8Caps* caps=DX8Wrapper::Get_Current_Caps();
+	fprintf(stderr,"[CHIPSET_TIER] legacy=%s(%d) shadermodel=%s(%d)%s - PS v%d.%d / %d stages per pass\n",
+		Chipset_Tier_Name(legacy),(int)legacy,
+		Chipset_Tier_Name(shaderModel),(int)shaderModel,
+		legacy!=shaderModel?" (LADGERS DISAGREE)":"",
+		caps?caps->Get_Pixel_Shader_Major_Version():0,
+		caps?caps->Get_Pixel_Shader_Minor_Version():0,
+		caps?caps->Get_Max_Simultaneous_Textures():0);
+	fflush(stderr);
+}
+
+// GeneralsX @feature PS3.0 batch2 12/10/2026 ---------------------------------------------------------
+// Which shader model a render path may emit. The legacy ladder in getChipset() identifies 2001-era cards
+// by vendor/device id and also feeds the LOD preset table, so it must not be repurposed: on this
+// machine's NVIDIA GPU every device id >= 0x250 is classified DC_GEFORCE4 (ordinal 11), which sits
+// below DC_GENERIC_PIXEL_SHADER_3_0 (16) while the device itself reports PS v3.0. Gating SM3 paths on
+// getChipset() would therefore leave them permanently dead on exactly the hardware they were written
+// for - and raising the legacy ladder to 16 would move the auto-selected detail level as a side effect.
+ChipsetType W3DShaderManager::getShaderModelTier()
+{
+	// A forced chipset (the m_chipSetType override -noshaders writes) wins outright: it is the user
+	// turning shader features off, and a caps-derived answer would ignore that.
+	if (TheGlobalData && TheGlobalData->m_chipSetType != DC_UNKNOWN)
+		return (ChipsetType)TheGlobalData->m_chipSetType;
+
+	return applyShaderModelCap(ShaderModelTierFromCaps());
+}
+
+ChipsetType W3DShaderManager::getChipset()
+{
+	//check if globaldata has an override for current chipset
+	if (TheGlobalData && TheGlobalData->m_chipSetType != DC_UNKNOWN)
+	{
+		ChipsetType override=(ChipsetType)TheGlobalData->m_chipSetType;
+		Report_Shader_Tiers(override,getShaderModelTier());
+		return override;
+	}
+
+	ChipsetType inForce=applyShaderModelCap(detectChipsetTier());
+	Report_Shader_Tiers(inForce,getShaderModelTier());
+	return inForce;
 }
 
 //=============================================================================

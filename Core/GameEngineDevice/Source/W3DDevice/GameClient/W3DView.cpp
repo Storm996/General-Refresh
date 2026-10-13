@@ -1900,10 +1900,20 @@ void W3DView::draw()
 	Bool preRenderResult = false;
 
 	// GeneralsX @feature 05/10/2026 Keep the bloom post-processing filter active whenever no
-	// transient effect (BW reveal, crossfade, motion blur) holds the filter slot.
+	// transient effect (BW reveal, BW fade, crossfade, motion blur) holds the filter slot.
+	// GeneralsX @bugfix PS3.0 batch6 12/10/2026 setViewFilter() only hands a filter to the shader manager
+	// once a mode is already selected, and nothing ever selected one for the bloom filter - so the filter
+	// registered itself and then sat unused every frame. The mode has to come first.
+	// GeneralsX @bugfix PS3.0 batch6 13/10/2026 Restricted to the tactical view: the filter redirects the whole
+	// device and hands the frame back inside TheTacticalView's viewport, so a different view taking the slot moves
+	// its own scene out of the back buffer and never puts it back. The unit and building preview views are that
+	// case. The shell map is not - it renders through TheTacticalView, so it keeps the effect.
 	if (W3DShaderManager::IsBloomFilterEnabled() &&
-		(m_viewFilter == FT_VIEW_DEFAULT || m_viewFilter == FT_NULL_FILTER))
+		this == TheTacticalView &&
+		(m_viewFilter == FT_VIEW_DEFAULT || m_viewFilter == FT_NULL_FILTER) &&
+		m_viewFilterMode != FM_VIEW_BLOOM_DEFAULT)
 	{
+		setViewFilterMode(FM_VIEW_BLOOM_DEFAULT);
 		setViewFilter(FT_VIEW_BLOOM_FILTER);
 	}
 

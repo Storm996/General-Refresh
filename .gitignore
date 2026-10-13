@@ -119,6 +119,18 @@ references/GameServer/
 /T0 编译工具 64位/
 /PS升级/
 /PS3.0升级调研/
+# ===== General-Refresh: PS3.0 survey folders and private tools (2026-10-13) =====
+# AI-written survey reports and their validation assets; the engine changes
+# they document land as code commits, the folders themselves stay local.
+/PS3.0 光影升级/
+/PS3.0 升级调研/
+/PS3.0 法线贴图升级/
+/PS3.0 贴图升级/
+/PS3.0 阴影升级/
+/T3 法线贴图生成工具/
+/运行验证/
+/GeneralRefresh.exe
+/GeneralRefresh.pdb
 /docs/WORKDIR/support/IDE_IMPORTS/
 /GeneralsZH/
 /work_tmp/

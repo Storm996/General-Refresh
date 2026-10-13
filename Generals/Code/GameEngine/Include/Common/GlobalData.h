@@ -120,6 +120,12 @@ public:
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int m_skirmishTickRate;
 	Int	m_chipSetType;	///<See W3DShaderManager::ChipsetType for options
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 Shader-model ceiling requested by the user, kept as
+	// the raw token ("1.1"/"1.4"/"2.0"/"3.0"/"auto"); W3DShaderManager::getChipset() is the single
+	// place that maps it onto a ChipsetType, with GENERALSX_SHADERMODEL as the fallback. Empty = auto.
+	// Deliberately not registered in the INI table: GlobalData INI contents feed the replay/room CRC,
+	// so a render-quality switch must stay out of the packaged config (golden rule 7).
+	AsciiString m_shaderModelCap;
 
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// Run game without graphics, input or audio.

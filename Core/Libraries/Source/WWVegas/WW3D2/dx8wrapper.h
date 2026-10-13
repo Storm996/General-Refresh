@@ -47,7 +47,6 @@
 // Use angle brackets (not quotes) to skip local d3d8.h stub and get DXVK headers
 // DXVK's d3d8.h includes d3d8types.h internally - no manual includes needed
 #include <d3d9.h>
-#include <stdio.h>	// GeneralsX @test d3d9 port 12/10/2026 temporary _Copy_DX8_Rects trace, remove with it
 #include "WWMath/matrix4.h"
 #include "statistics.h"
 #include "WWLib/wwstring.h"
@@ -77,10 +76,25 @@
 #define	VALUE_NAME_RENDER_DEVICE_WINDOWED			"RenderDeviceWindowed"
 #define	VALUE_NAME_RENDER_DEVICE_TEXTURE_DEPTH		"RenderDeviceTextureDepth"
 
-const unsigned MAX_TEXTURE_STAGES=8;
+// GeneralsX @feature PS3.0 batch3 12/10/2026 The three per-stage caches below are the wrapper's
+// dirty-check tables. Anything at or above MAX_TEXTURE_STAGES bypasses them and is pushed to the
+// device on every call, so the bound has to cover the whole programmable-shader range: ps_1_4 gives
+// 6 samplers, ps_2_0 and ps_3_0 give 16. Fixed-function passes are unaffected - they keep being
+// limited by D3DCAPS9::MaxSimultaneousTextures through Get_Max_Textures_Per_Pass(), which is what the
+// clearing loops in Apply_Default_State and the lightmap passes iterate over.
+const unsigned MAX_TEXTURE_STAGES=16;
 const unsigned MAX_VERTEX_STREAMS=2;
-const unsigned MAX_VERTEX_SHADER_CONSTANTS=96;
-const unsigned MAX_PIXEL_SHADER_CONSTANTS=8;
+// GeneralsX @feature PS3.0 batch1 12/10/2026 Shader constant caches used to be sized for the ps_1_x
+// budget (8 pixel / 96 vertex registers), which is the first wall any ps_2_0+ shader hits. The caches
+// are now allocated at the shader model 3.0 spec sizes; the registers a shader may actually address
+// are the per-device limits DX8Wrapper::Get_*_Shader_Constant_Limit() report - the pixel count comes
+// from the reported shader model, the vertex count from D3DCAPS9, both floored at the legacy budget.
+const unsigned MAX_PIXEL_SHADER_CONSTANTS_PS1X=8;			// ps_1_1..1_4 c0..c7
+const unsigned MAX_VERTEX_SHADER_CONSTANTS_PS1X=96;		// legacy DX8 budget, kept as a floor
+const unsigned MAX_PIXEL_SHADER_CONSTANTS_SM3=224;		// ps_3_0 c0..c223 - the cache size
+const unsigned MAX_VERTEX_SHADER_CONSTANTS_SM3=256;		// vs_3_0 gives 256 (vs_2_0 gives 128)
+const unsigned MAX_VERTEX_SHADER_CONSTANTS=MAX_VERTEX_SHADER_CONSTANTS_SM3;
+const unsigned MAX_PIXEL_SHADER_CONSTANTS=MAX_PIXEL_SHADER_CONSTANTS_SM3;
 const unsigned MAX_SHADOW_MAPS=1;
 
 #define prevVer
@@ -338,6 +352,20 @@ public:
 	static void Set_DX8_ZBias(int zbias);
 	static void Set_Projection_Transform_With_Z_Bias(const Matrix4x4& matrix,float znear, float zfar);	// pointer to 16 matrices
 
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 the two hardware depth-bias render states. DX8 never
+	// offered them: the only bias the legacy API had was D3DRS_ZBIAS, an integer 0..15 that the d3d9 port
+	// now emulates in the projection matrix (Set_DX8_ZBias above). Slope-scaled bias is a per-primitive
+	// offset that the rasteriser applies from the surface gradient, so unlike the matrix emulation it can
+	// be changed per draw call without rebuilding the projection, and it is what a shadow-map pass needs
+	// to stop the shadow acne on shallow-angle geometry. Both are float render states (D3DRS_DEPTHBIAS
+	// 195, D3DRS_SLOPESCALEDEPTHBIAS 175), which puts them inside the RenderStates[256] dirty cache, so
+	// they travel through the same cached setter as every other state and get restored by
+	// Apply_Default_State.
+	static void Set_Depth_Bias(float bias);
+	static void Set_Slope_Scale_Depth_Bias(float scale);
+	static float Get_Depth_Bias() { return DepthBias; }
+	static float Get_Slope_Scale_Depth_Bias() { return SlopeScaleDepthBias; }
+
 	static void Set_Transform(D3DTRANSFORMSTATETYPE transform,const Matrix4x4& m);
 	static void Set_Transform(D3DTRANSFORMSTATETYPE transform,const Matrix3D& m);
 	static void Get_Transform(D3DTRANSFORMSTATETYPE transform, Matrix4x4& m);
@@ -520,7 +548,7 @@ public:
 	static void					Set_Render_Target (IDirect3DSwapChain9 *swap_chain);
 	static bool					Is_Render_To_Texture() { return IsRenderToTexture; }
 
-	// Platform display size provider — set by SDL3 layer at init
+	// Platform display size provider - set by SDL3 layer at init
 	typedef bool (*DisplaySizeFunc)(int& outW, int& outH, float& outDensity);
 	static void					Set_Display_Size_Provider(DisplaySizeFunc nativeSize, DisplaySizeFunc windowSize);
 	static bool					GetNativeDisplaySize(int& outW, int& outH, float& outDensity);
@@ -579,6 +607,14 @@ public:
 	static bool Reset_Device(bool reload_assets=true);
 
 	static const DX8Caps*	Get_Current_Caps() { WWASSERT(CurrentCaps); return CurrentCaps; }
+
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 addressable shader constant registers for this
+	// device, and the refusal path for writes outside them. An out-of-range register would index
+	// past Pixel_Shader_Constants/Vertex_Shader_Constants into the statics behind them, which is the
+	// hardest class of corruption to trace, so the setters reject it in release builds too.
+	static unsigned Get_Vertex_Shader_Constant_Limit() { return Vertex_Shader_Constant_Limit; }
+	static unsigned Get_Pixel_Shader_Constant_Limit() { return Pixel_Shader_Constant_Limit; }
+	static void Report_Shader_Constant_Range(const char* setter,int reg,int count);
 
 	static bool Registry_Save_Render_Device( const char * sub_key );
 	static bool Registry_Load_Render_Device( const char * sub_key, bool resize_window );
@@ -711,6 +747,10 @@ protected:
 
 	static Vector4							Vertex_Shader_Constants[MAX_VERTEX_SHADER_CONSTANTS];
 	static Vector4							Pixel_Shader_Constants[MAX_PIXEL_SHADER_CONSTANTS];
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 registers the caches above that this device may
+	// actually be addressed with; recomputed by Compute_Caps() whenever caps are rebuilt.
+	static unsigned							Vertex_Shader_Constant_Limit;
+	static unsigned							Pixel_Shader_Constant_Limit;
 
 	static LightEnvironmentClass*		Light_Environment;
 	static RenderInfoClass*				Render_Info;
@@ -775,6 +815,9 @@ protected:
 	static void								Pillarbox_Cleanup();
 
 	static int								ZBias;
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 fed by Set_Depth_Bias / Set_Slope_Scale_Depth_Bias
+	static float							DepthBias;
+	static float							SlopeScaleDepthBias;
 	static float							ZNear;
 	static float							ZFar;
 	// GeneralsX @refactor BenderAI 10/02/2026
@@ -822,9 +865,10 @@ WWINLINE void DX8Wrapper::Set_Vertex_Declaration(IDirect3DVertexDeclaration9* de
 
 WWINLINE void DX8Wrapper::Set_Pixel_Shader(UINT_PTR pixel_shader)
 {
-	// may be incorrect if shaders are created and destroyed dynamically
-	if (Pixel_Shader==pixel_shader) return;
-
+	// GeneralsX @bugfix PS3.0 batch1 12/10/2026 the old "same handle, nothing to do" fast path is not
+	// safe in D3D9: IDirect3DPixelShader9* addresses get recycled, and after a Reset the device holds
+	// no shader while the cache still names the old pointer - the fast path then skips a binding the
+	// frame really needs. SetPixelShader with an unchanged pointer is cheap, so always forward it.
 	Pixel_Shader=pixel_shader;
 	DX8CALL(SetPixelShader(reinterpret_cast<IDirect3DPixelShader9*>(pixel_shader)));
 }
@@ -833,6 +877,12 @@ WWINLINE void DX8Wrapper::Set_Pixel_Shader(UINT_PTR pixel_shader)
 // already a Vector4 count, identical to SetVertexShaderConstantF/SetPixelShaderConstantF semantics.
 WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, int count)
 {
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 budget guard (see Get_*_Shader_Constant_Limit)
+	if (reg < 0 || count <= 0 || (unsigned)(reg + count) > Get_Vertex_Shader_Constant_Limit()) {
+		Report_Shader_Constant_Range("Set_Vertex_Shader_Constant",reg,count);
+		return;
+	}
+
 	int memsize=sizeof(Vector4)*count;
 
 	// may be incorrect if shaders are created and destroyed dynamically
@@ -844,6 +894,12 @@ WWINLINE void DX8Wrapper::Set_Vertex_Shader_Constant(int reg, const void* data, 
 
 WWINLINE void DX8Wrapper::Set_Pixel_Shader_Constant(int reg, const void* data, int count)
 {
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 budget guard (see Get_*_Shader_Constant_Limit)
+	if (reg < 0 || count <= 0 || (unsigned)(reg + count) > Get_Pixel_Shader_Constant_Limit()) {
+		Report_Shader_Constant_Range("Set_Pixel_Shader_Constant",reg,count);
+		return;
+	}
+
 	int memsize=sizeof(Vector4)*count;
 
 	// may be incorrect if shaders are created and destroyed dynamically
@@ -1095,37 +1151,62 @@ WWINLINE UINT DX8_Format_Bytes_Per_Pixel(D3DFORMAT format)
 	}
 }
 
+// GeneralsX @bugfix d3d9 port 12/10/2026 Block size of a block-compressed format, 0 when the
+// format is not compressed. DX8 CopyRects accepted same-format DXT copies (the device just moved
+// 4x4 blocks), and the house-color remapper feeds exactly those through here. Reporting only
+// per-pixel sizes made every compressed copy look unacceptable and got it skipped, which left the
+// destination surface uninitialised - the retail symptom is a solid black unit texture.
+WWINLINE UINT DX8_Format_Bytes_Per_Block(D3DFORMAT format)
+{
+	switch (format) {
+	case D3DFMT_DXT1:
+		return 8;
+	case D3DFMT_DXT2:
+	case D3DFMT_DXT3:
+	case D3DFMT_DXT4:
+	case D3DFMT_DXT5:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
 // GeneralsX @bugfix d3d9 port 12/10/2026 Single row-copy primitive for the legal CPU routes below.
 // A lock whose pitch cannot hold the row, or a format whose pixel size is unknown, is reported as a
 // refusal so the caller can pick another route - copying anyway is what corrupted the heap.
-// The bounded stderr trace is temporary diagnostics for the shell-map crash hunt; delete before merge.
 WWINLINE bool DX8_Copy_Locked_Rect_Rows(
 	const D3DLOCKED_RECT& destinationLock,
 	const D3DLOCKED_RECT& sourceLock,
 	UINT rows,
 	UINT columns,
-	D3DFORMAT format,
-	const char* route)
+	D3DFORMAT format)
 {
-	static Int s_traceCount = 0;
-	const UINT bytesPerPixel = DX8_Format_Bytes_Per_Pixel(format);
-	const UINT rowBytes = columns * bytesPerPixel;
-	const bool acceptable = bytesPerPixel != 0 && rows != 0 && columns != 0
+	const UINT bytesPerBlock = DX8_Format_Bytes_Per_Block(format);
+	bool acceptableDims = false;
+	UINT rowBytes = 0;
+	UINT copyRows = rows;
+
+	if (bytesPerBlock != 0) {
+		// Compressed: rows become block rows and a row is whole 4x4 blocks. D3D9 refuses to lock
+		// a non block-aligned rectangle, so a partial rect reaching this path is already rejected
+		// by LockRect above the caller.
+		acceptableDims = rows != 0 && columns != 0;
+		copyRows = (rows + 3) / 4;
+		rowBytes = ((columns + 3) / 4) * bytesPerBlock;
+	} else {
+		const UINT bytesPerPixel = DX8_Format_Bytes_Per_Pixel(format);
+		acceptableDims = bytesPerPixel != 0 && rows != 0 && columns != 0;
+		rowBytes = columns * bytesPerPixel;
+	}
+
+	const bool acceptable = acceptableDims
 		&& destinationLock.Pitch > 0 && sourceLock.Pitch > 0
 		&& (UINT)destinationLock.Pitch >= rowBytes && (UINT)sourceLock.Pitch >= rowBytes;
-
-	if (s_traceCount < 64) {
-		++s_traceCount;
-		fprintf(stderr, "[COPYRECTS] %s fmt=0x%X bpp=%u %ux%u dstPitch=%d srcPitch=%d ok=%d\n",
-			route, (unsigned)format, bytesPerPixel, columns, rows,
-			destinationLock.Pitch, sourceLock.Pitch, acceptable ? 1 : 0);
-		fflush(stderr);
-	}
 
 	if (!acceptable) {
 		return false;
 	}
-	for (UINT row = 0; row < rows; ++row) {
+	for (UINT row = 0; row < copyRows; ++row) {
 		memcpy((unsigned char*)destinationLock.pBits + (INT_PTR)row * destinationLock.Pitch,
 			(const unsigned char*)sourceLock.pBits + (INT_PTR)row * sourceLock.Pitch,
 			rowBytes);
@@ -1169,7 +1250,7 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 						DX8_Copy_Locked_Rect_Rows(dstLock, srcLock,
 							srcDesc.Height < dstDesc.Height ? srcDesc.Height : dstDesc.Height,
 							srcDesc.Width < dstDesc.Width ? srcDesc.Width : dstDesc.Width,
-							dstDesc.Format, "sysmem->sysmem");
+							dstDesc.Format);
 						pDestinationSurface->UnlockRect();
 					}
 					pSourceSurface->UnlockRect();
@@ -1204,7 +1285,7 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 						hr = dstLevel->LockRect(&dstLock, nullptr, 0);
 						if (SUCCEEDED(hr)) {
 							DX8_Copy_Locked_Rect_Rows(dstLock, srcLock, copyRows, copyColumns,
-								dstDesc.Format, "sysmem->managed-level");
+								dstDesc.Format);
 							dstLevel->UnlockRect();
 						}
 						pSourceSurface->UnlockRect();
@@ -1226,7 +1307,7 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 							hr = stageLevel->LockRect(&stageLock, nullptr, 0);
 							if (SUCCEEDED(hr)) {
 								const bool staged = DX8_Copy_Locked_Rect_Rows(stageLock, srcLock, copyRows, copyColumns,
-									dstDesc.Format, "sysmem->staging-texture");
+									dstDesc.Format);
 								stageLevel->UnlockRect();
 								if (staged) {
 									hr = _Get_D3D_Device8()->UpdateTexture(stageTexture, dstTexture);
@@ -1284,9 +1365,20 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 	ZeroMemory(&rectDstDesc, sizeof(rectDstDesc));
 	DX8_ErrorCode(pDestinationSurface->GetDesc(&rectDstDesc));
 
+	// DX8 CopyRects demanded identical pixel formats, and the byte-level routes below can only
+	// honour that. A conversion is D3DXLoadSurfaceFromSurface's job (SurfaceClass::Copy takes that
+	// branch the moment the formats differ), so refusing here is both faithful and loud.
+	if (rectSrcDesc.Format != rectDstDesc.Format) {
+		WWDEBUG_SAY(("_Copy_DX8_Rects source format 0x%X differs from destination format 0x%X",
+			(unsigned)rectSrcDesc.Format, (unsigned)rectDstDesc.Format));
+		return;
+	}
+
 	IDirect3DSurface9* stagedSource = pSourceSurface;
 	IDirect3DSurface9* stagingSurface = nullptr;
-	if (rectSrcDesc.Pool != D3DPOOL_SYSTEMMEM && rectDstDesc.Pool != D3DPOOL_DEFAULT) {
+	// D3DPOOL_MANAGED texture levels are CPU-lockable, so only a DEFAULT-pool source needs a
+	// staging readback. Asking GetRenderTargetData for anything else is what used to fault.
+	if (rectSrcDesc.Pool == D3DPOOL_DEFAULT && rectDstDesc.Pool != D3DPOOL_DEFAULT) {
 		const HRESULT stageHr = _Get_D3D_Device8()->CreateOffscreenPlainSurface(
 			rectSrcDesc.Width, rectSrcDesc.Height, rectSrcDesc.Format, D3DPOOL_SYSTEMMEM, &stagingSurface, nullptr);
 		if (SUCCEEDED(stageHr) && stagingSurface != nullptr) {
@@ -1335,7 +1427,7 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 				hr = pDestinationSurface->LockRect(&dstLock, &dstRect, 0);
 				if (SUCCEEDED(hr)) {
 					if (!DX8_Copy_Locked_Rect_Rows(dstLock, srcLock, (UINT)copyRows, (UINT)copyColumns,
-							rectDstDesc.Format, "rects")) {
+							rectDstDesc.Format)) {
 						hr = D3DERR_INVALIDCALL;
 					}
 					pDestinationSurface->UnlockRect();
@@ -1578,7 +1670,18 @@ WWINLINE void DX8Wrapper::Get_Shader(ShaderClass& shader)
 
 WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 {
-	WWASSERT(stage<(unsigned int)CurrentCaps->Get_Max_Textures_Per_Pass());
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 the deferred dirty bitmask above only reserves bits
+	// 6..13, i.e. stages 0..7 - which is exactly what the device advertises as simultaneous textures -
+	// and bit 14 onward is MATERIAL_CHANGED/SHADER_CHANGED/vertex and index buffer. ps_3_0 samplers go to
+	// 16 slots, so a shader binding stage 8..15 through this call used to write a bit belonging to another
+	// state: the texture never arrived and the material or shader got re-applied instead. Send the high
+	// stages straight to the cached stage path, which covers all MAX_TEXTURE_STAGES.
+	if (stage >= 8)
+	{
+		Set_DX8_Texture(stage,texture ? texture->Peek_D3D_Base_Texture() : nullptr);
+		return;
+	}
+
 	if (texture==render_state.Textures[stage]) return;
 	REF_PTR_SET(render_state.Textures[stage],texture);
 	render_state_changed|=(TEXTURE0_CHANGED<<stage);
@@ -1645,7 +1748,7 @@ WWINLINE void DX8Wrapper::Set_DX8_ZBias(int zbias)
 	// where Z testing is off) intentionally skip the bias.
 	if (ZNear!=ZFar) {
 		// GeneralsX @refactor BenderAI 10/02/2026
-		// Changed D3DMATRIX → Matrix4x4 to match ProjectionMatrix type change
+		// Changed D3DMATRIX -> Matrix4x4 to match ProjectionMatrix type change
 		Matrix4x4 tmp=ProjectionMatrix;
 		float tmp_zbias=ZBias;
 		tmp_zbias*=(1.0f/16.0f);
@@ -1653,6 +1756,22 @@ WWINLINE void DX8Wrapper::Set_DX8_ZBias(int zbias)
 		tmp[2][2]-=tmp_zbias*tmp[3][2];
 		DX8CALL(SetTransform(D3DTS_PROJECTION,(D3DMATRIX*)&tmp));
 	}
+}
+
+// GeneralsX @feature PS3.0 batch7 13/10/2026 float render states travel as the bit pattern of the
+// float, the same way the fog range states above already do.
+WWINLINE void DX8Wrapper::Set_Depth_Bias(float bias)
+{
+	if (bias==DepthBias) return;
+	DepthBias=bias;
+	Set_DX8_Render_State(D3DRS_DEPTHBIAS,*(DWORD *)(&bias));
+}
+
+WWINLINE void DX8Wrapper::Set_Slope_Scale_Depth_Bias(float scale)
+{
+	if (scale==SlopeScaleDepthBias) return;
+	SlopeScaleDepthBias=scale;
+	Set_DX8_Render_State(D3DRS_SLOPESCALEDEPTHBIAS,*(DWORD *)(&scale));
 }
 
 // GeneralsX @refactor BenderAI 10/02/2026

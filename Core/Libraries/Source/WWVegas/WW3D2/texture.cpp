@@ -41,6 +41,7 @@
 
 #include "texture.h"
 
+#include <stdio.h>
 #include <d3d9.h>
 #include <d3dx9core.h>
 #include "dx8wrapper.h"
@@ -922,7 +923,6 @@ void TextureClass::Apply_New_Surface
 		Height=d3d_desc.Height;
 	}
 	surface->Release();
-
 }
 
 

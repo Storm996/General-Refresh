@@ -43,6 +43,9 @@
 #include "Common/Registry.h"
 #include "Common/version.h"
 
+// GeneralsX @feature Qoder 13/10/2026 getenv() for the shader-model override precedence check.
+#include <cstdlib>
+
 #include "GameClient/ClientInstance.h"
 #include "GameClient/GameClient.h"
 #include "GameClient/InGameUI.h"
@@ -89,9 +92,6 @@ static GameWindow *		comboBoxOnlineIP		= nullptr;
 
 static NameKeyType		comboBoxLANIPID	= NAMEKEY_INVALID;
 static GameWindow *		comboBoxLANIP		= nullptr;
-
-static NameKeyType    comboBoxAntiAliasingID   = NAMEKEY_INVALID;
-static GameWindow *   comboBoxAntiAliasing     = nullptr;
 
 static NameKeyType    comboBoxResolutionID      = NAMEKEY_INVALID;
 static GameWindow *   comboBoxResolution       = nullptr;
@@ -194,19 +194,319 @@ static GameWindow *   checkNoDynamicLod   = nullptr;
 static NameKeyType    checkUnlockFpsID = NAMEKEY_INVALID;
 static GameWindow *   checkUnlockFps   = nullptr;
 
-// GeneralsX @feature 11/10/2026 dot3 normal-mapping user toggle (on/off), default ON.
-static NameKeyType    checkNormalMappingID = NAMEKEY_INVALID;
-static GameWindow *   checkNormalMapping   = nullptr;
-
-// GeneralsX @feature 05/10/2026 User selectable global render FPS limit (30 / 60 / no limit).
-static NameKeyType    comboBoxMaxFpsLimitID = NAMEKEY_INVALID;
-static GameWindow *   comboBoxMaxFpsLimit   = nullptr;
-static const Int      s_maxFpsOptionValues[] = { 30, 60, 120, 1000 };
-static NameKeyType    staticTextMaxFpsLimitID = NAMEKEY_INVALID;
-static GameWindow *   staticTextMaxFpsLimit   = nullptr;
+// GeneralsX @refactor Qoder 12/10/2026 Max FPS limit and normal mapping moved to the options registry below.
 
 static NameKeyType    checkHeatEffectsID = NAMEKEY_INVALID;
 static GameWindow *   checkHeatEffects   = nullptr;
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 12/10/2026 Declarative options registry (menu rework plan S1).
+// One user-facing option = one row in s_gameOptionRegistry. The row binds: the Options.ini key
+// (single source of truth), the layout gadget, the display label, the value domain and the runtime
+// side effect. Control lookup, entry building, refill on open, save on accept and startup
+// application are done by three generic loops below, so adding a new option no longer needs
+// dedicated static pointers, init blocks, saveOptions branches or GameEngine.cpp overrides.
+enum GameOptionType
+{
+	GAME_OPTION_BOOL,  // CheckBox gadget, stored as 0/1
+	GAME_OPTION_COMBO, // ComboBox gadget, stored as the selected value from comboValues
+};
+
+struct GameOptionDesc
+{
+	GameOptionType type;
+	const char *iniKey;               // Options.ini key
+	const char *controlName;          // interactive gadget name in the layout
+	const char *labelControlName;     // optional static text to relabel; nullptr = label the gadget itself
+	const wchar_t *labelText;         // optional label text set from code (\u escapes keep the layout free of localized strings)
+	const Int *comboValues;           // GAME_OPTION_COMBO: one stored value per entry
+	const wchar_t *const *comboTexts; // optional entry display text; nullptr = show the number
+	Int comboCount;
+	Int (*globalFallback)();          // effective value shown when the key is absent from Options.ini
+	void (*apply)(Int value);         // runtime side effect; called on save, and at startup only when the key exists
+};
+
+static Int gameOptionFallback_FpsLimit()
+{
+	return TheGlobalData ? TheGlobalData->m_framesPerSecondLimit : 60;
+}
+
+static Int gameOptionFallback_NormalMapping()
+{
+	return TheGlobalData ? (TheGlobalData->m_useNormalMapping != FALSE) : FALSE;
+}
+
+static void gameOptionApply_FpsLimit(Int fpsLimit)
+{
+	TheWritableGlobalData->m_framesPerSecondLimit = fpsLimit;
+	TheWritableGlobalData->m_useFpsLimit = TRUE;
+	if (TheFramePacer)
+	{
+		TheFramePacer->setFramesPerSecondLimit(fpsLimit);
+	}
+}
+
+static void gameOptionApply_NormalMapping(Int enabled)
+{
+	TheWritableGlobalData->m_useNormalMapping = (enabled != 0) ? TRUE : FALSE;
+	DX8NormalMap::Set_Enabled(enabled != 0);
+}
+
+static Int gameOptionFallback_AntiAliasing()
+{
+	return TheGlobalData ? TheGlobalData->m_antiAliasLevel : 0;
+}
+
+// The stored value is the WW3D multisample level (0/2/4/8), same domain the retail chain wrote,
+// so the startup read in GlobalData.cpp and this apply agree on the Options.ini encoding.
+static void gameOptionApply_AntiAliasing(Int level)
+{
+	TheWritableGlobalData->m_antiAliasLevel = level;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 13/10/2026 Pixel-shader ceiling (PS 1.4 / 2.0 / 3.0 ladder) on the registry.
+// Options.ini stores the tier as the shader model times ten (11/14/20/30) with 0 = auto, which is the
+// same dotted-free spelling -shadermodel and GENERALSX_SHADERMODEL already accept, so the three entry
+// points cannot drift apart. W3DShaderManager::applyShaderModelCap reads the resulting
+// GlobalData string on every tier query; only the ceiling can move, never the hardware tier.
+
+// "1.4"/"14" -> 14, the bare-shorthand "2"/"3" -> 20/30, "auto"/unknown -> 0. Unknown spellings
+// collapse to auto on purpose: the UI must never display a tier that is not actually in effect.
+static Int shaderModelCapToInt(const AsciiString &cap)
+{
+	Int digits = 0;
+	const char *s = cap.str();
+	if (!s)
+		return 0;
+	for (; *s; ++s)
+	{
+		if (*s >= '0' && *s <= '9')
+			digits = digits * 10 + (*s - '0');
+	}
+	if (digits > 0 && digits < 11)
+		digits *= 10;
+	switch (digits)
+	{
+		case 11: case 14: case 20: case 30:
+			return digits;
+		default:
+			return 0;
+	}
+}
+
+static Int gameOptionFallback_ShaderModel()
+{
+	return shaderModelCapToInt(TheGlobalData ? TheGlobalData->m_shaderModelCap : AsciiString());
+}
+
+static void setShaderModelCap(Int cap, const char *source, Bool assetsAlreadyBuilt)
+{
+	if (!TheWritableGlobalData)
+		return;
+
+	AsciiString value;
+	if (cap != 0)
+		value.format("%d", cap);
+	if (TheWritableGlobalData->m_shaderModelCap == value)
+		return;
+
+	TheWritableGlobalData->m_shaderModelCap = value;
+
+	// The shader assets W3DShaderManager::init() builds are compiled once, before this callback can
+	// run on a save, so a menu change only reaches the session through the next restart or the device
+	// re-acquire a resolution change triggers. Exactly the restart semantics the AntiAliasing row has.
+	if (assetsAlreadyBuilt)
+	{
+		fprintf(stderr, "[SHADERMODEL] %s set the pixel-shader ceiling to %s; shaders already built "
+			"this session keep their tier until restart\n", source, value.isEmpty() ? "auto" : value.str());
+	}
+	else
+	{
+		fprintf(stderr, "[SHADERMODEL] %s set the pixel-shader ceiling to %s\n",
+			source, value.isEmpty() ? "auto" : value.str());
+	}
+	fflush(stderr);
+}
+
+static void gameOptionApply_ShaderModel(Int cap)
+{
+	setShaderModelCap(cap, "options menu", TRUE);
+}
+
+static const Int s_fpsLimitValues[] = { 30, 60, 120, 1000 };
+static const wchar_t *const s_fpsLimitTexts[] = { L"30 FPS", L"60 FPS", L"120 FPS", L"No Limit" };
+
+// GeneralsX @feature Qoder 12/10/2026 Anti aliasing moved onto the registry; the retail combo
+// lived hidden in VideoParent with CSF-built entries, now the gadget is relabeled/refilled here.
+static const Int s_antiAliasingValues[] = { 0, 2, 4, 8 };
+static const wchar_t *const s_antiAliasingTexts[] = { L"Off", L"2X", L"4X", L"8X" };
+
+// GeneralsX @feature Qoder 13/10/2026 The full ladder the renderer's cap parser understands; 1.1 is
+// kept because ps_1_1 bytecode is still what a retail .pso asset ships as.
+static const Int s_shaderModelValues[] = { 0, 11, 14, 20, 30 };
+static const wchar_t *const s_shaderModelTexts[] = { L"Auto", L"1.1", L"1.4", L"2.0", L"3.0" };
+
+static const GameOptionDesc s_gameOptionRegistry[] =
+{
+	{
+		GAME_OPTION_COMBO, "MaxFPSLimit", "OptionsMenu.wnd:ComboBoxMaxFpsLimit",
+		"OptionsMenu.wnd:StaticTextMaxFpsLimit", L"\u6700\u5927\u5e27\u7387",
+		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues),
+		gameOptionFallback_FpsLimit, gameOptionApply_FpsLimit,
+	},
+	{
+		GAME_OPTION_BOOL, "UseNormalMapping", "OptionsMenu.wnd:CheckNormalMapping",
+		nullptr, L"\u6cd5\u7ebf\u8d34\u56fe",
+		nullptr, nullptr, 0,
+		gameOptionFallback_NormalMapping, gameOptionApply_NormalMapping,
+	},
+	{
+		GAME_OPTION_COMBO, "AntiAliasing", "OptionsMenu.wnd:ComboBoxAntiAliasing",
+		"OptionsMenu.wnd:StaticTextAntiAliasing", L"\u6297\u952f\u9f7f",
+		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues),
+		gameOptionFallback_AntiAliasing, gameOptionApply_AntiAliasing,
+	},
+	{
+		GAME_OPTION_COMBO, "ShaderModel", "OptionsMenu.wnd:ComboBoxShaderModel",
+		"OptionsMenu.wnd:StaticTextShaderModel", L"\u7740\u8272\u5668\u6863\u4f4d",
+		s_shaderModelValues, s_shaderModelTexts, (Int)ARRAY_SIZE(s_shaderModelValues),
+		gameOptionFallback_ShaderModel, gameOptionApply_ShaderModel,
+	},
+};
+
+static GameWindow *s_gameOptionControls[ARRAY_SIZE(s_gameOptionRegistry)] = { nullptr };
+
+static void initGameOptionControls( const OptionPreferences *optionsPref )
+{
+	for (Int i = 0; i < (Int)ARRAY_SIZE(s_gameOptionRegistry); ++i)
+	{
+		const GameOptionDesc &desc = s_gameOptionRegistry[i];
+		GameWindow *control = TheWindowManager->winGetWindowFromId( nullptr,
+			TheNameKeyGenerator->nameToKey( desc.controlName ) );
+		s_gameOptionControls[i] = control;
+		if (!control)
+			continue; // layout variant without this gadget: safe no-op
+
+		if (desc.labelText)
+		{
+			if (desc.labelControlName)
+			{
+				GameWindow *label = TheWindowManager->winGetWindowFromId( nullptr,
+					TheNameKeyGenerator->nameToKey( desc.labelControlName ) );
+				if (label)
+					GadgetStaticTextSetText( label, UnicodeString(desc.labelText) );
+			}
+			else if (desc.type == GAME_OPTION_BOOL)
+			{
+				GadgetCheckBoxSetText( control, UnicodeString(desc.labelText) );
+			}
+		}
+
+		const Int value = optionsPref->getInt( desc.iniKey, desc.globalFallback() );
+
+		if (desc.type == GAME_OPTION_COMBO)
+		{
+			GadgetComboBoxReset( control );
+			for (Int e = 0; e < desc.comboCount; ++e)
+			{
+				UnicodeString text;
+				if (desc.comboTexts && desc.comboTexts[e])
+					text = UnicodeString(desc.comboTexts[e]);
+				else
+					text.format( L"%d", desc.comboValues[e] );
+				GadgetComboBoxAddEntry( control, text, GameMakeColor(255,255,255,255) );
+			}
+			// Snap the selection to the first entry that meets or exceeds the stored value.
+			Int sel = desc.comboCount - 1;
+			for (Int e = 0; e < desc.comboCount; ++e)
+			{
+				if (desc.comboValues[e] >= value)
+				{
+					sel = e;
+					break;
+				}
+			}
+			GadgetComboBoxSetSelectedPos( control, sel );
+		}
+		else if (desc.type == GAME_OPTION_BOOL)
+		{
+			GadgetCheckBoxSetChecked( control, value != 0 );
+		}
+	}
+}
+
+static void saveGameOptionControls( OptionPreferences *optionsPref )
+{
+	for (Int i = 0; i < (Int)ARRAY_SIZE(s_gameOptionRegistry); ++i)
+	{
+		const GameOptionDesc &desc = s_gameOptionRegistry[i];
+		const GameWindow *control = s_gameOptionControls[i];
+		if (!control)
+			continue;
+
+		Int value = 0;
+		if (desc.type == GAME_OPTION_COMBO)
+		{
+			Int pos = 0;
+			GadgetComboBoxGetSelectedPos( (GameWindow *)control, &pos );
+			pos = clamp( 0, pos, desc.comboCount - 1 );
+			value = desc.comboValues[pos];
+		}
+		else
+		{
+			value = GadgetCheckBoxIsChecked( (GameWindow *)control ) ? 1 : 0;
+		}
+
+		optionsPref->setInt( desc.iniKey, value );
+		if (desc.apply)
+			desc.apply( value );
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 12/10/2026 Apply registry options that the user actually saved.
+// Called once at engine startup (see GameEngine.cpp) before the frame pacer and the shell
+// map/shader installation consume the values. Keys absent from Options.ini keep the values
+// loaded from Generals.ini/SagePatch.ini, so retail defaults and QA overrides are untouched.
+void ApplyGameOptionRegistryAtStartup()
+{
+	OptionPreferences optionsPref;
+	for (Int i = 0; i < (Int)ARRAY_SIZE(s_gameOptionRegistry); ++i)
+	{
+		const GameOptionDesc &desc = s_gameOptionRegistry[i];
+		if (!desc.apply)
+			continue;
+		if (optionsPref.getAsciiString( desc.iniKey, AsciiString() ).isEmpty() )
+			continue;
+		desc.apply( optionsPref.getInt( desc.iniKey, desc.globalFallback() ) );
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 13/10/2026 Read the saved pixel-shader ceiling before the renderer starts.
+// W3DShaderManager::init() compiles the shader assets inside GameClient::init(), which GameEngine.cpp
+// runs well before ApplyGameOptionRegistryAtStartup(), so a tier saved by the options menu would
+// otherwise never be consumed. This replays that single key early; -shadermodel and
+// GENERALSX_SHADERMODEL keep their documented precedence (command line > environment > Options.ini),
+// and the generic registry pass afterwards re-applies the same value as a no-op.
+void ApplyShaderModelCapFromStartupOptions()
+{
+	if (!TheWritableGlobalData)
+		return;
+	if (!TheWritableGlobalData->m_shaderModelCap.isEmpty())
+		return; // -shadermodel already owns the ceiling
+
+	static const char *const s_envCap = getenv("GENERALSX_SHADERMODEL");
+	if (s_envCap && *s_envCap)
+		return; // the environment override owns the ceiling
+
+	OptionPreferences optionsPref;
+	if (optionsPref.getAsciiString( "ShaderModel", AsciiString() ).isEmpty() )
+		return;
+	setShaderModelCap( optionsPref.getInt( "ShaderModel", 0 ), "Options.ini", FALSE );
+}
+
 
 /*
 
@@ -357,9 +657,6 @@ static void setDefaults()
 		//
 		GadgetCheckBoxSetChecked( checkUnlockFps, !TheGlobalData->m_useFpsLimit);
 
-		if (checkNormalMapping)
-			GadgetCheckBoxSetChecked( checkNormalMapping, TheGlobalData->m_useNormalMapping );
-
 		//-------------------------------------------------------------------------------------------------
  		// Heat Effects
 		//
@@ -483,32 +780,9 @@ static void saveOptions()
 	}
 
 	//-------------------------------------------------------------------------------------------------
-	// Max render FPS limit
-	//
-	if (comboBoxMaxFpsLimit && comboBoxMaxFpsLimit->winGetEnabled())
-	{
-		Int selectedPos = 1;
-		GadgetComboBoxGetSelectedPos(comboBoxMaxFpsLimit, &selectedPos);
-		if (selectedPos >= 0 && selectedPos < ARRAY_SIZE(s_maxFpsOptionValues))
-		{
-			Int fpsLimit = s_maxFpsOptionValues[selectedPos];
-			pref->setInt("MaxFPSLimit", fpsLimit);
-			TheWritableGlobalData->m_framesPerSecondLimit = fpsLimit;
-			TheWritableGlobalData->m_useFpsLimit = TRUE;
-			// GeneralsX @feature 05/10/2026 Apply immediately so the change is visible without a restart.
-			TheFramePacer->setFramesPerSecondLimit(fpsLimit);
-		}
-	}
-
-	//-------------------------------------------------------------------------------------------------
-	// Normal mapping toggle (GeneralsX @feature 11/10/2026): persist to Options.ini + apply immediately.
-	if (checkNormalMapping)
-	{
-		Bool nmOn = GadgetCheckBoxIsChecked( checkNormalMapping );
-		TheWritableGlobalData->m_useNormalMapping = nmOn;
-		(*pref)["UseNormalMapping"] = nmOn ? "yes" : "no";
-		DX8NormalMap::Set_Enabled( nmOn != FALSE );
-	}
+	// GeneralsX @refactor Qoder 12/10/2026 Registry-driven options (max FPS limit, normal mapping, ...):
+	// read gadgets, persist to Options.ini and run each row's apply() for immediate effect.
+	saveGameOptionControls( pref );
 
 	//-------------------------------------------------------------------------------------------------
 	// LOD
@@ -565,23 +839,6 @@ static void saveOptions()
 			(*pref)["FirewallPortOverride"] = aStr;
 		}
 	}
-
-	//-------------------------------------------------------------------------------------------------
-	// antialiasing
-  GadgetComboBoxGetSelectedPos(comboBoxAntiAliasing, &index);
-  if( index >= 0 )
-  {
-		Int mode = WW3D::MULTISAMPLE_MODE_NONE;
-
-		// TheSuperHackers @info We are converting comboBox entry position to MultiSampleModeEnum values
-		index = clamp((int)OptionPreferences::AntiAliasingMode_OFF, index, (int)OptionPreferences::AntiAliasingMode_MSAA_8X);
-		mode = (index > 0) ? 1 << index : 0;
-
-		TheWritableGlobalData->m_antiAliasLevel = mode;
-    AsciiString prefString;
-		prefString.format("%d", mode);
-		(*pref)["AntiAliasing"] = prefString;
-  }
 
 	//-------------------------------------------------------------------------------------------------
 	// texture filter mode
@@ -1010,8 +1267,6 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	checkDoubleClickAttackMove   = TheWindowManager->winGetWindowFromId( nullptr, checkDoubleClickAttackMoveID );
 	sliderScrollSpeedID	   = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:SliderScrollSpeed" );
 	sliderScrollSpeed		   = TheWindowManager->winGetWindowFromId( nullptr,  sliderScrollSpeedID);
-	comboBoxAntiAliasingID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ComboBoxAntiAliasing" );
-	comboBoxAntiAliasing   = TheWindowManager->winGetWindowFromId( nullptr, comboBoxAntiAliasingID );
 	comboBoxResolutionID   = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ComboBoxResolution" );
 	comboBoxResolution     = TheWindowManager->winGetWindowFromId( nullptr, comboBoxResolutionID );
 	comboBoxDetailID			 = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ComboBoxDetail" );
@@ -1099,36 +1354,8 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	checkUnlockFpsID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckUnlockFPS" );
 	checkUnlockFps   = TheWindowManager->winGetWindowFromId( nullptr, checkUnlockFpsID);
 
-	checkNormalMappingID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckNormalMapping" );
-	checkNormalMapping   = TheWindowManager->winGetWindowFromId( nullptr, checkNormalMappingID);
-	if (checkNormalMapping)
-	{
-		// GeneralsX @feature 11/10/2026 Chinese label set in code (u-escapes avoid .wnd localization strings).
-		GadgetCheckBoxSetText( checkNormalMapping, UnicodeString(L"\u6cd5\u7ebf\u8d34\u56fe") );
-	}
-
-	// GeneralsX @feature 05/10/2026 Max render FPS limit combo box. The entries are added
-	// here in code, so the .wnd layout file stays free of localized strings.
-	comboBoxMaxFpsLimitID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ComboBoxMaxFpsLimit" );
-	comboBoxMaxFpsLimit   = TheWindowManager->winGetWindowFromId( nullptr, comboBoxMaxFpsLimitID);
-	if (comboBoxMaxFpsLimit)
-	{
-		GadgetComboBoxReset(comboBoxMaxFpsLimit);
-		GadgetComboBoxAddEntry(comboBoxMaxFpsLimit, UnicodeString(L"30 FPS"), GameMakeColor(255,255,255,255));
-		GadgetComboBoxAddEntry(comboBoxMaxFpsLimit, UnicodeString(L"60 FPS"), GameMakeColor(255,255,255,255));
-		GadgetComboBoxAddEntry(comboBoxMaxFpsLimit, UnicodeString(L"No Limit"), GameMakeColor(255,255,255,255));
-	}
-
-	// GeneralsX @feature 05/10/2026 Label text is set here in code so the .wnd layout file stays
-	// free of localized strings.
-	// GeneralsX @tweak 11/10/2026 Localized label to Chinese ("Max Frame Rate"), written with
-	// \u escapes to stay immune to source-codepage issues (MSVC 936).
-	staticTextMaxFpsLimitID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:StaticTextMaxFpsLimit" );
-	staticTextMaxFpsLimit   = TheWindowManager->winGetWindowFromId( nullptr, staticTextMaxFpsLimitID );
-	if (staticTextMaxFpsLimit)
-	{
-		GadgetStaticTextSetText( staticTextMaxFpsLimit, UnicodeString(L"\u6700\u5927\u5e27\u7387") );
-	}
+	// GeneralsX @refactor Qoder 12/10/2026 Registry gadgets: built, labeled and refilled from Options.ini.
+	initGameOptionControls( pref );
 
 	checkBuildingOcclusionID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckBehindBuilding" );
 	checkBuildingOcclusion   = TheWindowManager->winGetWindowFromId( nullptr, checkBuildingOcclusionID);
@@ -1244,37 +1471,8 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 			GadgetTextEntrySetText(textEntryFirewallPortOverride,uStr);
 	}
 
-	// populate anti aliasing modes
-	AsciiString selectedAliasingMode = (*pref)["AntiAliasing"];
-	GadgetComboBoxReset(comboBoxAntiAliasing);
-	AsciiString temp;
-	Int i=0;
-	for (; i < OptionPreferences::AntiAliasingMode_Count; ++i)
-	{
-		temp.format("GUI:AntiAliasing%d", i);
-		str = TheGameText->fetch( temp );
-		index = GadgetComboBoxAddEntry(comboBoxAntiAliasing, str, color);
-	}
-	Int val = atoi(selectedAliasingMode.str());
-	Int pos = 0;
-
-	// TheSuperHackers @info We are converting from human readable value to comboBox entry position
-	val = highestBit(val);
-
-	if (val == WW3D::MULTISAMPLE_MODE_NONE)
-		pos = OptionPreferences::AntiAliasingMode_OFF;
-	else if (val == WW3D::MULTISAMPLE_MODE_2X)
-		pos = OptionPreferences::AntiAliasingMode_MSAA_2X;
-	else if (val == WW3D::MULTISAMPLE_MODE_4X)
-		pos = OptionPreferences::AntiAliasingMode_MSAA_4X;
-	else if (val == WW3D::MULTISAMPLE_MODE_8X)
-		pos = OptionPreferences::AntiAliasingMode_MSAA_8X;
-
-	if (val < 0 || val > WW3D::MULTISAMPLE_MODE_8X)
-	{
-		TheWritableGlobalData->m_antiAliasLevel = pos = 0;
-	}
-	GadgetComboBoxSetSelectedPos(comboBoxAntiAliasing, pos);
+	// GeneralsX @refactor Qoder 12/10/2026 Anti aliasing entry building and refill now happens in
+	// initGameOptionControls via the options registry.
 
 	// get resolution from saved preferences file
 	AsciiString selectedResolution = (*pref) ["Resolution"];
@@ -1292,6 +1490,7 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	}
 
 	// populate resolution modes
+	Int i = 0; // GeneralsX @refactor Qoder 12/10/2026 was declared in the removed anti aliasing block
 	GadgetComboBoxReset(comboBoxResolution);
 	Int numResolutions = TheDisplay->getDisplayModeCount();
 	UnsignedInt displayWidth = TheDisplay->getWidth();
@@ -1365,22 +1564,7 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 
 	GadgetCheckBoxSetChecked( checkUnlockFps, !TheGlobalData->m_useFpsLimit);
 
-	if (checkNormalMapping)
-		GadgetCheckBoxSetChecked( checkNormalMapping, TheGlobalData->m_useNormalMapping );
-
-	//-------------------------------------------------------------------------------------------------
-	// Max render FPS limit
-	//
-	if (comboBoxMaxFpsLimit)
-	{
-		Int fpsLimit = pref->getInt("MaxFPSLimit", TheGlobalData->m_framesPerSecondLimit);
-		Int selectedPos = 1; // default to 60 FPS
-		if (fpsLimit <= s_maxFpsOptionValues[0])
-			selectedPos = 0;
-		else if (fpsLimit >= s_maxFpsOptionValues[2])
-			selectedPos = 2;
-		GadgetComboBoxSetSelectedPos(comboBoxMaxFpsLimit, selectedPos);
-	}
+	// GeneralsX @refactor Qoder 12/10/2026 Normal mapping / max FPS refill handled by initGameOptionControls().
 
 	GadgetCheckBoxSetChecked( checkBuildingOcclusion, TheGlobalData->m_enableBehindBuildingMarkers);
 

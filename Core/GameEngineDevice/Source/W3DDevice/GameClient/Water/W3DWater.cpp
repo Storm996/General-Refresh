@@ -855,25 +855,27 @@ void WaterRenderObjClass::ReleaseResources()
 // device, printing the compiler reason on failure. DEBUG_LOG is compiled out in Release builds, so
 // this uses stderr directly; without it a rejected source would silently leave the water on the
 // fixed-function path.
+// GeneralsX @feature PS3.0 batch8 13/10/2026 - the profile is no longer baked into the source strings:
+// both shaders go through W3DShaderManager::compileShaderAtBestProfile, so they are emitted at ps_3_0
+// wherever the caps ladder allows (flow control, 32 temporaries, 224 pixel constants for the sparkle
+// and shroud stacks to grow into) and step back down to ps_2_0 if the runtime refuses it. The helper
+// prints the profile it got, because which one that was is the fact worth keeping on screen.
 #ifdef _WIN32
 static void CompileWaterPixelShader(const char* name, const char* source, IDirect3DPixelShader9** shaderOut)
 {
-	LPD3DXBUFFER compiledShader = nullptr;
-	LPD3DXBUFFER compileError = nullptr;
-	IDirect3DPixelShader9* shader = nullptr;
+	const char* profile = nullptr;
+	void* handle = nullptr;
 
-	HRESULT hr = D3DXAssembleShader(source, (UINT)strlen(source), 0, nullptr, &compiledShader, &compileError);
-	if (SUCCEEDED(hr) && compiledShader != nullptr)
-		hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((const DWORD*)compiledShader->GetBufferPointer(), &shader);
-	if (compiledShader) compiledShader->Release();
+	// compileShaderAtBestProfile already reports the failing profile, the HRESULT and the compiler
+	// reason on stderr, so only the success case is logged here.
+	const HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(source, false, "[WATER]", &profile, &handle);
+	*shaderOut = SUCCEEDED(hr) ? (IDirect3DPixelShader9*)handle : nullptr;
 
-	const char* reason = (FAILED(hr) && compileError && compileError->GetBufferPointer())
-		? (const char*)compileError->GetBufferPointer() : "";
-	fprintf(stderr, "[WATER] %s pixel shader hr=0x%08X handle=%p %s\n", name, (unsigned)hr, (void*)shader, reason);
-	fflush(stderr);
-
-	if (compileError) compileError->Release();
-	*shaderOut = SUCCEEDED(hr) ? shader : nullptr;
+	if (*shaderOut)
+	{
+		fprintf(stderr, "[WATER] %s pixel shader compiled as %s handle=%p\n", name, profile, (void*)*shaderOut);
+		fflush(stderr);
+	}
 }
 #endif // _WIN32
 
@@ -960,7 +962,6 @@ void WaterRenderObjClass::ReAcquireResources()
 		// texbem instruction - is gone together with its handle: texbem has no D3D9 equivalent, and
 		// nothing in the tree ever bound m_waterPixelShader to the device, so it was dead code.
 		CompileWaterPixelShader("river",
-			"// d3d-target: ps_2_0\n"
 			"sampler s0 : register(s0);\n"                 // river texture
 			"sampler s1 : register(s1);\n"                 // sparkles
 			"sampler s2 : register(s2);\n"                 // noise
@@ -978,7 +979,6 @@ void WaterRenderObjClass::ReAcquireResources()
 			&m_riverWaterPixelShader);
 
 		CompileWaterPixelShader("trapezoid",
-			"// d3d-target: ps_2_0\n"
 			"sampler s0 : register(s0);\n"                 // water texture
 			"sampler s1 : register(s1);\n"                 // white highlights on black background
 			"sampler s2 : register(s2);\n"                 // white highlights with more tiling

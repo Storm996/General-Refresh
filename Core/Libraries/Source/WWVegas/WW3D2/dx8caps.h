@@ -242,6 +242,11 @@ public:
 	int Get_Pixel_Shader_Major_Version() const { return 0xff&(PixelShaderVersion>>8); }
 	int Get_Pixel_Shader_Minor_Version() const { return 0xff&(PixelShaderVersion); }
 	int Get_Max_Simultaneous_Textures()	const { return MaxSimultaneousTextures;}
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 shader budget probes, fed by Check_Shader_Support.
+	// D3DCAPS9 reports a vertex constant-register count but, unlike D3DCAPS8, no pixel one: under d3d9
+	// the pixel budget is fixed by the reported shader model (8 / 32 / 224).
+	int Get_Max_Pixel_Shader_Constants() const { return MaxPixelShaderConst; }
+	int Get_Max_Vertex_Shader_Constants() const { return MaxVertexShaderConst; }
 
 	bool Support_Texture_Format(WW3DFormat format) const { return SupportTextureFormat[format]; }
 	bool Support_Render_To_Texture_Format(WW3DFormat format) const { return SupportRenderToTextureFormat[format]; }
@@ -307,6 +312,9 @@ private:
 	int VertexShaderVersion;
 	int PixelShaderVersion;
 	int MaxSimultaneousTextures;
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 fed by Check_Shader_Support
+	int MaxPixelShaderConst;
+	int MaxVertexShaderConst;
 	unsigned DeviceId;
 	unsigned DriverBuildVersion;
 	DriverVersionStatusType DriverVersionStatus;

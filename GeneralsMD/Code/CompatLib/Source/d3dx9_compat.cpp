@@ -189,6 +189,92 @@ static void DecompressDXTBlock(const unsigned char *block, D3DFORMAT fmt, unsign
 	for (int t = 0; t < 16; ++t) out[t][3] = alpha[t];
 }
 
+// GeneralsX @bugfix d3d9 port 12/10/2026 d3dx8 decompressed a block-compressed surface on the fly
+// whenever the destination format differed; the house-colour remapper depends on that, because
+// recoloring is per-pixel CPU work and a DXT source has no pixels to touch. D3D9 has no such
+// conversion, so decode the covered blocks here. Only 32-bit destinations are supported, which is
+// what every caller in this tree asks for (Get_Valid_Texture_Format never returns 16-bit formats
+// when the device depth is 32).
+static HRESULT UnpackDXTTo32BitSurface(
+	LPDIRECT3DSURFACE9 pDestSurface,
+	CONST RECT *pDestRect,
+	LPDIRECT3DSURFACE9 pSrcSurface,
+	CONST RECT *pSrcRect,
+	const D3DSURFACE_DESC &descSrc,
+	const D3DSURFACE_DESC &descDest)
+{
+	if (descDest.Format != D3DFMT_A8R8G8B8 && descDest.Format != D3DFMT_X8R8G8B8) {
+		return D3DERR_INVALIDCALL;
+	}
+
+	const LONG srcX = pSrcRect ? pSrcRect->left : 0;
+	const LONG srcY = pSrcRect ? pSrcRect->top : 0;
+	const LONG srcWidth = pSrcRect ? pSrcRect->right - pSrcRect->left : (LONG)descSrc.Width;
+	const LONG srcHeight = pSrcRect ? pSrcRect->bottom - pSrcRect->top : (LONG)descSrc.Height;
+	const LONG dstX = pDestRect ? pDestRect->left : 0;
+	const LONG dstY = pDestRect ? pDestRect->top : 0;
+	const LONG dstWidth = pDestRect ? pDestRect->right - pDestRect->left : (LONG)descDest.Width;
+	const LONG dstHeight = pDestRect ? pDestRect->bottom - pDestRect->top : (LONG)descDest.Height;
+
+	const LONG width = (srcWidth < dstWidth ? srcWidth : dstWidth);
+	const LONG height = (srcHeight < dstHeight ? srcHeight : dstHeight);
+	if (width <= 0 || height <= 0 || srcX < 0 || srcY < 0
+		|| srcX + width > (LONG)descSrc.Width || srcY + height > (LONG)descSrc.Height
+		|| dstX < 0 || dstY < 0
+		|| dstX + width > (LONG)descDest.Width || dstY + height > (LONG)descDest.Height) {
+		return D3DERR_INVALIDCALL;
+	}
+
+	D3DLOCKED_RECT sourceLock;
+	if (FAILED(pSrcSurface->LockRect(&sourceLock, NULL, D3DLOCK_READONLY))) {
+		return D3DERR_INVALIDCALL;
+	}
+	D3DLOCKED_RECT destLock;
+	if (FAILED(pDestSurface->LockRect(&destLock, NULL, 0))) {
+		pSrcSurface->UnlockRect();
+		return D3DERR_INVALIDCALL;
+	}
+
+	const int bytesPerBlock = DXTHasAlpha(descSrc.Format) ? 16 : 8;
+	const unsigned char *sourceBase = (const unsigned char *)sourceLock.pBits;
+	unsigned char *destBase = (unsigned char *)destLock.pBits;
+	const LONG firstBlockX = srcX / 4;
+	const LONG lastBlockX = (srcX + width - 1) / 4;
+	const LONG firstBlockY = srcY / 4;
+	const LONG lastBlockY = (srcY + height - 1) / 4;
+
+	for (LONG blockY = firstBlockY; blockY <= lastBlockY; ++blockY) {
+		for (LONG blockX = firstBlockX; blockX <= lastBlockX; ++blockX) {
+			unsigned char block[16][4];
+			DecompressDXTBlock(
+				sourceBase + (size_t)blockY * sourceLock.Pitch + (size_t)blockX * bytesPerBlock,
+				descSrc.Format, block);
+
+			for (int subY = 0; subY < 4; ++subY) {
+				const LONG sy = blockY * 4 + subY;
+				if (sy < srcY || sy >= srcY + height) continue;
+				for (int subX = 0; subX < 4; ++subX) {
+					const LONG sx = blockX * 4 + subX;
+					if (sx < srcX || sx >= srcX + width) continue;
+					const unsigned char *pixel = block[subY * 4 + subX];
+					unsigned char *target = destBase
+						+ (size_t)(dstY + sy - srcY) * destLock.Pitch
+						+ (size_t)(dstX + sx - srcX) * 4;
+					// A8R8G8B8/X8R8G8B8 store bytes in B,G,R,A order; block[][] is R,G,B,A.
+					target[0] = pixel[2];
+					target[1] = pixel[1];
+					target[2] = pixel[0];
+					target[3] = pixel[3];
+				}
+			}
+		}
+	}
+
+	pDestSurface->UnlockRect();
+	pSrcSurface->UnlockRect();
+	return D3D_OK;
+}
+
 HRESULT WINAPI
 D3DXLoadSurfaceFromSurface(
 	LPDIRECT3DSURFACE9 pDestSurface,
@@ -210,7 +296,11 @@ D3DXLoadSurfaceFromSurface(
 
 	if (descSrc.Format != descDest.Format)
 	{
-		// Currently we only support scaling between formats of the same type
+		if (IsDXTFormat(descSrc.Format) && !pSrcPalette && !pDestPalette) {
+			return UnpackDXTTo32BitSurface(
+				pDestSurface, pDestRect, pSrcSurface, pSrcRect, descSrc, descDest);
+		}
+		// Anything else still needs matching formats.
 		return D3DERR_INVALIDCALL;
 	}
 

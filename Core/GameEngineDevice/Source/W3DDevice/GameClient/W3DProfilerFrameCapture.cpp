@@ -20,6 +20,7 @@
 
 #include "../../../Include/W3DDevice/GameClient/W3DProfilerFrameCapture.h"
 
+#include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/surfaceclass.h"
 #include "WW3D2/texture.h"
@@ -65,11 +66,13 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	// compile swizzle shader convert BGRA to RGBA
 	if (!m_swizzleShader)
 	{
-		ID3DXBuffer *compiledShader = nullptr;
+#ifdef _WIN32
 		// GeneralsX @build d3d9 port 12/10/2026 - HLSL now that the D3D9 path has no DX8 assembler.
 		// c0/c1/c2 are the per-channel masks set below; the sampled alpha passes through untouched.
+		// GeneralsX @feature PS3.0 batch8 13/10/2026 - no "// d3d-target:" line: the shared ladder
+		// prefixes the highest profile the caps report, so this is ps_3_0 where the device takes it
+		// instead of a hard-coded ps_2_0, and steps back down by itself when it does not.
 		const char *shader =
-			"// d3d-target: ps_2_0\n"
 			"sampler s0 : register(s0);\n"
 			"float4 c0 : register(c0);\n"
 			"float4 c1 : register(c1);\n"
@@ -80,15 +83,17 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 			"    return float4(t.b * c0.rgb + t.g * c1.rgb + t.r * c2.rgb, t.a);\n"
 			"}\n";
 
-		HRESULT hr = D3DXAssembleShader(shader, strlen(shader), 0, nullptr, &compiledShader, nullptr);
-		if (FAILED(hr))
+		void *handle = nullptr;
+		// compileShaderAtBestProfile prints the failing profile, HRESULT and compiler reason itself.
+		if (FAILED(W3DShaderManager::compileShaderAtBestProfile(shader, false, "[PROFILER]", nullptr, &handle)))
 			return;
 
-		hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader((const DWORD*)compiledShader->GetBufferPointer(), &m_swizzleShader);
-		compiledShader->Release();
-
-		if (FAILED(hr))
-			return;
+		m_swizzleShader = (IDirect3DPixelShader9 *)handle;
+#else
+		// Runtime HLSL compilation only exists on Windows, so there is no swizzle shader to run the
+		// capture through. Returning here keeps the previous behaviour of a silently disabled capture.
+		return;
+#endif
 	}
 
 	// allocate render target

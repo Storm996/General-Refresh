@@ -58,6 +58,15 @@ extern void OptionsMenuUpdate( WindowLayout *layout, void *userData );
 extern void OptionsMenuShutdown( WindowLayout *layout, void *userData );
 extern WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg, WindowMsgData mData1, WindowMsgData mData2 );
 extern WindowMsgHandledType OptionsMenuInput( GameWindow *window, UnsignedInt msg, WindowMsgData mData1, WindowMsgData mData2 );
+// GeneralsX @feature Qoder 12/10/2026 Apply the declarative options registry (OptionsMenu.cpp) from
+// Options.ini at engine startup. Only keys the user actually saved are applied; everything else keeps
+// the values loaded from Generals.ini/SagePatch.ini.
+extern void ApplyGameOptionRegistryAtStartup();
+
+// GeneralsX @feature Qoder 13/10/2026 Replay the Options.ini pixel-shader ceiling (ShaderModel=) before
+// the game client builds the W3D shader assets, so a tier picked in the options menu is in effect from
+// the next launch. Command line and environment overrides take precedence and are left untouched.
+extern void ApplyShaderModelCapFromStartupOptions();
 
 // Map Select Menu --------------------------------------------------------------------------------
 extern void MapSelectMenuInit( WindowLayout *layout, void *userData );

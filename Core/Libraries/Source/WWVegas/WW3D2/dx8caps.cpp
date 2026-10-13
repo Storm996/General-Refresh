@@ -822,9 +822,19 @@ void DX8Caps::Check_Shader_Support(const D3DCAPS9& caps)
 {
 	VertexShaderVersion=caps.VertexShaderVersion;
 	PixelShaderVersion=caps.PixelShaderVersion;
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 read the constant-register budgets - until now no
+	// code in the tree queried them, so the engine-side budget was pure guesswork.
+	// GeneralsX @bugfix d3d9 port 12/10/2026 D3DCAPS9 has no MaxPixelShaderConst (that field was
+	// DX8-only); under d3d9 the pixel-constant budget is fixed by the reported shader model.
+	MaxPixelShaderConst=
+		(caps.PixelShaderVersion>=D3DPS_VERSION(3,0)) ? 224 :
+		(caps.PixelShaderVersion>=D3DPS_VERSION(2,0)) ? 32 : 8;
+	MaxVertexShaderConst=caps.MaxVertexShaderConst;
 	DXLOG(("Vertex shader version: %d.%d, pixel shader version: %d.%d\r\n",
 		(VertexShaderVersion>>8)&0xff,VertexShaderVersion&0xff,
 		(PixelShaderVersion>>8)&0xff,PixelShaderVersion&0xff));
+	DXLOG(("Shader constant registers reported by the device: vertex %d, pixel %d\r\n",
+		MaxVertexShaderConst,MaxPixelShaderConst));
 }
 
 void DX8Caps::Check_Driver_Version_Status()
@@ -1016,19 +1026,14 @@ void DX8Caps::Vendor_Specific_Hacks(const D3DADAPTER_IDENTIFIER9& adapter_id)
 		if (SupportNPatches) {
 			DXLOG(("NVidia Driver reported N-Patch support, disabling.\r\n"));
 		}
-		if (SupportTextureFormat[WW3D_FORMAT_DXT1]) {
-			DXLOG(("Disabling DXT1 support on NVidia hardware.\r\n"));
-		}
 
 		SupportNPatches = false;	// Driver incorrectly report N-Patch support
-		SupportTextureFormat[WW3D_FORMAT_DXT1] = false;			// DXT1 is broken on NVidia hardware
-		SupportDXTC=
-			SupportTextureFormat[WW3D_FORMAT_DXT1]|
-			SupportTextureFormat[WW3D_FORMAT_DXT2]|
-			SupportTextureFormat[WW3D_FORMAT_DXT3]|
-			SupportTextureFormat[WW3D_FORMAT_DXT4]|
-			SupportTextureFormat[WW3D_FORMAT_DXT5];
 
+		// GeneralsX @bugfix d3d9 port 12/10/2026 Retail forced DXT1 off here too, working around 2002
+		// era NV drivers that mis-decoded one-bit-alpha blocks. Under DXVK that workaround is the bug:
+		// Get_Valid_Texture_Format then promotes every DXT1 asset to DXT2, so premultiplied
+		// interpolated alpha gets read out of a DXT1 block - and the team-colour skins are exactly
+		// those assets. Report what the device actually supports instead.
 
     if (DeviceId == DEVICE_NVIDIA_GEFORCE2_MX ||
         DeviceId == DEVICE_NVIDIA_GEFORCE2_MX_400 )

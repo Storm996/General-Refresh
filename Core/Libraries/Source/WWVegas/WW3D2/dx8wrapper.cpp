@@ -326,7 +326,7 @@ void DX8Wrapper::Pillarbox_End()
 	D3DDevice->SetViewport(&vp);
 	D3DDevice->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0);
 
-	// Use DX8Wrapper's cached state setters so the cache stays in sync — no invalidation needed.
+	// Use DX8Wrapper's cached state setters so the cache stays in sync - no invalidation needed.
 	D3DDevice->SetTexture(0, s_offscreenTex);
 	Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
 	Set_DX8_Render_State(D3DRS_ZWRITEENABLE, FALSE);
@@ -434,6 +434,11 @@ IDirect3DVertexDeclaration9*		DX8Wrapper::Vertex_Declaration					= nullptr;
 
 Vector4							DX8Wrapper::Vertex_Shader_Constants[MAX_VERTEX_SHADER_CONSTANTS];
 Vector4							DX8Wrapper::Pixel_Shader_Constants[MAX_PIXEL_SHADER_CONSTANTS];
+// GeneralsX @feature PS3.0 batch1 12/10/2026 start from the pre-2.0 budget so a caller that runs
+// before Compute_Caps() cannot address registers the historic code could not; Compute_Caps widens
+// them to what the device reports.
+unsigned							DX8Wrapper::Vertex_Shader_Constant_Limit=MAX_VERTEX_SHADER_CONSTANTS_PS1X;
+unsigned							DX8Wrapper::Pixel_Shader_Constant_Limit=MAX_PIXEL_SHADER_CONSTANTS_PS1X;
 
 LightEnvironmentClass*		DX8Wrapper::Light_Environment							= nullptr;
 
@@ -466,6 +471,9 @@ unsigned							DX8Wrapper::_MainThreadID								= 0;
 bool								DX8Wrapper::CurrentDX8LightEnables[4];
 bool								DX8Wrapper::IsDeviceLost;
 int								DX8Wrapper::ZBias;
+// GeneralsX @feature PS3.0 batch7 13/10/2026 hardware depth bias mirror values, see DX8Wrapper::Set_Depth_Bias
+float							DX8Wrapper::DepthBias=0.0f;
+float							DX8Wrapper::SlopeScaleDepthBias=0.0f;
 float								DX8Wrapper::ZNear;
 float								DX8Wrapper::ZFar;
 // GeneralsX @refactor BenderAI 10/02/2026 - Use Matrix4x4 not D3DMATRIX (fighter19 pattern)
@@ -601,7 +609,9 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	// zero memory
 	memset(Textures,0,sizeof(IDirect3DBaseTexture9*)*MAX_TEXTURE_STAGES);
 	memset(RenderStates,0,sizeof(unsigned)*256);
-	memset(TextureStageStates,0,sizeof(unsigned)*32*MAX_TEXTURE_STAGES);
+	// GeneralsX @build PS3.0 batch1 12/10/2026 the TSS cache row is 33 wide since D3DTSS_CONSTANT was
+	// added; a hard-coded 32 left the last column carrying stale contents across init.
+	memset(TextureStageStates,0,sizeof(TextureStageStates));
 	memset(Vertex_Shader_Constants,0,sizeof(Vector4)*MAX_VERTEX_SHADER_CONSTANTS);
 	memset(Pixel_Shader_Constants,0,sizeof(Vector4)*MAX_PIXEL_SHADER_CONSTANTS);
 	memset(&render_state,0,sizeof(RenderStateStruct));
@@ -718,16 +728,16 @@ void DX8Wrapper::Shutdown()
 
 	}
 
-	if (CurrentCaps)
+	// GeneralsX @bugfix PS3.0 batch3 12/10/2026 release the whole texture cache, not just the
+	// fixed-function per-pass count. Set_DX8_Texture AddRefs into Textures[] for every stage below
+	// MAX_TEXTURE_STAGES, so bounding the release loop by Get_Max_Textures_Per_Pass() leaked the
+	// references held at the higher stages (which programmable shader passes do use).
+	for (int i = 0; i < (int)MAX_TEXTURE_STAGES; i++)
 	{
-		int max=CurrentCaps->Get_Max_Textures_Per_Pass();
-		for (int i = 0; i < max; i++)
+		if (Textures[i])
 		{
-			if (Textures[i])
-			{
-				Textures[i]->Release();
-				Textures[i] = nullptr;
-			}
+			Textures[i]->Release();
+			Textures[i] = nullptr;
 		}
 	}
 
@@ -823,6 +833,20 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 		Textures[a]=nullptr;
 	}
 
+	// GeneralsX @bugfix PS3.0 batch1 12/10/2026 the shader-handle caches were missing here. After a
+	// device Reset the bindings are gone but Vertex_Shader/Pixel_Shader/Vertex_Declaration still held
+	// the old values, so a shader re-bound to the same (or a recycled) address took the setters'
+	// "unchanged" fast path and the device silently kept running with no shader at all. Clear the
+	// cache and push the matching null so cache and device leave Reset in agreement.
+	Vertex_Shader=0;
+	Pixel_Shader=0;
+	Vertex_Declaration=nullptr;
+	if (_Get_D3D_Device8()) {
+		_Get_D3D_Device8()->SetVertexShader(nullptr);
+		_Get_D3D_Device8()->SetPixelShader(nullptr);
+		_Get_D3D_Device8()->SetVertexDeclaration(nullptr);
+	}
+
 	ShaderClass::Invalidate();
 
 	//Need to explicitly set render_state texture pointers to null. MW
@@ -851,7 +875,10 @@ void DX8Wrapper::Do_Onetime_Device_Dependent_Shutdowns()
 	if (render_state.index_buffer) render_state.index_buffer->Release_Engine_Ref();
 	REF_PTR_RELEASE(render_state.index_buffer);
 	REF_PTR_RELEASE(render_state.material);
-	for (i=0;i<CurrentCaps->Get_Max_Textures_Per_Pass();++i) REF_PTR_RELEASE(render_state.Textures[i]);
+	// GeneralsX @bugfix PS3.0 batch3 12/10/2026 same reason as the Textures[] cache release above: the
+	// snapshot struct has MAX_TEXTURE_STAGES slots, so releasing only Get_Max_Textures_Per_Pass() of
+	// them leaks whatever a programmable shader pass left in the upper slots.
+	for (i=0;i<(int)MAX_TEXTURE_STAGES;++i) REF_PTR_RELEASE(render_state.Textures[i]);
 
 
 	TextureLoader::Deinit();
@@ -3402,6 +3429,115 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 	DX8_Assert();
 	delete CurrentCaps;
 	CurrentCaps=new DX8Caps(_Get_D3D8(),D3DDevice,display_format,Get_Current_Adapter_Identifier());
+
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 derive the addressable shader constant budgets from
+	// the caps report. Pixel: DX8Caps already maps the shader model onto the spec count
+	// (ps_1_x 8, ps_2_x 32, ps_3_0 224) - D3DCAPS9 has no pixel field of its own - and the historic
+	// 8-register budget is kept as the floor so nothing that works today starts getting refused.
+	// Vertex: use the device count, floored at the legacy 96 for the same reason and clamped to the
+	// cache size.
+	unsigned pixelBudget=CurrentCaps->Get_Max_Pixel_Shader_Constants();
+	if (pixelBudget<MAX_PIXEL_SHADER_CONSTANTS_PS1X) pixelBudget=MAX_PIXEL_SHADER_CONSTANTS_PS1X;
+	if (pixelBudget>MAX_PIXEL_SHADER_CONSTANTS) pixelBudget=MAX_PIXEL_SHADER_CONSTANTS;
+	Pixel_Shader_Constant_Limit=pixelBudget;
+
+	unsigned vertexBudget=CurrentCaps->Get_Max_Vertex_Shader_Constants();
+	if (vertexBudget<MAX_VERTEX_SHADER_CONSTANTS_PS1X) vertexBudget=MAX_VERTEX_SHADER_CONSTANTS_PS1X;
+	if (vertexBudget>MAX_VERTEX_SHADER_CONSTANTS) vertexBudget=MAX_VERTEX_SHADER_CONSTANTS;
+	Vertex_Shader_Constant_Limit=vertexBudget;
+
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 one-time console record: these are the numbers that
+	// decide which shader-model permutation a render path may take, and they had never been printed.
+	{
+		static bool s_budgetLogged=false;
+		if (!s_budgetLogged) {
+			s_budgetLogged=true;
+			fprintf(stderr,"[SHADER_BUDGET] PS v%d.%d VS v%d.%d -> pixel constants %u (device %d), "
+				"vertex constants %u (device %d), samplers %d\n",
+				CurrentCaps->Get_Pixel_Shader_Major_Version(),CurrentCaps->Get_Pixel_Shader_Minor_Version(),
+				CurrentCaps->Get_Vertex_Shader_Major_Version(),CurrentCaps->Get_Vertex_Shader_Minor_Version(),
+				Pixel_Shader_Constant_Limit,CurrentCaps->Get_Max_Pixel_Shader_Constants(),
+				Vertex_Shader_Constant_Limit,CurrentCaps->Get_Max_Vertex_Shader_Constants(),
+				CurrentCaps->Get_Max_Simultaneous_Textures());
+			fflush(stderr);
+		}
+	}
+
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 the rest of the ps_3_0 capability picture, recorded once
+	// because a later content batch has to stay inside these numbers:
+	//   flow-control depth   - how deep an if/loop nest the shader may use (the spec ceiling is 24)
+	//   temps                - temporary registers; ps_2_0 gives 2 usable, the spec ceiling is 32
+	//   instruction slots    - the static instruction budget
+	//   PS20Caps option bits - GRADIENTINSTRUCTIONS is what lets a shader take ddx/ddy (tangent-space and
+	//                          screen-space work), NODEPENDENTREADLIMIT is what lets a PCF shadow loop
+	//                          issue unbounded dependent texture reads, ARBITRARYSWIZZLE matters for the
+	//                          single-channel depth reads a shadow map does.
+	// DXVK and native d3d9 report these as zero-filled on some drivers, which is itself the answer to
+	// "is this capability advertised", so the raw numbers are printed rather than a pass/fail.
+	{
+		static bool s_sm3Logged=false;
+		if (!s_sm3Logged) {
+			s_sm3Logged=true;
+			const D3DCAPS9& c=CurrentCaps->Get_DX8_Caps();
+			unsigned psCaps=c.PS20Caps.Caps;
+			fprintf(stderr,"[SM3_CAPS] PS flow(dynamic %d, static %d) temps %d slots %d | "
+				"VS flow(dynamic %d, static %d) temps %d | SM3 slots PS %d VS %d | "
+				"PS options%s%s%s%s%s\n",
+				c.PS20Caps.DynamicFlowControlDepth,c.PS20Caps.StaticFlowControlDepth,
+				c.PS20Caps.NumTemps,c.PS20Caps.NumInstructionSlots,
+				c.VS20Caps.DynamicFlowControlDepth,c.VS20Caps.StaticFlowControlDepth,c.VS20Caps.NumTemps,
+				(int)c.MaxPixelShader30InstructionSlots,(int)c.MaxVertexShader30InstructionSlots,
+				(psCaps & D3DPS20CAPS_ARBITRARYSWIZZLE)?" swizzle":"",
+				(psCaps & D3DPS20CAPS_GRADIENTINSTRUCTIONS)?" gradients":"",
+				(psCaps & D3DPS20CAPS_PREDICATION)?" predication":"",
+				(psCaps & D3DPS20CAPS_NODEPENDENTREADLIMIT)?" unboundedTextureReads":"",
+				(psCaps & D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT)?" unboundedTexInstructions":"");
+			fflush(stderr);
+		}
+	}
+
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 depth bias is the capability a shadow-map pass needs and
+	// the one the DX8 API never had (D3DRS_ZBIAS is gone in d3d9, see Set_DX8_ZBias). Ask the device for
+	// both float bias states and read them straight back from the device, not from the wrapper cache, so
+	// this line proves the runtime accepts them; the cached setters keep RenderStates[] and the mirror
+	// members in sync on the way in and back out to zero.
+	{
+		static bool s_depthBiasLogged=false;
+		if (!s_depthBiasLogged) {
+			s_depthBiasLogged=true;
+			const float testSlope=1.5f;
+			const float testConstant=-8.0f;
+			Set_Slope_Scale_Depth_Bias(testSlope);
+			Set_Depth_Bias(testConstant);
+
+			DWORD echoSlope=0, echoConstant=0;
+			DX8CALL(GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS,&echoSlope));
+			DX8CALL(GetRenderState(D3DRS_DEPTHBIAS,&echoConstant));
+			const float* asFloatSlope=(const float*)&echoSlope;
+			const float* asFloatConstant=(const float*)&echoConstant;
+
+			fprintf(stderr,"[DEPTH_BIAS] asked slope %.3f / constant %.3f, device echoes %.3f / %.3f -> %s\n",
+				testSlope,testConstant,*asFloatSlope,*asFloatConstant,
+				(*asFloatSlope==testSlope && *asFloatConstant==testConstant)?"accepted":"NOT echoed - treat as unavailable");
+
+			Set_Slope_Scale_Depth_Bias(0.0f);
+			Set_Depth_Bias(0.0f);
+			fflush(stderr);
+		}
+	}
+}
+
+// GeneralsX @feature PS3.0 batch1 12/10/2026 throttled so a shader that keeps asking for a register
+// outside the budget cannot flood the console; the first offenders are what needs fixing.
+void DX8Wrapper::Report_Shader_Constant_Range(const char* setter,int reg,int count)
+{
+	static int s_reportCount=0;
+	if (s_reportCount<16) {
+		++s_reportCount;
+		fprintf(stderr,"[SHADER_CONST_RANGE] %s rejected reg=%d count=%d (pixel limit %u, vertex limit %u)\n",
+			setter?setter:"?",reg,count,Pixel_Shader_Constant_Limit,Vertex_Shader_Constant_Limit);
+		fflush(stderr);
+	}
 }
 
 
@@ -4210,6 +4346,17 @@ void DX8Wrapper::Apply_Default_State()
 
 	//Set_DX8_Render_State(D3DRS_EDGEANTIALIAS, FALSE);
 	// GeneralsX @build d3d9 port 11/10/2026 - D3DRS_ZBIAS removed in D3D9; default ZBias=0 is the no-op state
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 reset the hardware depth bias with the other states, so a
+	// shadow pass that left a bias behind cannot leak it into whatever draws next. Pushed through the
+	// cached setter and the mirror members are updated to match, otherwise the two would disagree and a
+	// later Set_Depth_Bias(0.0f) would be swallowed as a no-op.
+	{
+		float biasZero=0.0f;
+		Set_DX8_Render_State(D3DRS_DEPTHBIAS,*(DWORD *)(&biasZero));
+		Set_DX8_Render_State(D3DRS_SLOPESCALEDEPTHBIAS,*(DWORD *)(&biasZero));
+		DepthBias=biasZero;
+		SlopeScaleDepthBias=biasZero;
+	}
 //	Set_DX8_Render_State(D3DRS_RANGEFOGENABLE, FALSE);
 	Set_DX8_Render_State(D3DRS_STENCILENABLE, FALSE);
 	Set_DX8_Render_State(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
@@ -4312,13 +4459,19 @@ void DX8Wrapper::Apply_Default_State()
 	}
 
 	// set up simple default TSS
-	Vector4 vconst[MAX_VERTEX_SHADER_CONSTANTS];
-	memset(vconst,0,sizeof(Vector4)*MAX_VERTEX_SHADER_CONSTANTS);
-	Set_Vertex_Shader_Constant(0, vconst, MAX_VERTEX_SHADER_CONSTANTS);
-
-	Vector4 pconst[MAX_PIXEL_SHADER_CONSTANTS];
-	memset(pconst,0,sizeof(Vector4)*MAX_PIXEL_SHADER_CONSTANTS);
-	Set_Pixel_Shader_Constant(0, pconst, MAX_PIXEL_SHADER_CONSTANTS);
+	// GeneralsX @feature PS3.0 batch1 12/10/2026 the clearing pattern is all zeros forever, so it
+	// lives in a static instead of putting 4KB (+3.5KB once the pixel budget was the SM3 one) on the
+	// stack in a function the resolution-change path runs. One buffer serves both stages because the
+	// vertex budget (256) is the larger of the two caches. Only the registers this device addresses
+	// are pushed, so the setter's budget guard stays quiet.
+	static Vector4 s_zeroShaderConstants[MAX_VERTEX_SHADER_CONSTANTS];
+	static bool s_zeroShaderConstantsInit=false;
+	if (!s_zeroShaderConstantsInit) {
+		memset(s_zeroShaderConstants,0,sizeof(s_zeroShaderConstants));
+		s_zeroShaderConstantsInit=true;
+	}
+	Set_Vertex_Shader_Constant(0,s_zeroShaderConstants,(int)Vertex_Shader_Constant_Limit);
+	Set_Pixel_Shader_Constant(0,s_zeroShaderConstants,(int)Pixel_Shader_Constant_Limit);
 
 	Set_Vertex_FVF(DX8_FVF_XYZNDUV2);
 	Set_Pixel_Shader(0);

@@ -706,6 +706,12 @@ void GameEngine::init()
 #endif
 
 		initSubsystem(TheUpgradeCenter,"TheUpgradeCenter", MSGNEW("GameEngineSubsystem") UpgradeCenter, &xferCRC, "Data\\INI\\Default\\Upgrade", "Data\\INI\\Upgrade");
+
+		// GeneralsX @feature Qoder 13/10/2026 The pixel-shader ceiling must be in GlobalData before
+		// GameClient::init() compiles the W3D shader assets, hence this single-key early replay; the
+		// full registry pass further down stays where it is (it also feeds the frame pacer and audio).
+		ApplyShaderModelCapFromStartupOptions();
+
 		initSubsystem(TheGameClient,"TheGameClient", createGameClient(), nullptr);
 
 #ifdef SAGE_USE_NGMP
@@ -782,11 +788,9 @@ void GameEngine::init()
 
 		TheSubsystemList->postProcessLoadAll();
 
-		// GeneralsX @feature 05/10/2026 Apply the user selected render FPS limit from the options menu.
-		{
-			OptionPreferences optionPref;
-			TheWritableGlobalData->m_framesPerSecondLimit = optionPref.getInt("MaxFPSLimit", TheGlobalData->m_framesPerSecondLimit);
-		}
+		// GeneralsX @refactor Qoder 12/10/2026 Registry-driven options (max FPS limit, normal mapping, ...)
+		// replace the hand-written per-option startup override that used to live here.
+		ApplyGameOptionRegistryAtStartup();
 
 		// GeneralsX @bugfix Copilot 11/05/2026 Prevent uncapped render when FPS limiter is enabled but no valid limit value was loaded.
 		if (TheGlobalData->m_useFpsLimit && TheGlobalData->m_framesPerSecondLimit <= 0)

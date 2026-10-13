@@ -150,7 +150,9 @@ static_assert(ARRAY_SIZE(CPUNames) == CPU_MAX + 1, "Incorrect array size");
 //Keep this in sync with enum in GameLOD.h
 static const char *const VideoNames[] =
 {
-	"XX","V2","V3","V4","V5","TNT","TNT2","GF2","R100","PS11","GF3","GF4","PS14","R200","PS20","R300", nullptr
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 "PS30" is the new tail entry; the existing names keep
+	// their ordinals so packaged INI files still resolve to the same chipset tier.
+	"XX","V2","V3","V4","V5","TNT","TNT2","GF2","R100","PS11","GF3","GF4","PS14","R200","PS20","R300","PS30", nullptr
 };
 static_assert(ARRAY_SIZE(VideoNames) == DC_MAX + 1, "Incorrect array size");
 

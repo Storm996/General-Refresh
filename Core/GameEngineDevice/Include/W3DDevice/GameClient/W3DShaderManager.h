@@ -49,6 +49,9 @@ enum CpuType CPP_11(: Int);
 enum GraphicsVenderID CPP_11(: Int);
 
 class TextureClass;	///forward reference
+// GeneralsX @feature PS3.0 batch7 13/10/2026 texture stages the shader manager keeps bindings for.
+// Must match WW3D2's MAX_TEXTURE_STAGES; W3DShaderManager.cpp static_asserts the two are equal.
+enum { SHADER_TEXTURE_STAGES = 16 };
 /** System for managing complex rendering settings which are either not handled by
 	WW3D2 or need custom paths depending on the video card.  This system will determine
 	the proper shader given video card limitations and also allow the app to query the
@@ -86,6 +89,16 @@ public:
 	static void shutdown();	///<release resources used by shaders
 	static void updateCloud();	///<update the cloud position once every render frame.
 	static ChipsetType getChipset();	///<return current device chipset.
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 Hardware detection without the user's shader-model
+	// ceiling; getChipset() applies the ceiling to whatever this returns. Separated so the vendor-id
+	// short-circuits inside cannot bypass -shadermodel / GENERALSX_SHADERMODEL.
+	static ChipsetType detectChipsetTier();
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 The tier a shader path may emit for, from the caps the
+	// device reports. Different from getChipset(): that ladder identifies legacy cards by vendor/device
+	// id (every NVIDIA device id >= 0x250 comes back DC_GEFORCE4) and feeds the LOD preset table, so it
+	// can sit below DC_GENERIC_PIXEL_SHADER_3_0 on a card that reports PS 3.0. Render paths that branch
+	// on shader model must ask this function, not getChipset().
+	static ChipsetType getShaderModelTier();
 	static GraphicsVenderID getCurrentVendor() {return m_currentVendor;}	///<return current card vendor.
 	// GeneralsX @bugfix BenderAI 13/02/2026 Use Int64 instead of __int64 for cross-platform builds
 	static Int64 getCurrentDriverVersion() {return m_driverVersion; }	///<return current driver version.
@@ -93,7 +106,7 @@ public:
 	static Int setShader(ShaderTypes shader, Int pass);	///<enable specific shader pass.
 	static Int setShroudTex(Int stage);	///<Set shroud in a texture stage.
 	static void resetShader(ShaderTypes shader);	///<make sure W3D2 gets restored to normal
-	///Specify all textures (up to 8) which can be accessed by the shaders.
+	///Specify all textures (up to SHADER_TEXTURE_STAGES) which can be accessed by the shaders.
 	static void setTexture(Int stage,TextureClass* texture) {m_Textures[stage]=texture;}
 	///Return current texture available to shaders.
 	static TextureClass *getShaderTexture(Int stage) { return m_Textures[stage];}	///<returns currently selected texture for given stage
@@ -104,6 +117,22 @@ public:
 	// output handle is an IDirect3D{Vertex,Pixel}Shader9* (void** here) in D3D9; DX8 DWORD handles
 	// and token arrays no longer exist.
 	static HRESULT LoadAndCreateD3DShader(const char* strFilePath, const D3DVERTEXELEMENT9* pDeclaration, DWORD Usage, Bool ShaderType, void** pHandle);
+
+	// GeneralsX @feature PS3.0 batch7 13/10/2026 -------------------------------------------------------------------------
+	// The profile a runtime-compiled HLSL shader should be emitted for, derived from getShaderModelTier()
+	// so no call site has to guess. Returns nullptr when the device is below ps_2_0/vs_2_0, which is the
+	// signal for a render path to stay on its fixed-function or shipped-asset route.
+	static const char* getPixelShaderProfile();
+	static const char* getVertexShaderProfile();
+	// Compile HLSL source that carries no "// d3d-target:" line for the highest profile the device
+	// accepts, retrying one step down the ladder (ps_3_0 -> ps_2_0, vs_3_0 -> vs_2_0) if the device
+	// refuses it. Handles the same void** the asset loader uses. ShaderType follows
+	// LoadAndCreateD3DShader: false = pixel, true = vertex. logTag prefixes the failure line ("[DOT3]").
+	// outProfile receives the profile actually compiled, so the caller can report it. Runtime HLSL
+	// compilation is Windows-only (the CompatLib shim drives d3dcompiler), and the definition is guarded
+	// accordingly - the profile getters above are available on every platform.
+	static HRESULT compileShaderAtBestProfile(const char* hlslSource, Bool ShaderType, const char* logTag,
+		const char** outProfile, void** pHandle);
 
 	static Bool testMinimumRequirements(ChipsetType *videoChipType, CpuType *cpuType, Int *cpuFreq, MemValueType *numRAM, Real *intBenchIndex, Real *floatBenchIndex, Real *memBenchIndex);
 	static StaticGameLODLevel getGPUPerformanceIndex();
@@ -127,7 +156,7 @@ public:
 
 
 protected:
-	static TextureClass *m_Textures[8];	///textures assigned to each of the possible stages
+	static TextureClass *m_Textures[SHADER_TEXTURE_STAGES];	///textures assigned to each of the possible stages
 	static ChipsetType m_currentChipset;	///<last video card chipset that was detected.
 	static GraphicsVenderID m_currentVendor;	///<last video card vendor
 	// GeneralsX @bugfix BenderAI 13/02/2026AI - Use Int64 instead of __int64 (cross-platform)
@@ -140,8 +169,17 @@ protected:
 	static Bool m_renderingToTexture;
 	static IDirect3DSurface9 *m_oldRenderSurface;	///<previous render target
 	static IDirect3DTexture9 *m_renderTexture;		///<texture into which rendering will be redirected.
-	static IDirect3DSurface9 *m_newRenderSurface;	///<new render target inside m_renderTexture
+	static IDirect3DSurface9 *m_newRenderSurface;	///<surface the filters sample from (resolve destination under MSAA)
 	static IDirect3DSurface9 *m_oldDepthSurface;	///<previous depth buffer surface
+	// GeneralsX @bugfix Storm996 12/10/2026 The render target actually bound while redirected, and the depth
+	// buffer bound with it. They always share one sample count, which the old pairing of a single-sample
+	// texture with the back buffer's multisampled depth buffer did not. m_rttColorSurface differs from
+	// m_newRenderSurface only when a resolve is required.
+	static IDirect3DSurface9 *m_rttColorSurface;
+	static IDirect3DSurface9 *m_rttDepthSurface;
+	// GeneralsX @bugfix Storm996 12/10/2026 One owner for the lifetime of the offscreen target: init() runs
+	// again on height-map rebuild and a rejected SetRenderTarget switches the feature off at runtime.
+	static void releaseRenderToTextureSurfaces();
 
 
 };

@@ -649,6 +649,8 @@ GlobalData::GlobalData()
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	m_skirmishTickRate = LOGICFRAMES_PER_SECOND;
 	m_chipSetType = 0;
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 empty = no cap, use whatever the hardware reports.
+	m_shaderModelCap.clear();
 	m_headless = FALSE;
 	// GeneralsX @feature Qoder 11/10/2026 AI-editable map logic dumper (-dumplogic).
 	m_dumpMapLogic = FALSE;

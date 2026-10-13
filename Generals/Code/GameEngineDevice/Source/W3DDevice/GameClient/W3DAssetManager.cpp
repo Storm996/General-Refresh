@@ -625,6 +625,24 @@ void W3DAssetManager::Remap_Palette(SurfaceClass *surface, const int color, Bool
 }
 
 //---------------------------------------------------------------------
+// GeneralsX @bugfix d3d9 port 12/10/2026 Shared by both one-time recolour paths. A block-compressed
+// source has to be widened to a pixel-addressable format before any per-pixel remap touches it;
+// A8R8G8B8 is also exactly the destination the compat layer's DXT unpacker writes.
+static WW3DFormat Recolor_Work_Format(WW3DFormat format)
+{
+	switch (format) {
+	case WW3D_FORMAT_DXT1:
+	case WW3D_FORMAT_DXT2:
+	case WW3D_FORMAT_DXT3:
+	case WW3D_FORMAT_DXT4:
+	case WW3D_FORMAT_DXT5:
+		return WW3D_FORMAT_A8R8G8B8;
+	default:
+		return format;
+	}
+}
+
+//---------------------------------------------------------------------
 TextureClass * W3DAssetManager::Recolor_Texture_One_Time(TextureClass *texture, const int color)
 {
 	const char *name=texture->Get_Texture_Name();
@@ -640,18 +658,38 @@ TextureClass * W3DAssetManager::Recolor_Texture_One_Time(TextureClass *texture, 
 	SurfaceClass *newsurf, *oldsurf;
 	texture->Get_Level_Description(desc);
 
+	// GeneralsX @performance d3d9 port 12/10/2026 A house-colour skin can only be remapped when its
+	// container carries the channel the retail remap reads: a ZHCa_ skin uses the alpha byte as the
+	// paint mask and a ZHCd_ skin matches its top-row palette by exact value. DXT1 has no alpha and
+	// quantises every 4x4 block to 565, so decompressing one here costs a full 32-bit surface per team
+	// colour and still yields a byte-identical, unpainted texture. Refuse it and let the caller keep the
+	// original - the same fallback the procedural check above already takes.
+	// GeneralsX @bugfix d3d9 port 13/10/2026 Say which skin was refused. A patch archive that ships a
+	// ZHCa_ skin as DXT1 silently turns that unit's painted parts house red, and the only surviving
+	// evidence of why was the pixel content of an override nobody can see. stderr, not DEBUG_LOG: this
+	// has to print in release builds, where the report of a broken patch asset is the point.
+	if (desc.Format == WW3D_FORMAT_DXT1)
+	{
+		fprintf(stderr, "[TEAMCOLOR] skin '%s' is DXT1 - no alpha mask survives in that container, so it"
+			" cannot be recoloured; drawing it unpainted. Re-export it as A8R8G8B8 or DXT5.\n", name);
+		fflush(stderr);
+		return nullptr;
+	}
+
 	Int psize;
-	psize=Get_Bytes_Per_Pixel(desc.Format);
+	WW3DFormat remapFormat = Recolor_Work_Format(desc.Format);
+	psize=Get_Bytes_Per_Pixel(remapFormat);
 	DEBUG_ASSERTCRASH( psize == 2 || psize == 4, ("Can't Recolor Texture %s", name) );
 
 	oldsurf=texture->Get_Surface_Level();
 
-
-
-	newsurf=NEW_REF(SurfaceClass,(desc.Width,desc.Height,desc.Format));
+	// GeneralsX @bugfix d3d9 port 12/10/2026 A team-colour skin that ships block-compressed cannot
+	// be remapped in place: Remap_Palette indexes pixels, and a same-format DXT copy is exactly the
+	// combination the d3d9 blit refuses, so the working surface stayed uninitialised and every
+	// recoloured infantry texture drew solid black. Decompress into a lockable 32-bit surface first -
+	// the same move SurfaceClass::Is_Monochrome already makes for its own test.
+	newsurf=NEW_REF(SurfaceClass,(desc.Width,desc.Height,remapFormat));
 	newsurf->Copy(0,0,0,0,desc.Width,desc.Height,oldsurf);
-
-
 
 	if (*(name+3) == 'D' || *(name+3) == 'd')
 		Remap_Palette(newsurf,color, true, false );	//texture only contains a palette stored in top row.
@@ -1539,7 +1577,10 @@ TextureClass * W3DAssetManager::Recolor_Texture_One_Time(TextureClass *texture, 
 
 	oldsurf=texture->Get_Surface_Level();
 
-	newsurf=NEW_REF(SurfaceClass,(desc.Width,desc.Height,desc.Format));
+	// GeneralsX @bugfix d3d9 port 12/10/2026 Same reason as the palette remap above: SurfaceClass::
+	// Hue_Shift walks pixels with Get_Bytes_Per_Pixel, which has no answer for a compressed format.
+	WW3DFormat remapFormat = Recolor_Work_Format(desc.Format);
+	newsurf=NEW_REF(SurfaceClass,(desc.Width,desc.Height,remapFormat));
 	newsurf->Copy(0,0,0,0,desc.Width,desc.Height,oldsurf);
 	newsurf->Hue_Shift(hsv_shift);
 	TextureClass * newtex=NEW_REF(TextureClass,(newsurf,(MipCountType)texture->Get_Mip_Level_Count()));

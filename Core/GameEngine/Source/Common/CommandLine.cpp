@@ -818,6 +818,18 @@ Int parseNoShaders(char *args[], int)
 	return 1;
 }
 
+// GeneralsX @feature PS3.0 batch2 12/10/2026 Cap the auto-detected shader-model tier so the render
+// paths can be walked back one level at a time: -shadermodel 1.1 | 1.4 | 2.0 | 3.0 | auto.
+// Only the token is kept here; W3DShaderManager::getChipset() owns the mapping onto ChipsetType and
+// only ever lowers the detected tier, so asking for 3.0 on a 2.0 device gets 2.0, never more.
+Int parseShaderModel(char *args[], int num)
+{
+	if (num > 1)
+		TheWritableGlobalData->m_shaderModelCap = args[1];
+
+	return 2;
+}
+
 Int parseNoLogo(char *args[], int)
 {
 	TheWritableGlobalData->m_playIntro = FALSE;
@@ -1235,6 +1247,8 @@ static CommandLineParam paramsForEngineInit[] =
 	{ "-playStats", parsePlayStats },
 	{ "-mod", parseMod },
 	{ "-noshaders", parseNoShaders },
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 shader-model ceiling for the render paths
+	{ "-shadermodel", parseShaderModel },
 	{ "-quickstart", parseQuickStart },
 	{ "-useWaveEditor", parseUseWaveEditor },
 

@@ -1342,7 +1342,6 @@ void DX8SkinFVFCategoryContainer::Log(bool only_visible)
 #endif
 }
 
-// ----------------------------------------------------------------------------
 
 void DX8SkinFVFCategoryContainer::Render()
 {

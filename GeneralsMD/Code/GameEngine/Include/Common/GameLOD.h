@@ -94,6 +94,11 @@ enum ChipsetType CPP_11(: Int)
 	DC_RADEON_8500,
 	DC_GENERIC_PIXEL_SHADER_2_0,
 	DC_RADEON_9700,
+	// GeneralsX @feature PS3.0 batch2 12/10/2026 the tier the D3D9 port unlocked. Appended rather
+	// than inserted in version order: these ordinals are also the indices of the "VideoNames" list INI
+	// files reference by name (PS11/PS14/PS20...), so renumbering would reinterpret retail configs and
+	// replays (golden rule 6). Nothing in the tree compares against DC_MAX, only ">=" per tier.
+	DC_GENERIC_PIXEL_SHADER_3_0,
 	DC_MAX
 };
 
