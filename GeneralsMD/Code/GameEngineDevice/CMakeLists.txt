@@ -140,6 +140,7 @@ set(GAMEENGINEDEVICE_SRC
 #    Source/W3DDevice/GameClient/HeightMap.cpp
     Source/W3DDevice/GameClient/Shadow/W3DBufferManager.cpp
     Source/W3DDevice/GameClient/Shadow/W3DProjectedShadow.cpp
+    Source/W3DDevice/GameClient/Shadow/W3DSunShadowMap.cpp
     Source/W3DDevice/GameClient/Shadow/W3DShadow.cpp
     Source/W3DDevice/GameClient/Shadow/W3DVolumetricShadow.cpp
 #    Source/W3DDevice/GameClient/TerrainTex.cpp

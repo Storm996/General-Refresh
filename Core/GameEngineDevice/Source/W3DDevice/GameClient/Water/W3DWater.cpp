@@ -360,6 +360,7 @@ WaterRenderObjClass::WaterRenderObjClass()
 
 	m_dwWavePixelShader = nullptr;
 	m_dwWaveVertexShader = nullptr;
+	m_waveHlsl = FALSE;	//GeneralsX @feature PS3.0 T3 13/10/2026: decided in ReAcquireResources.
 	m_meshData=nullptr;
 	m_meshDataSize = 0;
 	m_meshInMotion = FALSE;
@@ -877,6 +878,85 @@ static void CompileWaterPixelShader(const char* name, const char* source, IDirec
 		fflush(stderr);
 	}
 }
+
+// GeneralsX @feature PS3.0 T3 13/10/2026 water upgrade: HLSL replacement for the retail
+// wave.vso/wave.pso pair.  The retail pixel shader ends at DX8's texbem (emboss bump-mapped
+// reflection) which has no D3D9 byte-code equivalent, so this pass reproduces the EMBM result
+// explicitly - perturb the screen-projected reflection uv by the bump gradient - and adds what
+// the fixed-function stage could not: a Fresnel term that keeps the reflection strong at grazing
+// angles and lets the water body color through when looking down, plus a sun sparkle driven by
+// the same gradient.  Vertex side keeps the retail constant layout untouched (c2..c5 = WorldViewProj,
+// c6..c9 = screen tex-projection) so the per-patch constant uploads do not change.
+//
+// ps_3_0 first with the compileShaderAtBestProfile step-down, same ladder as the river/trapezoid
+// shaders.  Windows-only like them: the runtime D3DCompile shim is the only compiler in the
+// shipped build, so failure here means "keep the retail byte code", never "no water".
+static const char* kWaveVertexShaderHLSL =
+	"float4x4 cWVP   : register(c2);\n"	//rows c2..c5, uploaded per patch like the vs.1.1 original
+	"float4   cTexP0 : register(c6);\n"	//screen tex-projection row 0 (c6..c9 owned, c6 used)
+	"struct WAVES_IN  { float4 pos : POSITION; float4 diff : COLOR0; float2 uv : TEXCOORD0; };\n"
+	"struct WAVES_OUT { float4 pos : POSITION; float4 diff : COLOR0; float2 bumpUV : TEXCOORD0; float2 screenUV : TEXCOORD1; };\n"
+	"WAVES_OUT main(WAVES_IN i)\n"
+	"{\n"
+	"    WAVES_OUT o;\n"
+	"    o.pos = mul(i.pos, cWVP);\n"
+	"    o.bumpUV = i.uv;\n"
+	"    o.diff = i.diff;\n"
+	"    float2 ndc = o.pos.xy / o.pos.w;\n"
+	"    o.screenUV = ndc * cTexP0.xy + cTexP0.zw;\n"
+	"    return o;\n"
+	"}\n";
+
+static const char* kWavePixelShaderHLSL =
+	"sampler bump : register(s0);\n"
+	"sampler refl : register(s1);\n"
+	"float4 cWave : register(c0);\n"	//x=bumpScale, y=sparkle intensity, z=Fresnel bias, w=Fresnel scale
+	"float4 cSun  : register(c1);\n"	//xy=sun direction in reflection-uv space, zw unused
+	"float4 main(float4 diff : COLOR0, float2 bumpUV : TEXCOORD0, float2 screenUV : TEXCOORD1) : COLOR\n"
+	"{\n"
+	"    float3 b = tex2D(bump, bumpUV).xyz;\n"
+	"    float2 grad = (b.xy - 0.5) * cWave.x;\n"
+	"    float3 r = tex2D(refl, screenUV + grad).rgb;\n"
+	"    float3 body = diff.rgb * r;                                  // retail look: reflection tinted by diffuse\n"
+	"    float ndl = saturate(dot(normalize(float3(grad, 0.35)), normalize(float3(cSun.xy, 0.9))));\n"
+	"    float sparkle = pow(ndl, 48.0) * cWave.y;                    // tight sun glint on wave crests\n"
+	"    float fres = saturate(cWave.z + cWave.w * pow(1.0 - saturate(b.z), 3.0));\n"
+	"    float3 rgb = lerp(body * 0.85, body + r, fres) + sparkle;\n" // grazing -> stronger mirror reflection
+	"    return float4(rgb, diff.a);\n"                                // alpha stays the retail distance/edge fade
+	"}\n";
+
+static Bool CompileWaveShadersHLSL(IDirect3DVertexShader9** vsOut, IDirect3DPixelShader9** psOut)
+{
+	const char* profile = nullptr;
+	void* handle = nullptr;
+
+	if (getenv("GENERALSX_WAVE3") && atoi(getenv("GENERALSX_WAVE3")) == 0)
+	{
+		fprintf(stderr, "[WAVE3] disabled by GENERALSX_WAVE3=0, retail wave byte code stays\n");
+		fflush(stderr);
+		return FALSE;
+	}
+
+	HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kWaveVertexShaderHLSL, true, "[WAVE3]", &profile, &handle);
+	if (FAILED(hr) || handle == nullptr)
+		return FALSE;	//helper already printed the reason; keep retail path.
+	*vsOut = (IDirect3DVertexShader9*)handle;
+
+	const char* psProfile = nullptr;
+	handle = nullptr;
+	hr = W3DShaderManager::compileShaderAtBestProfile(kWavePixelShaderHLSL, false, "[WAVE3]", &psProfile, &handle);
+	if (FAILED(hr) || handle == nullptr)
+	{
+		(*vsOut)->Release();
+		*vsOut = nullptr;
+		return FALSE;
+	}
+	*psOut = (IDirect3DPixelShader9*)handle;
+
+	fprintf(stderr, "[WAVE3] wave vs=%s ps=%s installed (GENERALSX_WAVE3=0 reverts)\n", profile, psProfile);
+	fflush(stderr);
+	return TRUE;
+}
 #endif // _WIN32
 
 void WaterRenderObjClass::ReAcquireResources()
@@ -933,13 +1013,25 @@ void WaterRenderObjClass::ReAcquireResources()
 			D3DDECL_END()
 		};
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, (void**)&m_dwWavePixelShader);
-		if (FAILED(hr))
-			return;
+		// GeneralsX @feature PS3.0 T3 13/10/2026: prefer the HLSL wave pass (EMBM equivalent +
+		// Fresnel + sparkle).  If the runtime compiler refuses anything we fall back to the
+		// retail wave.pso/wave.vso byte code, so water can never disappear over a shader bug.
+		Bool compiledHlslWave = FALSE;
+#ifdef _WIN32
+		compiledHlslWave = CompileWaveShadersHLSL(&m_dwWaveVertexShader, &m_dwWavePixelShader);
+#endif
+		m_waveHlsl = compiledHlslWave;
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, (void**)&m_dwWaveVertexShader);
-		if (FAILED(hr))
-			return;
+		if (!m_waveHlsl)
+		{
+			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, (void**)&m_dwWavePixelShader);
+			if (FAILED(hr))
+				return;
+
+			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, (void**)&m_dwWaveVertexShader);
+			if (FAILED(hr))
+				return;
+		}
 
 		// Create reflection texture
 		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (SEA_REFLECTION_SIZE, SEA_REFLECTION_SIZE);
@@ -1932,6 +2024,31 @@ Matrix4x4 matProj, matView, matWW3D;
 	// Setup constants
 	m_pDev->SetVertexShaderConstantF(CV_ZERO,   (const float*)D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f), 1);
 	m_pDev->SetVertexShaderConstantF(CV_ONE,    (const float*)D3DXVECTOR4(1.0f, 1.0f, 1.0f, 1.0f), 1);
+
+	// GeneralsX @feature PS3.0 T3 13/10/2026: pixel constants for the HLSL wave pass only.
+	// Sparkle/Fresnel strengths are env-tunable for A/B runs the same way the dot3 specular is;
+	// the sun direction is a fixed screen-space-ish vector in this first cut (the retail pass had
+	// no sun term at all), which keeps the wave highlight stable until T5 brings real light dirs.
+	if (m_waveHlsl)
+	{
+		static Real s_waveSparkle = -1.0f;
+		static Real s_waveFresBias = -1.0f;
+		static Real s_waveFresScale = -1.0f;
+		if (s_waveSparkle < 0.0f)
+		{
+			const char* envSparkle = getenv("GENERALSX_WAVE_SPARKLE");
+			const char* envFres = getenv("GENERALSX_WAVE_FRESNEL");
+			s_waveSparkle = envSparkle ? (Real)atof(envSparkle) : 0.35f;
+			s_waveFresBias = envFres ? 0.10f : 0.20f;	//a hand-tuned Fresnel floor; env just switches profile
+			s_waveFresScale = envFres ? (Real)atof(envFres) : 0.80f;
+			if (s_waveFresScale < 0.0f) s_waveFresScale = 0.0f;
+			if (s_waveFresScale > 2.0f) s_waveFresScale = 2.0f;
+		}
+		float waveParams[4] = { m_fBumpScale, s_waveSparkle, s_waveFresBias, s_waveFresScale };
+		float sunParams[4] = { 0.55f, -0.35f, 0.0f, 0.0f };
+		m_pDev->SetPixelShaderConstantF(0, waveParams, 1);
+		m_pDev->SetPixelShaderConstantF(1, sunParams, 1);
+	}
 
 	m_pDev->SetVertexShader(m_dwWaveVertexShader);
 	m_pDev->SetPixelShader(m_dwWavePixelShader);

@@ -35,6 +35,26 @@ namespace DX8NormalMap
 	static bool     g_Enabled = false;      // rule: default OFF
 	static float    g_Strength = 0.8f;      // per-pixel perturbation strength
 
+	// GeneralsX @feature PS3.0 T5 13/10/2026 multi-light pair + kill switch (env read once).
+	static UINT_PTR g_VS_ML = 0;
+	static UINT_PTR g_PS_ML = 0;
+
+	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle)
+	{
+		g_VS_ML = vs_handle;
+		g_PS_ML = ps_handle;
+	}
+
+	static bool ML_Enabled()
+	{
+		static int cached = -1;
+		if (cached < 0) {
+			const char* ev = getenv("GENERALSX_MULTILIGHT");
+			cached = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
+		}
+		return cached == 1 && g_VS_ML != 0 && g_PS_ML != 0;
+	}
+
 	// GeneralsX @feature T3-0 P1: global sun fallback (direction TOWARD the light source - same
 	// convention as LightEnvironmentClass::Get_Light_Direction - plus object ambient) for meshes
 	// that carry no per-mesh light environment (battlefield objects). Injected by
@@ -199,6 +219,24 @@ namespace DX8NormalMap
 		c4.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(4, &c4, 1);   // c4 = model-space light (VS rotates via TBN)
 
+		// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong eye vector. The camera's +Z axis in world
+		// space (scene->eye; it looks down -Z) is, in the raw DX8 view format, the same "axis r lives at
+		// flat[r], flat[r+4], flat[r+8]" pattern the light above uses, with r=2. Rotated into model space
+		// exactly like c4 and fed to the VS as c5, where it joins the light to form the half-vector sum.
+		const float* vm = reinterpret_cast<const float*>(&view);
+		Vector3 Ew(vm[2], vm[6], vm[10]);
+		{
+			float el2 = sqrtf(Ew.X * Ew.X + Ew.Y * Ew.Y + Ew.Z * Ew.Z);
+			if (el2 > 1e-6f) { Ew.X /= el2; Ew.Y /= el2; Ew.Z /= el2; }
+			else { Ew = Vector3(0.0f, 0.0f, 1.0f); }   // degenerate view matrix: headlight fallback
+		}
+		Vector4 c5eye;
+		c5eye.X = m[0] * Ew.X + m[4] * Ew.Y + m[8] * Ew.Z;
+		c5eye.Y = m[1] * Ew.X + m[5] * Ew.Y + m[9] * Ew.Z;
+		c5eye.Z = m[2] * Ew.X + m[6] * Ew.Y + m[10] * Ew.Z;
+		c5eye.W = 1.0f;
+		DX8Wrapper::Set_Vertex_Shader_Constant(5, &c5eye, 1); // c5 = model-space eye direction
+
 		// --- PS constants: c1 = strength, c2 = ambient, c5 = flat normal for NOSTAGE1 diag ---
 		Vector4 c5(0.0f, 0.0f, 1.0f, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(5, &c5, 1);
@@ -226,7 +264,78 @@ namespace DX8NormalMap
 		Vector4 bs(xyScale, 0.0f, 1.0f, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(3, &bs, 1);          // c3 = xy exaggeration k, z passthrough
 
+		// GeneralsX @feature PS3.0 T1 13/10/2026: c6 = (specPow, specIntensity, -, -) for the Blinn-Phong
+		// term in the main dot3 PS. Subtle by default (a moving highlight along bump edges, not a second
+		// sun); QA knobs GENERALSX_NORMALMAP_SPEC (intensity) / GENERALSX_NORMALMAP_SPECPOWER.
+		{
+			static float specPow = -1.0f;
+			static float specInt = -1.0f;
+			if (specPow < 0.0f) {
+				specPow = 24.0f;
+				specInt = 0.12f;
+				const char* evPow = getenv("GENERALSX_NORMALMAP_SPECPOWER");
+				if (evPow != nullptr && *evPow != 0) specPow = (float)atof(evPow);
+				const char* evInt = getenv("GENERALSX_NORMALMAP_SPEC");
+				if (evInt != nullptr && *evInt != 0) specInt = (float)atof(evInt);
+				if (specPow < 1.0f) specPow = 1.0f;
+				if (specInt < 0.0f) specInt = 0.0f;
+			}
+			Vector4 sc6(specPow, specInt, 0.0f, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(6, &sc6, 1);
+		}
+
 		// --- bind textures / switch shaders ---
+		// GeneralsX @feature PS3.0 T5 13/10/2026 multi-light branch: when this mesh's light
+		// environment actually carries point lights (crates fire, superweapon blasts, lamp posts)
+		// and the device layer installed the ML pair, bind that instead - the PS loops over up to
+		// four lights per pixel with radius falloff.  No point lights (the overwhelming common
+		// case) or GENERALSX_MULTILIGHT=0 keeps the T1 single-light path bit-for-bit.
+		if (lenv != nullptr && ML_Enabled())
+		{
+			Vector4 mlLights[8];
+			int mlCount = 0;
+			const int total = lenv->Get_Light_Count();
+			for (int i = 0; i < total && mlCount < 4; ++i)
+			{
+				if (!lenv->isPointLight(i)) continue;
+				const Vector3& c = lenv->getPointCenter(i);
+				const Vector3& d = lenv->getPointDiffuse(i);
+				mlLights[mlCount * 2]     = Vector4(c.X, c.Y, c.Z, lenv->getPointIrad(i));
+				mlLights[mlCount * 2 + 1] = Vector4(d.X, d.Y, d.Z, lenv->getPointOrad(i));
+				++mlCount;
+			}
+
+			if (mlCount > 0)
+			{
+				// GeneralsX @feature PS3.0 T5 13/10/2026: one-shot proof the multi-light branch is
+				// actually taken at runtime (a mesh with a point light in its environment mounted the
+				// ML VS/PS pair). Silent otherwise; A/B delta only shows when lights touch NM meshes.
+				static int s_mlMounted = 0;
+				if (s_mlMounted < 5)
+				{
+					++s_mlMounted;
+					fprintf(stderr, "[ML] multi-light branch mounted: %d point light(s) on this mesh\n", mlCount);
+					fflush(stderr);
+				}
+				// VS c7..c10 = world matrix rows (wmDx8 carries the translation in .w of the
+				// position rows, matching the dot(pos, row) convention the WVP upload uses).
+				DX8Wrapper::Set_Vertex_Shader_Constant(7, m, 4);
+				// PS c4/c5 = WORLD-space sun/eye (the single-light pair uses model-space VS copies).
+				Vector4 sunWorld(Lw.X, Lw.Y, Lw.Z, 0.0f);
+				DX8Wrapper::Set_Pixel_Shader_Constant(4, &sunWorld, 1);
+				Vector4 eyeWorld(Ew.X, Ew.Y, Ew.Z, 0.0f);
+				DX8Wrapper::Set_Pixel_Shader_Constant(5, &eyeWorld, 1);
+				Vector4 cnt((float)mlCount, 0.0f, 0.0f, 0.0f);
+				DX8Wrapper::Set_Pixel_Shader_Constant(16, &cnt, 1);
+				DX8Wrapper::Set_Pixel_Shader_Constant(17, &mlLights[0], 8);
+
+				DX8Wrapper::Set_Texture(1, nm);
+				DX8Wrapper::Set_Vertex_Shader(g_VS_ML);
+				DX8Wrapper::Set_Pixel_Shader(g_PS_ML);
+				return true;
+			}
+		}
+
 		DX8Wrapper::Set_Texture(1, nm);
 		DX8Wrapper::Set_Vertex_Shader(g_VS);
 		DX8Wrapper::Set_Pixel_Shader(g_PS);

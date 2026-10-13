@@ -57,6 +57,8 @@
 #include "GameClient/Drawable.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: compileShaderAtBestProfile for the blur PS.
+#include "W3DDevice/GameClient/W3DShaderManager.h"
 
 
 /** @todo: We're going to have a pool of a couple rendertargets to use
@@ -104,6 +106,29 @@ struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
 };
 
 #define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
+
+// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: a separable 5-tap gaussian (the two
+// "wide" weights 0.270659/0.060002 folded into offsets 1.3846/3.2308, classic linear-sampling
+// trick) run once horizontally and once vertically over the shadow atlas.  It is drawn as a
+// full-screen pre-transformed quad so it needs no world vertex buffer.
+#define SHADOW_BLUR_FVF	(D3DFVF_XYZRHW | D3DFVF_TEX1)
+
+struct SHADOW_BLUR_VERTEX	//clip-space quad vertex for the blur pass
+{
+		float x,y,z,rhw;
+		float u,v;
+};
+
+static const char* kShadowBlurShader =
+	"sampler s0 : register(s0);\n"
+	"float4 c0 : register(c0);\n"
+	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+	"{\n"
+	"    float4 sum = tex2D(s0, uv) * 0.2270270;\n"
+	"    sum += (tex2D(s0, uv + c0.xy * 1.3846153) + tex2D(s0, uv - c0.xy * 1.3846153)) * 0.3162162;\n"
+	"    sum += (tex2D(s0, uv + c0.xy * 3.2307692) + tex2D(s0, uv - c0.xy * 3.2307692)) * 0.0702702;\n"
+	"    return sum;\n"
+	"}\n";
 
 IDirect3DVertexBuffer9* shadowDecalVertexBufferD3D=nullptr;		///<D3D vertex buffer
 IDirect3DIndexBuffer9*	shadowDecalIndexBufferD3D=nullptr;	///<D3D index buffer
@@ -221,6 +246,15 @@ W3DProjectedShadowManager::W3DProjectedShadowManager()
 	m_drawStartX = 0;
 	m_drawStartY = 0;
 	m_renderTargetSize = DEFAULT_RENDER_TARGET_WIDTH;	//GeneralsX @feature 10/10/2026 shadow S2: default step, ReAcquireResources overrides it from the option
+	// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: blur resources stay inert until
+	// ReAcquireResources builds them (they are device-dependent).
+	m_blurRT[0] = nullptr;
+	m_blurRT[1] = nullptr;
+	m_blurShader = nullptr;
+	m_blurVB = nullptr;
+	m_blurIB = nullptr;
+	m_blurReady = FALSE;
+	m_blurRadius = 0;
 }
 
 W3DProjectedShadowManager::~W3DProjectedShadowManager()
@@ -336,12 +370,17 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			return FALSE;
 	}
 
+	// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: build the blur detour on top of the
+	// atlas that was just created.  Failure is non-fatal - it only leaves shadows sharp.
+	initBlurResources();
+
 	return TRUE;
 }
 
 void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
+	releaseBlurResources();	//GeneralsX @feature PS3.0 T2 13/10/2026: blur RTs/buffers are device-dependent too.
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
 	if (shadowDecalIndexBufferD3D)
 		shadowDecalIndexBufferD3D->Release();
@@ -349,6 +388,206 @@ void W3DProjectedShadowManager::ReleaseResources()
 		shadowDecalVertexBufferD3D->Release();
 	shadowDecalIndexBufferD3D=nullptr;
 	shadowDecalVertexBufferD3D=nullptr;
+}
+
+// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening.  Retail projected shadows are a hard
+// silhouette: updateTexture copies the shadow atlas straight into each object's private texture and
+// flushDecals stamps that onto the terrain with zero filtering of the shape itself.  Softening is
+// done at the atlas level, BEFORE the per-object Copy, because the atlas packing of shadows shifts
+// from frame to frame - blurring a private copy later would sample stale neighbours.  The cost is
+// two full-atlas blur passes per shadow that actually re-renders its texture, and shadows only
+// re-render when their light angle moves, so steady-state cost is ~zero.
+//
+// Level comes from Options.ini ShadowSoftening (S-family, outside m_iniCRC); the environment
+// variable GENERALSX_SHADOWBLUR overrides it so A/B runs never need to touch the user's Options.ini.
+void W3DProjectedShadowManager::initBlurResources()
+{
+#ifdef _WIN32
+	Int level = OptionPreferences().getShadowSoftening();
+	const char* env = getenv("GENERALSX_SHADOWBLUR");
+	if (env)
+		level = atoi(env);
+	if (level < 1)
+		return;	//softening off: the original sharp atlas path stays untouched.
+	if (level > 3)
+		level = 3;
+	m_blurRadius = level;
+
+	if (m_dynamicRenderTarget == nullptr)
+		return;	//no atlas to blur behind.
+
+	const char* profile = nullptr;
+	void* handle = nullptr;
+	// compileShaderAtBestProfile reports HRESULT and the compiler reason on stderr itself; ps_3_0
+	// first with a ps_2_0 step-down, same ladder the water and dot3 shaders use.
+	HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kShadowBlurShader, false, "[SHADOWBLUR]", &profile, &handle);
+	if (FAILED(hr) || handle == nullptr)
+		return;
+	m_blurShader = handle;
+
+	m_blurRT[0] = DX8Wrapper::Create_Render_Target(m_renderTargetSize, m_renderTargetSize, WW3D_FORMAT_A8R8G8B8);
+	m_blurRT[1] = DX8Wrapper::Create_Render_Target(m_renderTargetSize, m_renderTargetSize, WW3D_FORMAT_A8R8G8B8);
+	if (m_blurRT[0] == nullptr || m_blurRT[1] == nullptr)
+	{
+		releaseBlurResources();
+		return;
+	}
+
+	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
+	if (dev == nullptr ||
+		FAILED(dev->CreateVertexBuffer(4*sizeof(SHADOW_BLUR_VERTEX), D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, (LPDIRECT3DVERTEXBUFFER9*)&m_blurVB, nullptr)) ||
+		FAILED(dev->CreateIndexBuffer(6*sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, (LPDIRECT3DINDEXBUFFER9*)&m_blurIB, nullptr)))
+	{
+		releaseBlurResources();
+		return;
+	}
+
+	//Clip-space quad covering the whole atlas; texture row 0 maps to NDC y=-1 (top of the RT).
+	SHADOW_BLUR_VERTEX quad[4] =
+	{
+		{ -1.0f, -1.0f, 0.5f, 1.0f, 0.0f, 0.0f },
+		{ -1.0f,  1.0f, 0.5f, 1.0f, 0.0f, 1.0f },
+		{  1.0f, -1.0f, 0.5f, 1.0f, 1.0f, 0.0f },
+		{  1.0f,  1.0f, 0.5f, 1.0f, 1.0f, 1.0f },
+	};
+	VOID* vbBits = nullptr;
+	if (SUCCEEDED(((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Lock(0, sizeof(quad), &vbBits, 0)))
+	{
+		memcpy(vbBits, quad, sizeof(quad));
+		((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Unlock();
+	}
+
+	WORD ibIndices[6] = {0, 1, 2, 1, 3, 2};
+	VOID* ibBits = nullptr;
+	if (SUCCEEDED(((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Lock(0, sizeof(ibIndices), &ibBits, 0)))
+	{
+		memcpy(ibBits, ibIndices, sizeof(ibIndices));
+		((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Unlock();
+	}
+
+	m_blurReady = TRUE;
+	fprintf(stderr, "[SHADOWBLUR] enabled radius=%d profile=%s atlas=%d\n", m_blurRadius, profile, m_renderTargetSize);
+	fflush(stderr);
+#else
+	// Runtime HLSL compilation is Windows-only (the CompatLib shim drives d3dcompiler), same
+	// boundary as compileShaderAtBestProfile itself.  On other platforms shadow softening stays
+	// off until the blur program ships as a build-time asset; the sharp path is unaffected.
+#endif
+}
+
+void W3DProjectedShadowManager::releaseBlurResources()
+{
+	REF_PTR_RELEASE(m_blurRT[0]);
+	REF_PTR_RELEASE(m_blurRT[1]);
+	if (m_blurShader)
+	{
+		((IDirect3DPixelShader9*)m_blurShader)->Release();
+		m_blurShader = nullptr;
+	}
+	if (m_blurVB)
+	{
+		((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Release();
+		m_blurVB = nullptr;
+	}
+	if (m_blurIB)
+	{
+		((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Release();
+		m_blurIB = nullptr;
+	}
+	m_blurReady = FALSE;
+	m_blurRadius = 0;
+}
+
+void W3DProjectedShadowManager::runBlurPass(void* srcTexture, void* dstSurface, float texelOffsetX, float texelOffsetY)
+{
+	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
+	if (dev == nullptr || srcTexture == nullptr || dstSurface == nullptr || m_blurShader == nullptr)
+		return;
+
+	dev->SetRenderTarget(0, (IDirect3DSurface9*)dstSurface);
+
+	D3DVIEWPORT9 vp;
+	vp.X = 0;
+	vp.Y = 0;
+	vp.Width = m_renderTargetSize;
+	vp.Height = m_renderTargetSize;
+	vp.MinZ = 0.0f;
+	vp.MaxZ = 1.0f;
+	dev->SetViewport(&vp);
+
+	dev->SetTexture(0, (IDirect3DBaseTexture9*)srcTexture);
+	//Linear filtering is part of the gaussian: the 3-tap weights rely on sampling between texels.
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+	float c0v[4] = { texelOffsetX, texelOffsetY, 0.0f, 0.0f };
+	dev->SetPixelShaderConstantF(0, c0v, 1);
+
+	//D18 lesson: SetFVF does not unbind a custom vertex shader left behind by another pass, so
+	//the null binding must be explicit or the quad could be drawn through a stale world VS.
+	dev->SetVertexShader(nullptr);
+	dev->SetPixelShader((IDirect3DPixelShader9*)m_blurShader);
+
+	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+	dev->SetStreamSource(0, (LPDIRECT3DVERTEXBUFFER9)m_blurVB, 0, sizeof(SHADOW_BLUR_VERTEX));
+	dev->SetIndices((LPDIRECT3DINDEXBUFFER9)m_blurIB);
+	dev->SetFVF(SHADOW_BLUR_FVF);
+	dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+
+	dev->SetPixelShader(nullptr);
+}
+
+TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
+{
+	if (!m_blurReady || m_dynamicRenderTarget == nullptr)
+		return m_dynamicRenderTarget;
+
+	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
+	if (dev == nullptr)
+		return m_dynamicRenderTarget;
+
+	//Remember the shadow-render state we interrupt, so the caller's own device stays usable.
+	IDirect3DSurface9* prevRT = nullptr;
+	D3DVIEWPORT9 prevVP;
+	dev->GetRenderTarget(0, &prevRT);
+	dev->GetViewport(&prevVP);
+
+	//Radius is in texels per pass; the shader multiplies by 1.38/3.23 for the wide taps.
+	float step = (float)m_blurRadius / (float)m_renderTargetSize;
+
+	TextureClass* result = m_dynamicRenderTarget;
+
+	SurfaceClass* hSurface = m_blurRT[0] ? m_blurRT[0]->Get_Surface_Level() : nullptr;
+	if (hSurface)
+	{
+		runBlurPass((void*)m_dynamicRenderTarget->Peek_D3D_Texture(), (void*)hSurface->Peek_D3D_Surface(), step, 0.0f);
+		hSurface->Release_Ref();
+
+		SurfaceClass* vSurface = m_blurRT[1] ? m_blurRT[1]->Get_Surface_Level() : nullptr;
+		if (vSurface)
+		{
+			runBlurPass((void*)m_blurRT[0]->Peek_D3D_Texture(), (void*)vSurface->Peek_D3D_Surface(), 0.0f, step);
+			vSurface->Release_Ref();
+			result = m_blurRT[1];
+		}
+	}
+
+	dev->SetRenderTarget(0, prevRT);
+	if (prevRT)
+		prevRT->Release();
+	dev->SetViewport(&prevVP);
+	dev->SetTexture(0, nullptr);
+	//The detour wrote raw D3D state over everything DX8Wrapper caches (viewport, shaders, states).
+	DX8Wrapper::Invalidate_Cached_Render_States();
+
+	return result;
 }
 
 void W3DProjectedShadowManager::invalidateCachedLightPositions()
@@ -2258,7 +2497,12 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 
 		//Need to copy generated texture into permanent texture.
 		SurfaceClass *oldSurface=m_shadowTexture[0]->getTexture()->Get_Surface_Level();
-		SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
+		// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: copy from the blurred atlas when
+		// ShadowSoftening is on (acquireBlurredAtlas returns the sharp atlas itself when it isn't,
+		// so the original path is bit-identical).  The blur has to happen here, before the Copy:
+		// the projector repacks the atlas every re-render, so blurring a private copy afterwards
+		// would mix in stale neighbour shadows.
+		SurfaceClass *newSurface=TheW3DProjectedShadowManager->acquireBlurredAtlas()->Get_Surface_Level();
 
 		//Copy shadow from temporary video-memory surface into a permanent texture
 		// GeneralsX @feature 10/10/2026 Shadow S2: must use the real dimensions, not the macros, or a

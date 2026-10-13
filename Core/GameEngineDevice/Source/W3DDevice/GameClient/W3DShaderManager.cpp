@@ -70,6 +70,7 @@
 #include "GameLogic/GameLogic.h"
 #include "Common/GlobalData.h"
 #include "Common/GameLOD.h"
+#include "Common/OptionPreferences.h"	// GeneralsX @feature 13/10/2026 lighting-knob getters
 #include "d3dx9tex.h"
 #include "WW3D2/dx8caps.h"
 // GeneralsX @feature T3-0 M3/M4: dot3 runtime assembly + startup diagnostics + WW3D2-side mount module
@@ -149,9 +150,25 @@ protected:
 	virtual Int set(FilterModes mode) override;		///<setup shader for the specified rendering pass.
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
 	enum { BLOOM_TEX_SIZE = 256 };	///<quarter-resolution bright pass buffer (power of two).
+	// GeneralsX @feature PS3.0 T4 13/10/2026 programmable bloom chain sizes.
+	enum { BLOOM_MID_SIZE = 128, BLOOM_SMALL_SIZE = 64 };
 	static Bool s_enabled;			///<global bloom on/off switch (not part of game state/CRC).
 	IDirect3DTexture9 *m_bloomTexture;	///<quarter-resolution buffer holding the bright pass.
 	IDirect3DSurface9 *m_bloomSurface;	///<render target surface of m_bloomTexture.
+	// GeneralsX @feature PS3.0 T4 13/10/2026 HLSL chain: soft-knee brightpass, 9-tap tent downsample
+	// (used 256->128 and 128->64), additive composite with an intensity constant.  When any part of
+	// this fails to compile the filter keeps the fixed-function passes above - bloom never disappears
+	// over a shader bug.
+	Bool m_hlsl;						///<TRUE when all three HLSL passes compiled and the extra RTs exist.
+	IDirect3DPixelShader9 *m_brightPS;	///<soft-threshold brightpass program.
+	IDirect3DPixelShader9 *m_blurPS;	///<9-tap tent downsample program (one program, two calls).
+	IDirect3DPixelShader9 *m_compositePS;///<intensity-scaled additive composite program.
+	IDirect3DTexture9 *m_midTexture;	///<128px first blur level.
+	IDirect3DSurface9 *m_midSurface;
+	IDirect3DTexture9 *m_smallTexture;	///<64px second blur level - the one composited back.
+	IDirect3DSurface9 *m_smallSurface;
+	Bool initHlslChain();				///<compile programs + create the two blur levels.
+	void releaseHlslChain();			///<release everything initHlslChain owns (idempotent).
 };
 
 ScreenBloomFilter screenBloomFilter;
@@ -351,15 +368,134 @@ Int ScreenBloomFilter::init()
 	if (FAILED(hr))
 		return FALSE;
 
+	// GeneralsX @feature PS3.0 T4 13/10/2026 try the programmable chain; the fixed-function
+	// passes in postRender stay as the fallback whenever this fails.
+	initHlslChain();
+
 	W3DFilters[FT_VIEW_BLOOM_FILTER]=&screenBloomFilter;
 	return TRUE;
 }
 
 Int ScreenBloomFilter::shutdown()
 {
+	releaseHlslChain();
 	SAFE_RELEASE(m_bloomSurface);
 	SAFE_RELEASE(m_bloomTexture);
 	return TRUE;
+}
+
+// GeneralsX @feature PS3.0 T4 13/10/2026 programmable bloom chain sources.  The fixed-function
+// passes reproduce these with a hard SUBTRACT threshold, no blur of its own (the halo came from
+// bilinear upscaling of the quarter-res buffer alone) and a vertex-diffuse intensity scale.
+// Here the threshold gets a soft knee so lights fade into the glow instead of popping, two
+// tent-blurred downsample levels give a real wide halo, and the composite intensity is a float
+// constant instead of a quantised colour byte.
+static const char* kBloomBrightShader =
+	"sampler s0 : register(s0);\n"
+	"float4 c0 : register(c0);\n"	//x=threshold, y=knee width
+	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+	"{\n"
+	"    float3 c = tex2D(s0, uv).rgb;\n"
+	"    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));\n"
+	"    float soft = saturate((lum - c0.x) / max(c0.y, 0.0001));\n"	//linear knee: 0 below threshold, 1 past threshold+knee
+	"    return float4(c * soft, 1.0);\n"
+	"}\n";
+
+static const char* kBloomBlurShader =
+	"sampler s0 : register(s0);\n"
+	"float4 c0 : register(c0);\n"	//xy=tent spread in source uv units
+	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+	"{\n"
+	"    float3 sum = float3(0.0, 0.0, 0.0);\n"
+	"    sum += tex2D(s0, uv + float2(-c0.x, -c0.y)).rgb;\n"
+	"    sum += tex2D(s0, uv + float2( 0.0,  -c0.y)).rgb;\n"
+	"    sum += tex2D(s0, uv + float2( c0.x,  -c0.y)).rgb;\n"
+	"    sum += tex2D(s0, uv + float2(-c0.x,  0.0 )).rgb;\n"
+	"    sum += tex2D(s0, uv).rgb;\n"
+	"    sum += tex2D(s0, uv + float2( c0.x,  0.0 )).rgb;\n"
+	"    sum += tex2D(s0, uv + float2(-c0.x,  c0.y)).rgb;\n"
+	"    sum += tex2D(s0, uv + float2( 0.0,   c0.y)).rgb;\n"
+	"    sum += tex2D(s0, uv + float2( c0.x,  c0.y)).rgb;\n"
+	"    return float4(sum * (1.0 / 9.0), 1.0);\n"
+	"}\n";
+
+static const char* kBloomCompositeShader =
+	"sampler s0 : register(s0);\n"
+	"float4 c0 : register(c0);\n"	//x=intensity
+	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+	"{\n"
+	"    return float4(tex2D(s0, uv).rgb * c0.x, 0.0);\n"	//device adds it onto the scene (ONE,ONE)
+	"}\n";
+
+// Builds the three programs and the two extra blur levels.  Anything failing simply leaves
+// m_hlsl FALSE and the filter keeps its fixed-function passes, so this can never take bloom -
+// or the frame - down.  Windows-only like the other inline-HLSL users: the runtime D3DCompile
+// shim is the only compiler in the shipped build.
+Bool ScreenBloomFilter::initHlslChain()
+{
+	releaseHlslChain();
+#ifdef _WIN32
+	if (getenv("GENERALSX_BLOOM3") && atoi(getenv("GENERALSX_BLOOM3")) == 0)
+	{
+		fprintf(stderr, "[BLOOM3] disabled by GENERALSX_BLOOM3=0, fixed-function chain stays\n");
+		fflush(stderr);
+		return FALSE;
+	}
+
+	const char* profile = nullptr;
+	void* handle = nullptr;
+	if (FAILED(W3DShaderManager::compileShaderAtBestProfile(kBloomBrightShader, false, "[BLOOM3]", &profile, &handle)) || handle == nullptr)
+		return FALSE;
+	m_brightPS = (IDirect3DPixelShader9*)handle;
+
+	handle = nullptr;
+	if (FAILED(W3DShaderManager::compileShaderAtBestProfile(kBloomBlurShader, false, "[BLOOM3]", &profile, &handle)) || handle == nullptr)
+	{
+		releaseHlslChain();
+		return FALSE;
+	}
+	m_blurPS = (IDirect3DPixelShader9*)handle;
+
+	handle = nullptr;
+	if (FAILED(W3DShaderManager::compileShaderAtBestProfile(kBloomCompositeShader, false, "[BLOOM3]", &profile, &handle)) || handle == nullptr)
+	{
+		releaseHlslChain();
+		return FALSE;
+	}
+	m_compositePS = (IDirect3DPixelShader9*)handle;
+
+	LPDIRECT3DDEVICE9 pDev = DX8Wrapper::_Get_D3D_Device8();
+	if (FAILED(pDev->CreateTexture(BLOOM_MID_SIZE, BLOOM_MID_SIZE, 1, D3DUSAGE_RENDERTARGET,
+			D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_midTexture, nullptr)) || m_midTexture == nullptr ||
+		FAILED(m_midTexture->GetSurfaceLevel(0, &m_midSurface)) ||
+		FAILED(pDev->CreateTexture(BLOOM_SMALL_SIZE, BLOOM_SMALL_SIZE, 1, D3DUSAGE_RENDERTARGET,
+			D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_smallTexture, nullptr)) || m_smallTexture == nullptr ||
+		FAILED(m_smallTexture->GetSurfaceLevel(0, &m_smallSurface)))
+	{
+		releaseHlslChain();
+		return FALSE;
+	}
+
+	m_hlsl = TRUE;
+	fprintf(stderr, "[BLOOM3] programmable chain installed profile=%s levels=%d/%d/%d\n",
+		profile ? profile : "?", BLOOM_TEX_SIZE, BLOOM_MID_SIZE, BLOOM_SMALL_SIZE);
+	fflush(stderr);
+	return TRUE;
+#else
+	return FALSE;
+#endif
+}
+
+void ScreenBloomFilter::releaseHlslChain()
+{
+	if (m_brightPS) { m_brightPS->Release(); m_brightPS = nullptr; }
+	if (m_blurPS) { m_blurPS->Release(); m_blurPS = nullptr; }
+	if (m_compositePS) { m_compositePS->Release(); m_compositePS = nullptr; }
+	SAFE_RELEASE(m_midSurface);
+	SAFE_RELEASE(m_midTexture);
+	SAFE_RELEASE(m_smallSurface);
+	SAFE_RELEASE(m_smallTexture);
+	m_hlsl = FALSE;
 }
 
 Bool ScreenBloomFilter::preRender(Bool &skipRender, CustomScenePassModes &scenePassMode)
@@ -463,6 +599,74 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	}
 	pDev->SetRenderTarget(0, m_bloomSurface);
 	pDev->SetDepthStencilSurface(depthSurface);
+
+	if (m_hlsl)
+	{
+		// GeneralsX @feature PS3.0 T4 13/10/2026 programmable chain: soft-knee brightpass ->
+		// 256->128 tent -> 128->64 tent -> additive composite of the 64px halo.  Same screen-space
+		// quads as the fixed-function path; only the stage state lines are replaced by PS constants.
+		static Real s_bloomIntensity = -1.0f;
+		if (s_bloomIntensity < 0.0f)
+		{
+			// GeneralsX @feature 13/10/2026 Options.ini BloomIntensity via the options menu
+			// (restart to take effect); env GENERALSX_BLOOM_INTENSITY remains the QA override
+			// inside the getter, default stays 0.35 (retail byte-quantised scale was 0x33/255 ~ 0.2).
+			s_bloomIntensity = OptionPreferences().getBloomIntensity();
+		}
+
+		// Bright pass: scene texture -> quarter-res buffer through the knee.
+		float thr[4] = { 0.45f, 0.25f, 0.0f, 0.0f };
+		pDev->SetVertexShader(nullptr);
+		pDev->SetPixelShader(m_brightPS);
+		pDev->SetPixelShaderConstantF(0, thr, 1);
+		pDev->SetTexture(0, tex);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
+		BuildBloomQuad(v, u0*BLOOM_TEX_SIZE, v0*BLOOM_TEX_SIZE, u1*BLOOM_TEX_SIZE, v1*BLOOM_TEX_SIZE, u0, v0, u1, v1, 0xffffffff);
+		DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
+		pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+
+		// First blur level: 256 -> 128, tent spread of two source texels.
+		pDev->SetRenderTarget(0, m_midSurface);
+		pDev->SetPixelShader(m_blurPS);
+		float spread[4] = { 2.0f / BLOOM_TEX_SIZE, 2.0f / BLOOM_TEX_SIZE, 0.0f, 0.0f };
+		pDev->SetPixelShaderConstantF(0, spread, 1);
+		pDev->SetTexture(0, m_bloomTexture);
+		BuildBloomQuad(v, 0.0f, 0.0f, (Real)BLOOM_MID_SIZE, (Real)BLOOM_MID_SIZE, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
+		DX8Wrapper::Apply_Render_State_Changes();
+		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+
+		// Second blur level: 128 -> 64, same program, wider spread in source uv units.
+		pDev->SetRenderTarget(0, m_smallSurface);
+		spread[0] = 2.0f / BLOOM_MID_SIZE;
+		spread[1] = 2.0f / BLOOM_MID_SIZE;
+		pDev->SetPixelShaderConstantF(0, spread, 1);
+		pDev->SetTexture(0, m_midTexture);
+		BuildBloomQuad(v, 0.0f, 0.0f, (Real)BLOOM_SMALL_SIZE, (Real)BLOOM_SMALL_SIZE, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
+		DX8Wrapper::Apply_Render_State_Changes();
+		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+
+		// Composite: 64px halo upscaled over the tactical view, scaled by the float intensity.
+		pDev->SetRenderTarget(0, backSurface);
+		pDev->SetPixelShader(m_compositePS);
+		float inten[4] = { s_bloomIntensity, 0.0f, 0.0f, 0.0f };
+		pDev->SetPixelShaderConstantF(0, inten, 1);
+		pDev->SetTexture(0, m_smallTexture);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, D3DBLEND_ONE );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
+		BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, 0xffffffff);
+		DX8Wrapper::Apply_Render_State_Changes();
+		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+
+		//D18 contract: whoever bound the shader unbinds it before the fixed-function next pass.
+		pDev->SetPixelShader(nullptr);
+		pDev->SetVertexShader(nullptr);
+		backSurface->Release();
+		SAFE_RELEASE(depthSurface);
+		reset();
+		return true;
+	}
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SUBTRACT );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
@@ -3132,18 +3336,24 @@ static void InitNormalMapShaders()
 	// direction - rotate it into tangent space with the vertex basis (tangent, binormal, normal) and
 	// emit it as TEXCOORD1, so every surface gets its own light angle (per-face shading) instead of
 	// one constant tangent-space light that made all faces render the same flat darkness.
+	// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong: c5 = MODEL-SPACE eye direction (camera +Z axis,
+	// scene->eye; constant across the RTS view). The VS rotates it into tangent space exactly like c4 and
+	// emits the UNNORMALISED light+eye sum as TEXCOORD2; the PS normalises per pixel (the half vector must
+	// be re-normalised after interpolation, which is the ps_3_0 nrm/normalize win over the ps_2_0 pair).
 	static const char* kVertexShader =
 		"float4 c0 : register(c0);\n"
 		"float4 c1 : register(c1);\n"
 		"float4 c2 : register(c2);\n"
 		"float4 c3 : register(c3);\n"
 		"float4 c4 : register(c4);\n"
+		"float4 c5 : register(c5);\n"
 		"struct VS_OUT\n"
 		"{\n"
 		"    float4 pos     : POSITION;\n"
 		"    float4 diffuse : COLOR0;\n"
 		"    float2 uv      : TEXCOORD0;\n"
 		"    float3 light   : TEXCOORD1;\n"
+		"    float3 hvec    : TEXCOORD2;\n"
 		"};\n"
 		"VS_OUT main(float4 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0,\n"
 		"            float2 uv0 : TEXCOORD0, float3 tangent : TEXCOORD1, float3 binormal : TEXCOORD2)\n"
@@ -3153,6 +3363,9 @@ static void InitNormalMapShaders()
 		"    o.diffuse = diffuse;\n"
 		"    o.uv = uv0;\n"
 		"    o.light = float3(dot(c4.xyz, tangent), dot(c4.xyz, binormal), dot(c4.xyz, normal));\n"
+		"    float3 eT = float3(dot(c5.xyz, tangent), dot(c5.xyz, binormal), dot(c5.xyz, normal));\n"
+		"    float3 hsum = o.light + eT;\n"
+		"    o.hvec = (dot(hsum, hsum) < 1e-6) ? float3(0.0, 0.0, 1.0) : hsum;\n"  // degenerate guard: PS normalize(0) would NaN the specular
 		"    return o;\n"
 		"}\n";
 
@@ -3160,6 +3373,11 @@ static void InitNormalMapShaders()
 	// in-plane deviation is scaled by c3.x for bump contrast, and the per-vertex tangent-space light
 	// (from the VS) makes faces shade differently. dp3 is saturated exactly like the DX8 dp3_sat
 	// bump idiom; strength/ambient arrive as device constants c1/c2.
+	// GeneralsX @feature PS3.0 T1 13/10/2026: n and L are re-normalised per pixel (perturbed normals
+	// lose unit length after the c3 scaling; interpolated vectors lose it after rasterisation), and a
+	// Blinn-Phong term rides on the interpolated half vector: spec = pow(ndh, c6.x) * c6.y gated by ndl
+	// so back faces never gain a highlight. c6 defaults keep the highlight subtle; QA knobs
+	// GENERALSX_NORMALMAP_SPEC / _SPECPOWER override intensity/power from the launcher.
 	// GENERALSX_NORMALMAP_NOSTAGE1=1 swaps the normal-map sample for a flat (0,0,1) normal:
 	// if buildings still flicker, stage1 binding/sampling is innocent.
 	static const char* kPixelShader =
@@ -3168,11 +3386,13 @@ static void InitNormalMapShaders()
 		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
 		"float4 c2 : register(c2);\n"                  // ambient rgb
 		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): xy exaggeration, z passthrough
+		"float4 c6 : register(c6);\n"                  // (specPow, specIntensity, -, -)
 		"struct PS_IN\n"
 		"{\n"
 		"    float4 diffuse : COLOR0;\n"
 		"    float2 uv      : TEXCOORD0;\n"
 		"    float3 light   : TEXCOORD1;\n"
+		"    float3 hvec    : TEXCOORD2;\n"
 		"};\n"
 		"float4 main(PS_IN i) : COLOR\n"
 		"{\n"
@@ -3181,8 +3401,13 @@ static void InitNormalMapShaders()
 		"    float3 n = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
 		"    n.xy = n.xy * c3.x + c3.y;\n"
 		"    n.z  = n.z  * c3.z + c3.w;\n"
-		"    float3 lit = saturate(dot(n, i.light)) * c1.xxx + c2.rgb;\n"
-		"    return float4(base.rgb * lit, base.a);\n" // albedo detail always preserved (alpha kept)
+		"    n = normalize(n);\n"
+		"    float3 L = normalize(i.light);\n"
+		"    float ndl = saturate(dot(n, L));\n"
+		"    float3 lit = ndl * c1.xxx + c2.rgb;\n"
+		"    float ndh = saturate(dot(n, normalize(i.hvec)));\n"
+		"    float spec = pow(ndh, c6.x) * c6.y * ndl;\n"
+		"    return float4(base.rgb * lit + spec, base.a);\n" // albedo detail always preserved (alpha kept)
 		"}\n";
 
 	// Diagnostic variant: flat (0,0,1) normal - isolates stage1 sampling as the flicker source.
@@ -3236,6 +3461,103 @@ static void InitNormalMapShaders()
 		}
 	}
 
+	// GeneralsX @feature PS3.0 T5 13/10/2026 per-pixel multi-light variants.  The single-light pair
+	// above rotates ONE sun into tangent space per vertex; these carry the world position and the
+	// full TBN basis through to the pixel, so every point light in the mesh's LightEnvironment
+	// (max 4, the engine's own cap) gets its own per-pixel direction, smoothstep radius falloff
+	// and Blinn specular.  The sun pass reproduces the single-light result per-pixel, so a mesh
+	// without point lights looks the same modulo interpolation precision.  dx8normalmap.cpp binds
+	// this pair only when it actually collected >=1 point light, so the T1 path is untouched.
+	static const char* kVertexShaderML =
+		"float4 c0 : register(c0);\n"
+		"float4 c1 : register(c1);\n"
+		"float4 c2 : register(c2);\n"
+		"float4 c3 : register(c3);\n"
+		"float4 c7 : register(c7);\n"                  //world matrix rows (wmDx8, translation in .w of c7..c9)
+		"float4 c8 : register(c8);\n"
+		"float4 c9 : register(c9);\n"
+		"struct VS_OUT\n"
+		"{\n"
+		"    float4 pos     : POSITION;\n"
+		"    float4 diffuse : COLOR0;\n"
+		"    float2 uv      : TEXCOORD0;\n"
+		"    float3 wpos    : TEXCOORD1;\n"
+		"    float3 tT      : TEXCOORD2;\n"
+		"    float3 tB      : TEXCOORD3;\n"
+		"    float3 tN      : TEXCOORD4;\n"
+		"};\n"
+		"VS_OUT main(float4 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0,\n"
+		"            float2 uv0 : TEXCOORD0, float3 tangent : TEXCOORD1, float3 binormal : TEXCOORD2)\n"
+		"{\n"
+		"    VS_OUT o;\n"
+		"    o.pos = float4(dot(pos, c0), dot(pos, c1), dot(pos, c2), dot(pos, c3));\n"
+		"    o.wpos = float3(dot(pos, c7), dot(pos, c8), dot(pos, c9));\n"
+		"    o.diffuse = diffuse;\n"
+		"    o.uv = uv0;\n"
+		"    o.tT = float3(dot(tangent, c7.xyz), dot(tangent, c8.xyz), dot(tangent, c9.xyz));\n"
+		"    o.tB = float3(dot(binormal, c7.xyz), dot(binormal, c8.xyz), dot(binormal, c9.xyz));\n"
+		"    o.tN = float3(dot(normal, c7.xyz), dot(normal, c8.xyz), dot(normal, c9.xyz));\n"
+		"    return o;\n"
+		"}\n";
+
+	static const char* kPixelShaderML =
+		"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
+		"sampler s1 : register(s1);\n"                 // tangent-space normal map (stage1)
+		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
+		"float4 c2 : register(c2);\n"                  // ambient rgb
+		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): bump xy/z scaling
+		"float4 c4 : register(c4);\n"                  // world sun direction (toward the light)
+		"float4 c5 : register(c5);\n"                  // world eye direction (camera +Z)
+		"float4 c6 : register(c6);\n"                  // (specPow, specIntensity, -, -)
+		"float4 c16 : register(c16);\n"                // x = number of active point lights (0..4)
+		"float4 mlights[8] : register(c17);\n"         // pairs: (center.xyz, innerRadius), (diffuse.rgb, outerRadius)
+		"struct PS_IN\n"
+		"{\n"
+		"    float4 diffuse : COLOR0;\n"
+		"    float2 uv      : TEXCOORD0;\n"
+		"    float3 wpos    : TEXCOORD1;\n"
+		"    float3 tT      : TEXCOORD2;\n"
+		"    float3 tB      : TEXCOORD3;\n"
+		"    float3 tN      : TEXCOORD4;\n"
+		"};\n"
+		"float4 main(PS_IN i) : COLOR\n"
+		"{\n"
+		"    float4 base = tex2D(s0, i.uv);\n"
+		"    base.rgb *= i.diffuse.rgb;\n"
+		"    float3 tn = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
+		"    tn.xy = tn.xy * c3.x + c3.y;\n"
+		"    tn.z  = tn.z  * c3.z + c3.w;\n"
+		"    tn = normalize(tn);\n"
+		"    float3 T = normalize(i.tT);\n"
+		"    float3 B = normalize(i.tB);\n"
+		"    float3 N = normalize(i.tN);\n"
+		"    float3 n = tn.x * T + tn.y * B + tn.z * N;\n"   // world-space perturbed normal
+		"    float3 E = normalize(c5.xyz);\n"
+		"    float3 L = normalize(c4.xyz);\n"
+		"    float ndl = saturate(dot(n, L));\n"
+		"    float3 hs = L + E;\n"
+		"    float hsl = length(hs);\n"
+		"    float ndh = (hsl > 0.001) ? saturate(dot(n, hs / hsl)) : 0.0;\n"  // degenerate half-vector guard (SEL, ps_2_0 safe)
+		"    float3 col = base.rgb * (ndl * c1.xxx + c2.rgb) + pow(ndh, c6.x) * c6.y * ndl;\n"
+		"    for (int k = 0; k < 4; k++)\n"
+		"    {\n"
+		"        float4 lp = mlights[2 * k];\n"
+		"        float4 lc = mlights[2 * k + 1];\n"
+		"        float on = ((float)k < c16.x) ? 1.0 : 0.0;\n"	//static loop + mask: ps_2_0 has no dynamic break
+		"        float3 Lv = lp.xyz - i.wpos;\n"
+		"        float dist = length(Lv);\n"
+		"        float att = saturate((lc.w - dist) / max(lc.w - lp.w, 0.0001));\n"
+		"        att *= att;\n"
+		"        float3 Ld = Lv / max(dist, 0.0001);\n"
+		"        float ndl2 = saturate(dot(n, Ld));\n"
+		"        float3 h2 = Ld + E;\n"
+		"        float h2l = length(h2);\n"
+		"        float ndh2 = (h2l > 0.001) ? saturate(dot(n, h2 / h2l)) : 0.0;\n"
+		"        col += on * att * (base.rgb * (ndl2 * c1.xxx) * lc.rgb + pow(ndh2, c6.x) * c6.y * ndl2);\n"
+		"    }\n"
+		"    return float4(col, base.a);\n"
+		"}\n";
+
 	// GeneralsX @feature PS3.0 batch7 13/10/2026 the pair is emitted through the shared ladder: on a
 	// device that accepts it this compiles as vs_3_0/ps_3_0 (flow control, 32 temporaries, 224 pixel
 	// constants) and drops back to the previous vs_2_0/ps_2_0 automatically if the runtime refuses the
@@ -3258,13 +3580,45 @@ static void InitNormalMapShaders()
 		// GeneralsX @build d3d9 port 11/10/2026 - UINT_PTR carries the interface pointer losslessly on x64.
 		DX8NormalMap::Install((UINT_PTR)vsHandle, (UINT_PTR)psHandle);
 
+		// GeneralsX @feature PS3.0 T5 13/10/2026 compile the multi-light pair on top of the main one.
+		// Failure here is purely additive: g_VS_ML/g_PS_ML stay 0 and dx8normalmap never mounts them.
+		{
+			// GeneralsX @feature 13/10/2026 user toggle in the options-menu registry
+			// (Options.ini MultiLightEffect); env GENERALSX_MULTILIGHT=0 still forces OFF inside
+			// the getter so scripted A/B keeps working.  When disabled here the ML pair is simply
+			// never installed and dx8normalmap falls back to the T1 single-light path.
+			if (!OptionPreferences().getMultiLightEnabled()) {
+				fprintf(stderr, "[ML] disabled (env GENERALSX_MULTILIGHT=0 or Options.ini MultiLightEffect=0)\n");
+			} else {
+				IDirect3DVertexShader9* mlVS = nullptr;
+				IDirect3DPixelShader9* mlPS = nullptr;
+				const char* mlVSProfile = nullptr;
+				const char* mlPSProfile = nullptr;
+				HRESULT mlHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderML, true, "[ML]", &mlVSProfile, (void**)&mlVS);
+				if (SUCCEEDED(mlHR) && mlVS != nullptr)
+					mlHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderML, false, "[ML]", &mlPSProfile, (void**)&mlPS);
+				if (SUCCEEDED(mlHR) && mlVS != nullptr && mlPS != nullptr) {
+					DX8NormalMap::Install_ML((UINT_PTR)mlVS, (UINT_PTR)mlPS);
+					fprintf(stderr, "[ML] multi-light shaders installed vs=%s ps=%s (max 4 point lights)\n",
+						mlVSProfile, mlPSProfile);
+				} else {
+					if (mlVS != nullptr) mlVS->Release();
+					if (mlPS != nullptr) mlPS->Release();
+					fprintf(stderr, "[ML] multi-light compile failed, single-light path only\n");
+				}
+				fflush(stderr);
+			}
+		}
+
 		// GeneralsX @feature 11/10/2026 Normal mapping defaults OFF (the dot3 path still has unresolved
 		// bugs), driven by the user toggle in the graphics settings (GlobalData::m_useNormalMapping,
 		// persisted to Options.ini); users can still turn it ON from the options menu.
 		// Command line / env remain QA overrides: -nonormalmap / GENERALSX_NORMALMAP=0 force OFF,
 		// -normalmap / GENERALSX_NORMALMAP=1 force ON. Strength via -normalmapstrength=<0..2> (default 0.8).
 		bool enable = TheGlobalData ? (TheGlobalData->m_useNormalMapping != FALSE) : false;
-		float strength = 0.8f;
+		// GeneralsX @feature 13/10/2026 strength default now comes from the options-menu registry
+		// (Options.ini NormalMapStrength, env-free key); the command line still overrides below.
+		float strength = OptionPreferences().getNormalMapStrength();
 		const char* cmd = GetCommandLineA();
 		if (cmd) {
 			if (strstr(cmd, "-nonormalmap") != nullptr) enable = false;

@@ -58,6 +58,7 @@
 #include "GameClient/GadgetComboBox.h"
 #include "GameClient/GadgetRadioButton.h"
 #include "GameClient/GadgetSlider.h"
+#include "GameClient/GadgetPushButton.h" // GeneralsX @feature Qoder 13/10/2026 GadgetButtonSetText for the lighting subpage labels
 #include "GameClient/HeaderTemplate.h"
 #include "GameClient/Shell.h"
 #include "GameClient/KeyDefs.h"
@@ -158,6 +159,16 @@ static GameWindow *   ButtonAdvancedAccept				= nullptr;
 static NameKeyType    ButtonAdvancedCancelID      = NAMEKEY_INVALID;
 static GameWindow *   ButtonAdvancedCancel				= nullptr;
 
+// GeneralsX @feature Qoder 13/10/2026 Lighting settings subpage (光影设置 popup), same
+// hidden USER-window pattern as WinAdvancedDisplayOptions: entry button shows the popup,
+// back button hides it, the main accept button persists everything through the registry.
+static NameKeyType    ButtonLightingID            = NAMEKEY_INVALID;
+static GameWindow *   ButtonLighting              = nullptr;
+static NameKeyType    WinLightingOptionsID        = NAMEKEY_INVALID;
+static GameWindow *   WinLightingOptions          = nullptr;
+static NameKeyType    ButtonLightingBackID        = NAMEKEY_INVALID;
+static GameWindow *   ButtonLightingBack          = nullptr;
+
 static NameKeyType    sliderTextureResolutionID = NAMEKEY_INVALID;
 static GameWindow *   sliderTextureResolution = nullptr;
 
@@ -208,8 +219,9 @@ static GameWindow *   checkHeatEffects   = nullptr;
 // dedicated static pointers, init blocks, saveOptions branches or GameEngine.cpp overrides.
 enum GameOptionType
 {
-	GAME_OPTION_BOOL,  // CheckBox gadget, stored as 0/1
-	GAME_OPTION_COMBO, // ComboBox gadget, stored as the selected value from comboValues
+	GAME_OPTION_BOOL,   // CheckBox gadget, stored as 0/1
+	GAME_OPTION_COMBO,  // ComboBox gadget, stored as the selected value from comboValues
+	GAME_OPTION_SLIDER, // HorzSlider gadget, stored as the raw slider position (integer ticks)
 };
 
 struct GameOptionDesc
@@ -222,6 +234,8 @@ struct GameOptionDesc
 	const Int *comboValues;           // GAME_OPTION_COMBO: one stored value per entry
 	const wchar_t *const *comboTexts; // optional entry display text; nullptr = show the number
 	Int comboCount;
+	Int sliderMin;                    // GAME_OPTION_SLIDER: min position applied to the gadget at init
+	Int sliderMax;                    // GAME_OPTION_SLIDER: max position applied to the gadget at init
 	Int (*globalFallback)();          // effective value shown when the key is absent from Options.ini
 	void (*apply)(Int value);         // runtime side effect; called on save, and at startup only when the key exists
 };
@@ -347,31 +361,129 @@ static const wchar_t *const s_antiAliasingTexts[] = { L"Off", L"2X", L"4X", L"8X
 static const Int s_shaderModelValues[] = { 0, 11, 14, 20, 30 };
 static const wchar_t *const s_shaderModelTexts[] = { L"Auto", L"1.1", L"1.4", L"2.0", L"3.0" };
 
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 13/10/2026 PS3.0 lighting parameters on the registry (引擎改造/设置参数交接说明 §8).
+// All values persist as integer ticks in Options.ini through the generic setInt loop; the
+// OptionPreferences getters own the units conversion and keep the GENERALSX_* QA env overrides
+// authoritative, so these fallbacks show exactly what the renderer will consume when the ini key
+// is absent. Sliders store raw ticks: 0-200 = percent x100 for the 0.0-2.0 strength range, 0-100
+// elsewhere. Only the normal-map strength has a live apply hook (DX8NormalMap re-arms every frame);
+// bloom, multi-light and the sun shadow map are compiled/created once per process and need a restart.
+
+static Int gameOptionFallback_NormalStrength()
+{
+	return (Int)(OptionPreferences().getNormalMapStrength() * 100.0f + 0.5f);
+}
+
+static Int gameOptionFallback_Bloom()
+{
+	return (Int)(OptionPreferences().getBloomIntensity() * 100.0f + 0.5f);
+}
+
+static Int gameOptionFallback_ShadowDensity()
+{
+	return OptionPreferences().getShadowMapIntensity();
+}
+
+static Int gameOptionFallback_ShadowSoftening()
+{
+	return OptionPreferences().getShadowSoftening();
+}
+
+static Int gameOptionFallback_SunShadowRes()
+{
+	return OptionPreferences().getSunShadowMapResolution();
+}
+
+static Int gameOptionFallback_MultiLight()
+{
+	return OptionPreferences().getMultiLightEnabled() != FALSE;
+}
+
+static Int gameOptionFallback_ShadowMap()
+{
+	return OptionPreferences().getShadowMapEnabled() != FALSE;
+}
+
+static void gameOptionApply_NormalStrength(Int tick)
+{
+	DX8NormalMap::Set_Strength((Real)tick * 0.01f);
+}
+
+static const Int s_shadowSofteningValues[] = { 0, 1, 2, 3 };
+static const wchar_t *const s_shadowSofteningTexts[] = { L"\u5173", L"\u4f4e", L"\u4e2d", L"\u9ad8" };
+
+static const Int s_sunShadowResValues[] = { 256, 512, 1024 };
+static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024" };
+
 static const GameOptionDesc s_gameOptionRegistry[] =
 {
 	{
 		GAME_OPTION_COMBO, "MaxFPSLimit", "OptionsMenu.wnd:ComboBoxMaxFpsLimit",
 		"OptionsMenu.wnd:StaticTextMaxFpsLimit", L"\u6700\u5927\u5e27\u7387",
-		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues),
+		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues), 0, 0,
 		gameOptionFallback_FpsLimit, gameOptionApply_FpsLimit,
 	},
 	{
 		GAME_OPTION_BOOL, "UseNormalMapping", "OptionsMenu.wnd:CheckNormalMapping",
 		nullptr, L"\u6cd5\u7ebf\u8d34\u56fe",
-		nullptr, nullptr, 0,
+		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_NormalMapping, gameOptionApply_NormalMapping,
 	},
 	{
 		GAME_OPTION_COMBO, "AntiAliasing", "OptionsMenu.wnd:ComboBoxAntiAliasing",
 		"OptionsMenu.wnd:StaticTextAntiAliasing", L"\u6297\u952f\u9f7f",
-		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues),
+		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues), 0, 0,
 		gameOptionFallback_AntiAliasing, gameOptionApply_AntiAliasing,
 	},
 	{
 		GAME_OPTION_COMBO, "ShaderModel", "OptionsMenu.wnd:ComboBoxShaderModel",
 		"OptionsMenu.wnd:StaticTextShaderModel", L"\u7740\u8272\u5668\u6863\u4f4d",
-		s_shaderModelValues, s_shaderModelTexts, (Int)ARRAY_SIZE(s_shaderModelValues),
+		s_shaderModelValues, s_shaderModelTexts, (Int)ARRAY_SIZE(s_shaderModelValues), 0, 0,
 		gameOptionFallback_ShaderModel, gameOptionApply_ShaderModel,
+	},
+	// GeneralsX @feature Qoder 13/10/2026 Lighting subpage controls (hidden popup WinLightingOptions).
+	{
+		GAME_OPTION_SLIDER, "NormalMapStrength", "OptionsMenu.wnd:SliderNormalStrength",
+		"OptionsMenu.wnd:StaticTextNormalStrength", L"\u6cd5\u7ebf\u5f3a\u5ea6",
+		nullptr, nullptr, 0, 0, 200,
+		gameOptionFallback_NormalStrength, gameOptionApply_NormalStrength,
+	},
+	{
+		GAME_OPTION_SLIDER, "BloomIntensity", "OptionsMenu.wnd:SliderBloom",
+		"OptionsMenu.wnd:StaticTextBloom", L"\u6cdb\u5149\u5f3a\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_Bloom, nullptr,
+	},
+	{
+		GAME_OPTION_SLIDER, "ShadowMapIntensity", "OptionsMenu.wnd:SliderShadowDensity",
+		"OptionsMenu.wnd:StaticTextShadowDensity", L"\u9634\u5f71\u6d53\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_ShadowDensity, nullptr,
+	},
+	{
+		GAME_OPTION_COMBO, "ShadowSoftening", "OptionsMenu.wnd:ComboBoxShadowSoftening",
+		"OptionsMenu.wnd:StaticTextShadowSoftening", L"\u9634\u5f71\u67d4\u5316",
+		s_shadowSofteningValues, s_shadowSofteningTexts, (Int)ARRAY_SIZE(s_shadowSofteningValues), 0, 0,
+		gameOptionFallback_ShadowSoftening, nullptr,
+	},
+	{
+		GAME_OPTION_COMBO, "SunShadowMapResolution", "OptionsMenu.wnd:ComboBoxSunShadowRes",
+		"OptionsMenu.wnd:StaticTextSunShadowRes", L"\u9634\u5f71\u5206\u8fa8\u7387",
+		s_sunShadowResValues, s_sunShadowResTexts, (Int)ARRAY_SIZE(s_sunShadowResValues), 0, 0,
+		gameOptionFallback_SunShadowRes, nullptr,
+	},
+	{
+		GAME_OPTION_BOOL, "MultiLightEffect", "OptionsMenu.wnd:CheckMultiLight",
+		nullptr, L"\u591a\u5149\u6e90\u6548\u679c",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_MultiLight, nullptr,
+	},
+	{
+		GAME_OPTION_BOOL, "ShadowMap", "OptionsMenu.wnd:CheckShadowMap",
+		nullptr, L"\u771f\u5b9e\u9634\u5f71\uff08\u5b9e\u9a8c\uff09",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_ShadowMap, nullptr,
 	},
 };
 
@@ -433,6 +545,11 @@ static void initGameOptionControls( const OptionPreferences *optionsPref )
 		{
 			GadgetCheckBoxSetChecked( control, value != 0 );
 		}
+		else if (desc.type == GAME_OPTION_SLIDER)
+		{
+			GadgetSliderSetMinMax( control, desc.sliderMin, desc.sliderMax );
+			GadgetSliderSetPosition( control, value );
+		}
 	}
 }
 
@@ -452,6 +569,10 @@ static void saveGameOptionControls( OptionPreferences *optionsPref )
 			GadgetComboBoxGetSelectedPos( (GameWindow *)control, &pos );
 			pos = clamp( 0, pos, desc.comboCount - 1 );
 			value = desc.comboValues[pos];
+		}
+		else if (desc.type == GAME_OPTION_SLIDER)
+		{
+			value = GadgetSliderGetPosition( (GameWindow *)control );
 		}
 		else
 		{
@@ -1324,6 +1445,20 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	ButtonAdvancedCancelID		= TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ButtonAdvanceBack" );
 	ButtonAdvancedCancel      = TheWindowManager->winGetWindowFromId( nullptr, ButtonAdvancedCancelID );
 
+	// GeneralsX @feature Qoder 13/10/2026 Lighting subpage: locate gadgets and set CJK labels from code.
+	ButtonLightingID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ButtonLightingOpen" );
+	ButtonLighting = TheWindowManager->winGetWindowFromId( nullptr, ButtonLightingID );
+	if (ButtonLighting)
+		GadgetButtonSetText( ButtonLighting, UnicodeString(L"\u5149\u5f71\u8bbe\u7f6e") );
+	WinLightingOptionsID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:WinLightingOptions" );
+	WinLightingOptions = TheWindowManager->winGetWindowFromId( nullptr, WinLightingOptionsID );
+	if (WinLightingOptions)
+		WinLightingOptions->winHide(TRUE);
+	ButtonLightingBackID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:ButtonLightingBack" );
+	ButtonLightingBack = TheWindowManager->winGetWindowFromId( nullptr, ButtonLightingBackID );
+	if (ButtonLightingBack)
+		GadgetButtonSetText( ButtonLightingBack, UnicodeString(L"\u8fd4\u56de") );
+
 	sliderTextureResolutionID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:LowResSlider" );
 	sliderTextureResolution = TheWindowManager->winGetWindowFromId( nullptr, sliderTextureResolutionID );
 
@@ -1938,6 +2073,17 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 			else if (controlID == ButtonAdvancedCancelID )
 			{
 				cancelAdvancedOptions();
+			}
+			// GeneralsX @feature Qoder 13/10/2026 Lighting subpage open/back (save stays on the main accept button).
+			else if (controlID == ButtonLightingID )
+			{
+				if (WinLightingOptions)
+					WinLightingOptions->winHide(FALSE);
+			}
+			else if (controlID == ButtonLightingBackID )
+			{
+				if (WinLightingOptions)
+					WinLightingOptions->winHide(TRUE);
 			}
 			else if ( controlID == buttonKeyboardOptionsMenu )
 			{

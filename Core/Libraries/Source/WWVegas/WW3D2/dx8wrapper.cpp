@@ -741,11 +741,16 @@ void DX8Wrapper::Shutdown()
 		}
 	}
 
-	if (D3D9Lib) {
-		FreeLibrary(D3D9Lib);
-		D3D9Lib = nullptr;
-	}
-
+	// GeneralsX @bugfix 13/10/2026 Do NOT unload the D3D9 front-end here.
+	// shutdownAll() (GameEngine.cpp) is not the last word on texture destruction: TextureClass
+	// instances still alive afterwards (W3DDisplay's asset manager teardown, and anything released
+	// later still, such as Drawable::killStaticImages()) run ~TextureBaseClass, which calls the COM
+	// virtual D3DTexture->Release() (texture.cpp:138). Freeing this library here left that vtable
+	// pointing into an unmapped image => access violation on quit, and the crash dump itself froze
+	// the process for 15-21s (Full minidump), which is what the user experienced as "hangs forever
+	// when leaving the game". The front-end stays loaded for the remaining lifetime of the process
+	// and the OS reclaims it at exit. Note this unloaded-frontend window is inherited from the
+	// imported baseline (it did the same with FreeLibrary(D3D8Lib)), not introduced by the D3D9 port.
 	_RenderDeviceNameTable.Clear();		 // note - Delete_All() resizes the vector, causing a reallocation.  Clear is better. jba.
 	_RenderDeviceShortNameTable.Clear();
 	_RenderDeviceDescriptionTable.Clear();

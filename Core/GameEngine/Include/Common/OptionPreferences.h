@@ -143,6 +143,19 @@ public:
 	Real getShadowVolumetricIntensity() const;				///< 0-100 percent, volumetric shadow darkening (default 22, the original was about 37.3)
 	void getShadowTint(Real *r, Real *g, Real *b) const;		///< "R G B" in permille (default "880 1000 1150"), returned as three per-channel multipliers
 	Int getShadowMapResolution() const;							///< shadow map edge length, one of 512/768/1024/2048, default 768
+	// GeneralsX @feature PS3.0 T2 13/10/2026 Shadow S-family: projected-shadow softening level,
+	// 0 = sharp (retail behavior, the default), 1-3 = gaussian blur radius in texels per pass.
+	Int getShadowSoftening() const;
+	// GeneralsX @feature 13/10/2026 PS3.0 lighting knobs from 引擎改造/设置参数交接说明.md.  All of
+	// them persist as integer ticks in the Options.ini S-family (never folded into m_iniCRC, so
+	// replays and LAN matching are safe); the GENERALSX_* environment variables keep overriding
+	// them inside these getters so scripted A/B runs never need to touch the user's file.
+	Real getNormalMapStrength() const;			///< tick 0-200 stored, returned 0.0-2.0 (default 0.8)
+	Real getBloomIntensity() const;				///< tick 0-100 stored, returned 0.0-1.0; env GENERALSX_BLOOM_INTENSITY wins outright (default 0.35)
+	Bool getMultiLightEnabled() const;			///< env GENERALSX_MULTILIGHT=0 forces OFF, else ini MultiLightEffect (default ON)
+	Bool getShadowMapEnabled() const;			///< any GENERALSX_SHADOWMAP with atoi>0 forces ON / =0 forces OFF, else ini ShadowMap (default OFF)
+	Int getShadowMapIntensity() const;			///< 0-100 percent; env GENERALSX_SHADOWMAP_INT wins when set (default 55)
+	Int getSunShadowMapResolution() const;		///< one of 256/512/1024, snap-up (default 1024)
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int getSkirmishTickRate() const;
 };

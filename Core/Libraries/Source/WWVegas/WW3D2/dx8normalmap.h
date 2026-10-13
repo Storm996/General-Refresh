@@ -25,6 +25,11 @@ namespace DX8NormalMap
 	// GeneralsX @build d3d9 port 11/10/2026 - handles are D3D9 interface pointers carried as UINT_PTR.
 	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
+	// GeneralsX @feature PS3.0 T5 13/10/2026 optional per-pixel multi-light pair (world TBN + up to
+	// 4 point lights from the mesh's LightEnvironment).  Mounted by Apply only when the mesh
+	// actually collects at least one point light; without it the single-light path above is used.
+	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle);
+
 	// Master switch (driven by command line -normalmap / INI). When OFF, Apply is never called.
 	void Set_Enabled(bool on);
 	bool Is_Enabled();

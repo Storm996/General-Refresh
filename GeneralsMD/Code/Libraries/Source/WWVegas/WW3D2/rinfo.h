@@ -54,6 +54,7 @@ class LightEnvironmentClass;
 class VisRasterizerClass;
 class BWRenderClass;
 class TexProjectClass;
+class SunShadowSinkClass;	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map
 
 const unsigned MAX_ADDITIONAL_MATERIAL_PASSES=32;
 const unsigned MAX_OVERRIDE_FLAG_LEVEL=32;
@@ -148,6 +149,11 @@ public:
 	// RENDER_SHADOW variables and methods:
 	// NOTE: this is somewhat obsolete now that we have hardware render-to-texture.
 	BWRenderClass *				BWRenderer;					// Black & white non-textured renderer
+
+	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map: when set on a RENDER_SHADOW
+	// context, every MeshModelClass funnels its clip-space deformed geometry here instead of the
+	// (dead) BWRenderer path. Owned by the caller; never referenced outside the render call.
+	SunShadowSinkClass *		SunSink;
 
 private:
 

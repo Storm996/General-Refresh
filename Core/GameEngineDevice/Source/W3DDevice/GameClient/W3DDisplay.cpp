@@ -88,6 +88,7 @@ static void drawFramerateBar();
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/GameClient/W3DDebugDisplay.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
+#include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @feature PS3.0 T6 (base game links the inline no-op stub)
 #include "W3DDevice/GameClient/W3DScreenshot.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "WWMath/wwmath.h"
@@ -2203,6 +2204,10 @@ AGAIN:
 			//before we enter main rendering loop.
 			if (TheW3DProjectedShadowManager)
 				TheW3DProjectedShadowManager->updateRenderTargetTextures();
+
+			// GeneralsX @feature PS3.0 T6 sun shadow map: depth pass before the scene opens,
+			// receiver right after drawViews below.  No-ops unless GENERALSX_SHADOWMAP is set.
+			W3DSunShadowMap::preSceneUpdate(primaryW3DView->get3DCamera());
 		}
 
 		viewsUpdated = FALSE;
@@ -2242,6 +2247,10 @@ AGAIN:
 
 				// draw all views of the world
 				drawViews();
+
+				// GeneralsX @feature PS3.0 T6 sun shadow map: darken terrain where this frame's
+				// depth map says casters occlude the sun.  Inside the open scene, like the UI.
+				W3DSunShadowMap::renderTerrainReceiver(primaryW3DView->get3DCamera());
 
 				// draw the user interface
 				TheInGameUI->DRAW();
@@ -2322,6 +2331,55 @@ AGAIN:
 					m_profilerFrameCapture->Capture(getWidth(), getHeight());
 				}
 #endif
+
+				// GeneralsX @feature Qoder 13/10/2026 PS3.0 runtime forensics: GENERALSX_SHOTS="80,88,96"
+				// (seconds after the first rendered frame) schedules self-screenshots on the main thread,
+				// taken right before End_Render() while the finished frame is still in the back buffer.
+				// This gives the verification toolkit a deterministic trigger that does not depend on
+				// foreground key injection. Empty/unset = zero behavior change.
+				{
+					static std::vector<Int> s_shotSeconds;
+					static bool s_shotInit = false;
+					static unsigned long s_shotStartMs = 0;
+					static size_t s_shotIndex = 0;
+					if (!s_shotInit)
+					{
+						s_shotInit = true;
+						const char* ev = getenv("GENERALSX_SHOTS");
+						if (ev && *ev)
+						{
+							const char* p = ev;
+							while (*p)
+							{
+								while (*p == ',' || *p == ' ' || *p == ';') ++p;
+								if (!*p) break;
+								char* end = nullptr;
+								long v = strtol(p, &end, 10);
+								if (end == p || v < 0) break;
+								s_shotSeconds.push_back((Int)v);
+								p = end;
+							}
+							s_shotStartMs = timeGetTime();
+							fprintf(stderr, "[SSHOT] scheduled %zu shots (s):", s_shotSeconds.size());
+							for (size_t i = 0; i < s_shotSeconds.size(); ++i) fprintf(stderr, " %d", s_shotSeconds[i]);
+							fprintf(stderr, "\n");
+							fflush(stderr);
+						}
+					}
+					if (!s_shotSeconds.empty() && s_shotIndex < s_shotSeconds.size())
+					{
+						const unsigned long elapsedS = (timeGetTime() - s_shotStartMs) / 1000;
+						if (elapsedS >= (unsigned long)s_shotSeconds[s_shotIndex])
+						{
+							fprintf(stderr, "[SSHOT] firing #%zu at %lus (target %ds)\n",
+								s_shotIndex + 1, elapsedS, s_shotSeconds[s_shotIndex]);
+							fflush(stderr);
+							takeScreenShot(SCREENSHOT_PNG, DEFAULT_JPEG_QUALITY);
+							++s_shotIndex;
+						}
+					}
+				}
+
 				// render is all done!
 				WW3D::End_Render();
 			}
