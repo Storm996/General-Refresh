@@ -49,6 +49,7 @@ The following are **already implemented and playable**:
 - 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — no 32-bit D3D8 shims needed anymore: the Direct3D9 renderer runs on the native 64-bit runtime.
 - 🏎️ **High-frame-rate gameplay** — the battle itself now runs smooth: unit locomotion, steering, turret aiming, weapon fire and animation are interpolated at the display refresh rate in Skirmish, Campaign and cinematic views — all as a presentation-layer improvement on top of the unchanged deterministic simulation, so online play, LAN and replays stay bit-for-bit faithful.
 - 🧱 **Normal-mapped (dot3) rendering** — a tangent-space dot3 normal-mapping path is wired into the W3D renderer, giving surfaces real per-pixel lighting depth. It can be toggled live from **Options → the "Normal Mapping" checkbox** without a restart.
+- 💡 **Per-pixel lighting** — rigid battlefield meshes are lit per pixel instead of per vertex: each batch's own directional lights (up to 4) are re-evaluated against interpolated world-space geometric normals with Blinn-Phong specular, sharpening light/shadow transitions on tanks and buildings; the ambient floor ships at 0.5 for stronger contrast. Enabled by default (`GENERALSX_GEOMNORMAL=0` reverts to per-vertex).
 - 🎨 **Texture repaints / upscaling** — unit and terrain artwork has been re-painted and upscaled through an AI-assisted texture pipeline, replacing blurry low-res retail textures with crisper, higher-detail maps.
 - 🧩 **Mission UI rework** — the mission briefing / selection interface has been redesigned.
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
@@ -60,7 +61,7 @@ The following are **already implemented and playable**:
 
 What we are actively building and planning next:
 
-1. ✨ **Lighting upgrade** — normal maps, softened shadows, bloom and per-pixel multi-light shading are all implemented on the development branch and will ship with the next update; a **native Vulkan / D3D11 backend** remains the long-term goal.
+1. ✨ **Lighting upgrade** — per-pixel lighting is live and enabled by default; normal maps, softened shadows, bloom and per-pixel multi-light are implemented on the development branch and will ship with the next update; a **native Vulkan / D3D11 backend** remains the long-term goal.
 2. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
 3. 🤖 **AI-driven opponents** — adding **artificial-intelligence-powered battle AI** to bring a wider variety of AI personalities and play styles to Skirmish and beyond.
 4. 🗺️ **Mission map support** — expanded handling for mission/custom maps.
