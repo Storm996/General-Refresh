@@ -3340,6 +3340,9 @@ static void InitNormalMapShaders()
 	// scene->eye; constant across the RTS view). The VS rotates it into tangent space exactly like c4 and
 	// emits the UNNORMALISED light+eye sum as TEXCOORD2; the PS normalises per pixel (the half vector must
 	// be re-normalised after interpolation, which is the ps_3_0 nrm/normalize win over the ps_2_0 pair).
+	// GeneralsX @feature PS3.0 L1 13/10/2026 three-point lighting: c9 = MODEL-SPACE sky-fill
+	// direction (dx8normalmap rotates g_FillDir world->model exactly like c4). It rides the same
+	// per-vertex TBN into TEXCOORD3 so the fill shades per-face just like the key.
 	static const char* kVertexShader =
 		"float4 c0 : register(c0);\n"
 		"float4 c1 : register(c1);\n"
@@ -3347,6 +3350,7 @@ static void InitNormalMapShaders()
 		"float4 c3 : register(c3);\n"
 		"float4 c4 : register(c4);\n"
 		"float4 c5 : register(c5);\n"
+		"float4 c9 : register(c9);\n"
 		"struct VS_OUT\n"
 		"{\n"
 		"    float4 pos     : POSITION;\n"
@@ -3354,6 +3358,7 @@ static void InitNormalMapShaders()
 		"    float2 uv      : TEXCOORD0;\n"
 		"    float3 light   : TEXCOORD1;\n"
 		"    float3 hvec    : TEXCOORD2;\n"
+		"    float3 fill    : TEXCOORD3;\n"
 		"};\n"
 		"VS_OUT main(float4 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0,\n"
 		"            float2 uv0 : TEXCOORD0, float3 tangent : TEXCOORD1, float3 binormal : TEXCOORD2)\n"
@@ -3366,6 +3371,8 @@ static void InitNormalMapShaders()
 		"    float3 eT = float3(dot(c5.xyz, tangent), dot(c5.xyz, binormal), dot(c5.xyz, normal));\n"
 		"    float3 hsum = o.light + eT;\n"
 		"    o.hvec = (dot(hsum, hsum) < 1e-6) ? float3(0.0, 0.0, 1.0) : hsum;\n"  // degenerate guard: PS normalize(0) would NaN the specular
+		"    float3 fT = float3(dot(c9.xyz, tangent), dot(c9.xyz, binormal), dot(c9.xyz, normal));\n"
+		"    o.fill = (dot(fT, fT) < 1e-6) ? float3(0.0, 0.0, 1.0) : fT;\n"        // fill off (c9 zero): unit up-vector, c7 black makes it a no-op
 		"    return o;\n"
 		"}\n";
 
@@ -3387,12 +3394,14 @@ static void InitNormalMapShaders()
 		"float4 c2 : register(c2);\n"                  // ambient rgb
 		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): xy exaggeration, z passthrough
 		"float4 c6 : register(c6);\n"                  // (specPow, specIntensity, -, -)
+		"float4 c7 : register(c7);\n"                  // GeneralsX L1: sky-fill color rgb (black = off)
 		"struct PS_IN\n"
 		"{\n"
 		"    float4 diffuse : COLOR0;\n"
 		"    float2 uv      : TEXCOORD0;\n"
 		"    float3 light   : TEXCOORD1;\n"
 		"    float3 hvec    : TEXCOORD2;\n"
+		"    float3 fill    : TEXCOORD3;\n"
 		"};\n"
 		"float4 main(PS_IN i) : COLOR\n"
 		"{\n"
@@ -3405,6 +3414,8 @@ static void InitNormalMapShaders()
 		"    float3 L = normalize(i.light);\n"
 		"    float ndl = saturate(dot(n, L));\n"
 		"    float3 lit = ndl * c1.xxx + c2.rgb;\n"
+		"    float3 F = normalize(i.fill);\n"         // GeneralsX L1: second lambert lobe from the sky fill
+		"    lit += saturate(dot(n, F)) * c7.rgb;\n"  // c7 black keeps the single-key look bit-for-bit
 		"    float ndh = saturate(dot(n, normalize(i.hvec)));\n"
 		"    float spec = pow(ndh, c6.x) * c6.y * ndl;\n"
 		"    return float4(base.rgb * lit + spec, base.a);\n" // albedo detail always preserved (alpha kept)
@@ -3608,6 +3619,160 @@ static void InitNormalMapShaders()
 				}
 				fflush(stderr);
 			}
+		}
+
+		// GeneralsX @feature PS3.0 L2 14/10/2026 geometric-normal per-pixel diffuse pair.
+		// The GNprobe runs showed the battlefield rigid batches carry FVF 0x112 = DX8_FVF_XYZNUV1
+		// (position+normal+one UV, NO vertex-color channel): they are realtime-lit and their per-mesh
+		// LightEnvironment collects up to 3 directional lights (sun + two fills, from the map's
+		// TerrainObjectsLighting*). A two-light "correction" cannot reproduce that, so these programs
+		// instead rebuild the fixed pipeline's Gouraud sum for an ARBITRARY set of world directional
+		// lights and evaluate it per-pixel: the VS transforms position + the world normal only (a custom
+		// VS bypasses fixed-function lighting, so nothing else can be read from the stream); the PS sums
+		//     col = ambient + sum_i (matDiffuse*lightColor_i) * saturate(dot(n, lightDir_i))
+		// using the SAME Get_Equivalent_Ambient / Get_Light_Diffuse / Get_Light_Direction accessors the
+		// fixed Set_Light_Environment path (dx8wrapper.cpp) feeds to D3D, so it matches retail lighting
+		// exactly and only upgrades the Lambert term from per-vertex to per-pixel. Colors/ambient are
+		// material-scaled on the CPU inside DX8GeomNormal::Apply, which reads the batch's own lenv.
+		// Mounting is gated inside DX8GeomNormal (env switch + FVF in {XYZNUV1,XYZNUV2} + every light
+		// directional and count<=4), so point/spot-lit props and vertex-colored batches stay FF.
+		{
+			// Two full VS sources because D3D9 input declarations must match the batch FVF
+			// exactly; only the parameter list differs (NUV2 carries an extra TEXCOORD1).
+			static const char* kVertexShaderGN_NUV1 =
+				"float4 c0 : register(c0);\n"
+				"float4 c1 : register(c1);\n"
+				"float4 c2 : register(c2);\n"
+				"float4 c3 : register(c3);\n"
+				"float4 c4 : register(c4);\n"
+				"float4 c5 : register(c5);\n"
+				"float4 c6 : register(c6);\n"	// world rotation rows (object normal -> world)
+				"struct VS_OUT\n"
+				"{\n"
+				"    float4 pos : POSITION;\n"
+				"    float2 uv  : TEXCOORD0;\n"
+				"    float3 wn  : TEXCOORD1;\n"
+				"};\n"
+				"VS_OUT main(float3 pos : POSITION, float3 normal : NORMAL, float2 uv0 : TEXCOORD0)\n"
+				"{\n"
+				"    VS_OUT o;\n"
+				"    float4 p = float4(pos, 1.0);\n"
+				"    o.pos = float4(dot(p, c0), dot(p, c1), dot(p, c2), dot(p, c3));\n"
+				"    o.uv = uv0;\n"
+				"    o.wn = float3(dot(normal, c4.xyz), dot(normal, c5.xyz), dot(normal, c6.xyz));\n"
+				"    return o;\n"
+				"}\n";
+
+			static const char* kVertexShaderGN_NUV2 =
+				"float4 c0 : register(c0);\n"
+				"float4 c1 : register(c1);\n"
+				"float4 c2 : register(c2);\n"
+				"float4 c3 : register(c3);\n"
+				"float4 c4 : register(c4);\n"
+				"float4 c5 : register(c5);\n"
+				"float4 c6 : register(c6);\n"	// world rotation rows (object normal -> world)
+				"struct VS_OUT\n"
+				"{\n"
+				"    float4 pos : POSITION;\n"
+				"    float2 uv  : TEXCOORD0;\n"
+				"    float3 wn  : TEXCOORD1;\n"
+				"};\n"
+				"VS_OUT main(float3 pos : POSITION, float3 normal : NORMAL, float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1)\n"
+				"{\n"
+				"    VS_OUT o;\n"
+				"    float4 p = float4(pos, 1.0);\n"
+				"    o.pos = float4(dot(p, c0), dot(p, c1), dot(p, c2), dot(p, c3));\n"
+				"    o.uv = uv0;\n"
+				"    o.wn = float3(dot(normal, c4.xyz), dot(normal, c5.xyz), dot(normal, c6.xyz));\n"
+				"    return o;\n"
+				"}\n";
+
+			static const char* kPixelShaderGN =
+				"sampler s0 : register(s0);\n"                 // diffuse texture (bound by the category)
+				"float4 c4 : register(c4);\n"                  // ambient: matAmbient*envAmbient + emissive
+				"float4 c5 : register(c5);\n"                  // world light dir 0 (toward light)
+				"float4 c6 : register(c6);\n"                  // world light dir 1
+				"float4 c7 : register(c7);\n"                  // world light dir 2
+				"float4 c8 : register(c8);\n"                  // world light dir 3
+				"float4 c9 : register(c9);\n"                  // matDiffuse*lightColor 0
+				"float4 c10 : register(c10);\n"                // matDiffuse*lightColor 1
+				"float4 c11 : register(c11);\n"                // matDiffuse*lightColor 2
+				"float4 c12 : register(c12);\n"                // matDiffuse*lightColor 3
+				"float4 c13 : register(c13);\n"                // world eye dir (toward camera), w = spec power
+				"float4 c14 : register(c14);\n"                // spec intensity rgb (light 0 only, T1 knobs)
+				"struct PS_IN\n"
+				"{\n"
+				"    float2 uv : TEXCOORD0;\n"
+				"    float3 wn : TEXCOORD1;\n"
+				"};\n"
+				"float4 main(PS_IN i) : COLOR\n"
+				"{\n"
+				"    float4 base = tex2D(s0, i.uv);\n"
+				"    float l = length(i.wn);\n"
+				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				"    float ndl0 = saturate(dot(n, c5.xyz));\n"
+				"    float3 col = c4.rgb\n"
+				"        + c9.rgb  * ndl0\n"
+				"        + c10.rgb * saturate(dot(n, c6.xyz))\n"
+				"        + c11.rgb * saturate(dot(n, c7.xyz))\n"
+				"        + c12.rgb * saturate(dot(n, c8.xyz));\n"
+				"    float3 h = normalize(c5.xyz + normalize(c13.xyz));\n"
+				"    float3 spec = c14.rgb * pow(saturate(dot(n, h)), c13.w) * ndl0;\n"
+				"    return float4(base.rgb * saturate(col) + spec, base.a);\n"
+				"}\n";
+
+			// GeneralsX @debug PS3.0 L2 coverage probe: GENERALSX_GEOMNORMAL_RAW=1 swaps the PS for
+			// one that emits the first two per-light Lambert terms as R/G. Mounted meshes read red =
+			// light0-facing, green = light1-facing, black = not mounted - the unmistakable signal that
+			// tells "GN never mounts" apart from "GN mounts but the change is invisible".
+			static const char* kPixelShaderGNRaw =
+				"sampler s0 : register(s0);\n"
+				"float4 c5 : register(c5);\n"
+				"float4 c6 : register(c6);\n"
+				"struct PS_IN\n"
+				"{\n"
+				"    float2 uv : TEXCOORD0;\n"
+				"    float3 wn : TEXCOORD1;\n"
+				"};\n"
+				"float4 main(PS_IN i) : COLOR\n"
+				"{\n"
+				"    float4 base = tex2D(s0, i.uv);\n"
+				"    float l = length(i.wn);\n"
+				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				"    float l0 = saturate(dot(n, c5.xyz));\n"
+				"    float l1 = saturate(dot(n, c6.xyz));\n"
+				"    return float4(l0, l1, 0.0, base.a);\n"
+				"}\n";
+
+			const char* gnPsSrc = kPixelShaderGN;
+			{
+				const char* rawEnv = getenv("GENERALSX_GEOMNORMAL_RAW");
+				if (rawEnv != nullptr && rawEnv[0] != 0 && strcmp(rawEnv, "0") != 0) {
+					gnPsSrc = kPixelShaderGNRaw;
+					fprintf(stderr, "[GN] raw-visual mode ON (R=light0 term, G=light1 term)\n");
+					fflush(stderr);
+				}
+			}
+
+			IDirect3DVertexShader9* gnVS1 = nullptr;
+			IDirect3DVertexShader9* gnVS2 = nullptr;
+			IDirect3DPixelShader9* gnPS = nullptr;
+			const char* gnP1 = nullptr; const char* gnP2 = nullptr; const char* gnPP = nullptr;
+			HRESULT gnHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderGN_NUV1, true, "[GN]", &gnP1, (void**)&gnVS1);
+			if (SUCCEEDED(gnHR) && gnVS1 != nullptr)
+				gnHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderGN_NUV2, true, "[GN]", &gnP2, (void**)&gnVS2);
+			if (SUCCEEDED(gnHR) && gnVS2 != nullptr)
+				gnHR = W3DShaderManager::compileShaderAtBestProfile(gnPsSrc, false, "[GN]", &gnPP, (void**)&gnPS);
+			if (gnVS1 != nullptr && gnVS2 != nullptr && gnPS != nullptr) {
+				DX8GeomNormal::Install((UINT_PTR)gnVS1, (UINT_PTR)gnVS2, (UINT_PTR)gnPS);
+				fprintf(stderr, "[GN] geometric-normal installed vs=%s/%s ps=%s\n", gnP1, gnP2, gnPP);
+			} else {
+				if (gnVS1 != nullptr) gnVS1->Release();
+				if (gnVS2 != nullptr) gnVS2->Release();
+				if (gnPS != nullptr) gnPS->Release();
+				fprintf(stderr, "[GN] geometric-normal compile failed, fixed pipeline only\n");
+			}
+			fflush(stderr);
 		}
 
 		// GeneralsX @feature 11/10/2026 Normal mapping defaults OFF (the dot3 path still has unresolved

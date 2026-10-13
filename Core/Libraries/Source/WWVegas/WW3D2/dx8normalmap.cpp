@@ -68,6 +68,20 @@ namespace DX8NormalMap
 		g_FallbackAmbient = ambient;
 	}
 
+	// GeneralsX @feature PS3.0 L1 13/10/2026: global sky fill for the dot3 single-light path.
+	// The fixed pipeline gets fill/bounce through real LightClass slots (W3DScene collects them),
+	// but dot3 meshes bypass Lights[4] entirely, so the fill must be injected here too or the
+	// NM-mounted units would keep the old single-key look while everything around them fills.
+	// Zero color = feature off = bit-for-bit the old single-light path.
+	static Vector3  g_FillDir(0.0f, 0.0f, 0.0f);     // "toward the fill light", world space
+	static Vector3  g_FillColor(0.0f, 0.0f, 0.0f);   // premultiplied fill diffuse
+
+	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color)
+	{
+		g_FillDir = world_dir;
+		g_FillColor = color;
+	}
+
 	// GeneralsX @tweak T3-0 showcase mode: GENERALSX_NORMALMAP_SHOWCASE=1 exaggerates the bump
 	// (6x in-plane normal deviation + fixed oblique tangent-space light + low ambient) so the
 	// dot3 pipeline effect is unmistakably visible for verification. Never active by default.
@@ -237,6 +251,24 @@ namespace DX8NormalMap
 		c5eye.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(5, &c5eye, 1); // c5 = model-space eye direction
 
+		// GeneralsX @feature PS3.0 L1 13/10/2026 sky fill for the dot3 single-light path. The fill
+		// rotates world->model exactly like the key light (c4) and leaves the VS as TEXCOORD3 via
+		// c9; its premultiplied color lands in PS c7. When the display layer never injected a fill
+		// (color == 0), c7 is black and the extra lambert term is a numerical no-op. The ML branch
+		// below keeps its own layout and is intentionally fill-free (point lights dominate there).
+		Vector3 Fw = g_FillDir;
+		{
+			float fl2 = sqrtf(Fw.X * Fw.X + Fw.Y * Fw.Y + Fw.Z * Fw.Z);
+			if (fl2 > 1e-6f) { Fw.X /= fl2; Fw.Y /= fl2; Fw.Z /= fl2; }
+			else { Fw = Vector3(0.0f, 0.0f, 0.0f); }
+		}
+		Vector4 c9fill;
+		c9fill.X = m[0] * Fw.X + m[4] * Fw.Y + m[8] * Fw.Z;
+		c9fill.Y = m[1] * Fw.X + m[5] * Fw.Y + m[9] * Fw.Z;
+		c9fill.Z = m[2] * Fw.X + m[6] * Fw.Y + m[10] * Fw.Z;
+		c9fill.W = 1.0f;
+		DX8Wrapper::Set_Vertex_Shader_Constant(9, &c9fill, 1);  // c9 = model-space fill direction
+
 		// --- PS constants: c1 = strength, c2 = ambient, c5 = flat normal for NOSTAGE1 diag ---
 		Vector4 c5(0.0f, 0.0f, 1.0f, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(5, &c5, 1);
@@ -257,6 +289,11 @@ namespace DX8NormalMap
 		DX8Wrapper::Set_Pixel_Shader_Constant(1, &sc, 1);          // c1 = strength
 		Vector4 ac(ambColor.X, ambColor.Y, ambColor.Z, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(2, &ac, 1);          // c2 = ambient
+
+		// GeneralsX @feature PS3.0 L1 13/10/2026: c7 = fill color for the second lambert term
+		// (pairs with the VS c9 -> TEXCOORD3 fill direction above). Black = feature off.
+		Vector4 fc7(g_FillColor.X, g_FillColor.Y, g_FillColor.Z, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(7, &fc7, 1);         // c7 = fill color
 		const float xyScale = 2.5f;
 		// GeneralsX @tweak Qoder 11/10/2026 T3-0: c3 = (k, 0, 1, 0) feeds the PS exaggeration
 		// (mad r3.xy = r1_bx2.xy * k ; mad r3.z = r1_bx2.z * 1). k=2.5 makes building bumps clearly
@@ -354,5 +391,215 @@ namespace DX8NormalMap
 		// fixed-pipeline format must go through Set_Vertex_FVF (SetFVF), not Set_Vertex_Shader.
 		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);
 		DX8Wrapper::Set_Texture(1, nullptr);
+	}
+}
+
+//=============================================================================
+// GeneralsX @feature PS3.0 L2 14/10/2026 geometric-normal per-pixel diffuse.
+// See dx8normalmap.h for the model. This module never samples a normal map: the PS
+// re-lighting uses the interpolated geometric VERTEX normal evaluated per pixel, so it
+// mounts on the plain realtime-lit XYZNUV1/XYZNUV2 rigid batches (no vertex-color channel)
+// that the dot3 path skips. Apply sums the batch's own up-to-4 directional lights.
+// GeneralsX @tweak PS3.0 L2 14/10/2026: promoted to DEFAULT ON after the GNspec A/B certified
+// coverage (293 mount samples, zero terrain/HUD bleed). GENERALSX_GEOMNORMAL=0 in the process
+// environment at startup disables (read once inside Install); enabling still needs a successful
+// device-layer install.
+//=============================================================================
+#include "dx8fvf.h"
+#include "vertmaterial.h"
+
+namespace DX8GeomNormal
+{
+	static UINT_PTR g_VS_DUV1 = 0;
+	static UINT_PTR g_VS_DUV2 = 0;
+	static UINT_PTR g_PS      = 0;
+	static bool     g_Enabled = false;   // off until Install; default ON after (kill switch: =0)
+
+	// World-space key sun (direction TOWARD the light, same convention as DX8NormalMap's
+	// fallback) and its diffuse color; the L1 sky fill mirrors DX8NormalMap's pair.
+	static Vector3  g_KeyDir(0.0f, 0.0f, 1.0f);
+	static Vector3  g_KeyColor(0.0f, 0.0f, 0.0f);
+	static Vector3  g_FillDir(0.0f, 0.0f, 0.0f);
+	static Vector3  g_FillColor(0.0f, 0.0f, 0.0f);
+	// Scene ambient (the object ambient the display layer feeds Set_Ambient_Light with). The GN VS
+	// multiplies it by the material ambient and adds material emissive to rebuild the fixed-pipeline
+	// Gouraud base, since a custom VS bypasses fixed-function lighting (realtime meshes carry no
+	// vertex-color channel - FVF 0x112).
+	static Vector3  g_Ambient(0.0f, 0.0f, 0.0f);
+
+	void Install(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle)
+	{
+		g_VS_DUV1 = vs_duv1;
+		g_VS_DUV2 = vs_duv2;
+		g_PS      = ps_handle;
+		const char* ev = getenv("GENERALSX_GEOMNORMAL");
+		g_Enabled = (ev == nullptr || strcmp(ev, "0") != 0);   // GeneralsX @tweak PS3.0 L2 14/10/2026 default ON
+		fprintf(stderr, "[GN] geometric-normal shaders installed vs_duv1=%p vs_duv2=%p ps=%p enabled=%d\n",
+			(void*)vs_duv1, (void*)vs_duv2, (void*)ps_handle, (int)g_Enabled);
+		fflush(stderr);
+	}
+
+	bool Ready_To_Render()
+	{
+		return g_Enabled && g_PS != 0 && (g_VS_DUV1 != 0 || g_VS_DUV2 != 0);
+	}
+
+	void Set_Global_Key_Light(const Vector3& world_dir, const Vector3& color)
+	{
+		g_KeyDir = world_dir;
+		g_KeyColor = color;
+	}
+
+	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color)
+	{
+		g_FillDir = world_dir;
+		g_FillColor = color;
+	}
+
+	void Set_Global_Ambient(const Vector3& ambient)
+	{
+		g_Ambient = ambient;
+	}
+
+	static void Normalize(Vector3& v)
+	{
+		const float l2 = v.X * v.X + v.Y * v.Y + v.Z * v.Z;
+		if (l2 > 1e-12f) {
+			const float inv = 1.0f / sqrtf(l2);
+			v.X *= inv; v.Y *= inv; v.Z *= inv;
+		}
+	}
+
+	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv)
+	{
+		if (!Ready_To_Render()) return false;
+		UINT_PTR vs = 0;
+		if (fvf == (int)DX8_FVF_XYZNUV1) vs = g_VS_DUV1;
+		else if (fvf == (int)DX8_FVF_XYZNUV2) vs = g_VS_DUV2;
+		else return false;
+		if (vs == 0) return false;
+
+		// Same WVP convention as DX8NormalMap::Apply (raw DX8 transforms, transpose once);
+		// see the water-shader precedent comment there.
+		Matrix4x4 view;
+		Matrix4x4 proj;
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, view);
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, proj);
+
+		Matrix4x4 wm(world);
+		Matrix4x4 wmDx8 = wm.Transpose();
+		Matrix4x4 wvp = wmDx8 * view;
+		wvp = wvp * proj;
+		wvp = wvp.Transpose();
+
+		const float* s = reinterpret_cast<const float*>(&wvp);
+		DX8Wrapper::Set_Vertex_Shader_Constant(0, s, 4);              // VS c0..c3 = WVP
+		const float* m = reinterpret_cast<const float*>(&wmDx8);
+		DX8Wrapper::Set_Vertex_Shader_Constant(4, m, 3);             // VS c4..c6 = world rotation rows (normal -> world)
+
+		// The fixed pipeline multiplied every light's diffuse by the material diffuse before the
+		// vertex lambert sum, and used D3DRS_AMBIENT = Get_Equivalent_Ambient() scaled by the
+		// material ambient, plus material emissive. We mirror that exactly, but as a per-pixel sum
+		// over the batch's OWN directional lights, so GN only differs from retail in normal
+		// interpolation (per-pixel vs per-vertex), never in the light set or its scaling.
+		Vector3 md(1.0f, 1.0f, 1.0f);
+		Vector3 ma(0.0f, 0.0f, 0.0f);
+		Vector3 me(0.0f, 0.0f, 0.0f);
+		if (vm != nullptr) { vm->Get_Diffuse(&md); vm->Get_Ambient(&ma); vm->Get_Emissive(&me); }
+
+		Vector4 dirs[4];
+		Vector4 cols[4];
+		Vector3 amb(0.0f, 0.0f, 0.0f);
+		int n = 0;
+
+		if (lenv != nullptr) {
+			const Vector3& envAmb = lenv->Get_Equivalent_Ambient();
+			amb.X = ma.X * envAmb.X + me.X;
+			amb.Y = ma.Y * envAmb.Y + me.Y;
+			amb.Z = ma.Z * envAmb.Z + me.Z;
+			int lc = lenv->Get_Light_Count();
+			if (lc > 4) lc = 4;
+			for (int li = 0; li < lc; ++li) {
+				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
+				Normalize(d);
+				const Vector3& c = lenv->Get_Light_Diffuse(li);
+				dirs[li] = Vector4(d.X, d.Y, d.Z, 0.0f);
+				cols[li] = Vector4(c.X * md.X, c.Y * md.Y, c.Z * md.Z, 0.0f);
+			}
+			n = lc;
+		} else {
+			// Global-lit fallback (no per-mesh environment): the injected key sun + L1 sky fill.
+			amb.X = ma.X * g_Ambient.X + me.X;
+			amb.Y = ma.Y * g_Ambient.Y + me.Y;
+			amb.Z = ma.Z * g_Ambient.Z + me.Z;
+			Vector3 key = g_KeyDir; Normalize(key);
+			dirs[0] = Vector4(key.X, key.Y, key.Z, 0.0f);
+			cols[0] = Vector4(g_KeyColor.X * md.X, g_KeyColor.Y * md.Y, g_KeyColor.Z * md.Z, 0.0f);
+			n = 1;
+			Vector3 fill = g_FillDir;
+			const float fl2 = fill.X * fill.X + fill.Y * fill.Y + fill.Z * fill.Z;
+			if (fl2 > 1e-12f) {
+				Normalize(fill);
+				dirs[1] = Vector4(fill.X, fill.Y, fill.Z, 0.0f);
+				cols[1] = Vector4(g_FillColor.X * md.X, g_FillColor.Y * md.Y, g_FillColor.Z * md.Z, 0.0f);
+				n = 2;
+			}
+		}
+
+		// Zero the unused light slots: saturate(dot(n,0))=0 and color=0, so they contribute nothing.
+		for (int li = n; li < 4; ++li) {
+			dirs[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+			cols[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+
+		Vector4 c4amb(amb.X, amb.Y, amb.Z, 1.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(4, &c4amb, 1);          // PS c4 = material-scaled ambient
+		DX8Wrapper::Set_Pixel_Shader_Constant(5, &dirs[0], 4);        // PS c5..c8 = up to 4 world light dirs
+		DX8Wrapper::Set_Pixel_Shader_Constant(9, &cols[0], 4);        // PS c9..c12 = matDiffuse-scaled colors
+
+		// GeneralsX @feature PS3.0 L2 14/10/2026: per-pixel Blinn-Phong on light 0, the one term the
+		// old GN pass omitted. The FF feed (dx8wrapper.cpp Set_Light_Environment) gives light0 a white
+		// D3DLIGHT.Specular, so dropping it made GN-on read visibly DARKER on curved tank/building
+		// tops than retail (-2.4 RGB region mean measured 13/10). Eye vector follows the T1 dot3
+		// precedent: the camera's +Z axis in world space sits at flat[2], flat[6], flat[10] of the raw
+		// DX8 view matrix. GN normals and light dirs are already WORLD space (VS rotates them), so
+		// unlike dot3 (model space) no inverse transform is needed here. Knobs mirror the dot3 ones:
+		// GENERALSX_GEOMNORMAL_SPECPOWER (default 24) / GENERALSX_GEOMNORMAL_SPEC (default 0.35;
+		// 0.35 is the showcase value measured 14/10, 0.12 was the retail-parity dot3 default).
+		{
+			const float* vd = reinterpret_cast<const float*>(&view);
+			Vector3 Ew(vd[2], vd[6], vd[10]);
+			const float el2 = Ew.X * Ew.X + Ew.Y * Ew.Y + Ew.Z * Ew.Z;
+			if (el2 > 1e-6f) { const float inv = 1.0f / sqrtf(el2); Ew.X *= inv; Ew.Y *= inv; Ew.Z *= inv; }
+			else { Ew = Vector3(0.0f, 0.0f, 1.0f); }   // degenerate view matrix: headlight fallback
+
+			static float specPow = -1.0f;
+			static float specInt = -1.0f;
+			if (specPow < 0.0f) {
+				specPow = 24.0f;
+				specInt = 0.35f;   // GeneralsX @tweak PS3.0 L2 14/10/2026: showcase level (was 0.12)
+				const char* evPow = getenv("GENERALSX_GEOMNORMAL_SPECPOWER");
+				if (evPow != nullptr && *evPow != 0) specPow = (float)atof(evPow);
+				const char* evInt = getenv("GENERALSX_GEOMNORMAL_SPEC");
+				if (evInt != nullptr && *evInt != 0) specInt = (float)atof(evInt);
+				if (specPow < 1.0f) specPow = 1.0f;
+				if (specInt < 0.0f) specInt = 0.0f;
+			}
+			Vector4 c13eye(Ew.X, Ew.Y, Ew.Z, specPow);
+			DX8Wrapper::Set_Pixel_Shader_Constant(13, &c13eye, 1);    // PS c13 = world eye dir, w = spec power
+			Vector4 c14spec(specInt, specInt, specInt, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(14, &c14spec, 1);   // PS c14 = spec intensity (0 = off)
+		}
+
+		DX8Wrapper::Set_Vertex_Shader(vs);
+		DX8Wrapper::Set_Pixel_Shader(g_PS);
+		return true;
+	}
+
+	void Restore(UINT_PTR fvf)
+	{
+		DX8Wrapper::Set_Pixel_Shader(0);
+		DX8Wrapper::Set_Vertex_Shader(0);
+		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);
 	}
 }

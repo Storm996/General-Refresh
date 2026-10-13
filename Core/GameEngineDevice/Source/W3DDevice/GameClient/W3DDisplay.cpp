@@ -944,13 +944,21 @@ void W3DDisplay::init()
 		// m_myLight = NEW_REF
 	//============================================================================
 		Int lindex;
-		for (lindex=0; lindex<TheGlobalData->m_numGlobalLights; lindex++)
+		Int numGlobal = TheGlobalData->m_numGlobalLights;
+		// GeneralsX @feature PS3.0 L1 13/10/2026: the sky fill / ground bounce rig writes into
+		// global slots [1]/[2] when the map data leaves them black (retail INI only owns slot 0),
+		// so make sure those LightClass objects exist even if the data asks for a single sun.
+		// Unfilled extra slots keep diffuse=0 and are dropped by LightEnvironment's black-light
+		// filter, so registering them is behavior-neutral.
+		if (numGlobal < 3) numGlobal = 3;
+		if (numGlobal > LightEnvironmentClass::MAX_LIGHTS) numGlobal = LightEnvironmentClass::MAX_LIGHTS;
+		for (lindex=0; lindex<numGlobal; lindex++)
 		{	m_myLight[lindex] = NEW_REF( LightClass, (LightClass::DIRECTIONAL) );
 		}
 
 		setTimeOfDay( TheGlobalData->m_timeOfDay );	//set each light to correct values for given time
 
-		for (lindex=0; lindex<TheGlobalData->m_numGlobalLights; lindex++)
+		for (lindex=0; lindex<numGlobal; lindex++)
 		{	m_3DScene->setGlobalLight( m_myLight[lindex], lindex );
 		}
 
@@ -1992,6 +2000,46 @@ Int W3DDisplay::getLastFrameDrawCalls()
 	return Debug_Statistics::Get_Draw_Calls();
 }
 
+// GeneralsX @feature Qoder 13/10/2026 PS3.0: screenshot scheduler for headless runs.
+// GENERALSX_SHOTS="60,88" lists seconds after the first scheduled frame at which the game itself
+// takes a PNG screenshot (via the fixed GetFrontBufferData capture path in W3DScreenshot.cpp), so
+// verification harnesses no longer depend on injecting Ctrl+F12 into a foreground window.
+static bool W3D_SSHOT_Due()
+{
+	static std::vector<Int> s_secs;
+	static bool s_init = false;
+	static unsigned long s_startMs = 0;
+	static size_t s_index = 0;
+	if (!s_init)
+	{
+		s_init = true;
+		const char* ev = getenv("GENERALSX_SHOTS");
+		if (ev && *ev)
+		{
+			const char* p = ev;
+			while (*p)
+			{
+				while (*p == ',' || *p == ' ' || *p == ';') ++p;
+				if (!*p) break;
+				char* end = nullptr;
+				long v = strtol(p, &end, 10);
+				if (end == p || v < 0) break;
+				s_secs.push_back((Int)v);
+				p = end;
+			}
+			s_startMs = timeGetTime();
+			fprintf(stderr, "[SSHOT] scheduled %zu shots (s):", s_secs.size());
+			for (size_t i = 0; i < s_secs.size(); ++i) fprintf(stderr, " %d", s_secs[i]);
+			fprintf(stderr, "\n");
+			fflush(stderr);
+		}
+	}
+	if (s_secs.empty() || s_index >= s_secs.size()) return false;
+	if ((timeGetTime() - s_startMs) / 1000 < (unsigned long)s_secs[s_index]) return false;
+	++s_index;
+	return true;
+}
+
 // W3DDisplay::update =========================================================
 /** Update the client state of the W3D Display */
 //=============================================================================
@@ -2332,52 +2380,13 @@ AGAIN:
 				}
 #endif
 
-				// GeneralsX @feature Qoder 13/10/2026 PS3.0 runtime forensics: GENERALSX_SHOTS="80,88,96"
-				// (seconds after the first rendered frame) schedules self-screenshots on the main thread,
-				// taken right before End_Render() while the finished frame is still in the back buffer.
-				// This gives the verification toolkit a deterministic trigger that does not depend on
-				// foreground key injection. Empty/unset = zero behavior change.
+				// GeneralsX @feature Qoder 13/10/2026 PS3.0: scheduled GENERALSX_SHOTS capture,
+				// whole frame drawn and present pending (the historical screenshot spot).
+				if (W3D_SSHOT_Due())
 				{
-					static std::vector<Int> s_shotSeconds;
-					static bool s_shotInit = false;
-					static unsigned long s_shotStartMs = 0;
-					static size_t s_shotIndex = 0;
-					if (!s_shotInit)
-					{
-						s_shotInit = true;
-						const char* ev = getenv("GENERALSX_SHOTS");
-						if (ev && *ev)
-						{
-							const char* p = ev;
-							while (*p)
-							{
-								while (*p == ',' || *p == ' ' || *p == ';') ++p;
-								if (!*p) break;
-								char* end = nullptr;
-								long v = strtol(p, &end, 10);
-								if (end == p || v < 0) break;
-								s_shotSeconds.push_back((Int)v);
-								p = end;
-							}
-							s_shotStartMs = timeGetTime();
-							fprintf(stderr, "[SSHOT] scheduled %zu shots (s):", s_shotSeconds.size());
-							for (size_t i = 0; i < s_shotSeconds.size(); ++i) fprintf(stderr, " %d", s_shotSeconds[i]);
-							fprintf(stderr, "\n");
-							fflush(stderr);
-						}
-					}
-					if (!s_shotSeconds.empty() && s_shotIndex < s_shotSeconds.size())
-					{
-						const unsigned long elapsedS = (timeGetTime() - s_shotStartMs) / 1000;
-						if (elapsedS >= (unsigned long)s_shotSeconds[s_shotIndex])
-						{
-							fprintf(stderr, "[SSHOT] firing #%zu at %lus (target %ds)\n",
-								s_shotIndex + 1, elapsedS, s_shotSeconds[s_shotIndex]);
-							fflush(stderr);
-							takeScreenShot(SCREENSHOT_PNG, DEFAULT_JPEG_QUALITY);
-							++s_shotIndex;
-						}
-					}
+					fprintf(stderr, "[SSHOT] firing scheduled screenshot\n");
+					fflush(stderr);
+					takeScreenShot(SCREENSHOT_PNG, DEFAULT_JPEG_QUALITY);
 				}
 
 				// render is all done!
@@ -2600,6 +2609,244 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 		DX8NormalMap::Set_Global_Fallback_Light(
 			Vector3(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z),
 			Vector3(sl->ambient.red, sl->ambient.green, sl->ambient.blue));
+		// GeneralsX @feature PS3.0 L2 14/10/2026: the geometric-normal per-pixel diffuse module
+		// corrects the fixed-pipeline sun term, so it needs the same direction plus the key's
+		// DIFFUSE color (the fallback light above only carries direction + ambient).
+		DX8GeomNormal::Set_Global_Key_Light(
+			Vector3(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z),
+			Vector3(sl->diffuse.red, sl->diffuse.green, sl->diffuse.blue));
+		// The GN VS rebuilds the Gouraud base, so it also needs the scene object ambient (the same
+		// slot0 ambient fed to Set_Ambient_Light above).
+		DX8GeomNormal::Set_Global_Ambient(
+			Vector3(sl->ambient.red, sl->ambient.green, sl->ambient.blue));
+	}
+
+	// GeneralsX @feature PS3.0 L1 13/10/2026: three-point lighting rig (key = the retail sun above).
+	// Retail lit the world with that single sun plus a flat ambient, so backfaces lifted with
+	// frontfaces and macro shading read flat (Lambert report section 3). Here a cool sky FILL
+	// (opposite the sun's azimuth, high) and an optional warm ground BOUNCE (opt-in, default 0)
+	// are synthesized from the key and delivered through two paths kept in lockstep:
+	//  - fixed pipeline: when the rig is ON, slot1 is FORCE-OWNED by it (GeneralsX @tweak PS3.0 L1
+	//    14/10/2026): the map/save TerrainObjectsLighting*2 fill is REPLACED by the synthetic sky
+	//    fill every update, so fresh games and save loads render the same treatment instead of
+	//    yielding to embedded INI data. Slot2 (bounce) stays opt-in: while
+	//    GENERALSX_BOUNCE_INTENSITY=0 the map's third light is left untouched, avoiding a regression
+	//    to darker-than-retail scenes. W3DScene then collects the slots into every object's
+	//    LightEnvironment; Add_Light's contribution ranking keeps strong map lamps above the fill.
+	//  - dot3 normal-map path: it bypasses Lights[4] entirely, so DX8NormalMap receives the same
+	//    fill (bounce is fixed-pipeline-only there; point-light scenes dominate anyway).
+	// Knobs are process env (restart to change): GENERALSX_FILL_LIGHT=1 enables the rig (see the
+	// default-OFF note below); GENERALSX_FILL_INTENSITY = fill as a fraction of the key color
+	// (default 0.22); GENERALSX_BOUNCE_INTENSITY = bounce fraction (default 0 = slot stays dark).
+	{
+		static Real s_fillScale = -1.0f;
+		static Real s_bounceScale = -1.0f;
+		if (s_fillScale < 0.0f) {
+			const char* ev = getenv("GENERALSX_FILL_INTENSITY");
+			s_fillScale = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.22f;
+			if (s_fillScale < 0.0f) s_fillScale = 0.0f;
+			if (s_fillScale > 1.0f) s_fillScale = 1.0f;
+		}
+		if (s_bounceScale < 0.0f) {
+			const char* ev = getenv("GENERALSX_BOUNCE_INTENSITY");
+			s_bounceScale = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.0f;
+			if (s_bounceScale < 0.0f) s_bounceScale = 0.0f;
+			if (s_bounceScale > 0.5f) s_bounceScale = 0.5f;
+		}
+		const char* evOff = getenv("GENERALSX_FILL_LIGHT");
+		// GeneralsX @tweak PS3.0 L1 14/10/2026: synthetic blue fill default flipped to OFF. The user's
+		// live A/B rejected the forced cool fill (cold cast on shadow sides, overall too dark) and
+		// approved the MAPLIGHT recipe instead: crush the flat ambient and let the MAP's own neutral
+		// slot1 fill light the shadow side. The rig is now opt-in: GENERALSX_FILL_LIGHT=1 restores it.
+		const bool fillOn = (evOff != nullptr && atoi(evOff) != 0);
+		// GeneralsX @feature PS3.0 L1 14/10/2026: fill-gain, now the amplitude of the FORCED synthetic
+		// fill (history: the first L1 A/B showed the old "only while black" guard yielding to map
+		// slot1 data; an interim gain mode amplified the map's own fill instead. The 14/10 user ruling
+		// promoted the rig to default lighting, so gain now simply scales the synthetic lobe before
+		// it overwrites slot1). GENERALSX_FILL_GAIN multiplies FILL_INTENSITY's output, clamped to
+		// white per channel. Default 4 reproduces the showcase brightness measured on map 00000006
+		// (buildings +2..+5 lum, terrain zero bleed); GENERALSX_FILL_GAIN=1 gives the quiet 0.22 fill.
+		static Real s_fillGain = -1.0f;
+		if (s_fillGain < 0.0f) {
+			const char* ev = getenv("GENERALSX_FILL_GAIN");
+			s_fillGain = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 4.0f;
+			if (s_fillGain < 1.0f) s_fillGain = 1.0f;
+			if (s_fillGain > 4.0f) s_fillGain = 4.0f;
+		}
+
+		Vector3 dot3FillDir(0.0f, 0.0f, 0.0f);   // toward the fill; zero = dot3 term disabled
+		Vector3 dot3FillColor(0.0f, 0.0f, 0.0f);
+		if (fillOn && (s_fillScale > 0.001f || s_bounceScale > 0.001f)) {
+			const GlobalData::TerrainLighting* key = &TheGlobalData->m_terrainObjectsLighting[tod][0];
+			Vector3 toSun(-key->lightPos.x, -key->lightPos.y, -key->lightPos.z);
+			const Real sunLen2 = toSun.X * toSun.X + toSun.Y * toSun.Y + toSun.Z * toSun.Z;
+			if (sunLen2 > 1e-6f) {
+				toSun *= (Real)(1.0f / sqrtf((float)sunLen2));
+				Vector3 kd(key->diffuse.red, key->diffuse.green, key->diffuse.blue);
+
+				// --- cool sky fill: opposite azimuth, stays above the horizon ---
+				Vector3 fd(-toSun.X, -toSun.Y, toSun.Z > 0.15f ? (Real)(0.25f + 0.55f * toSun.Z) : 0.85f);
+				const Real fdLen2 = fd.X * fd.X + fd.Y * fd.Y + fd.Z * fd.Z;
+				if (fdLen2 > 1e-6f) fd *= (Real)(1.0f / sqrtf((float)fdLen2));
+				Vector3 fc(kd.X * 0.45f, kd.Y * 0.68f, kd.Z * 1.05f);
+				fc *= s_fillScale;
+				if (fc.X > 1.0f) fc.X = 1.0f;
+				if (fc.Y > 1.0f) fc.Y = 1.0f;
+				if (fc.Z > 1.0f) fc.Z = 1.0f;
+
+				if (s_fillScale > 0.001f) {
+					if (m_myLight[1] != nullptr) {
+						// GeneralsX @tweak PS3.0 L1 14/10/2026: FORCE-OWN slot1 (user ruling: the rig IS
+						// the default lighting). No "only while black" guard and no map-data branch:
+						// every update overwrites slot1 with the synthetic sky fill scaled by gain, so
+						// new games and save loads (whose embedded INI previously owned this slot) render
+						// identically. The loop above re-reads TheGlobalData from INI every call, so the
+						// overwrite is idempotent and a GENERALSX_FILL_LIGHT=0 restart restores retail.
+						Vector3 fcEff = fc;
+						fcEff.X *= s_fillGain;
+						fcEff.Y *= s_fillGain;
+						fcEff.Z *= s_fillGain;
+						if (fcEff.X > 1.0f) fcEff.X = 1.0f;
+						if (fcEff.Y > 1.0f) fcEff.Y = 1.0f;
+						if (fcEff.Z > 1.0f) fcEff.Z = 1.0f;
+
+						static unsigned s_fillLogTick = 0;
+						if ((s_fillLogTick++ & 511u) == 0u) {
+							Vector3 cur; m_myLight[1]->Get_Diffuse(&cur);
+							fprintf(stderr, "[L1] slot1 FORCED (map data overwritten): synth=(%.3f,%.3f,%.3f) gain=%.2f -> installed=(%.3f,%.3f,%.3f) was=(%.3f,%.3f,%.3f) n=%u\n",
+								fc.X, fc.Y, fc.Z, s_fillGain, fcEff.X, fcEff.Y, fcEff.Z,
+								cur.X, cur.Y, cur.Z, s_fillLogTick);
+							fflush(stderr);
+						}
+						m_myLight[1]->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+						m_myLight[1]->Set_Diffuse(fcEff);
+						m_myLight[1]->Set_Specular(Vector3(0.0f, 0.0f, 0.0f));
+						Matrix3D fm;
+						fm.Set(Vector3(1,0,0), Vector3(0,1,0), Vector3(-fd.X, -fd.Y, -fd.Z), Vector3(0,0,0));
+						m_myLight[1]->Set_Transform(fm);
+						dot3FillDir = fd;
+						dot3FillColor = fcEff;
+					}
+				}
+
+				// --- warm ground bounce: same sun azimuth, from below (opt-in) ---
+				if (s_bounceScale > 0.001f && m_myLight[2] != nullptr) {
+					Vector3 bd(toSun.X, toSun.Y, -0.6f);
+					const Real bdLen2 = bd.X * bd.X + bd.Y * bd.Y + bd.Z * bd.Z;
+					if (bdLen2 > 1e-6f) bd *= (Real)(1.0f / sqrtf((float)bdLen2));
+					Vector3 bc(kd.X, kd.Y * 0.62f, kd.Z * 0.38f);
+					bc *= s_bounceScale;
+					if (bc.X > 1.0f) bc.X = 1.0f;
+					if (bc.Y > 1.0f) bc.Y = 1.0f;
+					if (bc.Z > 1.0f) bc.Z = 1.0f;
+					Vector3 cur; m_myLight[2]->Get_Diffuse(&cur);
+					if (cur.Length2() < 0.0025f) {   // slot unused by data -> ours
+						m_myLight[2]->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+						m_myLight[2]->Set_Diffuse(bc);
+						m_myLight[2]->Set_Specular(Vector3(0.0f, 0.0f, 0.0f));
+						Matrix3D bm;
+						bm.Set(Vector3(1,0,0), Vector3(0,1,0), Vector3(-bd.X, -bd.Y, -bd.Z), Vector3(0,0,0));
+						m_myLight[2]->Set_Transform(bm);
+					}
+				}
+			}
+		}
+		// Single call outside the branches: disabled/off states zero the dot3 fill term.
+		DX8NormalMap::Set_Global_Fill_Light(dot3FillDir, dot3FillColor);
+		// GeneralsX @feature PS3.0 L2: GN corrects the same fill lobe on plain meshes; keep in lockstep.
+		DX8GeomNormal::Set_Global_Fill_Light(dot3FillDir, dot3FillColor);
+	}
+
+	// GeneralsX @feature PS3.0 L1c 14/10/2026: dark-side crush (contrast) knob. The user A/B on the
+	// fill amplitude alone (0.02 vs 0.005) showed the shadow side barely changed: the real light
+	// "leaking" onto backfaces is NOT slot1 but (a) the slot0 scene AMBIENT fed to Set_Ambient_Light
+	// and mirrored into the GN/dot3 global feeds, and (b) the map's slot2/3 secondary lights, which
+	// the retail loop above re-installs from INI every call. GENERALSX_AMBIENT_SCALE (0..1, see the
+	// default note below) scales every non-key term at once; the key sun diffuse (slot0) is left
+	// untouched so the lit side keeps its brightness and only the shadow side crushes toward black.
+	// Idempotent: the retail loop rewrites raw INI values before us each call.
+	// GeneralsX @tweak PS3.0 L1c 14/10/2026: default promoted to 0.5 (user ruling after the live
+	// single-variable A/B: ambient 100% reproduces the retail "every face equally bright" look,
+	// 0.1~0.4 reads too dark for RTS legibility; 0.5 keeps the light/dark separation while the
+	// shadow side stays readable). Set GENERALSX_AMBIENT_SCALE=1 for retail parity.
+	{
+		static Real s_ambScale = -1.0f;
+		if (s_ambScale < 0.0f) {
+			const char* ev = getenv("GENERALSX_AMBIENT_SCALE");
+			s_ambScale = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.5f;
+			if (s_ambScale < 0.0f) s_ambScale = 0.0f;
+			if (s_ambScale > 1.0f) s_ambScale = 1.0f;
+		}
+		if (s_ambScale < 0.999f) {
+			const GlobalData::TerrainLighting* k0 = &TheGlobalData->m_terrainObjectsLighting[tod][0];
+			Vector3 amb(k0->ambient.red, k0->ambient.green, k0->ambient.blue);
+			amb *= s_ambScale;
+			if (m_3DScene) {
+				m_3DScene->Set_Ambient_Light(amb);
+			}
+			// GN Gouraud base + dot3 fallback carry the same ambient: keep all three paths in lockstep.
+			DX8GeomNormal::Set_Global_Ambient(amb);
+			DX8NormalMap::Set_Global_Fallback_Light(
+				Vector3(-k0->lightPos.x, -k0->lightPos.y, -k0->lightPos.z), amb);
+			// Map-owned secondary lights (slot2/3): the retail loop wrote raw INI values this call,
+			// so scaling the CURRENT value is always scale-of-raw, never compounding.
+			for (Int i = 2; i < LightEnvironmentClass::MAX_LIGHTS; ++i) {
+				if (m_myLight[i] != nullptr) {
+					Vector3 d; m_myLight[i]->Get_Diffuse(&d);
+					d *= s_ambScale;
+					m_myLight[i]->Set_Diffuse(d);
+				}
+			}
+			static unsigned s_ambLogTick = 0;
+			if ((s_ambLogTick++ & 511u) == 0u) {
+				const Vector3 a0 = (m_3DScene != nullptr) ? m_3DScene->Get_Ambient_Light() : Vector3(0,0,0);
+				Vector3 d2(0,0,0), d3(0,0,0);
+				if (m_myLight[2]) m_myLight[2]->Get_Diffuse(&d2);
+				if (m_myLight[3]) m_myLight[3]->Get_Diffuse(&d3);
+				fprintf(stderr, "[L1c] ambScale=%.2f sceneAmb=(%.3f,%.3f,%.3f) slot2=(%.3f,%.3f,%.3f) slot3=(%.3f,%.3f,%.3f) n=%u\n",
+					s_ambScale, a0.X, a0.Y, a0.Z, d2.X, d2.Y, d2.Z, d3.X, d3.Y, d3.Z, s_ambLogTick);
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @feature PS3.0 L1k 14/10/2026: key-sun gain. The user approved the MAPLIGHT recipe
+	// (crushed scene ambient + the map's own neutral fill; synthetic blue fill retired) and asked
+	// to push the sunlit side harder on top of it. GENERALSX_KEY_GAIN (1..3, default 1 = retail
+	// parity) amplifies ONLY the key light: slot0 diffuse for the fixed pipeline plus the GN
+	// module's global key color, kept in lockstep. The shadow side is untouched (it is fed by the
+	// map fill + ambient), so raising this widens the light/dark ratio directly. Terrain keeps its
+	// own sun slots (m_terrainLighting) and is deliberately out of scope here. Idempotent like the
+	// blocks above: the retail loop rewrites raw INI values into slot0 every call.
+	{
+		static Real s_keyGain = -1.0f;
+		if (s_keyGain < 0.0f) {
+			const char* ev = getenv("GENERALSX_KEY_GAIN");
+			s_keyGain = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 1.0f;
+			if (s_keyGain < 1.0f) s_keyGain = 1.0f;
+			if (s_keyGain > 3.0f) s_keyGain = 3.0f;
+		}
+		if (s_keyGain > 1.0001f) {
+			const GlobalData::TerrainLighting* k0 = &TheGlobalData->m_terrainObjectsLighting[tod][0];
+			Vector3 kd(k0->diffuse.red, k0->diffuse.green, k0->diffuse.blue);
+			kd *= s_keyGain;
+			if (kd.X > 1.0f) kd.X = 1.0f;
+			if (kd.Y > 1.0f) kd.Y = 1.0f;
+			if (kd.Z > 1.0f) kd.Z = 1.0f;
+			if (m_myLight[0] != nullptr) {
+				m_myLight[0]->Set_Diffuse(kd);
+			}
+			DX8GeomNormal::Set_Global_Key_Light(
+				Vector3(-k0->lightPos.x, -k0->lightPos.y, -k0->lightPos.z), kd);
+			static unsigned s_keyLogTick = 0;
+			if ((s_keyLogTick++ & 511u) == 0u) {
+				Vector3 cur(0,0,0);
+				if (m_myLight[0]) m_myLight[0]->Get_Diffuse(&cur);
+				fprintf(stderr, "[L1k] keyGain=%.2f raw=(%.3f,%.3f,%.3f) -> sun=(%.3f,%.3f,%.3f) n=%u\n",
+					s_keyGain, k0->diffuse.red, k0->diffuse.green, k0->diffuse.blue, cur.X, cur.Y, cur.Z, s_keyLogTick);
+				fflush(stderr);
+			}
+		}
 	}
 }
 

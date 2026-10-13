@@ -96,6 +96,8 @@ static FunctionLexicon::TableEntry gameWinSystemTable[] =
 	{ NAMEKEY_INVALID, "MOTDSystem",                         (void*)MOTDSystem },
 	{ NAMEKEY_INVALID, "MainMenuSystem",                     (void*)MainMenuSystem },
 	{ NAMEKEY_INVALID, "OptionsMenuSystem",                  (void*)OptionsMenuSystem },
+	// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options page callbacks.
+	{ NAMEKEY_INVALID, "GraphicsOptionsMenuSystem",          (void*)GraphicsOptionsMenuSystem },
 	{ NAMEKEY_INVALID, "SinglePlayerMenuSystem",             (void*)SinglePlayerMenuSystem },
 	{ NAMEKEY_INVALID, "QuitMenuSystem",                     (void*)QuitMenuSystem },
 	{ NAMEKEY_INVALID, "MapSelectMenuSystem",                (void*)MapSelectMenuSystem },
@@ -177,6 +179,8 @@ static FunctionLexicon::TableEntry gameWinInputTable[] =
 	{ NAMEKEY_INVALID, "MainMenuInput",                     (void*)MainMenuInput },
 	{ NAMEKEY_INVALID, "MapSelectMenuInput",                (void*)MapSelectMenuInput },
 	{ NAMEKEY_INVALID, "OptionsMenuInput",                  (void*)OptionsMenuInput },
+	// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options page callbacks.
+	{ NAMEKEY_INVALID, "GraphicsOptionsMenuInput",          (void*)GraphicsOptionsMenuInput },
 	{ NAMEKEY_INVALID, "SinglePlayerMenuInput",             (void*)SinglePlayerMenuInput },
 	{ NAMEKEY_INVALID, "LanLobbyMenuInput",                 (void*)LanLobbyMenuInput },
 	{ NAMEKEY_INVALID, "ReplayMenuInput",                   (void*)ReplayMenuInput },
@@ -247,6 +251,8 @@ static FunctionLexicon::TableEntry winLayoutInitTable[] =
 
 	{ NAMEKEY_INVALID, "MainMenuInit",                  (void*)MainMenuInit },
 	{ NAMEKEY_INVALID, "OptionsMenuInit",               (void*)OptionsMenuInit },
+	// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options page callbacks.
+	{ NAMEKEY_INVALID, "GraphicsOptionsMenuInit",       (void*)GraphicsOptionsMenuInit },
 	{ NAMEKEY_INVALID, "SaveLoadMenuInit",              (void*)SaveLoadMenuInit },
 	{ NAMEKEY_INVALID, "SaveLoadMenuFullScreenInit",    (void*)SaveLoadMenuFullScreenInit },
 
@@ -344,6 +350,8 @@ static FunctionLexicon::TableEntry winLayoutShutdownTable[] =
 
 	{ NAMEKEY_INVALID, "MainMenuShutdown",                  (void*)MainMenuShutdown },
 	{ NAMEKEY_INVALID, "OptionsMenuShutdown",               (void*)OptionsMenuShutdown },
+	// GeneralsX @bugfix Qoder 13/10/2026 Graphics page shutdown: reports shutdownComplete so @pop works.
+	{ NAMEKEY_INVALID, "GraphicsOptionsMenuShutdown",       (void*)GraphicsOptionsMenuShutdown },
 	{ NAMEKEY_INVALID, "SaveLoadMenuShutdown",              (void*)SaveLoadMenuShutdown },
 	{ NAMEKEY_INVALID, "PopupCommunicatorShutdown",         (void*)PopupCommunicatorShutdown },
 	{ NAMEKEY_INVALID, "KeyboardOptionsMenuShutdown",       (void*)KeyboardOptionsMenuShutdown },

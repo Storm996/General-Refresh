@@ -48,6 +48,7 @@
 #include "dx8fvf.h"
 #include "dx8caps.h"
 #include "dx8normalmap.h"   // GeneralsX @feature T3-0 M4 (段E): dot3 网格着色器挂载 hook
+#include "lightenvironment.h" // GeneralsX @feature PS3.0 L2: GN gate inspects the mesh light env
 #include <cstdio>           // GeneralsX @debug T3-0 mount diagnostics (fprintf)
 #include "dx8rendererdebugger.h"
 #include "WWDebug/wwdebug.h"
@@ -2035,6 +2036,70 @@ void DX8TextureCategoryClass::Render()
 			nmApplied = DX8NormalMap::Apply(*world_transform, lenv, Peek_Texture(0));
 		}
 
+		/*
+		** GeneralsX @feature PS3.0 L2 (段E'): 几何法线逐像素漫反射 - 只接管 dot3 路径没碰过的普通
+		** DUV1/DUV2 刚性批次, 且默认关 (GENERALSX_GEOMNORMAL=1 才挂)。PS 仅把太阳/L1 fill 两个
+		** Lambert 项从逐顶点改判为逐像素, 其余固定管线贡献 (ambient/贴花灯/自发光/tint) 原样保留。
+		*/
+		bool gnApplied = false;
+		// GeneralsX @debug PS3.0 L2 forensics: the GN run mounted zero batches. Log the first few
+		// rigid candidates' actual FVF and every gate sub-condition so we can see exactly which one
+		// blocks the mount (wrong FVF expectation vs blend/pass/sort/skin vs alpha-override).
+		if (!nmApplied && DX8GeomNormal::Ready_To_Render()) {
+			static unsigned s_gnProbe = 0;
+			if (s_gnProbe < 12u) {
+				++s_gnProbe;
+				const unsigned fvf = Get_Container()->Get_FVF();
+				fprintf(stderr, "[GNPROBE] #%u fvf=0x%08X (NUV1=0x%08X NUV2=0x%08X) match=%d lenv=%d lc=%d pass=%d sort=%d skin=%d alphaOv=%.3f srcB=%d dstB=%d\n",
+					s_gnProbe, fvf, (unsigned)DX8_FVF_XYZNUV1, (unsigned)DX8_FVF_XYZNUV2,
+					(fvf == (unsigned)DX8_FVF_XYZNUV1 || fvf == (unsigned)DX8_FVF_XYZNUV2),
+					(lenv != nullptr), (lenv ? lenv->Get_Light_Count() : 0),
+					mesh->Peek_Model()->Get_Pass_Count(),
+					(int)mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT),
+					(int)mesh->Peek_Model()->Get_Flag(MeshModelClass::SKIN),
+					mesh->Get_Alpha_Override(),
+					(int)theShader.Get_Src_Blend_Func(), (int)theShader.Get_Dst_Blend_Func());
+				fflush(stderr);
+			}
+		}
+		// GeneralsX @feature PS3.0 L2: mount GN only on realtime-lit XYZNUV1/2 batches (no vertex-color
+		// channel) whose light environment is a set of PURE DIRECTIONAL lights (sun + fills) the GN PS
+		// can rebuild per-pixel. Battlefield units qualify - they collect the global sun plus up to two
+		// directional map fills. Any point/spot light (which we would silently drop, changing the look)
+		// or a count above MAX_LIGHTS keeps the batch on the fixed pipeline. lenv==null (pure global FF)
+		// also qualifies: Apply then falls back to the injected global key+fill+ambient.
+		bool gnLenvSafe = false;
+		if (lenv == nullptr) {
+			gnLenvSafe = true;
+		} else if (lenv->Get_Light_Count() <= LightEnvironmentClass::MAX_LIGHTS) {
+			gnLenvSafe = true;
+			for (int li = 0; li < lenv->Get_Light_Count(); ++li) {
+				if (lenv->isPointLight(li)) { gnLenvSafe = false; break; }
+			}
+		}
+		if (!nmApplied && gnLenvSafe && DX8GeomNormal::Ready_To_Render()
+			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNUV1 || Get_Container()->Get_FVF() == DX8_FVF_XYZNUV2)
+			&& mesh->Peek_Model()->Get_Pass_Count() == 1
+			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
+			&& !mesh->Peek_Model()->Get_Flag(MeshModelClass::SKIN)
+			&& mesh->Get_Alpha_Override() == 1.0f
+			&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
+			// Same opaque-blend contract as the dot3 gate: alpha-blended glass with animated
+			// backgrounds flickered there (T3-0 fix), keep GN out of it too.
+			&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
+			&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO) {
+			gnApplied = DX8GeomNormal::Apply(*world_transform, vmaterial, Get_Container()->Get_FVF(), lenv);
+			// GeneralsX @debug PS3.0 L2: sampled mount counter - distinguishes "gate never hits"
+			// (wrong FVF/pass/blend in practice) from "mounts but the change is invisible".
+			static unsigned s_gnMounted = 0;
+			if (gnApplied && (s_gnMounted++ % 4096u) == 0u) {
+				fprintf(stderr, "[GN] mounted batch #%u fvf=%s tex=%s\n", s_gnMounted,
+					Get_Container()->Get_FVF() == (int)DX8_FVF_XYZNUV1 ? "NUV1" : "NUV2",
+					Peek_Texture(0) ? Peek_Texture(0)->Get_Texture_Name().str() : "(none)");
+				fflush(stderr);
+			}
+		}
+
 
 //--------------------------------------------------------------------
 		if (mesh->Get_ObjectScale() != 1.0f)
@@ -2120,6 +2185,10 @@ void DX8TextureCategoryClass::Render()
 		*/
 		if (nmApplied) {
 			DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
+		}
+		// GeneralsX @feature PS3.0 L2: restore the fixed pipeline after a GN batch too.
+		if (gnApplied) {
+			DX8GeomNormal::Restore(Get_Container()->Get_FVF());
 		}
 
 		/*
