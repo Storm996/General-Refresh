@@ -32,24 +32,15 @@ GeneralsX modernized the **platform**: SDL3 windowing, DXVK/Vulkan rendering, Op
 
 ### 🎨 Visual quality
 
-- 🎨 **AI-refined textures** — repainted & upscaled artwork for crisper visuals.
-- 🧱 **Normal maps (dot3)** — real per-pixel surface depth.
-- 💡 **Per-pixel lighting** — sharper light/shadow transitions everywhere.
-- 🔩 **PBR roughness materials** — physically-based shading with GGX specular.
+AI-refined textures, dot3 normal maps, per-pixel lighting and PBR roughness materials make the battlefield dramatically crisper and more tactile.
 
 ### 🕹️ Gameplay & experience
 
-- 🏎️ **High frame rates** — battle motion interpolated at your display's refresh rate.
-- 🖱️ **RA3-style selection panel** — one click selects every unit of a type.
-- 🧩 **Reworked mission UI** — a redesigned briefing & selection screen.
-- 🎬 **Quick-launch any mission** — jump in straight from the main menu.
-- 🤖 **Personality-style AI** — 8 Skirmish AI styles plus a neural-AI scaffold.
+High-frame-rate battles, an RA3-style selection panel, a reworked mission UI, quick-launch of any mission, and 8 personality-style AI drivers.
 
 ### 🛠️ Platform & build
 
-- 🎇 **Direct3D9 renderer** — PS 3.0 shader ceiling replaces D3D8/`ps_1_4`.
-- 🖥️ **Native 64-bit build** — breaks the 2GB/4GB wall, uses all RAM & VRAM.
-- 🔊 **Modern audio/video stack** — MiniAudio / OpenAL audio, FFmpeg video.
+A Direct3D9 renderer with a PS 3.0 shader ceiling, a native 64-bit build, and a modern audio/video stack (MiniAudio / OpenAL + FFmpeg).
 
 > *Note: like GeneralsX, this is an engine re-port and requires original game data from a legitimate copy of Command & Conquer: Generals / Zero Hour.*
 
