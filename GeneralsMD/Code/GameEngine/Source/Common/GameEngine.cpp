@@ -864,11 +864,6 @@ void GameEngine::init()
 
 		initSubsystem(TheUpgradeCenter,"TheUpgradeCenter", MSGNEW("GameEngineSubsystem") UpgradeCenter, &xferCRC, "Data\\INI\\Default\\Upgrade", "Data\\INI\\Upgrade");
 
-		// GeneralsX @feature Qoder 13/10/2026 The pixel-shader ceiling must be in GlobalData before
-		// GameClient::init() compiles the W3D shader assets, hence this single-key early replay; the
-		// full registry pass further down stays where it is (it also feeds the frame pacer and audio).
-		ApplyShaderModelCapFromStartupOptions();
-
 		initSubsystem(TheGameClient,"TheGameClient", createGameClient(), nullptr);
 
 #ifdef SAGE_USE_NGMP

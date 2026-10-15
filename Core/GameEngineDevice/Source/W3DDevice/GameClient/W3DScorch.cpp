@@ -90,7 +90,22 @@ void W3DScorch::addScorch(Vector3 location, Real radius, Scorches type)
 		return;
 	}
 
-	if ((Int)m_scorches.size() >= MAX_SCORCH_MARKS)
+	// GeneralsX @feature PS3.0-P3-31 14/10/2026 G6: the retail hard cap of 500 live scorches evicted
+	// marks on busy maps; GENERALSX_SCORCH_MAX raises/lowers it (clamped 50..2000, default = the
+	// retail MAX_SCORCH_MARKS so shipped behaviour is unchanged). Marker line proves the override is read.
+	static int scorchMax = -1;
+	if (scorchMax < 0) {
+		scorchMax = MAX_SCORCH_MARKS;
+		const char* ev = getenv("GENERALSX_SCORCH_MAX");
+		if (ev != nullptr && *ev != 0) {
+			scorchMax = atoi(ev);
+			if (scorchMax < 50) scorchMax = 50;
+			if (scorchMax > 2000) scorchMax = 2000;
+			fprintf(stderr, "[SCORCHMAX] cap=%d\n", scorchMax);
+			fflush(stderr);
+		}
+	}
+	if ((Int)m_scorches.size() >= scorchMax)
 	{
 		m_scorches.pop_front();
 	}

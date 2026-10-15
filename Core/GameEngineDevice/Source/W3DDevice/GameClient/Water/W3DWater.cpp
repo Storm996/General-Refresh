@@ -94,7 +94,25 @@
 #define PATCH_SIZE 15		//number of vertices on patch edge.  Large patches may waste vertices off edge of screen.
 #define PATCH_UV_TILES	42	//number of times the bump map texture is tiled across patch (must be integer!).
 #define PATCH_SCALE (4.0f * MAP_XY_FACTOR)	//horizontal scale factor. Adjust this and size to get desired vertex density.
-#define SEA_REFLECTION_SIZE 256		//dimensions of reflection texture
+// GeneralsX @tweak PS3.0-P2-4 14/10/2026 W1: the reflection RT was fixed at 256 (2003 VRAM budget);
+// mirrored scenery then upscales ~10x onto near water and reads as mush. 512 costs 1 MB instead of
+// 0.25 MB (A8R8G8B8) - negligible on any current device. GENERALSX_WATERREFLECT=256|1024|2048 A/B.
+static Int GetSeaReflectionSize()
+{
+	static Int s_cached = 0;
+	if (s_cached == 0)
+	{
+		s_cached = 512;
+		const char* env = getenv("GENERALSX_WATERREFLECT");
+		if (env != nullptr)
+		{
+			const int v = atoi(env);
+			if (v == 256 || v == 1024 || v == 2048)
+				s_cached = v;
+		}
+	}
+	return s_cached;
+}
 
 #define SEA_BUMP_SCALE		(0.06f)		//scales the du/dv offsets stored in bump map (~ amount to perturb)
 #define BUMP_SIZE (50.f)
@@ -360,6 +378,7 @@ WaterRenderObjClass::WaterRenderObjClass()
 
 	m_dwWavePixelShader = nullptr;
 	m_dwWaveVertexShader = nullptr;
+	m_waveHlsl = FALSE;	//GeneralsX @feature PS3.0 T3 13/10/2026: decided in ReAcquireResources.
 	m_meshData=nullptr;
 	m_meshDataSize = 0;
 	m_meshInMotion = FALSE;
@@ -877,6 +896,112 @@ static void CompileWaterPixelShader(const char* name, const char* source, IDirec
 		fflush(stderr);
 	}
 }
+
+// GeneralsX @feature PS3.0 T3 13/10/2026 water upgrade: HLSL replacement for the retail
+// wave.vso/wave.pso pair.  The retail pixel shader ends at DX8's texbem (emboss bump-mapped
+// reflection) which has no D3D9 byte-code equivalent, so this pass reproduces the EMBM result
+// explicitly - perturb the screen-projected reflection uv by the bump gradient - and adds what
+// the fixed-function stage could not: a Fresnel term that keeps the reflection strong at grazing
+// angles and lets the water body color through when looking down, plus a sun sparkle driven by
+// the same gradient.  Vertex side keeps the retail constant layout untouched (c2..c5 = WorldViewProj,
+// c6..c9 = screen tex-projection) so the per-patch constant uploads do not change.
+//
+// ps_3_0 first with the compileShaderAtBestProfile step-down, same ladder as the river/trapezoid
+// shaders.  Windows-only like them: the runtime D3DCompile shim is the only compiler in the
+// shipped build, so failure here means "keep the retail byte code", never "no water".
+static const char* kWaveVertexShaderHLSL =
+	"float4x4 cWVP   : register(c2);\n"	//rows c2..c5, uploaded per patch like the vs.1.1 original
+	"float4   cTexP0 : register(c6);\n"	//screen tex-projection row 0 (c6..c9 owned, c6 used)
+	"struct WAVES_IN  { float4 pos : POSITION; float4 diff : COLOR0; float2 uv : TEXCOORD0; };\n"
+	"struct WAVES_OUT { float4 pos : POSITION; float4 diff : COLOR0; float2 bumpUV : TEXCOORD0; float2 screenUV : TEXCOORD1; };\n"
+	"WAVES_OUT main(WAVES_IN i)\n"
+	"{\n"
+	"    WAVES_OUT o;\n"
+	"    o.pos = mul(i.pos, cWVP);\n"
+	"    o.bumpUV = i.uv;\n"
+	"    o.diff = i.diff;\n"
+	"    float2 ndc = o.pos.xy / o.pos.w;\n"
+	"    o.screenUV = ndc * cTexP0.xy + cTexP0.zw;\n"
+	"    return o;\n"
+	"}\n";
+
+static const char* kWavePixelShaderHLSL =
+	"sampler bump : register(s0);\n"
+	"sampler refl : register(s1);\n"
+	"float4 cWave : register(c0);\n"	//x=bumpScale, y=sparkle intensity, z=Fresnel bias, w=Fresnel scale
+	"float4 cSun  : register(c1);\n"	//xy=sun direction in reflection-uv space, z=sun diffuse strength (P3-19), w unused
+	"float4 cFog  : register(c2);\n"	//P3-14: rgb=fog color, w=blend strength (0 disables the lerp exactly)
+	"float4 cFog2 : register(c3);\n"	//P3-14: x=eye-depth fog start, y=1/ramp length, zw unused
+	"float4 cFx   : register(c4);\n"	//P3-17/32: x=time(s), y=caustic strength, z=refl blur mix, w=blur texel offset
+	"float4 main(float4 pos : POSITION, float4 diff : COLOR0, float2 bumpUV : TEXCOORD0, float2 screenUV : TEXCOORD1) : COLOR\n"
+	"{\n"
+	"    float3 b = tex2D(bump, bumpUV).xyz;\n"
+	"    float2 grad = (b.xy - 0.5) * cWave.x;\n"
+	"    float2 rUV = screenUV + grad;\n"
+	"    float3 r1 = tex2D(refl, rUV).rgb;\n"
+	// GeneralsX @feature PS3.0-P3-32 14/10/2026 W1: cheap 4-tap cross blur of the reflection, mixed
+	// by cFx.z. The retail RT is 512 and its edges snap hard onto the water; a half-texel cross reads
+	// as roughness. cFx.z=0 keeps the single tap bit-for-bit (the taps still cost, gated to batch 9).
+	"    float3 rb = (tex2D(refl, rUV + float2(cFx.w, 0.0)).rgb + tex2D(refl, rUV - float2(cFx.w, 0.0)).rgb\n"
+	"               + tex2D(refl, rUV + float2(0.0, cFx.w)).rgb + tex2D(refl, rUV - float2(0.0, cFx.w)).rgb) * 0.25;\n"
+	"    float3 r = lerp(r1, rb, cFx.z);\n"
+	"    float3 body = diff.rgb * r;                                  // retail look: reflection tinted by diffuse\n"
+	"    float ndl = saturate(dot(normalize(float3(grad, 0.35)), normalize(float3(cSun.xy, 0.9))));\n"
+	"    float sparkle = pow(ndl, 48.0) * cWave.y;                    // tight sun glint on wave crests\n"
+	"    float fres = saturate(cWave.z + cWave.w * pow(1.0 - saturate(b.z), 3.0));\n"
+	// GeneralsX @feature PS3.0-P3-19 14/10/2026: broad sun Lambert on the wave body. The sparkle
+	// already had a per-pixel ndl against the bump-perturbed normal; cSun.z (GENERALSX_WAVE_SUNDIFFUSE,
+	// 0 = the pre-P3-19 look bit-for-bit) feeds that same term into the body color so wave faces
+	// tilted toward the sun read brighter, not just the tight glint.
+	"    float3 lit = body * (1.0 + ndl * cSun.z);                     // P3-19 sun diffuse on the body\n"
+	// GeneralsX @feature PS3.0-P3-17 14/10/2026 W2: procedural caustic band on the wave body, free
+	// time term - three drifting sine lobes, the crest of |sum| under 1 lights the body like pooled
+	// sun through ripples. No new texture. cFx.y=0 makes the multiplier exactly 1 (bit-for-bit parity).
+	"    float2 cp = bumpUV * 6.2831853 * 3.0 + float2(cFx.x * 0.62, cFx.x * 0.41);\n"
+	"    float cau = saturate(1.0 - 0.33333 * abs(sin(cp.x) + sin(cp.y) + sin(cp.x + cp.y)));\n"
+	"    cau = cau * cau * cau * cFx.y;\n"
+	"    lit = lit * (1.0 + cau);                                      // P3-17 caustics on the body\n"
+	"    float3 rgb = lerp(lit * 0.85, lit + r, fres) + sparkle;\n"	// grazing -> stronger mirror reflection
+	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: linear eye-depth distance fog on the sea plane.
+	// clip w interpolates as view-space eye distance in the perspective pass, so no new vertex output
+	// was needed; cFog.w=0 leaves the pixel exactly as the pre-P3-14 formula (GENERALSX_WAVE_FOG=0).
+	"    float fog = saturate((pos.w - cFog2.x) * cFog2.y) * cFog.w;\n"
+	"    rgb = lerp(rgb, cFog.rgb, fog);\n"
+	"    return float4(rgb, diff.a);\n"                                // alpha stays the retail distance/edge fade
+	"}\n";
+
+static Bool CompileWaveShadersHLSL(IDirect3DVertexShader9** vsOut, IDirect3DPixelShader9** psOut)
+{
+	const char* profile = nullptr;
+	void* handle = nullptr;
+
+	if (getenv("GENERALSX_WAVE3") && atoi(getenv("GENERALSX_WAVE3")) == 0)
+	{
+		fprintf(stderr, "[WAVE3] disabled by GENERALSX_WAVE3=0, retail wave byte code stays\n");
+		fflush(stderr);
+		return FALSE;
+	}
+
+	HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kWaveVertexShaderHLSL, true, "[WAVE3]", &profile, &handle);
+	if (FAILED(hr) || handle == nullptr)
+		return FALSE;	//helper already printed the reason; keep retail path.
+	*vsOut = (IDirect3DVertexShader9*)handle;
+
+	const char* psProfile = nullptr;
+	handle = nullptr;
+	hr = W3DShaderManager::compileShaderAtBestProfile(kWavePixelShaderHLSL, false, "[WAVE3]", &psProfile, &handle);
+	if (FAILED(hr) || handle == nullptr)
+	{
+		(*vsOut)->Release();
+		*vsOut = nullptr;
+		return FALSE;
+	}
+	*psOut = (IDirect3DPixelShader9*)handle;
+
+	fprintf(stderr, "[WAVE3] wave vs=%s ps=%s installed (GENERALSX_WAVE3=0 reverts)\n", profile, psProfile);
+	fflush(stderr);
+	return TRUE;
+}
 #endif // _WIN32
 
 void WaterRenderObjClass::ReAcquireResources()
@@ -933,16 +1058,39 @@ void WaterRenderObjClass::ReAcquireResources()
 			D3DDECL_END()
 		};
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, (void**)&m_dwWavePixelShader);
-		if (FAILED(hr))
-			return;
+		// GeneralsX @feature PS3.0 T3 13/10/2026: prefer the HLSL wave pass (EMBM equivalent +
+		// Fresnel + sparkle).  If the runtime compiler refuses anything we fall back to the
+		// retail wave.pso/wave.vso byte code, so water can never disappear over a shader bug.
+		Bool compiledHlslWave = FALSE;
+#ifdef _WIN32
+		compiledHlslWave = CompileWaveShadersHLSL(&m_dwWaveVertexShader, &m_dwWavePixelShader);
+#endif
+		m_waveHlsl = compiledHlslWave;
 
-		hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, (void**)&m_dwWaveVertexShader);
-		if (FAILED(hr))
-			return;
+		if (!m_waveHlsl)
+		{
+			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.pso", &Declaration[0], 0, false, (void**)&m_dwWavePixelShader);
+			if (FAILED(hr))
+				return;
+
+			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\wave.vso", &Declaration[0], 0, true, (void**)&m_dwWaveVertexShader);
+			if (FAILED(hr))
+				return;
+		}
 
 		// Create reflection texture
-		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (SEA_REFLECTION_SIZE, SEA_REFLECTION_SIZE);
+		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (GetSeaReflectionSize(), GetSeaReflectionSize());
+		// GeneralsX @feature PS3.0-P2-4 14/10/2026 log the reflection RT size once so the raised
+		// default (and any GENERALSX_WATERREFLECT override) is verifiable from a headless run's stderr.
+		{
+			static Bool s_loggedSeaSize = false;
+			if (!s_loggedSeaSize)
+			{
+				fprintf(stderr, "[WATER] sea reflection RT size=%d\n", (int)GetSeaReflectionSize());
+				fflush(stderr);
+				s_loggedSeaSize = true;
+			}
+		}
 	}
 
 	if (m_waterTrackSystem)
@@ -1932,6 +2080,134 @@ Matrix4x4 matProj, matView, matWW3D;
 	// Setup constants
 	m_pDev->SetVertexShaderConstantF(CV_ZERO,   (const float*)D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f), 1);
 	m_pDev->SetVertexShaderConstantF(CV_ONE,    (const float*)D3DXVECTOR4(1.0f, 1.0f, 1.0f, 1.0f), 1);
+
+	// GeneralsX @feature PS3.0 T3 13/10/2026: pixel constants for the HLSL wave pass only.
+	// Sparkle/Fresnel strengths are env-tunable for A/B runs the same way the dot3 specular is;
+	// the sun direction is a fixed screen-space-ish vector in this first cut (the retail pass had
+	// no sun term at all), which keeps the wave highlight stable until T5 brings real light dirs.
+	// GeneralsX @feature PS3.0-P3-19 14/10/2026: cSun.z now carries the broad sun-diffuse strength
+	// (GENERALSX_WAVE_SUNDIFFUSE, default 0.35, 0 = the pre-P3-19 look) - the same per-pixel ndl
+	// that drives the sparkle also lifts wave faces tilted toward the sun.
+	if (m_waveHlsl)
+	{
+		static Real s_waveSparkle = -1.0f;
+		static Real s_waveFresBias = -1.0f;
+		static Real s_waveFresScale = -1.0f;
+		static Real s_waveSunDiffuse = -1.0f;
+		static Real s_waveFogStrength = -1.0f;
+		if (s_waveSparkle < 0.0f)
+		{
+			const char* envSparkle = getenv("GENERALSX_WAVE_SPARKLE");
+			const char* envFres = getenv("GENERALSX_WAVE_FRESNEL");
+			const char* envSunDiff = getenv("GENERALSX_WAVE_SUNDIFFUSE");
+			const char* envFog = getenv("GENERALSX_WAVE_FOG");
+			s_waveSparkle = envSparkle ? (Real)atof(envSparkle) : 0.35f;
+			s_waveFresBias = envFres ? 0.10f : 0.20f;	//a hand-tuned Fresnel floor; env just switches profile
+			s_waveFresScale = envFres ? (Real)atof(envFres) : 0.80f;
+			s_waveSunDiffuse = envSunDiff ? (Real)atof(envSunDiff) : 0.35f;
+			// P3-14: 0 restores the pre-fog wave pixel exactly; any other value is the blend
+			// strength (clamped 0..1). Default 0.7 keeps distant sea folding into the haze band.
+			s_waveFogStrength = envFog ? (Real)atof(envFog) : 0.7f;
+			if (s_waveFresScale < 0.0f) s_waveFresScale = 0.0f;
+			if (s_waveFresScale > 2.0f) s_waveFresScale = 2.0f;
+			if (s_waveSunDiffuse < 0.0f) s_waveSunDiffuse = 0.0f;
+			if (s_waveSunDiffuse > 2.0f) s_waveSunDiffuse = 2.0f;
+			if (s_waveFogStrength < 0.0f) s_waveFogStrength = 0.0f;
+			if (s_waveFogStrength > 1.0f) s_waveFogStrength = 1.0f;
+			fprintf(stderr, "[WAVE3] fog: strength=%.2f (GENERALSX_WAVE_FOG)\n", (double)s_waveFogStrength);
+			fflush(stderr);
+		}
+		float waveParams[4] = { m_fBumpScale, s_waveSparkle, s_waveFresBias, s_waveFresScale };
+
+		// GeneralsX @feature PS3.0-P3-17 14/10/2026 W2: real sun direction in reflection-uv space.
+		// The first cut (T3) used a fixed screen-ish vector; the retail tod table's light0 carries the
+		// world sun (-lightPos = toward the light, same sign convention as the dot3 fallback), and the
+		// wrapper's cached VIEW matrix projects it into view space. Degenerate projections (sun straight
+		// ahead/behind) keep the old fixed pair.
+		float sunUV[2] = { 0.55f, -0.35f };
+		if (TheGlobalData)
+		{
+			const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+			Vector3 Lw(-sl.lightPos.x, -sl.lightPos.y, -sl.lightPos.z);
+			Matrix4x4 viewM;
+			DX8Wrapper::Get_Transform(D3DTS_VIEW, viewM);
+			Vector3 Lv(
+				Lw.X * viewM[0].X + Lw.Y * viewM[1].X + Lw.Z * viewM[2].X,
+				Lw.X * viewM[0].Y + Lw.Y * viewM[1].Y + Lw.Z * viewM[2].Y,
+				0.0f);
+			const Real hlen = sqrt(Lv.X * Lv.X + Lv.Y * Lv.Y);
+			if (hlen > 0.01f)
+			{
+				sunUV[0] = Lv.X / hlen;
+				sunUV[1] = Lv.Y / hlen;
+			}
+		}
+		float sunParams[4] = { sunUV[0], sunUV[1], s_waveSunDiffuse, 0.0f };
+		m_pDev->SetPixelShaderConstantF(0, waveParams, 1);
+		m_pDev->SetPixelShaderConstantF(1, sunParams, 1);
+
+		// GeneralsX @feature PS3.0-P3-17/P3-32 14/10/2026: cFx = (time, caustic strength, reflection
+		// blur mix, blur texel offset). Time drives the procedural caustic drift (render-only clock,
+		// never a sim value); the texel follows the P2-4 reflection RT size so the blur radius stays
+		// constant in screen space at 256/512/1024/2048. GENERALSX_WAVE_CAUSTIC / GENERALSX_REFLBLUR
+		// at 0 make both PS terms exact no-ops.
+		{
+			static Real s_waveCaustic = -1.0f;
+			static Real s_waveBlur = -1.0f;
+			if (s_waveCaustic < 0.0f)
+			{
+				const char* envCau = getenv("GENERALSX_WAVE_CAUSTIC");
+				const char* envBlur = getenv("GENERALSX_REFLBLUR");
+				s_waveCaustic = envCau ? (Real)atof(envCau) : 0.25f;
+				s_waveBlur = envBlur ? (Real)atof(envBlur) : 0.35f;
+				if (s_waveCaustic < 0.0f) s_waveCaustic = 0.0f;
+				if (s_waveCaustic > 1.0f) s_waveCaustic = 1.0f;
+				if (s_waveBlur < 0.0f) s_waveBlur = 0.0f;
+				if (s_waveBlur > 1.0f) s_waveBlur = 1.0f;
+			}
+			const float timeSec = (float)(::GetTickCount() % 86400000) * 0.001f;	// wrap at a day: no f32 drift
+			const Real rtSize = (Real)GetSeaReflectionSize();
+			float fxParams[4] = { timeSec, s_waveCaustic, s_waveBlur, s_waveBlur > 0.0f ? 2.0f / rtSize : 0.0f };
+			m_pDev->SetPixelShaderConstantF(4, fxParams, 1);
+		}
+
+		// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: sea-plane distance fog constants. Ramp is
+		// derived from the camera far clip so the band scales with the user's draw distance; the
+		// color is a hand-tuned cool haze (real sky-tint pickup belongs with the batch-6 reflection
+		// work). strength 0 makes both constants inert (lerp factor multiplies out).
+		{
+			// Far plane anchor follows the W3DView normal-zoom formula (see P3-14 note in
+			// W3DShaderManager.cpp); the live per-frame farZ varies with edge scroll and real-zoom pitch.
+			const Real farClip = WorldHeightMap::NORMAL_DRAW_WIDTH * MAP_XY_FACTOR;
+			const Real fogStart = farClip * 0.55f;
+			const Real fogLen = farClip * 0.45f;
+			// GeneralsX @feature PS3.0-P3-17 14/10/2026: the cool base blends toward the time-of-day
+			// warmth (tod light0 diffuse). GENERALSX_WAVE_FOGTINT=0 keeps the constant cool haze.
+			float fogColor[4] = { 0.72f, 0.78f, 0.84f, s_waveFogStrength };
+			static int tintOn = -1;
+			if (tintOn < 0)
+			{
+				const char* ev = getenv("GENERALSX_WAVE_FOGTINT");
+				tintOn = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
+			}
+			if (tintOn && TheGlobalData)
+			{
+				const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+				Real warmR = 0.55f + sl.diffuse.red * 0.45f;
+				Real warmG = 0.60f + sl.diffuse.green * 0.40f;
+				Real warmB = 0.62f + sl.diffuse.blue * 0.30f;
+				if (warmR > 1.0f) warmR = 1.0f;
+				if (warmG > 1.0f) warmG = 1.0f;
+				if (warmB > 1.0f) warmB = 1.0f;
+				fogColor[0] = 0.72f * 0.5f + 0.5f * (float)warmR;
+				fogColor[1] = 0.78f * 0.5f + 0.5f * (float)warmG;
+				fogColor[2] = 0.84f * 0.5f + 0.5f * (float)warmB;
+			}
+			float fogRamp[4] = { fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f };
+			m_pDev->SetPixelShaderConstantF(2, fogColor, 1);
+			m_pDev->SetPixelShaderConstantF(3, fogRamp, 1);
+		}
+	}
 
 	m_pDev->SetVertexShader(m_dwWaveVertexShader);
 	m_pDev->SetPixelShader(m_dwWavePixelShader);

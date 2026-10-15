@@ -39,6 +39,9 @@
 
 #include "texturefilter.h"
 #include "dx8wrapper.h"
+// GeneralsX @build PS3.0-P3-5 14/10/2026 getenv/fprintf for the terrain filter env override + marker
+#include <stdlib.h>
+#include <stdio.h>
 
 const char* const TextureFilterClass::TextureFilterModeString[TEXTURE_FILTER_COUNT] = {
 	"None",
@@ -355,3 +358,118 @@ void TextureFilterClass::_Set_Default_Mip_Filter(FilterType filter)
 		_MipMapFilters[i][FILTER_TYPE_DEFAULT]=_MipMapFilters[i][filter];
 	}
 }
+
+// ----------------------------------------------------------------------------
+//
+// GeneralsX @feature PS3.0-P3-5 14/10/2026 (report 画质提升总报告 §2 T3/T4)
+// The five terrain shader set() paths in W3DShaderManager and the two live Apply() paths in
+// TerrainTex used to write sampler states straight from the retail Bilinear/TrilinearTerrainTex
+// INI bools. Both bools default to FALSE in the shipped GameData, so those stages were pinned to
+// D3DTEXF_POINT min/mag/mip no matter what the player picked in the options menu - the biggest
+// screen-area surfaces (the terrain atlas and its noise layer, the alpha-edge and scorch decals)
+// lost bilinear, trilinear and anisotropic filtering alike. Three of the sites also differed from
+// each other: the multi-stage variants left stage 1 on LINEAR while forcing stage 0 to POINT, an
+// inconsistency with no visible purpose.
+//
+// Apply_Player_Filter replaces all of them by reading the same tier tables every other texture in
+// the engine uses, so the player's mode, the capability vetting in _Init_Filters and the
+// per-stage anisotropy downgrade (stage >0 samples a tiling helper layer, not a stretched surface)
+// all apply automatically. The INI bools survive as a floor: TrilinearTerrainTex may still upgrade a
+// POINT mip step. GENERALSX_TERRAIN_FILTER=legacy reproduces the retail override so the change can
+// be A/B'd on the same binary.
+//
+// ----------------------------------------------------------------------------
+unsigned TextureFilterClass::Get_Tier_Min_Filter(FilterType tier, unsigned stage)
+{
+	if (stage>=MAX_TEXTURE_STAGES) stage=MAX_TEXTURE_STAGES-1;
+	if ((unsigned)tier>=FILTER_TYPE_COUNT) return D3DTEXF_POINT;
+	return _MinTextureFilters[stage][tier];
+}
+
+unsigned TextureFilterClass::Get_Tier_Mag_Filter(FilterType tier, unsigned stage)
+{
+	if (stage>=MAX_TEXTURE_STAGES) stage=MAX_TEXTURE_STAGES-1;
+	if ((unsigned)tier>=FILTER_TYPE_COUNT) return D3DTEXF_POINT;
+	return _MagTextureFilters[stage][tier];
+}
+
+unsigned TextureFilterClass::Get_Tier_Mip_Filter(FilterType tier, unsigned stage)
+{
+	if (stage>=MAX_TEXTURE_STAGES) stage=MAX_TEXTURE_STAGES-1;
+	if ((unsigned)tier>=FILTER_TYPE_COUNT) return D3DTEXF_NONE;
+	return _MipMapFilters[stage][tier];
+}
+
+// One-time console marker so a screenshot leg can prove which path ran.
+static bool s_terrainFilterLegacyMode=false;
+static bool s_terrainFilterModeQueried=false;
+
+static bool Terrain_Filter_Legacy_Mode()
+{
+	if (!s_terrainFilterModeQueried) {
+		s_terrainFilterModeQueried=true;
+		const char* env=getenv("GENERALSX_TERRAIN_FILTER");
+		s_terrainFilterLegacyMode=(env!=nullptr && stricmp(env,"legacy")==0);
+		fprintf(stderr,"[TEXCONV] terrain stage filtering: %s\n",
+			s_terrainFilterLegacyMode?"retail override (legacy)":"player tier (converged)");
+		fflush(stderr);
+	}
+	return s_terrainFilterLegacyMode;
+}
+
+// GeneralsX @feature PS3.0-P3-3r 14/10/2026 I4 consumer: the device-level mip capability that
+// Compute_Caps probes into Support_MipMap_On_Particles() (D3DPTEXTURECAPS_MIPMAP, which under D3D9 is
+// also the gate for mip-mapped point sprites) now decides whether a mip step may be requested at all.
+// Previously the probe answer was logged and dropped, so the player's tier or an INI hint could raise
+// MIPFILTER on hardware that reports no mipmapping support.
+static bool Device_Supports_Mip_Filtering()
+{
+	const DX8Caps* caps=DX8Wrapper::Get_Current_Caps();
+	if (caps==nullptr) return true;
+	return caps->Support_MipMap_On_Particles();
+}
+
+void TextureFilterClass::Apply_Player_Filter(unsigned stage, bool bilinearHint, bool trilinearHint)
+{
+	if (stage>=MAX_TEXTURE_STAGES) stage=MAX_TEXTURE_STAGES-1;
+
+	if (Terrain_Filter_Legacy_Mode()) {
+		// Pre-P3-5 behaviour, kept verbatim for A/B legs: the bools are a ceiling.
+		const bool linear=bilinearHint||trilinearHint;
+		DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MINFILTER,linear?D3DTEXF_LINEAR:D3DTEXF_POINT);
+		DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MAGFILTER,linear?D3DTEXF_LINEAR:D3DTEXF_POINT);
+		DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MIPFILTER,trilinearHint?D3DTEXF_LINEAR:D3DTEXF_POINT);
+		return;
+	}
+
+	unsigned minFilter=Get_Tier_Min_Filter(FILTER_TYPE_DEFAULT,stage);
+	unsigned magFilter=Get_Tier_Mag_Filter(FILTER_TYPE_DEFAULT,stage);
+	unsigned mipFilter=Get_Tier_Mip_Filter(FILTER_TYPE_DEFAULT,stage);
+
+	// The retail TrilinearTerrainTex bool can only raise the mip step, never lower it.
+	if (trilinearHint && mipFilter==D3DTEXF_POINT) mipFilter=D3DTEXF_LINEAR;
+	if (!Device_Supports_Mip_Filtering()) mipFilter=D3DTEXF_NONE;
+
+	DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MINFILTER,minFilter);
+	DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MAGFILTER,magFilter);
+	DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MIPFILTER,mipFilter);
+}
+
+void TextureFilterClass::Apply_Player_Mip_Filter(unsigned stage, bool trilinearHint)
+{
+	if (stage>=MAX_TEXTURE_STAGES) stage=MAX_TEXTURE_STAGES-1;
+
+	// Retail rule for the mip-only override paths (the road shader): TrilinearTerrainTex decided
+	// between LINEAR and POINT, and nothing else did.
+	if (Terrain_Filter_Legacy_Mode()) {
+		DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MIPFILTER,trilinearHint?D3DTEXF_LINEAR:D3DTEXF_POINT);
+		return;
+	}
+
+	unsigned mipFilter=Get_Tier_Mip_Filter(FILTER_TYPE_DEFAULT,stage);
+	if (trilinearHint && mipFilter==D3DTEXF_POINT) mipFilter=D3DTEXF_LINEAR;
+	if (!Device_Supports_Mip_Filtering()) mipFilter=D3DTEXF_NONE;
+
+	DX8Wrapper::Set_DX8_Sampler_State(stage,D3DSAMP_MIPFILTER,mipFilter);
+}
+

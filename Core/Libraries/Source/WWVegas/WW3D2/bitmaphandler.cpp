@@ -19,10 +19,131 @@
 #include "bitmaphandler.h"
 #include "WWDebug/wwdebug.h"
 #include "colorspace.h"
+// GeneralsX @feature PS3.0-P3-7 14/10/2026 getenv for the mip-kernel A/B switch, fprintf for the
+// one-time console marker that lets a verification leg prove which kernel ran.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 void Bitmap_Assert(bool condition)
 {
 	WWASSERT(condition);
+}
+
+// ----------------------------------------------------------------------------
+//
+// GeneralsX @feature PS3.0-P3-7 14/10/2026 Load-time mip-chain kernel selection.
+//
+// The retail generator built every mip level from a 2x2 box average (Combine_A8R8G8B8), which
+// is the low-pass that makes every non-DDS texture in the game look mushy from mip 1 upwards:
+// a 50% duty box keeps only the DC term of each 2x2 block, so high-frequency detail is folded
+// into the level below rather than attenuated, and the chain loses contrast far faster than a
+// hardware-generated chain would.  The replacement is the Catmull-Rom form of the Lanczos-2
+// windowed sinc, sampled at the fixed offsets of a 2:1 minification:
+//
+//   w(0.5) = 0.5625,  w(1.5) = -0.0625   ->  taps [-1/16, 9/16, 9/16, -1/16], sum = 1
+//
+// which keeps the passband the box filter throws away while its small negative lobes cancel
+// most of the box's blur.  Negative lobes can overshoot, so every channel is clamped back into
+// [0,255] and edge taps (where the window hangs off the surface) are re-normalised instead of
+// silently darkening the border.
+//
+// The kernel replaces only the *halving* side effect of Copy_Image; the destination copy that
+// happens in the same call still goes through the untouched retail code path, so formats that
+// need conversion (DXT targets, 16-bit sources, bump-map Sobel passes, 1-pixel mip tails) keep
+// exactly the behaviour they had.
+//
+// ----------------------------------------------------------------------------
+
+static bool s_mipgenBoxMode=false;
+static bool s_mipgenModeQueried=false;
+
+static bool Mipgen_High_Quality_Mode()
+{
+	if (!s_mipgenModeQueried) {
+		s_mipgenModeQueried=true;
+		const char* env=getenv("GENERALSX_MIPGEN");
+		s_mipgenBoxMode=(env!=nullptr && stricmp(env,"box")==0);
+		fprintf(stderr,"[MIPGEN] load-time mip kernel: %s\n",
+			s_mipgenBoxMode?"retail 2x2 box (legacy)":"catmull-rom / lanczos2");
+		fflush(stderr);
+	}
+	return !s_mipgenBoxMode;
+}
+
+// Catmull-Rom (Lanczos-2) weight at distance t, in destination-filter units.
+static float Lanczos2_Weight(float t)
+{
+	const float a=(t<0.0f)?-t:t;
+	if (a<=1.0f) return ((1.5f*a-2.5f)*a*a)+1.0f;
+	if (a<2.0f) return ((-0.5f*a+2.5f)*a-4.0f)*a+2.0f;
+	return 0.0f;
+}
+
+// Halve a 32-bit (A8R8G8B8 / X8R8G8B8) surface in place, exactly the footprint the retail box
+// path leaves behind: a (width/2 x height/2) image stored at the top-left of the same buffer,
+// row pitch unchanged.  All reads happen before any write-back, so the wider 4-tap window can
+// look ahead into rows the in-place 2-tap scheme would have had to consume first.
+static void Downscale_Level_High_Quality(unsigned char* surface,unsigned width,unsigned height,
+	unsigned pitch_bytes,const Vector3& hsv_shift)
+{
+	const unsigned hw=width/2;
+	const unsigned hh=height/2;
+	if (hw==0||hh==0) return;
+
+	const bool has_hsv_shift=hsv_shift[0]!=0.0f||hsv_shift[1]!=0.0f||hsv_shift[2]!=0.0f;
+	const unsigned pitch=pitch_bytes/4;
+	unsigned* src=(unsigned*)surface;
+
+	// The four taps of a 2:1 downscale sit at a constant fractional offset (centre = 2*d+0.5),
+	// so the weights are loop invariants: -1/16, 9/16, 9/16, -1/16.
+	float weight[4];
+	for (int t=0;t<4;++t) weight[t]=Lanczos2_Weight((float)(t-2)+0.5f);
+
+	unsigned* mip=new unsigned[hw*hh];
+	for (unsigned y=0;y<hh;++y) {
+		unsigned* mip_row=mip+y*hw;
+		for (unsigned x=0;x<hw;++x) {
+			float acc[4]={0.0f,0.0f,0.0f,0.0f};
+			float wsum=0.0f;
+			for (int ty=0;ty<4;++ty) {
+				int sy=(int)(2*y+ty-1);
+				if (sy<0) sy=0;
+				if (sy>=(int)height) sy=height-1;
+				const unsigned* src_row=src+(unsigned)sy*pitch;
+				const float wy=weight[ty];
+				for (int tx=0;tx<4;++tx) {
+					int sx=(int)(2*x+tx-1);
+					if (sx<0) sx=0;
+					if (sx>=(int)width) sx=width-1;
+					unsigned pixel=src_row[sx];
+					if (has_hsv_shift) Recolor(pixel,hsv_shift);
+					const float w=wy*weight[tx];
+					acc[0]+=w*(float)(pixel&0xffu);
+					acc[1]+=w*(float)((pixel>>8)&0xffu);
+					acc[2]+=w*(float)((pixel>>16)&0xffu);
+					acc[3]+=w*(float)((pixel>>24)&0xffu);
+					wsum+=w;
+				}
+			}
+			// Re-normalise so clamped edge windows keep the surface's brightness, then clamp the
+			// negative-lobe overshoot back into the 8-bit range.
+			const float inv=1.0f/wsum;
+			unsigned out=0;
+			for (int c=0;c<4;++c) {
+				float v=acc[c]*inv;
+				if (v<0.0f) v=0.0f;
+				if (v>255.0f) v=255.0f;
+				out|=((unsigned)(v+0.5f))<<(8*c);
+			}
+			mip_row[x]=out;
+		}
+	}
+
+	for (unsigned y=0;y<hh;++y) {
+		memcpy(src+y*pitch,mip+y*hw,hw*sizeof(unsigned));
+	}
+	delete[] mip;
 }
 
 void BitmapHandlerClass::Create_Mipmap_B8G8R8A8(
@@ -320,6 +441,40 @@ void BitmapHandlerClass::Copy_Image(
 				src_ptr_next_line+=src_bpp;
 			}
 		}
+		return;
+	}
+
+	// GeneralsX @feature PS3.0-P3-7 14/10/2026 High-quality mip-chain hook.
+	//
+	// Only the halving side effect of the mip-generation call is replaced: the destination copy
+	// is delegated back through the untouched retail code (same formats, generate_mip_level now
+	// false), and the next level is then built from the 32-bit source with the windowed-sinc
+	// kernel. Bump-map (Sobel) passes returned above, 16-bit/paletted sources and non-32-bit
+	// *sources* keep the retail path, as do the 1-pixel mip tails where a 4-tap window has
+	// nothing left to reach into. Set GENERALSX_MIPGEN=box to get the shipped box filter back
+	// for an A/B leg.
+	if (generate_mip_level && Mipgen_High_Quality_Mode() &&
+		(src_surface_format==WW3D_FORMAT_A8R8G8B8 || src_surface_format==WW3D_FORMAT_X8R8G8B8) &&
+		dest_surface_width==src_surface_width && dest_surface_height==src_surface_height &&
+		dest_surface_width>1 && dest_surface_height>1)
+	{
+		Copy_Image(
+			dest_surface,
+			dest_surface_width,
+			dest_surface_height,
+			dest_surface_pitch,
+			dest_surface_format,
+			src_surface,
+			src_surface_width,
+			src_surface_height,
+			src_surface_pitch,
+			src_surface_format,
+			src_palette,
+			src_palette_bpp,
+			false,
+			hsv_shift);
+		Downscale_Level_High_Quality(src_surface,src_surface_width,src_surface_height,
+			src_surface_pitch,hsv_shift);
 		return;
 	}
 

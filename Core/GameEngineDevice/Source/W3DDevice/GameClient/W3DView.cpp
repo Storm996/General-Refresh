@@ -178,6 +178,8 @@ W3DView::W3DView()
 	m_FXPitch = 1.0f;
 	m_freezeTimeForCameraMovement = false;
 	m_lastScreenToTerrainValid = false;
+	// GeneralsX @feature PS3.0-P3-25b 14/10/2026 camera render interpolation starts inactive.
+	m_camInterpInit = false;
 
 	// GeneralsX @feature 05/10/2026 Initialize the real time driven scripted camera movement.
 	m_scriptedCameraLastTimeMs = SystemTime.Get();
@@ -843,10 +845,83 @@ void W3DView::updateCameraClipPlanes(const Matrix3D &transform)
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0-P3-25b 14/10/2026 camera render interpolation helpers.  The tactical
+// camera pose advances on logic frames; rendering above that rate visibly steps (30 Hz stair on a
+// 144 Hz panel).  draw() blends the two most recent committed poses with
+// FramePacer::getLogicFramePhase() for the 3D scene pass only, then restores, so picking, radar and
+// every logic-side consumer keep seeing the plain logic-frame pose.  14/10/2026 user verdict: the
+// blend caused visible screen jitter in skirmish, so the shipping default is now the retail
+// stepped behavior; GENERALSX_CAMINTERP=1 keeps the interpolation available as a QA leg.
+static Bool Cam_Interp_On()
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		const char* ev = getenv("GENERALSX_CAMINTERP");
+		cached = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+static void Cam_Interp_Xform(Matrix3D& out, const Matrix3D& prev, const Matrix3D& cur, Real t)
+{
+	// Translation lerp.
+	const Vector3 pT = prev.Get_Translation();
+	const Vector3 cT = cur.Get_Translation();
+	const Vector3 tT(pT.X + (cT.X - pT.X) * t, pT.Y + (cT.Y - pT.Y) * t, pT.Z + (cT.Z - pT.Z) * t);
+
+	// Basis lerp + Gram-Schmidt.  Inter-frame rotation deltas of an RTS camera are small, so the
+	// re-normalized blend stays orthonormal to float precision without a quaternion path.
+	Vector3 x = prev.Get_X_Vector();
+	const Vector3 cx = cur.Get_X_Vector();
+	x.Set(x.X + (cx.X - x.X) * t, x.Y + (cx.Y - x.Y) * t, x.Z + (cx.Z - x.Z) * t);
+	x.Normalize();
+	Vector3 y = prev.Get_Y_Vector();
+	const Vector3 cy = cur.Get_Y_Vector();
+	y.Set(y.X + (cy.X - y.X) * t, y.Y + (cy.Y - y.Y) * t, y.Z + (cy.Z - y.Z) * t);
+	const Real d = Vector3::Dot_Product(y, x);
+	y.Set(y.X - x.X * d, y.Y - x.Y * d, y.Z - x.Z * d);
+	y.Normalize();
+	Vector3 z;
+	Vector3::Cross_Product(x, y, &z);	// output-param form: the by-value overload sits under ALLOW_TEMPORARIES
+
+	out[0].Set(x.X, y.X, z.X, tT.X);
+	out[1].Set(x.Y, y.Y, z.Y, tT.Y);
+	out[2].Set(x.Z, y.Z, z.Z, tT.Z);
+}
+
 //-------------------------------------------------------------------------------------------------
 void W3DView::setCameraTransform(const Matrix3D &transform)
 {
 	m_lastScreenToTerrainValid = false;
+
+	// GeneralsX @feature PS3.0-P3-25b 14/10/2026 snapshot the logic-rate pose for draw().  A jump
+	// larger than ~200 world units or ~25 degrees in one logic step is a teleport (jump-to-area,
+	// map edge recenter, debug move), so collapse prev to cur and the blend never slides through
+	// the map.
+	if (Cam_Interp_On())
+	{
+		if (!m_camInterpInit)
+		{
+			m_camInterpPrev = transform;
+			m_camInterpCur = transform;
+			m_camInterpInit = true;
+		}
+		else
+		{
+			const Vector3 pT = m_camInterpCur.Get_Translation();
+			const Vector3 cT = transform.Get_Translation();
+			const Real dx = cT.X - pT.X;
+			const Real dy = cT.Y - pT.Y;
+			const Real dz = cT.Z - pT.Z;
+			const Real turnDot = Vector3::Dot_Product(m_camInterpCur.Get_X_Vector(), transform.Get_X_Vector());
+			if (dx * dx + dy * dy + dz * dz > 40000.0f || turnDot < 0.9f)
+				m_camInterpPrev = transform;
+			else
+				m_camInterpPrev = m_camInterpCur;
+			m_camInterpCur = transform;
+		}
+	}
 
 #if defined(RTS_DEBUG)
 	m_3DCamera->Set_View_Plane( m_FOV, -1 );
@@ -1938,11 +2013,36 @@ void W3DView::draw()
 	{
 		// Render 3D scene from our camera
 		W3DDisplay::m_3DScene->setCustomPassMode(customScenePassMode);
+
+		// GeneralsX @feature PS3.0-P3-25b 14/10/2026 blend the logic-rate camera pose forward into
+		// the frame currently being rendered.  Restricted to the user-controlled tactical view with
+		// no camera lock and no scripted movement in flight: those paths Set_Transform the camera
+		// directly (bypassing our snapshots) and must keep the pose they just wrote.  The plain
+		// logic pose is restored right after the 3D pass, so picking/radar/2D all still see it.
+		Bool camInterpApplied = FALSE;
+		Matrix3D camInterpRestore;
+		if (Cam_Interp_On() && this == TheTacticalView && m_isUserControlled &&
+			m_camInterpInit && !getCameraLock() && m_scriptedState == 0)
+		{
+			const Real phase = TheFramePacer ? TheFramePacer->getLogicFramePhase() : 1.0f;
+			if (phase > 0.0f && phase < 1.0f)
+			{
+				camInterpRestore = m_3DCamera->Get_Transform();
+				Matrix3D interpXform;
+				Cam_Interp_Xform(interpXform, m_camInterpPrev, m_camInterpCur, phase);
+				m_3DCamera->Set_Transform(interpXform);
+				camInterpApplied = TRUE;
+			}
+		}
+
 		if (m_isWireFrameEnabled)
 			W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_CLEAR_LINE);
 		W3DDisplay::m_3DScene->doRender( m_3DCamera );
 		W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_DISABLE);
 		m_isWireFrameEnabled = m_nextWireFrameEnabled;
+
+		if (camInterpApplied)
+			m_3DCamera->Set_Transform(camInterpRestore);	// GeneralsX @feature PS3.0-P3-25b 14/10/2026
 	}
 
 	if (m_viewFilterMode &&

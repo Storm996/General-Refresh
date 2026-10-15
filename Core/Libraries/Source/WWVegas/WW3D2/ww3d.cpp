@@ -81,6 +81,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 
+#include <stdlib.h>		// GeneralsX @build PS3.0-P2-1 14/10/2026 getenv/atoi for texture filter env overrides
 #include "ww3d.h"
 #include "WWLib/win.h"  // GeneralsX @build fbraz 10/02/2026 - For MMRESULT/timeBeginPeriod/BITMAP structures
 #include "rinfo.h"
@@ -227,8 +228,41 @@ static bool												_LargeTextureExtraReductionEnabled = false;
 int														WW3D::LastFrameMemoryAllocations;
 int														WW3D::LastFrameMemoryFrees;
 
-int														WW3D::TextureFilter = TextureFilterClass::TextureFilterMode::TEXTURE_FILTER_BILINEAR;
-int														WW3D::AnisotropyLevel = TextureFilterClass::AnisotropicFilterMode::TEXTURE_FILTER_ANISOTROPIC_2X;
+// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Raise the factory default to anisotropic filtering.
+// Bilinear (the old default) keeps MIPFILTER=POINT, so every mip boundary in the world switches
+// hard (distant grass/roads flicker/banding - see quality report items T3/T4). The Anisotropic
+// mode falls back to trilinear, then bilinear automatically inside
+// TextureFilterClass::_Init_Filters when the device lacks the matching D3DPTFILTERCAPS bits,
+// so this is capability-gated by construction.
+int														WW3D::TextureFilter = TextureFilterClass::TextureFilterMode::TEXTURE_FILTER_ANISOTROPIC;
+int														WW3D::AnisotropyLevel = TextureFilterClass::AnisotropicFilterMode::TEXTURE_FILTER_ANISOTROPIC_4X;
+
+// GeneralsX @feature PS3.0-P2-1 14/10/2026 QA-only env overrides for in-game A/B evidence.
+// GENERALSX_TEXFILTER=None|Point|Bilinear|Trilinear|Anisotropic, GENERALSX_TEXANISO=2|4|8|16.
+// Unset or unknown values keep the user's saved choice. The setters only run at device
+// init and option apply, so re-reading the env per call is cheap and avoids caching tricks.
+static int _GetTexFilterEnvOverride()
+{
+	const char* env = getenv("GENERALSX_TEXFILTER");
+	if (env == nullptr || *env == 0)
+		return -1;
+	for (int i = 0; i < TextureFilterClass::TEXTURE_FILTER_COUNT; ++i) {
+		if (stricmp(env, TextureFilterClass::TextureFilterModeString[i]) == 0)
+			return i;
+	}
+	return -1;
+}
+
+static int _GetTexAnisoEnvOverride()
+{
+	const char* env = getenv("GENERALSX_TEXANISO");
+	if (env == nullptr || *env == 0)
+		return -1;
+	int level = atoi(env);
+	if (level < 2 || level > 16)
+		return -1;
+	return level;
+}
 
 bool														WW3D::Lite = false;
 
@@ -777,6 +811,11 @@ void WW3D::_Invalidate_Textures()
 
 void WW3D::Set_Texture_Filter(int texture_filter)
 {
+	// GeneralsX @feature PS3.0-P2-1 14/10/2026 env override for A/B evidence capture (see _GetTexFilterEnvOverride)
+	const int envOverride = _GetTexFilterEnvOverride();
+	if (envOverride >= 0)
+		texture_filter = envOverride;
+
 	TextureFilter = clamp((int)TextureFilterClass::TEXTURE_FILTER_NONE, texture_filter, (int)TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC);
 	TextureFilterClass::_Init_Filters(
 		(TextureFilterClass::TextureFilterMode)TextureFilter,
@@ -786,6 +825,11 @@ void WW3D::Set_Texture_Filter(int texture_filter)
 
 void WW3D::Set_Anisotropy_Level(int level)
 {
+	// GeneralsX @feature PS3.0-P2-1 14/10/2026 env override for A/B evidence capture (see _GetTexAnisoEnvOverride)
+	const int envAniso = _GetTexAnisoEnvOverride();
+	if (envAniso >= 0)
+		level = envAniso;
+
 	level = clamp((int)TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_2X, level, (int)TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_16X);
 	level = highestBit(level);
 
@@ -795,6 +839,13 @@ void WW3D::Set_Anisotropy_Level(int level)
 		WWDEBUG_SAY(("Requested anisotropy level %u is unsupported; using %u",
 			(unsigned)level,
 			(unsigned)AnisotropyLevel));
+
+	// GeneralsX @tweak PS3.0-P2-1 14/10/2026 stderr log of the combined effective state. Emitted
+	// here because W3DDisplay applies the filter mode first, then the anisotropy level; DEBUG_LOG
+	// is compiled out of release builds.
+	fprintf(stderr, "[TEXFILTER] mode=%s aniso=%dx\n",
+		TextureFilterClass::TextureFilterModeString[TextureFilter], AnisotropyLevel);
+	fflush(stderr);
 }
 
 /***********************************************************************************************

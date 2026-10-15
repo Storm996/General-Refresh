@@ -160,6 +160,10 @@ protected:
 	Int						m_vertexBufferD3DOffset;	///<location to start writing vertices
 	IDirect3DPixelShader9*					m_dwWavePixelShader;	///<handle to D3D pixel shader
 	IDirect3DVertexShader9*					m_dwWaveVertexShader;	///<handle to D3D vertex shader
+	// GeneralsX @feature PS3.0 T3 13/10/2026 water upgrade: TRUE when the wave pass runs on the
+	// inline HLSL shaders (EMBM equivalent + Fresnel + sun sparkle); FALSE keeps the retail
+	// wave.pso/wave.vso byte code.  Decided once in ReAcquireResources.
+	Bool										m_waveHlsl;
 	Int	m_numVertices;				///<number of vertices in D3D vertex buffer
 	Int m_numIndices;				///<number of indices in D3D index buffer
 	IDirect3DTexture9* m_pBumpTexture[NUM_BUMP_FRAMES]; ///<animation frames

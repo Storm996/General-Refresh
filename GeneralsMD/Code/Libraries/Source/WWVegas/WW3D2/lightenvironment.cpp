@@ -388,7 +388,10 @@ void LightEnvironmentClass::Calculate_Fill_Light()
 	InputLightStruct average_light = InputLights[0];
 
 	// Loop through the remaining lights on the list (up to 2) and add their contributions to the averaged light
-	int num_lights = min(LightCount, MAX_LIGHTS - 1);
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: literal 3, not MAX_LIGHTS - 1. The fill light's
+	// "average of the top 3" semantics were tuned against the old 4-slot environment; after the 4->8
+	// widening, averaging up to 7 lights would drift the fill color on busy night scenes.
+	int num_lights = min(LightCount, 3);
 	for (int i = 1; i < num_lights; ++i) {
 
 		// The ratio is the percentage of the remaining light's contribution compared to the primary light source

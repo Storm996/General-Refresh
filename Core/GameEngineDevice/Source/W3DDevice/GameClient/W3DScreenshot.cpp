@@ -203,7 +203,22 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	}
 
 	SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
-	DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
+
+	// GeneralsX @bugfix Qoder 13/10/2026 PS3.0: with MSAA active (user Options.ini AntiAliasing=8
+	// on the DXVK d3d9 shim) the surface behind GetBackBuffer(0)+GetRenderTargetData never holds
+	// the 2D in-game HUD. Proven with four same-frame captures (frame start before Begin_Render's
+	// clear / right after the UI draw / before present / after present): every one shows the 3D
+	// scene and the debug overlay text but no HUD, while the desktop shows the HUD normally.
+	// D3D9's documented way to capture an anti-aliased screen is GetFrontBufferData, which copies
+	// the composited front buffer (the image that actually gets presented), so take the screenshot
+	// from there and keep the old back-buffer readback only as a fallback.
+	const HRESULT frontHr = DX8Wrapper::_Get_D3D_Device8()->GetFrontBufferData(0, surfaceCopy->Peek_D3D_Surface());
+	if (FAILED(frontHr))
+	{
+		fprintf(stderr, "[SHOT] GetFrontBufferData failed hr=0x%08X, falling back to back-buffer copy\n", (unsigned)frontHr);
+		fflush(stderr);
+		DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
+	}
 
 	surface->Release_Ref();
 	surface = nullptr;

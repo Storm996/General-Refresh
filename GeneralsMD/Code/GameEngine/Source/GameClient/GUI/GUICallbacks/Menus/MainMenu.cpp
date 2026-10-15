@@ -446,8 +446,8 @@ static void initLabelVersion()
 	if (TheVersion) {
 		creditText = TheVersion->getUnicodeProjectWatermark();
 	} else {
-		// GeneralsX @tweak Storm996 11/10/2026 Rebrand fallback watermark text to General Refresh
-		creditText.translate("General Refresh");
+		// GeneralsX @tweak Storm996 14/10/2026 Add Storm99 author signature to fallback watermark
+		creditText.translate("General Refresh by Storm99");
 	}
 
 	if (labelVersion)
@@ -603,6 +603,16 @@ void MainMenuInit( WindowLayout *layout, void *userData )
 		GameWindow *buttonMissions = TheWindowManager->winGetWindowFromId( parentMainMenu, buttonMissionsID );
 		if( buttonMissions )
 			GadgetButtonSetText( buttonMissions, UnicodeString( L"\u4efb\u52a1" ) );
+	}
+
+	// GeneralsX @feature Qoder 13/10/2026 "Graphics options" entry: opens the standalone
+	// GraphicsOptions.wnd page through the declarative @push verb (same zero-click-C++ pattern as
+	// the mission button above); only the visible label is localized here.
+	{
+		NameKeyType buttonGraphicsID = TheNameKeyGenerator->nameToKey( "MainMenu.wnd:ButtonGraphicsOptions@push Menus/GraphicsOptions.wnd" );
+		GameWindow *buttonGraphics = TheWindowManager->winGetWindowFromId( parentMainMenu, buttonGraphicsID );
+		if( buttonGraphics )
+			GadgetButtonSetText( buttonGraphics, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
 	}
 
 	dropDownWindows[DROPDOWN_SINGLE] = TheWindowManager->winGetWindowFromId( parentMainMenu, TheNameKeyGenerator->nameToKey( "MainMenu.wnd:MapBorder" ));

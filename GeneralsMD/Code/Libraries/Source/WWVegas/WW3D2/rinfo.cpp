@@ -140,7 +140,8 @@ SpecialRenderInfoClass::SpecialRenderInfoClass(CameraClass & cam,int render_type
 	RenderInfoClass(cam),
 	RenderType(render_type),
 	VisRasterizer(nullptr),
-	BWRenderer(nullptr)
+	BWRenderer(nullptr),
+	SunSink(nullptr)	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map
 {
 }
 

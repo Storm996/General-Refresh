@@ -47,6 +47,7 @@
 #include "bwrender.h"
 #include "camera.h"
 #include "dx8renderer.h"
+#include "sunsink.h"	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map sink interface
 #include "WWLib/hashtemplate.h"
 // GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (段D): companion normal-map detection needs the
 // WW3D file factory (existence test), the DX8 caps (Support_Dot3), texture names and the
@@ -521,6 +522,19 @@ DX8FVFCategoryContainer* MeshModelClass::Peek_FVF_Category_Container()
 
 void MeshModelClass::Shadow_Render(SpecialRenderInfoClass & rinfo,const Matrix3D & tm,const HTreeClass * htree)
 {
+	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map: the occluder pass reuses this
+	// same Special_Render plumbing that the (dead) BWRenderer atlas path used. The helper outputs
+	// GL-convention clip space (z in [-1,1], ortho so w==1); the sink rebases to D3D [0,1] itself.
+	if (rinfo.SunSink != nullptr) {
+		if (_TempTransformedVertexBuffer.Length() < VertexCount) _TempTransformedVertexBuffer.Resize(VertexCount);
+		Vector4* transf_ptr=&(_TempTransformedVertexBuffer[0]);
+		get_deformed_screenspace_vertices(transf_ptr,rinfo,tm,htree);
+
+		rinfo.SunSink->Submit_Screenspace_Triangles(transf_ptr,VertexCount,
+			reinterpret_cast<const unsigned short*>(Poly->Get_Array()),PolyCount);
+		return;
+	}
+
 	if (rinfo.BWRenderer != nullptr) {
 		if (_TempTransformedVertexBuffer.Length() < VertexCount) _TempTransformedVertexBuffer.Resize(VertexCount);
 		Vector4* transf_ptr=&(_TempTransformedVertexBuffer[0]);

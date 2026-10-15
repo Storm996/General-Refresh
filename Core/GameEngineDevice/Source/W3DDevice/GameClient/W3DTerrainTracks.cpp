@@ -62,6 +62,40 @@
 
 
 #define BRIDGE_OFFSET_FACTOR	0.25f	//amount to raise tracks above bridges.
+
+// GeneralsX @feature PS3.0-P3-10 14/10/2026 V3: track lift height (was the fixed BRIDGE_OFFSET_FACTOR
+// on every vertex). GENERALSX_TRACK_LIFT lowers it toward 0 so the marks sit on the terrain instead of
+// floating 0.25 above it when seen from a low angle; below the retail constant the flush pass pairs the
+// lowered lift with hardware depth bias (Is_Depth_Bias_Available, P2-7) to keep the z-fight away.
+// Default = retail value: bit-for-bit the old geometry, and no bias is touched.
+static Real Track_Lift()
+{
+	static Real cached = -1.0f;
+	if (cached < 0.0f) {
+		cached = BRIDGE_OFFSET_FACTOR;
+		const char* ev = getenv("GENERALSX_TRACK_LIFT");
+		if (ev != nullptr && *ev != 0) {
+			cached = (Real)atof(ev);
+			if (cached < 0.0f) cached = 0.0f;
+			if (cached > 1.0f) cached = BRIDGE_OFFSET_FACTOR; // absurd value = stay retail
+		}
+	}
+	return cached;
+}
+
+// GeneralsX @feature PS3.0-P3-10: slope shading ON/OFF knob (flush() multiplies each edge's baked
+// diffuse by a sun-vs-terrain-slope term). 0 keeps the flat retail time-of-day tint bit-for-bit.
+static bool Track_Slope_On()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = 1;
+		const char* ev = getenv("GENERALSX_TRACK_SLOPE");
+		if (ev != nullptr && *ev != 0) cached = (strcmp(ev, "0") != 0) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 //=============================================================================
 // TerrainTracksRenderObjClass::~TerrainTracksRenderObjClass
 //=============================================================================
@@ -206,7 +240,7 @@ void TerrainTracksRenderObjClass::addCapEdgeToTrack(Real x, Real y)
 	Real eHeight;
 
 	if (m_ownerDrawable && (objectLayer=m_ownerDrawable->getObject()->getLayer()) != LAYER_GROUND)
-		eHeight=BRIDGE_OFFSET_FACTOR+TheTerrainLogic->getLayerHeight(x,y,objectLayer,&vZTmp);
+		eHeight=Track_Lift()+TheTerrainLogic->getLayerHeight(x,y,objectLayer,&vZTmp);
 	else
 		eHeight=TheTerrainLogic->getGroundHeight(x,y,&vZTmp);
 
@@ -316,7 +350,7 @@ void TerrainTracksRenderObjClass::addEdgeToTrack(Real x, Real y)
 		//no anchor yet, make this point an anchor.
 		PathfindLayerEnum objectLayer;
 		if (m_ownerDrawable && (objectLayer=m_ownerDrawable->getObject()->getLayer()) != LAYER_GROUND)
-			m_lastAnchor=Vector3(x,y,TheTerrainLogic->getLayerHeight(x,y,objectLayer)+BRIDGE_OFFSET_FACTOR);
+			m_lastAnchor=Vector3(x,y,TheTerrainLogic->getLayerHeight(x,y,objectLayer)+Track_Lift());
 		else
 			m_lastAnchor=Vector3(x,y,TheTerrainLogic->getGroundHeight(x,y));
 
@@ -334,7 +368,7 @@ void TerrainTracksRenderObjClass::addEdgeToTrack(Real x, Real y)
 	PathfindLayerEnum objectLayer;
 
 	if (m_ownerDrawable && (objectLayer=m_ownerDrawable->getObject()->getLayer()) != LAYER_GROUND)
-		eHeight=BRIDGE_OFFSET_FACTOR+TheTerrainLogic->getLayerHeight(x,y,objectLayer,&vZTmp);
+		eHeight=Track_Lift()+TheTerrainLogic->getLayerHeight(x,y,objectLayer,&vZTmp);
 	else
 		eHeight=TheTerrainLogic->getGroundHeight(x,y,&vZTmp);
 
@@ -830,6 +864,24 @@ Try improving the fit to vertical surfaces like cliffs.
 	diffuseLight = REAL_TO_INT(shadeB) | (REAL_TO_INT(shadeG) << 8) | (REAL_TO_INT(shadeR) << 16);
 	Real numFadedEdges=m_maxTankTrackEdges-m_maxTankTrackOpaqueEdges;
 
+	// GeneralsX @feature PS3.0-P3-10 14/10/2026 V3: slope lighting for the retail "@todo: Add diffuse
+	// lighting" edge case. The baked tint above is flat for the whole batch; on hills the marks should
+	// still read brighter facing the sun and darker facing away. Each edge's gradient is taken along the
+	// track direction from consecutive edge midpoints (both endpoints share an edge's ground height), the
+	// shade term is (0.667 + 0.667*ndl) so ndl=0.5 - the half-key baked into diffuseLight - reproduces
+	// the flat retail tint exactly, and GENERALSX_TRACK_SLOPE=0 skips the multiply altogether.
+	// Pure render vertex color: no simulation value is touched.
+	Real sunLx=0.0f, sunLy=0.0f, sunLz=1.0f;
+	const bool slopeOn = Track_Slope_On() && TheGlobalData != nullptr;
+	if (slopeOn)
+	{
+		const GlobalData::TerrainLighting* sl = &TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+		Vector3 L(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z);   // toward the light (L1 sign convention)
+		float llen = L.Length();
+		if (llen > 0.001f) { sunLx = L.X/llen; sunLy = L.Y/llen; sunLz = L.Z/llen; }
+		else { sunLx = 0.0f; sunLy = 0.0f; sunLz = 1.0f; }
+	}
+
 	//check if there is anything to draw and fill vertex buffer
 	if (m_edgesToFlush >= 2)
 	{
@@ -866,6 +918,34 @@ Try improving the fit to vertical surfaces like cliffs.
 
 					distanceFade *= mod->m_edges[index].alpha;	//adjust fade with distance from start of track
 
+					// GeneralsX @feature PS3.0-P3-10: per-edge slope-vs-sun boost (see flush() note).
+					Int litColor = diffuseLight;
+					if (slopeOn && i >= 1)
+					{
+						Vector3 midCur = (mod->m_edges[index].endPointPos[0] + mod->m_edges[index].endPointPos[1]) * 0.5f;
+						Int pidx = index - 1;
+						if (pidx < 0) pidx += m_maxTankTrackEdges;
+						Vector3 midPrev = (mod->m_edges[pidx].endPointPos[0] + mod->m_edges[pidx].endPointPos[1]) * 0.5f;
+						Real dx = midCur.X - midPrev.X, dy = midCur.Y - midPrev.Y, dz = midCur.Z - midPrev.Z;
+						Real hlen = sqrt(dx*dx + dy*dy);
+						if (hlen > 0.01f)
+						{
+							Real grad = dz / hlen;                       // slope along the track direction
+							Real nx = -(dx/hlen)*grad, ny = -(dy/hlen)*grad;   // Z-up surface normal (nx,ny,1)
+							Real ndl = (nx*sunLx + ny*sunLy + sunLz) / sqrt(nx*nx + ny*ny + 1.0f);
+							if (ndl < 0.0f) ndl = 0.0f;
+							if (ndl > 1.0f) ndl = 1.0f;
+							Real boost = 0.66667f + 0.66667f * ndl;      // ndl=0.5 -> 1.0 (retail neutral)
+							Int r = (Int)(((diffuseLight >> 16) & 0xff) * boost);
+							Int g = (Int)(((diffuseLight >> 8) & 0xff) * boost);
+							Int b = (Int)((diffuseLight & 0xff) * boost);
+							if (r > 255) r = 255; if (r < 0) r = 0;
+							if (g > 255) g = 255; if (g < 0) g = 0;
+							if (b > 255) b = 255; if (b < 0) b = 0;
+							litColor = b | (g << 8) | (r << 16);
+						}
+					}
+
 					verts->x=endPoint->X;
 					verts->y=endPoint->Y;
 					verts->z=endPoint->Z;
@@ -874,7 +954,7 @@ Try improving the fit to vertical surfaces like cliffs.
 					verts->v1=endPointUV->Y;
 
 					//fade the alpha channel with distance
-					verts->diffuse=diffuseLight | ( REAL_TO_INT(distanceFade*255.0f) <<24);
+					verts->diffuse=litColor | ( REAL_TO_INT(distanceFade*255.0f) <<24);
 					verts++;
 
 					endPoint=&mod->m_edges[index].endPointPos[1];	//right endpoint
@@ -885,9 +965,9 @@ Try improving the fit to vertical surfaces like cliffs.
 					verts->z=endPoint->Z;
 
 					verts->u1=endPointUV->X;
-					verts->v1=endPointUV->Y;			///@todo: Add diffuse lighting.
+					verts->v1=endPointUV->Y;			// GeneralsX @feature PS3.0-P3-10: diffuse lighting added (per-edge slope boost above).
 
-					verts->diffuse=diffuseLight | ( REAL_TO_INT(distanceFade*255.0f) <<24);
+					verts->diffuse=litColor | ( REAL_TO_INT(distanceFade*255.0f) <<24);
 					verts++;
 				}
 			}
@@ -907,6 +987,15 @@ Try improving the fit to vertical surfaces like cliffs.
 		trackStartIndex=0;
 		mod=m_usedModules;
 		DX8Wrapper::Set_Transform(D3DTS_WORLD,mod->Transform);
+		// GeneralsX @feature PS3.0-P3-10 14/10/2026 V3: with a lowered GENERALSX_TRACK_LIFT the marks no
+		// longer clear the terrain by geometry, so push their depth forward with the float bias states
+		// the P2-7 probe proved the device accepts. Retail lift (or no bias capability) = untouched.
+		const bool biasTracks = DX8Wrapper::Is_Depth_Bias_Available() && Track_Lift() < BRIDGE_OFFSET_FACTOR;
+		if (biasTracks)
+		{
+			DX8Wrapper::Set_Slope_Scale_Depth_Bias(-1.0f);
+			DX8Wrapper::Set_Depth_Bias(-8.0f);
+		}
 		while (mod)
 		{
 			if (mod->m_activeEdgeCount >= 2 && mod->Is_Really_Visible())
@@ -918,6 +1007,11 @@ Try improving the fit to vertical surfaces like cliffs.
 				trackStartIndex += mod->m_activeEdgeCount*2;
 			}
 			mod=mod->m_nextSystem;
+		}
+		if (biasTracks)
+		{
+			DX8Wrapper::Set_Slope_Scale_Depth_Bias(0.0f);
+			DX8Wrapper::Set_Depth_Bias(0.0f);
 		}
 	}
 

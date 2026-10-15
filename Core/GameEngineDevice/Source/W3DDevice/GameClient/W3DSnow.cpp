@@ -26,6 +26,57 @@
 #include "WW3D2/camera.h"
 #include "WW3D2/assetmgr.h"
 
+// GeneralsX @feature PS3.0-P3-26 14/10/2026 V2: snow receives scene light + per-flake sway phase.
+#include "Common/GlobalData.h"
+
+// GeneralsX @feature PS3.0-P3-26: deterministic per-flake sway phase in [0,2pi). The retail phase is
+// the emitter column index, so every flake in a column sways as one sheet (visible banding). A cheap
+// integer hash decorrelates neighbours while staying frame-stable for the same x,y. salt picks the
+// X or Y channel phase so they do not move in lockstep either.
+static Real Snow_Sway_Phase(Int x, Int y, Int salt)
+{
+	UnsignedInt h = (UnsignedInt)(x + salt) * 73856093u ^ (UnsignedInt)(y - salt) * 19349663u;
+	h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+	return (Real)(h & 0xffffu) * (6.2831853f / 65536.0f);
+}
+
+static bool Snow_Sway_On()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = 1;
+		const char* ev = getenv("GENERALSX_SNOW_SWAY");
+		if (ev != nullptr && *ev != 0) cached = (strcmp(ev, "0") != 0) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+// GeneralsX @feature PS3.0-P3-26: quad vertex tint from the same time-of-day pair the tracks use
+// (terrain ambient + half key). Retail leaves it 0xffffffff so snow ignores the scene light entirely.
+// Clamped to [0.45,1] per channel: snow stays recognisable at night without going pitch black.
+// GENERALSX_SNOW_LIT=0 restores 0xffffffff bit-for-bit.
+static UnsignedInt Snow_Lit_Color()
+{
+	static bool litOn = [] {
+		const char* ev = getenv("GENERALSX_SNOW_LIT");
+		return ev == nullptr || strcmp(ev, "0") != 0;
+	}();
+	if (!litOn || !TheGlobalData) return 0xffffffff;
+	Real shade[3] = {
+		TheGlobalData->m_terrainAmbient[0].red + TheGlobalData->m_terrainDiffuse[0].red * 0.5f,
+		TheGlobalData->m_terrainAmbient[0].green + TheGlobalData->m_terrainDiffuse[0].green * 0.5f,
+		TheGlobalData->m_terrainAmbient[0].blue + TheGlobalData->m_terrainDiffuse[0].blue * 0.5f,
+	};
+	for (Int i = 0; i < 3; i++) {
+		if (shade[i] < 0.45f) shade[i] = 0.45f;
+		if (shade[i] > 1.0f) shade[i] = 1.0f;
+	}
+	const UnsignedInt r = (UnsignedInt)(shade[0] * 255.0f);
+	const UnsignedInt g = (UnsignedInt)(shade[1] * 255.0f);
+	const UnsignedInt b = (UnsignedInt)(shade[2] * 255.0f);
+	return 0xff000000u | (b) | (g << 8) | (r << 16);
+}
+
 
 
 #define D3DFVF_POINTVERTEX (D3DFVF_XYZ)
@@ -301,8 +352,12 @@ void W3DSnowManager::renderSubBox(RenderInfoClass &rinfo, Int originX, Int origi
 				snowCenter.Set(x*m_emitterSpacing,y*m_emitterSpacing,h0);
 
 				//Adjust position so snow flakes don't fall straight down.
-				snowCenter.X += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleX + (Real)x);
-				snowCenter.Y += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleY + (Real)y);
+				// GeneralsX @feature PS3.0-P3-26: per-flake phase (GENERALSX_SNOW_SWAY=0 restores the
+				// retail per-column phase bit-for-bit).
+				const Real phaseX = Snow_Sway_On() ? Snow_Sway_Phase(x, y, 0) : (Real)x;
+				const Real phaseY = Snow_Sway_On() ? Snow_Sway_Phase(x, y, 17) : (Real)y;
+				snowCenter.X += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleX + phaseX);
+				snowCenter.Y += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleY + phaseY);
 
 				*(Vector3 *)verts=snowCenter;
 				verts++;
@@ -540,8 +595,15 @@ void W3DSnowManager::renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int 
 					Matrix3D::Transform_Vector(view,snowCenter,&snowCenterVS);
 
 					//Adjust position so snow flakes don't fall straight down.
-					snowCenterVS.X += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleX + (Real)x);
-					snowCenterVS.Y += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleY + (Real)y);
+					// GeneralsX @feature PS3.0-P3-26: per-flake phase (GENERALSX_SNOW_SWAY=0 restores
+					// the retail per-column phase bit-for-bit).
+					const Real quadPhaseX = Snow_Sway_On() ? Snow_Sway_Phase(x, y, 0) : (Real)x;
+					const Real quadPhaseY = Snow_Sway_On() ? Snow_Sway_Phase(x, y, 17) : (Real)y;
+					snowCenterVS.X += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleX + quadPhaseX);
+					snowCenterVS.Y += m_amplitude * WWMath::Fast_Sin( h0 * m_frequencyScaleY + quadPhaseY);
+
+					// GeneralsX @feature PS3.0-P3-26: scene-light tint instead of the constant white.
+					const UnsignedInt litColor = Snow_Lit_Color();
 
 					for (Int i=0; i<4; i++)
 					{
@@ -549,7 +611,7 @@ void W3DSnowManager::renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int 
 						verts->nx=0;	//keep AGP write-combining active
 						verts->ny=0;
 						verts->nz=0;
-						verts->diffuse=0xffffffff;	//set to opaque
+						verts->diffuse=litColor;	//GeneralsX @feature PS3.0-P3-26: opaque alpha, scene-lit rgb
 						verts->u1=quad_uvs[i].X;
 						verts->v1=quad_uvs[i].Y;
 						verts->u2=0;	//keep AGP write-combining active

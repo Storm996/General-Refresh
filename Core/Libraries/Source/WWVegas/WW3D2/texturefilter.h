@@ -129,6 +129,25 @@ public:
 	void Set_V_Addr_Mode(TxtAddrMode mode) { VAddressMode=mode; }
 
 	// These need to be called after device has been created
+	// GeneralsX @feature PS3.0-P3-5 14/10/2026 Read access to the tier tables built by _Init_Filters.
+	// The renderer paths that sample terrain textures used to write hard-coded D3DTEXF_* states taken
+	// from the retail Bilinear/TrilinearTerrainTex INI bools. Those bools shipped FALSE, so the
+	// player's texture-filtering option was silently overridden with POINT filtering on those stages.
+	static unsigned Get_Tier_Min_Filter(FilterType tier, unsigned stage);
+	static unsigned Get_Tier_Mag_Filter(FilterType tier, unsigned stage);
+	static unsigned Get_Tier_Mip_Filter(FilterType tier, unsigned stage);
+
+	// Apply the player's filtering tier (FILTER_TYPE_DEFAULT, i.e. whatever _Init_Filters derived from
+	// the texture-filtering option plus the device's capability vetting) to one texture stage. The
+	// retail INI bools are kept as a floor only: TrilinearTerrainTex can upgrade a POINT mip step to
+	// LINEAR, but neither bool can pull a stage below what the player asked for.
+	// GENERALSX_TERRAIN_FILTER=legacy restores the pre-P3-5 retail override for A/B evidence legs.
+	static void Apply_Player_Filter(unsigned stage, bool bilinearHint, bool trilinearHint);
+
+	// Same tier lookup, mip step only. For paths that leave min/mag to the texture's own filter object
+	// and used to pin D3DSAMP_MIPFILTER from TrilinearTerrainTex (the road shader).
+	static void Apply_Player_Mip_Filter(unsigned stage, bool trilinearHint);
+
 	static void _Init_Filters(TextureFilterMode texture_filter, AnisotropicFilterMode anisotropy_level);
 	// GeneralsX @bugfix Copilot 24/08/2026 Return the capability-limited anisotropy level applied to the renderer.
 	static int _Set_Max_Anisotropy(int level);

@@ -105,6 +105,13 @@ public:
 	static Int getShaderPasses(ShaderTypes shader);	///<rendering passes required for shader
 	static Int setShader(ShaderTypes shader, Int pass);	///<enable specific shader pass.
 	static Int setShroudTex(Int stage);	///<Set shroud in a texture stage.
+	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: uploads the shared [TERRAIN30] per-pixel haze
+	// ramp into PS constants c0/c1 (haze rgb + strength / start + 1/length). Used by the HLSL
+	// terrain trio and road shader in W3DShaderManager.cpp and by the W3DTreeBuffer TREE30 path.
+	static void uploadPerPixelFogConstants();
+	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed,
+	// meaning the shared per-pixel haze ramp is valid. The TREE30 path gates its own HLSL haze on this.
+	static Bool arePerPixelFogShadersActive();
 	static void resetShader(ShaderTypes shader);	///<make sure W3D2 gets restored to normal
 	///Specify all textures (up to SHADER_TEXTURE_STAGES) which can be accessed by the shaders.
 	static void setTexture(Int stage,TextureClass* texture) {m_Textures[stage]=texture;}
@@ -177,6 +184,11 @@ protected:
 	// m_newRenderSurface only when a resolve is required.
 	static IDirect3DSurface9 *m_rttColorSurface;
 	static IDirect3DSurface9 *m_rttDepthSurface;
+	// GeneralsX @tweak PS3.0-P2-3 14/10/2026 S6: one transient SetRenderTarget failure used to
+	// permanently disable RTT (report §S6 "残留保守项"). Failures are now counted; RTT only
+	// switches itself off after the fuse threshold is hit in a row, so a single bad frame no
+	// longer kills bloom/monochrome/motion-blur/cross-fade for the whole session.
+	static Int m_rttBindFailures;
 	// GeneralsX @bugfix Storm996 12/10/2026 One owner for the lifetime of the offscreen target: init() runs
 	// again on height-map rebuild and a rejected SetRenderTarget switches the feature off at runtime.
 	static void releaseRenderToTextureSurfaces();

@@ -136,13 +136,16 @@ Bool FramePacer::isActualFramesPerSecondLimitEnabled() const
 
 Int FramePacer::getActualFramesPerSecondLimit() const
 {
-	// GeneralsX @tweak Storm996 11/10/2026 Force 240 FPS in the main menu shell and the
+	// GeneralsX @tweak Storm996 11/10/2026 Force a high FPS cap in the main menu shell and the
 	// single-player campaign, regardless of the user's Options FPS setting. The render cap
 	// is independent from the fixed 30 Hz simulation, so this does not affect determinism.
+	// GeneralsX @tweak PS3.0 #71 15/10/2026: TEMPORARY 240 -> 1000 for the performance A/B - the
+	// 240 ceiling masked whether menu/mission frame-rate drops come from the cap's 1% low frames
+	// or from render work. Restore to 240 after the diagnosis.
 	const GameMode mode = (TheGameLogic != nullptr) ? TheGameLogic->getGameMode() : GAME_NONE;
 	if (mode == GAME_SHELL || mode == GAME_SINGLE_PLAYER)
 	{
-		return 240;
+		return 1000;
 	}
 
 	return isActualFramesPerSecondLimitEnabled() ? getFramesPerSecondLimit() : RenderFpsPreset::UncappedFpsValue;

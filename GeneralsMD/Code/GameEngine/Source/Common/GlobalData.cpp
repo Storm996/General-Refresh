@@ -973,8 +973,11 @@ GlobalData::GlobalData()
 	m_standardPublicBones.clear();
 
 	m_antiAliasLevel = WW3D::MultiSampleModeEnum::MULTISAMPLE_MODE_NONE;
-	m_textureFilteringMode = TextureFilterClass::TextureFilterMode::TEXTURE_FILTER_BILINEAR;
-	m_textureAnisotropyLevel = TextureFilterClass::AnisotropicFilterMode::TEXTURE_FILTER_ANISOTROPIC_2X;
+	// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Factory default raised to anisotropic+4X (trilinear
+	// equivalent + aniso, capability-gated in TextureFilterClass); was Bilinear+2X which kept
+	// MIPFILTER=POINT and caused hard mip transitions everywhere (report T3/T4).
+	m_textureFilteringMode = TextureFilterClass::TextureFilterMode::TEXTURE_FILTER_ANISOTROPIC;
+	m_textureAnisotropyLevel = TextureFilterClass::AnisotropicFilterMode::TEXTURE_FILTER_ANISOTROPIC_4X;
 
 //	m_languageFilterPref = false;
 	m_languageFilterPref = true;

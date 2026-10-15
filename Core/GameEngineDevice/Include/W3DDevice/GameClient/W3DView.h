@@ -42,6 +42,7 @@
 #include "GameClient/ParabolicEase.h"
 #include "GameClient/View.h"
 #include "WW3D2/camera.h"
+#include "WWMath/matrix3d.h"	// GeneralsX @feature PS3.0-P3-25b 14/10/2026 Matrix3D for the camera render-interpolation state
 
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
 class Drawable;
@@ -268,6 +269,14 @@ private:
 	Vector3 m_shakerAngles;													//WST 11/12/2002 new multiple instance camera shaker system
 
 	ScriptedState m_scriptedState; ///< Flags for scripted camera movements. Use functions addScriptedState, removeScriptedState for write.
+
+	// GeneralsX @feature PS3.0-P3-25b 14/10/2026 camera render interpolation state.  The logic-rate
+	// camera pose is snapshotted here on every setCameraTransform; W3DView::draw blends prev->cur by
+	// FramePacer::getLogicFramePhase() for the 3D scene render only, then restores.  Purely render
+	// side - nothing here feeds GameLogic or the deterministic math.
+	Bool m_camInterpInit;			///< FALSE until the first pose snapshot (no interpolation before).
+	Matrix3D m_camInterpPrev;	///< pose the camera held on the previous logic commit.
+	Matrix3D m_camInterpCur;		///< pose committed by the most recent logic-rate update.
 
 	TRotateCameraInfo m_rcInfo;
 	TPitchCameraInfo m_pcInfo;

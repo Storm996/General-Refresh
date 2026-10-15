@@ -68,7 +68,11 @@
 #define WATER_VB_PAGES	1000
 #define WATER_STRIP_X	2		//vertex resolution of each strip
 #define WATER_STRIP_Y	2
-#define SYNC_WAVES			//all the waves are in sync - movement resets at same time.
+// GeneralsX @feature PS3.0-P3-2 14/10/2026 W4: SYNC_WAVES removed. It re-seeded every existing
+// wake's elapsed time whenever a new one was added, so shoreline ripples all over the map pulsed in
+// lockstep ("all the waves are in sync" per the retail comment). Each module already seeds
+// m_elapsedMs from its own m_initTimeOffset in Init() and wraps independently, so phases stay
+// decorrelated without the global reset.
 //#define DEFAULT_FINAL_WAVE_WIDTH	28.0f
 //#define DEFAULT_FINAL_WAVE_HEIGHT	18.0f
 //#define DEFAULT_SECOND_WAVE_TIME_OFFSET 6267	//should always be half of totalMs
@@ -545,15 +549,8 @@ WaterTracksObj *WaterTracksRenderSystem::bindTrack(waveType type)
 		mod->m_bound=true;
 	}
 
-	#ifdef SYNC_WAVES
-	nextmod=m_usedModules;
-
-	while(nextmod)
-	{
-		nextmod->m_elapsedMs=nextmod->m_initTimeOffset;
-		nextmod=nextmod->m_nextSystem;
-	}
-	#endif
+	// GeneralsX @feature PS3.0-P3-2 14/10/2026 W4: the old SYNC_WAVES block that re-seeded
+	// nextmod->m_elapsedMs for the whole list lived here; see the note at the top of the file.
 
 	return mod;
 }

@@ -545,10 +545,16 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 	// derived classes should use light environment
 	WWASSERT(rinfo.light_environment==nullptr);
 	// Turn off lights in case we have none
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026 backport: null the whole widened DX8Wrapper unit range
+	// (4 -> 8) so this light_environment-free scene path cannot leave a stale enabled unit behind.
 	DX8Wrapper::Set_Light(0,nullptr);
 	DX8Wrapper::Set_Light(1,nullptr);
 	DX8Wrapper::Set_Light(2,nullptr);
 	DX8Wrapper::Set_Light(3,nullptr);
+	DX8Wrapper::Set_Light(4,nullptr);
+	DX8Wrapper::Set_Light(5,nullptr);
+	DX8Wrapper::Set_Light(6,nullptr);
+	DX8Wrapper::Set_Light(7,nullptr);
 	int count=0;
 	for (it.First(&LightList); !it.Is_Done(); it.Next())
 	{

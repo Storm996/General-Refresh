@@ -30,6 +30,9 @@
 
 #include "windows.h"
 #include "stdlib.h"
+// GeneralsX @feature PS3.0-P3-8 14/10/2026 fprintf/fflush for the one-time tile-upscale kernel
+// marker, so a verification leg can prove which kernel the sheet went through.
+#include "stdio.h"
 #include "Common/STLTypedefs.h"
 
 #include "Common/DataChunk.h"
@@ -1346,9 +1349,119 @@ static Bool ChooseTileGrid(Short imageWidth, Short imageHeight, Int expectedTile
 	return true;
 }
 
-/// Count how many tiles come in from a targa file.
-Int WorldHeightMap::countTiles(InputStream *pStr, Bool *halfTile, Int expectedTileCount, Bool *pIsLegacyGrid)
+// GeneralsX @feature PS3.0-P3-8 14/10/2026 Wrap-aware upscale kernel for legacy tile sheets.
+//
+// A 64px (or 32px) grid cell has to be blown up by 4x (resp. 8x) to fill the native
+// TILE_PIXEL_EXTENT (256px) destination cell. The shipped code nearest-neighbour replicates every
+// decoded pixel across its scale x scale block, which turns a hand-painted legacy grass sheet into
+// a visible 4px staircase of blocks in game, and - because the block edges are hard - the mip chain
+// built over it (TileData::updateMips) averages *within* blocks rather than across the tile, so the
+// blur arrives late and unevenly.
+//
+// The replacement is the same Catmull-Rom / Lanczos-2 windowed sinc used by the load-time mip
+// generator, sampled with WRAPPING: a terrain cell is by definition one period of a repeating
+// pattern, so taps that fall off the left edge must read the right edge, not the edge pixel. Clamped
+// taps (the retail-style alternative) are what produce the seam, because the left and right borders
+// of the cell then get different smoothing. Wrap-aware cubic resampling keeps the pattern continuous
+// across cell boundaries while adding the high-frequency structure the NN blocks smear out.
+//
+// Cells that are only partially present in the file (a truncated sheet) cannot be wrapped, so they
+// keep the retail edge-clamped nearest-neighbour fill, black where the file has no data. Native
+// (scale==1) content is memcpy'd, so HD replacement sheets are byte-identical to before.
+// Set GENERALSX_TILE_UPSCALE=nearest to get the shipped replication behaviour back for an A/B leg.
+
+static Bool s_tileUpscaleNearest=false;
+static Bool s_tileUpscaleModeQueried=false;
+
+static Bool Tile_Upscale_Nearest_Mode()
 {
+	if (!s_tileUpscaleModeQueried) {
+		s_tileUpscaleModeQueried=true;
+		const char* env=getenv("GENERALSX_TILE_UPSCALE");
+		s_tileUpscaleNearest=(env!=nullptr && stricmp(env,"nearest")==0);
+		fprintf(stderr,"[TILEUP] legacy tile upscale: %s\n",
+			s_tileUpscaleNearest?"retail nearest-neighbour (legacy)":"wrap-aware catmull-rom");
+		fflush(stderr);
+	}
+	return s_tileUpscaleNearest;
+}
+
+// Lanczos-2 (Catmull-Rom form) weight at distance t.
+static float Tile_Upscale_Weight(float t)
+{
+	const float a=(t<0.0f)?-t:t;
+	if (a<=1.0f) return ((1.5f*a-2.5f)*a*a)+1.0f;
+	if (a<2.0f) return ((-0.5f*a+2.5f)*a-4.0f)*a+2.0f;
+	return 0.0f;
+}
+
+// Resample one complete srcCellExtent x srcCellExtent source cell into the TILE_PIXEL_EXTENT
+// destination cell with wrapping taps. src is the decoded sheet (BGRA, stride srcStride), already
+// positioned at the cell's top-left corner.
+static void Tile_Upscale_Wrap_Catmull_Rom(const UnsignedByte* src, Int srcStride, Int srcCellExtent,
+	Int scale, UnsignedByte* dest)
+{
+	// dest pixel d has its centre at source coordinate (d+0.5)/scale - 0.5. Writing d = q*scale + r
+	// makes the fractional part depend on r alone, so the four tap weights only ever need computing
+	// once per residue class instead of once per destination pixel.
+	float weights[8][4];
+	for (Int r=0; r<scale; ++r) {
+		const float f=((float)(r)+0.5f)/(float)scale - 0.5f;
+		for (Int t=0; t<4; ++t) {
+			weights[r][t]=Tile_Upscale_Weight((float)(t-1)-f);
+		}
+	}
+
+	for (Int dy=0; dy<TILE_PIXEL_EXTENT; ++dy) {
+		const Int qy=dy/scale;
+		const Int ry=dy-qy*scale;
+		const float wy0=weights[ry][0], wy1=weights[ry][1], wy2=weights[ry][2], wy3=weights[ry][3];
+		// Wrap the four taps into the cell: the cell is one period of the pattern.
+		Int iy[4];
+		for (Int t=0; t<4; ++t) {
+			Int v=qy-1+t;
+			v%=srcCellExtent;
+			if (v<0) v+=srcCellExtent;
+			iy[t]=v;
+		}
+		const UnsignedByte* row0=src+iy[0]*srcStride*4;
+		const UnsignedByte* row1=src+iy[1]*srcStride*4;
+		const UnsignedByte* row2=src+iy[2]*srcStride*4;
+		const UnsignedByte* row3=src+iy[3]*srcStride*4;
+		UnsignedByte* destRow=dest+dy*TILE_PIXEL_EXTENT*TILE_BYTES_PER_PIXEL;
+
+		for (Int dx=0; dx<TILE_PIXEL_EXTENT; ++dx) {
+			const Int qx=dx/scale;
+			const Int rx=dx-qx*scale;
+			const float wx0=weights[rx][0], wx1=weights[rx][1], wx2=weights[rx][2], wx3=weights[rx][3];
+			Int ix[4];
+			for (Int t=0; t<4; ++t) {
+				Int v=qx-1+t;
+				v%=srcCellExtent;
+				if (v<0) v+=srcCellExtent;
+				ix[t]=v;
+			}
+			const float a00=wy0*wx0, a01=wy0*wx1, a02=wy0*wx2, a03=wy0*wx3;
+			const float a10=wy1*wx0, a11=wy1*wx1, a12=wy1*wx2, a13=wy1*wx3;
+			const float a20=wy2*wx0, a21=wy2*wx1, a22=wy2*wx2, a23=wy2*wx3;
+			const float a30=wy3*wx0, a31=wy3*wx1, a32=wy3*wx2, a33=wy3*wx3;
+			for (Int c=0; c<4; ++c) {
+				const float v=
+					a00*(float)row0[ix[0]*4+c]+a01*(float)row0[ix[1]*4+c]+a02*(float)row0[ix[2]*4+c]+a03*(float)row0[ix[3]*4+c]+
+					a10*(float)row1[ix[0]*4+c]+a11*(float)row1[ix[1]*4+c]+a12*(float)row1[ix[2]*4+c]+a13*(float)row1[ix[3]*4+c]+
+					a20*(float)row2[ix[0]*4+c]+a21*(float)row2[ix[1]*4+c]+a22*(float)row2[ix[2]*4+c]+a23*(float)row2[ix[3]*4+c]+
+					a30*(float)row3[ix[0]*4+c]+a31*(float)row3[ix[1]*4+c]+a32*(float)row3[ix[2]*4+c]+a33*(float)row3[ix[3]*4+c];
+			 Int i=(Int)(v+0.5f);
+				if (i<0) i=0;
+				if (i>255) i=255;
+				destRow[dx*TILE_BYTES_PER_PIXEL+c]=(UnsignedByte)i;
+			}
+		}
+	}
+}
+
+/// Count how many tiles come in from a targa file.
+Int WorldHeightMap::countTiles(InputStream *pStr, Bool *halfTile, Int expectedTileCount, Bool *pIsLegacyGrid){
 	TTargaHeader hdr;
 	if (halfTile) {
 		*halfTile = false;
@@ -1449,7 +1562,26 @@ Bool WorldHeightMap::readTiles(InputStream *pStr, TileData **tiles, Int numRows,
 	int repeatCount = 0;
 //	Bool read = false;
 	Bool running = false;
+
+	// GeneralsX @feature PS3.0-P3-8 14/10/2026 Two-stage tile upload.
+	//
+	// Stage 1 decodes the sheet into a linear BGRA buffer. The retail stream-order loop wrote each
+	// decoded pixel straight into its scale x scale block, which is why only a nearest-neighbour
+	// kernel was possible there: any resampler needs to see a cell's neighbours, and the stream only
+	// offers one pixel at a time. Stage 2 fills the destination cells, using the wrap-aware cubic
+	// kernel for complete cells and the retail per-pixel scatter everywhere else, so partial sheets,
+	// native HD sheets and the GENERALSX_TILE_UPSCALE=legacy leg keep the exact old pixels.
+	//
+	// Stream consumption is unchanged: the same rows (up to numRows*srcCellExtent) and the same
+	// columns (up to imageWidth, including ones wider than the tile grid) are read, in the same
+	// order.
+	const Int rowsToDecode = (hdr.imageHeight < numRows*srcCellExtent) ? hdr.imageHeight : numRows*srcCellExtent;
+	const Int sheetCols = hdr.imageWidth;
+	UnsignedByte* sheet = new UnsignedByte[(rowsToDecode>0?rowsToDecode:1)*sheetCols*4];
+	for (Int i2=0; i2<(rowsToDecode>0?rowsToDecode:1)*sheetCols*4; ++i2) sheet[i2]=0;
+
 	for (row = 0; row < numRows*srcCellExtent; row++) {
+		UnsignedByte* sheetRow = (row < rowsToDecode) ? sheet + row*sheetCols*4 : nullptr;
 		for (column=0; column<hdr.imageWidth; column++) {
 			UnsignedByte r, g, b, a;
 			if (row < hdr.imageHeight) {
@@ -1478,30 +1610,59 @@ Bool WorldHeightMap::readTiles(InputStream *pStr, TileData **tiles, Int numRows,
 			} else {
 				r = g = b = a = 0;
 			}
-			if (column >= (numRows*srcCellExtent)) continue;
-			int tileNdx = (column/srcCellExtent) + numRows*(row/srcCellExtent);
-			int cellCol = column % srcCellExtent;
-			int cellRow = row % srcCellExtent;
-
-			UnsignedByte *tileBase = tiles[tileNdx]->getDataPtr();
-			// Nearest-neighbor scatter: replicate this one decoded source pixel into
-			// its scale x scale destination block. No row lookahead needed -- the
-			// whole block is written immediately from the single decoded pixel.
-			for (int dy=0; dy<scale; dy++) {
-				int destRow = cellRow*scale+dy;
-				for (int dx=0; dx<scale; dx++) {
-					int destCol = cellCol*scale+dx;
-					int pixelNdx = destCol + TILE_PIXEL_EXTENT*destRow;
-					UnsignedByte *pixel = tileBase + pixelNdx*TILE_BYTES_PER_PIXEL;
-					pixel[0] = b;
-					pixel[1] = g;
-					pixel[2] = r;
-					pixel[3] = a;
-				}
+			if (sheetRow) {
+				UnsignedByte* pixel = sheetRow + column*4;
+				pixel[0]=b;
+				pixel[1]=g;
+				pixel[2]=r;
+				pixel[3]=a;
 			}
 		}
 		DEBUG_ASSERTCRASH(repeatCount==0, ("Invalid tga."));
 	}
+
+	const Bool useWrapKernel = (!Tile_Upscale_Nearest_Mode() && scale>1 && scale<=8);
+	static const UnsignedByte kBlack[4] = {0,0,0,0};
+
+	for (Int cy=0; cy<numRows; ++cy) {
+		for (Int cx=0; cx<numRows; ++cx) {
+			const Int sx0=cx*srcCellExtent;
+			const Int sy0=cy*srcCellExtent;
+			if (sx0>=sheetCols) continue;					// retail never visited these columns
+			const Int availW=(sheetCols-sx0<srcCellExtent)?(sheetCols-sx0):srcCellExtent;
+			const Int availH=(rowsToDecode-sy0<srcCellExtent)?(rowsToDecode-sy0):srcCellExtent;
+			if (availW<=0) continue;
+			UnsignedByte* tileBase=tiles[cx+numRows*cy]->getDataPtr();
+
+			if (useWrapKernel && availW==srcCellExtent && availH==srcCellExtent) {
+				Tile_Upscale_Wrap_Catmull_Rom(sheet+(sy0*sheetCols+sx0)*4, sheetCols, srcCellExtent, scale, tileBase);
+				continue;
+			}
+
+			for (Int y=0;y<srcCellExtent;++y) {
+				const Bool rowExists=(sy0+y)<rowsToDecode;
+				const UnsignedByte* srow=rowExists?sheet+((sy0+y)*sheetCols+sx0)*4:kBlack;
+				for (Int x=0;x<availW;++x) {
+					const UnsignedByte* p=rowExists?srow+x*4:kBlack;
+					for (Int dy=0; dy<scale; dy++) {
+						int destRow = y*scale+dy;
+						for (Int dx=0; dx<scale; dx++) {
+							int destCol = x*scale+dx;
+							int pixelNdx = destCol + TILE_PIXEL_EXTENT*destRow;
+							UnsignedByte *pixel = tileBase + pixelNdx*TILE_BYTES_PER_PIXEL;
+							pixel[0] = p[0];
+							pixel[1] = p[1];
+							pixel[2] = p[2];
+							pixel[3] = p[3];
+						}
+					}
+				}
+			}
+		}
+	}
+
+	delete[] sheet;
+	sheet = nullptr;
 	for (i=0; i<numRows*numRows; i++) {
 		tiles[i]->updateMips();
 	}

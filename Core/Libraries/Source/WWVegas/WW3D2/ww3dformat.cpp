@@ -95,6 +95,15 @@ void Get_WW3D_Format_Name(WW3DFormat format, StringClass& name)
 	case WW3D_FORMAT_DXT3: name="DXT3"; break;
 	case WW3D_FORMAT_DXT4: name="DXT4"; break;
 	case WW3D_FORMAT_DXT5: name="DXT5"; break;
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 Names for the new HDR/packed formats; DX8Caps logs the
+	// capability probe results through this function, so a missing case used to print an empty string.
+	case WW3D_FORMAT_R16F: name="R16F"; break;
+	case WW3D_FORMAT_G16R16F: name="G16R16F"; break;
+	case WW3D_FORMAT_A16B16G16R16F: name="A16B16G16R16F"; break;
+	case WW3D_FORMAT_R32F: name="R32F"; break;
+	case WW3D_FORMAT_G32R32F: name="G32R32F"; break;
+	case WW3D_FORMAT_A32B32G32R32F: name="A32B32G32R32F"; break;
+	case WW3D_FORMAT_A2B10G10R10: name="A2B10G10R10"; break;
 	}
 }
 
@@ -123,6 +132,27 @@ unsigned char RGB_to_CIEY(Vector4 color)
 {
 	float lum=0.2126f*color.X + 0.7152f*color.Y + 0.0722f*color.Z;
 	return (unsigned char) (255.0f*lum);
+}
+
+// GeneralsX @feature PS3.0-P3-9 14/10/2026 Channel packers for the 10/2-bit packed format. Input is a
+// normalised float; out-of-range values clamp instead of wrapping into the neighbouring channel field.
+static unsigned Pack_Channel_To_10(float value)
+{
+	if (value<=0.0f) return 0;
+	if (value>=1.0f) return 1023;
+	return (unsigned)(value*1023.0f+0.5f);
+}
+
+static unsigned Pack_Channel_To_2(float value)
+{
+	if (value<=0.0f) return 0;
+	if (value>=1.0f) return 3;
+	return (unsigned)(value*3.0f+0.5f);
+}
+
+static float Unpack_Channel_From_10(unsigned value)
+{
+	return value/1023.0f;
 }
 
 void Vector4_to_Color(unsigned int *outc,const Vector4 &inc,const WW3DFormat format)
@@ -188,6 +218,33 @@ void Vector4_to_Color(unsigned int *outc,const Vector4 &inc,const WW3DFormat for
 		lum=lum>>4;
 		*outc=(a<<4) | lum;
 		break;
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 CPU-side encoders for the formats added to the table.
+	// Only R32F and A2B10G10R10 fit the single unsigned int this helper writes; the multi-channel float
+	// formats need 64/128-bit storage and are a documented no-op rather than the assert the default
+	// branch would raise (nothing in the engine packs those through a 32-bit colour word).
+	case WW3D_FORMAT_R32F:
+		{
+			union { float value; unsigned int bits; } r32;
+			r32.value=inc.X;
+			*outc=r32.bits;
+		}
+		break;
+	case WW3D_FORMAT_A2B10G10R10:
+		{
+			unsigned r=Pack_Channel_To_10(inc.X);
+			unsigned g=Pack_Channel_To_10(inc.Y);
+			unsigned b=Pack_Channel_To_10(inc.Z);
+			unsigned a2=Pack_Channel_To_2(inc.W);
+			*outc=(a2<<30) | (b<<20) | (g<<10) | r;
+		}
+		break;
+	case WW3D_FORMAT_R16F:
+	case WW3D_FORMAT_G16R16F:
+	case WW3D_FORMAT_A16B16G16R16F:
+	case WW3D_FORMAT_G32R32F:
+	case WW3D_FORMAT_A32B32G32R32F:
+		*outc=0;
+		break;
 	default:
 		WWASSERT(0);
 	}
@@ -248,6 +305,35 @@ void Color_to_Vector4(Vector4* outc,const unsigned int inc,const WW3DFormat form
 		g=argb[2]<<4;
 		b=argb[3]<<4;
 		break;
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 Decoders for the new table entries. The byte-oriented
+	// code above assumes 8-bit channels, so the 32-bit float and packed 10-bit formats decode here and
+	// write the result directly.
+	case WW3D_FORMAT_R32F:
+		{
+			union { float value; unsigned int bits; } r32;
+			r32.bits=inc;
+			outc->X=r32.value;
+			outc->Y=0.0f;
+			outc->Z=0.0f;
+			outc->W=1.0f;
+			return;
+		}
+	case WW3D_FORMAT_A2B10G10R10:
+		{
+			outc->X=Unpack_Channel_From_10(inc & 0x3FF);
+			outc->Y=Unpack_Channel_From_10((inc >> 10) & 0x3FF);
+			outc->Z=Unpack_Channel_From_10((inc >> 20) & 0x3FF);
+			outc->W=((inc >> 30) & 0x3)/3.0f;
+			return;
+		}
+	case WW3D_FORMAT_R16F:
+	case WW3D_FORMAT_G16R16F:
+	case WW3D_FORMAT_A16B16G16R16F:
+	case WW3D_FORMAT_G32R32F:
+	case WW3D_FORMAT_A32B32G32R32F:
+		// Not addressable through a 32-bit colour word - see Vector4_to_Color.
+		outc->X=0.0f; outc->Y=0.0f; outc->Z=0.0f; outc->W=1.0f;
+		return;
 	default:
 		WWASSERT(0);
 	}
@@ -405,6 +491,10 @@ unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 	case WW3D_FORMAT_A8R8G8B8:
 	case WW3D_FORMAT_X8R8G8B8:
 	case WW3D_FORMAT_X8L8V8U8:
+	case WW3D_FORMAT_G16R16F:
+	case WW3D_FORMAT_R32F:
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 Packed 10-bit is a 32-bit surface too.
+	case WW3D_FORMAT_A2B10G10R10:
 		return 4;
 	case WW3D_FORMAT_R8G8B8:
 		return 3;
@@ -418,6 +508,7 @@ unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 	case WW3D_FORMAT_A8L8:
 	case WW3D_FORMAT_U8V8:
 	case WW3D_FORMAT_L6V5U5:
+	case WW3D_FORMAT_R16F:
 		return 2;
 	case WW3D_FORMAT_R3G3B2:
 	case WW3D_FORMAT_A8:
@@ -425,6 +516,13 @@ unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 	case WW3D_FORMAT_L8:
 	case WW3D_FORMAT_A4L4:
 		return 1;
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 Wide HDR formats: two 32-bit channels, and the full
+	// 32-bit RGBA float surface used by the linear-space lighting work.
+	case WW3D_FORMAT_G32R32F:
+	case WW3D_FORMAT_A16B16G16R16F:
+		return 8;
+	case WW3D_FORMAT_A32B32G32R32F:
+		return 16;
 
 	default:	WWASSERT(0); break;
 	}
@@ -522,6 +620,26 @@ unsigned ARGB_Color_To_WW3D_Color(WW3DFormat format, unsigned argb)
 	case WW3D_FORMAT_DXT3:
 	case WW3D_FORMAT_DXT4:
 	case WW3D_FORMAT_DXT5:
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 The float formats store IEEE values per channel, not an
+	// 8-bit component pattern, so an ARGB word cannot describe them.
+	case WW3D_FORMAT_R16F:
+	case WW3D_FORMAT_G16R16F:
+	case WW3D_FORMAT_A16B16G16R16F:
+	case WW3D_FORMAT_R32F:
+	case WW3D_FORMAT_G32R32F:
+	case WW3D_FORMAT_A32B32G32R32F:
+		return 0;
+
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 2/10/10/10 packs from an 8-bit ARGB word: the 10-bit
+	// channels widen by replicating the top bits so a full-scale 255 still lands on 1023.
+	case WW3D_FORMAT_A2B10G10R10:
+		{
+			unsigned r10=(r<<2) | (r>>6);
+			unsigned g10=(g<<2) | (g>>6);
+			unsigned b10=(b<<2) | (b>>6);
+			return ((a>>6) << 30) | (b10 << 20) | (g10 << 10) | r10;
+		}
+
 	default:
 			return 0;
 	}

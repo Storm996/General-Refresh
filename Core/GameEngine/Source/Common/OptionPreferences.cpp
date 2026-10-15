@@ -84,7 +84,9 @@ TextureFilterClass::TextureFilterMode OptionPreferences::getTextureFilterMode() 
 {
 	OptionPreferences::const_iterator it = find("TextureFilter");
 	if (it == end())
-		return TextureFilterClass::TEXTURE_FILTER_BILINEAR;
+		// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Fallback for users without a saved key now
+		// matches the raised factory default (Anisotropic); see GlobalData for rationale.
+		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC;
 
 	return TextureFilterClass::getTextureFilterMode(it->second.str());
 }
@@ -93,7 +95,8 @@ TextureFilterClass::AnisotropicFilterMode OptionPreferences::getTextureAnisotrop
 {
 	OptionPreferences::const_iterator it = find("AnisotropyLevel");
 	if (it == end())
-		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_2X;
+		// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Fallback raised 2X -> 4X with the new default mode.
+		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_4X;
 
 	TextureFilterClass::AnisotropicFilterMode level = (TextureFilterClass::AnisotropicFilterMode)atoi(it->second.str());
 	level = clamp(TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_2X, level, TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_16X);
@@ -1001,6 +1004,10 @@ static const Real SHADOW_VOLUMETRIC_INTENSITY_DEFAULT	= 22.0f;
 // W3DProjectedShadow::init() for the decal vertex color.
 static const Real SHADOW_TINT_DEFAULT[3]						= { 880.0f, 1000.0f, 1150.0f };
 static const Int SHADOW_MAP_RESOLUTION_DEFAULT				= 768;
+// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: 0 keeps retail sharp silhouettes; 1-3
+// blur the projected-shadow atlas by that many texels per gaussian pass.  Off by default so a
+// first launch never changes someone's shadows without asking.
+static const Int SHADOW_SOFTENING_DEFAULT						= 0;
 
 Real OptionPreferences::getShadowProjectedIntensity() const
 {
@@ -1082,5 +1089,131 @@ Int OptionPreferences::getShadowMapResolution() const
 			return allowed[i];
 	}
 	return allowed[allowedCount - 1];
+}
+
+Int OptionPreferences::getShadowSoftening() const
+{
+	OptionPreferences::const_iterator it = find("ShadowSoftening");
+	if (it == end())
+		return SHADOW_SOFTENING_DEFAULT;
+
+	Int val = atoi(it->second.str());
+	if (val < 0)
+		val = 0;
+	if (val > 3)
+		val = 3;
+	return val;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature 13/10/2026 PS3.0 lighting knobs (引擎改造/设置参数交接说明.md section 8).
+// Menu persistence is integer ticks under the Options.ini S-family; the GENERALSX_* environment
+// variables override here so QA/A/B runs keep working without touching the user's file.
+//-------------------------------------------------------------------------------------------------
+Real OptionPreferences::getNormalMapStrength() const
+{
+	Int tick = getInt("NormalMapStrength", 80);	// default 0.8, same as the original hard-code
+	if (tick < 0)
+		tick = 0;
+	if (tick > 200)
+		tick = 200;
+	return (Real)tick / 100.0f;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness (PBR) toggle. 0 = off (factory
+// default), 1 = M1 roughness Blinn, 2 = M2 GGX. GENERALSX_PBR wins outright so scripted A/B runs
+// never touch the user's Options.ini.
+//-------------------------------------------------------------------------------------------------
+Int OptionPreferences::getPBRMode() const
+{
+	const char* env = getenv("GENERALSX_PBR");
+	if (env != nullptr && *env != 0)
+	{
+		Int mode = atoi(env);
+		if (mode < 0)
+			mode = 0;
+		if (mode > 2)
+			mode = 2;
+		return mode;
+	}
+	Int mode = getInt("RoughnessMapping", 0);
+	if (mode < 0)
+		mode = 0;
+	if (mode > 2)
+		mode = 2;
+	return mode;
+}
+
+Real OptionPreferences::getBloomIntensity() const
+{
+	const char* env = getenv("GENERALSX_BLOOM_INTENSITY");
+	if (env != nullptr && *env != 0)
+		return (Real)atof(env);
+
+	Int tick = getInt("BloomIntensity", 35);	// 0.35, the T4 programable-chain default
+	if (tick < 0)
+		tick = 0;
+	if (tick > 100)
+		tick = 100;
+	return (Real)tick / 100.0f;
+}
+
+Bool OptionPreferences::getMultiLightEnabled() const
+{
+	const char* env = getenv("GENERALSX_MULTILIGHT");
+	if (env != nullptr && strcmp(env, "0") == 0)
+		return FALSE;
+
+	return (getInt("MultiLightEffect", 1) != 0) ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getShadowMapEnabled() const
+{
+	const char* env = getenv("GENERALSX_SHADOWMAP");
+	if (env != nullptr)
+		return (atoi(env) > 0) ? TRUE : FALSE;
+
+	return (getInt("ShadowMap", 0) != 0) ? TRUE : FALSE;
+}
+
+Int OptionPreferences::getShadowMapIntensity() const
+{
+	const char* env = getenv("GENERALSX_SHADOWMAP_INT");
+	Int val = env != nullptr ? atoi(env) : getInt("ShadowMapIntensity", 55);
+	if (val < 0)
+		val = 0;
+	if (val > 100)
+		val = 100;
+	return val;
+}
+
+Int OptionPreferences::getSunShadowMapResolution() const
+{
+	// The T6 atlas ladder is {1024, 512, 256}; snap the requested edge up to the ladder.
+	Int val = getInt("SunShadowMapResolution", 1024);
+	if (val <= 256)
+		return 256;
+	if (val <= 512)
+		return 512;
+	return 1024;
+}
+
+// GeneralsX @feature PS3.0-P3-25a 14/10/2026 vsync present interval for device creation (restart
+// to take effect).  The GENERALSX_SWAPINTERVAL env stays the QA override with its full 0..3
+// ladder; the user-facing preference is the plain on/off VSync key.
+Int OptionPreferences::getPresentInterval() const
+{
+	const char* env = getenv("GENERALSX_SWAPINTERVAL");
+	if (env != nullptr && env[0] != 0)
+	{
+		Int v = atoi(env);
+		if (v < 0)
+			v = 0;
+		if (v > 3)
+			v = 3;
+		return v;
+	}
+	return (getInt("VSync", 1) != 0) ? 1 : 0;
 }
 

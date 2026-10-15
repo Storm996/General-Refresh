@@ -53,6 +53,9 @@
 #include "GameClient/GameWindowTransitions.h"
 #include "GameClient/DisconnectMenu.h"
 #include "GameLogic/ScriptEngine.h"
+// GeneralsX @feature Qoder 13/10/2026 Declarative menu verbs (@push/@pop) so the in-game pause menu
+// can open the standalone GraphicsOptions page the same way the main menu does, with no click C++.
+#include "GameClient/MenuCommands.h"
 
 
 
@@ -78,6 +81,7 @@ static NameKeyType buttonRestart = NAMEKEY_INVALID;
 static NameKeyType buttonReturn = NAMEKEY_INVALID;
 static NameKeyType buttonOptions = NAMEKEY_INVALID;
 static NameKeyType buttonSaveLoad = NAMEKEY_INVALID;
+static NameKeyType buttonGraphics = NAMEKEY_INVALID;
 
 static void initGadgetsFullQuit()
 {
@@ -91,6 +95,15 @@ static void initGadgetsFullQuit()
 	buttonSaveLoadWin = TheWindowManager->winGetWindowFromId( nullptr, buttonSaveLoad );
 	buttonOptionsWin = TheWindowManager->winGetWindowFromId( nullptr, buttonOptions );
 	buttonExitWin = TheWindowManager->winGetWindowFromId( nullptr, buttonExit );
+
+	// GeneralsX @feature Qoder 13/10/2026 The in-game graphics entry opens the page as a persistent
+	// overlay (OpenGraphicsOptionsLayout), NOT a shell push - a shell pop inside a live match would
+	// expose the shell main menu still linked underneath. Chinese label is set at runtime (the string
+	// table lives in a packed BIG), like the main-menu button.
+	buttonGraphics = TheNameKeyGenerator->nameToKey( "QuitMenu.wnd:ButtonGraphicsOptions" );
+	GameWindow *graphicsWin = TheWindowManager->winGetWindowFromId( nullptr, buttonGraphics );
+	if( graphicsWin )
+		GadgetButtonSetText( graphicsWin, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
 }
 
 static void initGadgetsNoSaveQuit()
@@ -105,6 +118,12 @@ static void initGadgetsNoSaveQuit()
 	buttonOptionsWin = TheWindowManager->winGetWindowFromId( nullptr, buttonOptions );
 	buttonSaveLoadWin = nullptr;
 	buttonExitWin = TheWindowManager->winGetWindowFromId( nullptr, buttonExit );
+
+	// GeneralsX @feature Qoder 13/10/2026 Graphics entry for the no-save quit menu (see full-quit note).
+	buttonGraphics = TheNameKeyGenerator->nameToKey( "QuitNoSave.wnd:ButtonGraphicsOptions" );
+	GameWindow *graphicsWin = TheWindowManager->winGetWindowFromId( nullptr, buttonGraphics );
+	if( graphicsWin )
+		GadgetButtonSetText( graphicsWin, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
 
 }
 
@@ -457,6 +476,12 @@ WindowMsgHandledType QuitMenuSystem( GameWindow *window, UnsignedInt msg,
 			GameWindow *control = (GameWindow *)mData1;
 			Int controlID = control->winGetWindowId();
 
+			// GeneralsX @feature Qoder 13/10/2026 Give declarative @verb buttons (the 图形选项 entry
+			// carries "@push Menus/GraphicsOptions.wnd") first claim, mirroring MainMenuSystem. The
+			// page's own back button uses "@pop", which pops the shell stack back to this pause menu.
+			if( MenuCommandRegistry::dispatchControl( control ) )
+				break;
+
       if( controlID == buttonSaveLoad )
       {
 
@@ -503,6 +528,13 @@ WindowMsgHandledType QuitMenuSystem( GameWindow *window, UnsignedInt msg,
 				optLayout->runInit();
 				optLayout->hide(FALSE);
 				optLayout->bringForward();
+			}
+			else if( controlID == buttonGraphics )
+			{
+				// GeneralsX @feature Qoder 13/10/2026 Open the graphics page as a persistent overlay over
+				// this pause menu (same lifecycle as the options button above); closing it returns here,
+				// never to the shell main menu.
+				OpenGraphicsOptionsLayout();
 			}
 //			else if( controlID == buttonQuitToDesktop )
 //			{

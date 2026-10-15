@@ -12,6 +12,7 @@
 
 #include "WWLib/always.h"
 #include "WWMath/vector3.h"
+#include "WWMath/vector4.h"   // GeneralsX @feature PS3.0-P3-14 14/10/2026: Set_Fog carries Vector4 pairs
 
 class Matrix3D;
 class Matrix4x4;
@@ -25,6 +26,26 @@ namespace DX8NormalMap
 	// GeneralsX @build d3d9 port 11/10/2026 - handles are D3D9 interface pointers carried as UINT_PTR.
 	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
+	// GeneralsX @feature PS3.0 T5 13/10/2026 optional per-pixel multi-light pair (world TBN + up to
+	// 4 point lights from the mesh's LightEnvironment).  Mounted by Apply only when the mesh
+	// actually collects at least one point light; without it the single-light path above is used.
+	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle);
+
+	// GeneralsX @feature PS3.0-P4-1 15/10/2026 roughness/metalness (PBR) variant pair for the dot3
+	// single-light path.  #70 15/10/2026: the pair compiles unconditionally at shader install and
+	// mounts whenever Set_PBR_Mode(1/2) is armed and the diffuse carries a "<stem>_rp" companion
+	// (R=roughness, G=metalness, see 光影三阶段/粗糙度引擎承接工作清单.md §1) - independently of the
+	// normal-map switch. Without handles, at mode 0, or without the companion, the path below runs
+	// bit-for-bit - zero regression.
+	void Install_PBR(UINT_PTR vs_handle, UINT_PTR ps_handle);
+
+	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth distance haze shared by the GN and ML
+	// per-pixel families. colorStrength carries the haze rgb in xyz and the blend strength in w
+	// (0 leaves every pixel numerically identical to the pre-fog shaders); startInvLen is
+	// (eye-depth fog start, 1/ramp length, -, -). Injected once by the device layer from camera
+	// settings - WW3D2 must not read game-side GlobalData itself. Default state is strength 0.
+	void Set_Fog(const Vector4& colorStrength, const Vector4& startInvLen);
+
 	// Master switch (driven by command line -normalmap / INI). When OFF, Apply is never called.
 	void Set_Enabled(bool on);
 	bool Is_Enabled();
@@ -32,7 +53,20 @@ namespace DX8NormalMap
 	// Determined jointly by handle validity from Install + the switch.
 	bool Ready_To_Render();
 
+	// GeneralsX @feature PS3.0 #70 15/10/2026: the roughness (PBR) toggle is now independent of the
+	// normal-map switch. Mode 0 = off, 1 = M1 roughness-driven Blinn, 2 = M2 GGX metallic-roughness.
+	// The device layer injects it once at shader install (OptionPreferences::getPBRMode, whose own
+	// GENERALSX_PBR env override keeps QA A/B runs working) and the options menu re-arms it live via
+	// gameOptionApply_Roughness. With the normal-map switch OFF but mode > 0, Apply still mounts the
+	// PBR pair on RP_Ready meshes with a FLAT tangent normal (c3=(0,0,0,1)) - roughness specular on
+	// the geometric normal, no bump.
+	void Set_PBR_Mode(int mode);
+	int  Get_PBR_Mode();
+	bool RP_Ready();   // mode > 0 AND the PBR VS/PS pair installed
+
 	// Per-pixel perturbation strength (0..2, default 0.8).
+	// GeneralsX @bugfix PS3.0 #69 15/10/2026: this is now the BUMP deviation slider (PS c3.x),
+	// not the sun-gain multiplier it used to ride on.
 	void Set_Strength(float s);
 	float Get_Strength();
 
@@ -49,6 +83,99 @@ namespace DX8NormalMap
 	// negated: pass -lightZ), ambient is the scene object ambient (0..1 per channel).
 	void Set_Global_Fallback_Light(const Vector3& world_dir, const Vector3& ambient);
 
+	// GeneralsX @feature PS3.0 L1 13/10/2026: global sky fill light for the dot3 single-light path,
+	// injected by the display layer on time-of-day changes alongside the fallback sun. dir follows
+	// the same "toward the light" convention; color is the premultiplied fill diffuse. A zero
+	// color (or a degenerate direction) keeps the single-key look bit-for-bit.
+	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color);
+
 	// Restore the fixed pipeline after drawing (FVF + no PS).
+	void Restore(UINT_PTR fvf);
+}
+
+//=============================================================================
+// GeneralsX @feature PS3.0 L2 14/10/2026 geometric-normal per-pixel diffuse.
+//
+// The fixed pipeline lights rigid meshes PER VERTEX (Gouraud): on the big flat polys of tanks
+// and buildings the key/fill lambert term is a vertex average, so light boundaries smear and
+// curved hulls read as flat paper. This module mounts a lightweight VS/PS pair on plain
+// XYZNDUV1/XYZNDUV2 rigid batches (the ones the dot3 path above never touches - no normal map)
+// and applies a per-pixel CORRECTION to the two global lambert lobes:
+//
+//   out.rgb = tex.rgb * saturate(vertexColor.rgb + key*(ndl_pixel - ndl_vertex)
+//                                              + fill*(ndf_pixel - ndf_vertex))
+//
+// The vertex color keeps every other fixed-pipeline contribution intact (ambient, bounce,
+// attached/point lights, emissive, material tint, selection flash); only the sun and the L1
+// sky fill are re-evaluated against the interpolated geometric normal. ndl_vertex is computed
+// in the VS with the SAME light direction the fixed pipeline used, so the correction is a
+// numerical no-op on triangles that happen to be flat-shaded.
+//
+// Default OFF: mounts only when GENERALSX_GEOMNORMAL=1 is set in the process environment at
+// startup AND the device layer installed the shader pair. Any precondition missing leaves the
+// mesh on the fixed pipeline - zero regression.
+//=============================================================================
+class VertexMaterialClass;
+
+namespace DX8GeomNormal
+{
+	// Device layer installs after compiling the pair (two VS variants for the two FVF layouts,
+	// one shared PS). Zero handles disable the module.
+	void Install(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle);
+
+	bool Ready_To_Render();
+
+	// Global key sun (direction TOWARD the light, same convention as DX8NormalMap's fallback
+	// light) and its diffuse color, plus the L1 sky fill (zero color = off). Injected by the
+	// display layer on time-of-day changes.
+	void Set_Global_Key_Light(const Vector3& world_dir, const Vector3& color);
+	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color);
+
+	// Scene object ambient (the value fed to Set_Ambient_Light). The GN VS multiplies it by the
+	// material ambient and adds material emissive to rebuild the fixed-pipeline Gouraud base.
+	void Set_Global_Ambient(const Vector3& ambient);
+
+	// GeneralsX @feature PS3.0 P3-21b 14/10/2026 sun shadow map reception INSIDE the GN pass.
+	// Forensics (RECMODE 5/6 discriminator, 14/10): pixel-shader texture reads return 0 for ANY
+	// bound texture in the game layer's raw post-scene receiver draw (constant-PS draw fine,
+	// plain A8R8G8B8 dummy echo reads 0), while every sampling pass that uses a programmable VS
+	// (GN/ML/dot3/bloom) samples correctly. The shadow map therefore gets sampled here.
+	//
+	// Device layer compiles the shadow-aware pair (two VS variants + one PS) and installs it;
+	// zero handles or an uninstalled pair keeps the plain GN shaders. The game layer then feeds
+	// the per-frame state (map texture borrowed until Clear, world->light-clip matrix in the SAME
+	// convention the terrain receiver uses with Matrix4x4::Transform_Vector, tap spread in texels,
+	// depth bias in [0,1] space, strength 0..1). Active only when a non-null map with
+	// strength > 0 is set; Apply then mounts the variant on qualifying batches, binds the map to
+	// texture stage 2 (PS sampler s2), uploads the combined light matrix as VS c7..c10 and the
+	// knobs as PS c15, and attenuates ONLY the light-0 diffuse and specular terms (fill lights,
+	// ambient and the multiplicative terrain decal shadows stay untouched).
+	void Install_Sun_Shadow(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle);
+
+	// GeneralsX @feature PS3.0-P3-22 14/10/2026: optional 25-tap (5x5) PCF pixel shader for the
+	// sun-shadow path. Installed as a sibling of the 3x3 pair; only mounted when the process was
+	// started with GENERALSX_SMAP_PCF=5 AND this handle is valid - otherwise the 3x3 runs unchanged.
+	void Install_Sun_Shadow_PCF5(UINT_PTR ps_handle);
+	void Set_Sun_Shadow(TextureClass* map, const Matrix4x4& worldToLightClip,
+		float spreadTexels, float bias, float strength);
+	void Clear_Sun_Shadow();
+	bool Sun_Shadow_Ready();   // shadow variants installed + GN module enabled (map set not required)
+
+	// Mount before drawing a plain realtime-lit rigid batch: uploads WVP (VS c0..c3), the world
+	// rotation rows (VS c4..c6) and, on the PS, the material-scaled ambient (c4) plus up to four
+	// world directional lights - dirs c5..c8 and matDiffuse-scaled colors c9..c12 - read from the
+	// batch's OWN LightEnvironment via the same Get_Light_Direction/Get_Light_Diffuse/
+	// Get_Equivalent_Ambient accessors the fixed Set_Light_Environment path feeds to D3D, so the
+	// per-pixel Gouraud matches retail lighting except for the finer normal interpolation. When
+	// lenv is null it falls back to the injected global key+fill+ambient. PS c13 carries the world
+	// eye direction (w = spec power) and c14 the spec intensity, restoring the light0 Blinn-Phong
+	// highlight the fixed pipeline gets from its white D3DLIGHT.Specular (knobs:
+	// GENERALSX_GEOMNORMAL_SPECPOWER / GENERALSX_GEOMNORMAL_SPEC). fvf must be
+	// DX8_FVF_XYZNUV1 or DX8_FVF_XYZNUV2 (realtime-lit, no vertex-color channel). Returns false
+	// (state untouched) otherwise. The caller (dx8renderer) guarantees every light is directional
+	// and count<=4 before invoking this.
+	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv);
+
+	// Restore the fixed pipeline after drawing (FVF + no VS/PS).
 	void Restore(UINT_PTR fvf);
 }

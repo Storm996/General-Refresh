@@ -58,7 +58,10 @@
 #include "GameClient/GadgetComboBox.h"
 #include "GameClient/GadgetRadioButton.h"
 #include "GameClient/GadgetSlider.h"
+#include "GameClient/GadgetPushButton.h" // GeneralsX @feature Qoder 13/10/2026 GadgetButtonSetText for the lighting subpage labels
 #include "GameClient/HeaderTemplate.h"
+// GeneralsX @feature Qoder 13/10/2026 Graphics options page: @pop back button dispatch.
+#include "GameClient/MenuCommands.h"
 #include "GameClient/Shell.h"
 #include "GameClient/KeyDefs.h"
 #include "GameClient/GameWindowManager.h"
@@ -158,6 +161,10 @@ static GameWindow *   ButtonAdvancedAccept				= nullptr;
 static NameKeyType    ButtonAdvancedCancelID      = NAMEKEY_INVALID;
 static GameWindow *   ButtonAdvancedCancel				= nullptr;
 
+// GeneralsX @refactor Qoder 13/10/2026 The lighting subpage popup was retired after the crash
+// bisect; the seven lighting controls now live directly on the options page and are driven by
+// s_gameOptionRegistry only, so no popup gadgets are tracked here any more.
+
 static NameKeyType    sliderTextureResolutionID = NAMEKEY_INVALID;
 static GameWindow *   sliderTextureResolution = nullptr;
 
@@ -208,8 +215,9 @@ static GameWindow *   checkHeatEffects   = nullptr;
 // dedicated static pointers, init blocks, saveOptions branches or GameEngine.cpp overrides.
 enum GameOptionType
 {
-	GAME_OPTION_BOOL,  // CheckBox gadget, stored as 0/1
-	GAME_OPTION_COMBO, // ComboBox gadget, stored as the selected value from comboValues
+	GAME_OPTION_BOOL,   // CheckBox gadget, stored as 0/1
+	GAME_OPTION_COMBO,  // ComboBox gadget, stored as the selected value from comboValues
+	GAME_OPTION_SLIDER, // HorzSlider gadget, stored as the raw slider position (integer ticks)
 };
 
 struct GameOptionDesc
@@ -222,6 +230,8 @@ struct GameOptionDesc
 	const Int *comboValues;           // GAME_OPTION_COMBO: one stored value per entry
 	const wchar_t *const *comboTexts; // optional entry display text; nullptr = show the number
 	Int comboCount;
+	Int sliderMin;                    // GAME_OPTION_SLIDER: min position applied to the gadget at init
+	Int sliderMax;                    // GAME_OPTION_SLIDER: max position applied to the gadget at init
 	Int (*globalFallback)();          // effective value shown when the key is absent from Options.ini
 	void (*apply)(Int value);         // runtime side effect; called on save, and at startup only when the key exists
 };
@@ -265,74 +275,11 @@ static void gameOptionApply_AntiAliasing(Int level)
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 13/10/2026 Pixel-shader ceiling (PS 1.4 / 2.0 / 3.0 ladder) on the registry.
-// Options.ini stores the tier as the shader model times ten (11/14/20/30) with 0 = auto, which is the
-// same dotted-free spelling -shadermodel and GENERALSX_SHADERMODEL already accept, so the three entry
-// points cannot drift apart. W3DShaderManager::applyShaderModelCap reads the resulting
-// GlobalData string on every tier query; only the ceiling can move, never the hardware tier.
-
-// "1.4"/"14" -> 14, the bare-shorthand "2"/"3" -> 20/30, "auto"/unknown -> 0. Unknown spellings
-// collapse to auto on purpose: the UI must never display a tier that is not actually in effect.
-static Int shaderModelCapToInt(const AsciiString &cap)
-{
-	Int digits = 0;
-	const char *s = cap.str();
-	if (!s)
-		return 0;
-	for (; *s; ++s)
-	{
-		if (*s >= '0' && *s <= '9')
-			digits = digits * 10 + (*s - '0');
-	}
-	if (digits > 0 && digits < 11)
-		digits *= 10;
-	switch (digits)
-	{
-		case 11: case 14: case 20: case 30:
-			return digits;
-		default:
-			return 0;
-	}
-}
-
-static Int gameOptionFallback_ShaderModel()
-{
-	return shaderModelCapToInt(TheGlobalData ? TheGlobalData->m_shaderModelCap : AsciiString());
-}
-
-static void setShaderModelCap(Int cap, const char *source, Bool assetsAlreadyBuilt)
-{
-	if (!TheWritableGlobalData)
-		return;
-
-	AsciiString value;
-	if (cap != 0)
-		value.format("%d", cap);
-	if (TheWritableGlobalData->m_shaderModelCap == value)
-		return;
-
-	TheWritableGlobalData->m_shaderModelCap = value;
-
-	// The shader assets W3DShaderManager::init() builds are compiled once, before this callback can
-	// run on a save, so a menu change only reaches the session through the next restart or the device
-	// re-acquire a resolution change triggers. Exactly the restart semantics the AntiAliasing row has.
-	if (assetsAlreadyBuilt)
-	{
-		fprintf(stderr, "[SHADERMODEL] %s set the pixel-shader ceiling to %s; shaders already built "
-			"this session keep their tier until restart\n", source, value.isEmpty() ? "auto" : value.str());
-	}
-	else
-	{
-		fprintf(stderr, "[SHADERMODEL] %s set the pixel-shader ceiling to %s\n",
-			source, value.isEmpty() ? "auto" : value.str());
-	}
-	fflush(stderr);
-}
-
-static void gameOptionApply_ShaderModel(Int cap)
-{
-	setShaderModelCap(cap, "options menu", TRUE);
-}
+// GeneralsX @tweak Qoder 13/10/2026 The options-menu pixel-shader ceiling row was removed at the
+// user's request: on SM3-capable hardware the auto tier already is 3.0, so the row was a no-op in
+// normal use. The QA channels stay - -shadermodel (CommandLine.cpp writes m_shaderModelCap) and
+// GENERALSX_SHADERMODEL (W3DShaderManager::applyShaderModelCap) still cap the emitted tier for
+// A/B forensics without any menu plumbing.
 
 static const Int s_fpsLimitValues[] = { 30, 60, 120, 1000 };
 static const wchar_t *const s_fpsLimitTexts[] = { L"30 FPS", L"60 FPS", L"120 FPS", L"No Limit" };
@@ -342,49 +289,178 @@ static const wchar_t *const s_fpsLimitTexts[] = { L"30 FPS", L"60 FPS", L"120 FP
 static const Int s_antiAliasingValues[] = { 0, 2, 4, 8 };
 static const wchar_t *const s_antiAliasingTexts[] = { L"Off", L"2X", L"4X", L"8X" };
 
-// GeneralsX @feature Qoder 13/10/2026 The full ladder the renderer's cap parser understands; 1.1 is
-// kept because ps_1_1 bytecode is still what a retail .pso asset ships as.
-static const Int s_shaderModelValues[] = { 0, 11, 14, 20, 30 };
-static const wchar_t *const s_shaderModelTexts[] = { L"Auto", L"1.1", L"1.4", L"2.0", L"3.0" };
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 13/10/2026 PS3.0 lighting parameters on the registry (引擎改造/设置参数交接说明 §8).
+// All values persist as integer ticks in Options.ini through the generic setInt loop; the
+// OptionPreferences getters own the units conversion and keep the GENERALSX_* QA env overrides
+// authoritative, so these fallbacks show exactly what the renderer will consume when the ini key
+// is absent. Sliders store raw ticks: 0-200 = percent x100 for the 0.0-2.0 strength range, 0-100
+// elsewhere. Only the normal-map strength has a live apply hook (DX8NormalMap re-arms every frame);
+// bloom, multi-light and the sun shadow map are compiled/created once per process and need a restart.
 
+static Int gameOptionFallback_NormalStrength()
+{
+	return (Int)(OptionPreferences().getNormalMapStrength() * 100.0f + 0.5f);
+}
+
+static Int gameOptionFallback_Bloom()
+{
+	return (Int)(OptionPreferences().getBloomIntensity() * 100.0f + 0.5f);
+}
+
+static Int gameOptionFallback_ShadowDensity()
+{
+	return OptionPreferences().getShadowMapIntensity();
+}
+
+static Int gameOptionFallback_ShadowSoftening()
+{
+	return OptionPreferences().getShadowSoftening();
+}
+
+static Int gameOptionFallback_SunShadowRes()
+{
+	return OptionPreferences().getSunShadowMapResolution();
+}
+
+static Int gameOptionFallback_MultiLight()
+{
+	return OptionPreferences().getMultiLightEnabled() != FALSE;
+}
+
+static Int gameOptionFallback_ShadowMap()
+{
+	return OptionPreferences().getShadowMapEnabled() != FALSE;
+}
+
+static void gameOptionApply_NormalStrength(Int tick)
+{
+	DX8NormalMap::Set_Strength((Real)tick * 0.01f);
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 #70 15/10/2026: roughness (PBR) independent of the normal-map toggle.
+// Stored value is the mode itself (0/1/2) so Options.ini "RoughnessMapping" matches the env domain
+// GENERALSX_PBR and the startup read in W3DShaderManager consumes the same encoding.
+//-------------------------------------------------------------------------------------------------
+static Int gameOptionFallback_Roughness()
+{
+	return OptionPreferences().getPBRMode();
+}
+
+static void gameOptionApply_Roughness(Int mode)
+{
+	DX8NormalMap::Set_PBR_Mode(mode);
+}
+
+static const Int s_roughnessValues[] = { 0, 1, 2 };
+static const wchar_t *const s_roughnessTexts[] = { L"\u5173\u95ed", L"\u57fa\u7840\u9ad8\u5149", L"\u5b8c\u6574 PBR" };
+
+static const Int s_shadowSofteningValues[] = { 0, 1, 2, 3 };
+static const wchar_t *const s_shadowSofteningTexts[] = { L"\u5173", L"\u4f4e", L"\u4e2d", L"\u9ad8" };
+
+// GeneralsX @feature PS3.0-P3-22 14/10/2026: 2048 joins the sun-map resolution dropdown (S2 tiers).
+static const Int s_sunShadowResValues[] = { 256, 512, 1024, 2048 };
+static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024", L"2048" };
+
+// GeneralsX @feature Qoder 13/10/2026 Control names are the bare gadget names (no layout prefix):
+// the init loop formats "<layoutPrefix>:<name>", so the SAME rows drive both the retail
+// OptionsMenu.wnd gadgets and the clones on the new standalone GraphicsOptions.wnd page.
 static const GameOptionDesc s_gameOptionRegistry[] =
 {
 	{
-		GAME_OPTION_COMBO, "MaxFPSLimit", "OptionsMenu.wnd:ComboBoxMaxFpsLimit",
-		"OptionsMenu.wnd:StaticTextMaxFpsLimit", L"\u6700\u5927\u5e27\u7387",
-		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues),
+		GAME_OPTION_COMBO, "MaxFPSLimit", "ComboBoxMaxFpsLimit",
+		"StaticTextMaxFpsLimit", L"\u6700\u5927\u5e27\u7387",
+		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues), 0, 0,
 		gameOptionFallback_FpsLimit, gameOptionApply_FpsLimit,
 	},
 	{
-		GAME_OPTION_BOOL, "UseNormalMapping", "OptionsMenu.wnd:CheckNormalMapping",
+		GAME_OPTION_BOOL, "UseNormalMapping", "CheckNormalMapping",
 		nullptr, L"\u6cd5\u7ebf\u8d34\u56fe",
-		nullptr, nullptr, 0,
+		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_NormalMapping, gameOptionApply_NormalMapping,
 	},
+	// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness toggle (0 off / 1 M1 Blinn /
+	// 2 M2 GGX). Works with normal mapping on OR off; roughness-only mounts the PBR pair with flat
+	// normals, so the two features are orthogonal as the user requested.
 	{
-		GAME_OPTION_COMBO, "AntiAliasing", "OptionsMenu.wnd:ComboBoxAntiAliasing",
-		"OptionsMenu.wnd:StaticTextAntiAliasing", L"\u6297\u952f\u9f7f",
-		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues),
-		gameOptionFallback_AntiAliasing, gameOptionApply_AntiAliasing,
+		GAME_OPTION_COMBO, "RoughnessMapping", "ComboBoxRoughness",
+		"StaticTextRoughness", L"\u7c97\u7cd9\u5ea6\u8d34\u56fe",
+		s_roughnessValues, s_roughnessTexts, (Int)ARRAY_SIZE(s_roughnessValues), 0, 0,
+		gameOptionFallback_Roughness, gameOptionApply_Roughness,
 	},
 	{
-		GAME_OPTION_COMBO, "ShaderModel", "OptionsMenu.wnd:ComboBoxShaderModel",
-		"OptionsMenu.wnd:StaticTextShaderModel", L"\u7740\u8272\u5668\u6863\u4f4d",
-		s_shaderModelValues, s_shaderModelTexts, (Int)ARRAY_SIZE(s_shaderModelValues),
-		gameOptionFallback_ShaderModel, gameOptionApply_ShaderModel,
+		GAME_OPTION_COMBO, "AntiAliasing", "ComboBoxAntiAliasing",
+		"StaticTextAntiAliasing", L"\u6297\u952f\u9f7f",
+		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues), 0, 0,
+		gameOptionFallback_AntiAliasing, gameOptionApply_AntiAliasing,
+	},
+	// GeneralsX @feature Qoder 13/10/2026 Lighting option rows. After the popup crash bisect the
+	// seven gadgets live directly on the options page (inline layout in OptionsMenu.wnd); the
+	// generic init/save loops below drive them, so each row stays one table entry.
+	{
+		GAME_OPTION_SLIDER, "NormalMapStrength", "SliderNormalStrength",
+		"StaticTextNormalStrength", L"\u6cd5\u7ebf\u5f3a\u5ea6",
+		nullptr, nullptr, 0, 0, 200,
+		gameOptionFallback_NormalStrength, gameOptionApply_NormalStrength,
+	},
+	{
+		GAME_OPTION_SLIDER, "BloomIntensity", "SliderBloom",
+		"StaticTextBloom", L"\u6cdb\u5149\u5f3a\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_Bloom, nullptr,
+	},
+	{
+		GAME_OPTION_SLIDER, "ShadowMapIntensity", "SliderShadowDensity",
+		"StaticTextShadowDensity", L"\u9634\u5f71\u6d53\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_ShadowDensity, nullptr,
+	},
+	{
+		GAME_OPTION_COMBO, "ShadowSoftening", "ComboBoxShadowSoftening",
+		"StaticTextShadowSoftening", L"\u9634\u5f71\u67d4\u5316",
+		s_shadowSofteningValues, s_shadowSofteningTexts, (Int)ARRAY_SIZE(s_shadowSofteningValues), 0, 0,
+		gameOptionFallback_ShadowSoftening, nullptr,
+	},
+	{
+		GAME_OPTION_COMBO, "SunShadowMapResolution", "ComboBoxSunShadowRes",
+		"StaticTextSunShadowRes", L"\u9634\u5f71\u5206\u8fa8\u7387",
+		s_sunShadowResValues, s_sunShadowResTexts, (Int)ARRAY_SIZE(s_sunShadowResValues), 0, 0,
+		gameOptionFallback_SunShadowRes, nullptr,
+	},
+	{
+		GAME_OPTION_BOOL, "MultiLightEffect", "CheckMultiLight",
+		nullptr, L"\u591a\u5149\u6e90\u6548\u679c",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_MultiLight, nullptr,
+	},
+	{
+		GAME_OPTION_BOOL, "ShadowMap", "CheckShadowMap",
+		nullptr, L"\u771f\u5b9e\u9634\u5f71\uff08\u5b9e\u9a8c\uff09",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_ShadowMap, nullptr,
 	},
 };
 
-static GameWindow *s_gameOptionControls[ARRAY_SIZE(s_gameOptionRegistry)] = { nullptr };
+#define GAME_OPTION_COUNT (Int)ARRAY_SIZE(s_gameOptionRegistry)
 
-static void initGameOptionControls( const OptionPreferences *optionsPref )
+// GeneralsX @feature Qoder 13/10/2026 Slot set for the standalone GraphicsOptions.wnd page. The
+// graphics rows moved out of the retail options menu (.wnd blocks removed at the user's request),
+// so this is the only page driving the registry gadgets any more; the retail page keeps its own
+// hand-written controls untouched.
+static GameWindow *s_graphicsOptionControls[GAME_OPTION_COUNT] = { nullptr };
+
+static void initGameOptionControls( const OptionPreferences *optionsPref,
+	const GameOptionDesc *registry, Int count, GameWindow **slots, const char *layoutPrefix )
 {
-	for (Int i = 0; i < (Int)ARRAY_SIZE(s_gameOptionRegistry); ++i)
+	for (Int i = 0; i < count; ++i)
 	{
-		const GameOptionDesc &desc = s_gameOptionRegistry[i];
+		const GameOptionDesc &desc = registry[i];
+		AsciiString fullName;
+		fullName.format( "%s:%s", layoutPrefix, desc.controlName );
 		GameWindow *control = TheWindowManager->winGetWindowFromId( nullptr,
-			TheNameKeyGenerator->nameToKey( desc.controlName ) );
-		s_gameOptionControls[i] = control;
+			TheNameKeyGenerator->nameToKey( fullName ) );
+		slots[i] = control;
 		if (!control)
 			continue; // layout variant without this gadget: safe no-op
 
@@ -392,8 +468,10 @@ static void initGameOptionControls( const OptionPreferences *optionsPref )
 		{
 			if (desc.labelControlName)
 			{
+				AsciiString labelName;
+				labelName.format( "%s:%s", layoutPrefix, desc.labelControlName );
 				GameWindow *label = TheWindowManager->winGetWindowFromId( nullptr,
-					TheNameKeyGenerator->nameToKey( desc.labelControlName ) );
+					TheNameKeyGenerator->nameToKey( labelName ) );
 				if (label)
 					GadgetStaticTextSetText( label, UnicodeString(desc.labelText) );
 			}
@@ -433,15 +511,22 @@ static void initGameOptionControls( const OptionPreferences *optionsPref )
 		{
 			GadgetCheckBoxSetChecked( control, value != 0 );
 		}
+		else if (desc.type == GAME_OPTION_SLIDER)
+		{
+			GadgetSliderSetMinMax( control, desc.sliderMin, desc.sliderMax );
+			GadgetSliderSetPosition( control, value );
+		}
 	}
 }
 
-static void saveGameOptionControls( OptionPreferences *optionsPref )
+static void saveGameOptionControls( OptionPreferences *optionsPref,
+	const GameOptionDesc *registry, Int count, GameWindow **slots )
 {
-	for (Int i = 0; i < (Int)ARRAY_SIZE(s_gameOptionRegistry); ++i)
+	for (Int i = 0; i < count; ++i)
 	{
-		const GameOptionDesc &desc = s_gameOptionRegistry[i];
-		const GameWindow *control = s_gameOptionControls[i];
+		const GameOptionDesc &desc = registry[i];
+		const GameWindow *control = slots[i];
+		slots[i] = nullptr; // consumed for this page session; init repopulates on the next open
 		if (!control)
 			continue;
 
@@ -452,6 +537,10 @@ static void saveGameOptionControls( OptionPreferences *optionsPref )
 			GadgetComboBoxGetSelectedPos( (GameWindow *)control, &pos );
 			pos = clamp( 0, pos, desc.comboCount - 1 );
 			value = desc.comboValues[pos];
+		}
+		else if (desc.type == GAME_OPTION_SLIDER)
+		{
+			value = GadgetSliderGetPosition( (GameWindow *)control );
 		}
 		else
 		{
@@ -484,27 +573,218 @@ void ApplyGameOptionRegistryAtStartup()
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 13/10/2026 Read the saved pixel-shader ceiling before the renderer starts.
-// W3DShaderManager::init() compiles the shader assets inside GameClient::init(), which GameEngine.cpp
-// runs well before ApplyGameOptionRegistryAtStartup(), so a tier saved by the options menu would
-// otherwise never be consumed. This replays that single key early; -shadermodel and
-// GENERALSX_SHADERMODEL keep their documented precedence (command line > environment > Options.ini),
-// and the generic registry pass afterwards re-applies the same value as a no-op.
-void ApplyShaderModelCapFromStartupOptions()
+// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options page (menu rework plan S1b).
+// Shared preferences handle (declared here, further down this file, for the graphics page
+// callbacks below; definition moved up because the new callbacks run the registry save loop).
+static OptionPreferences *pref = nullptr;
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 13/10/2026 The in-game pause menu opens the graphics page as a persistent
+// overlay - exactly like the retail options page (getOptionsLayout + bringForward) - and NOT as a
+// shell-stack push. Inside a live match the shell stack still has the shell main menu linked under it,
+// so a "@push"/"@pop" there popped back onto that screen and flung the player out to the main menu. The
+// overlay is stacked over the pause menu and merely destroyed on close, so we return to whatever was
+// underneath. The main-menu entry keeps the declarative @push/@pop stack path (unchanged).
+static WindowLayout *s_graphicsLayout = nullptr;
+
+void OpenGraphicsOptionsLayout()
 {
-	if (!TheWritableGlobalData)
+	if (!s_graphicsLayout)
+		s_graphicsLayout = TheWindowManager->winCreateLayout( "Menus/GraphicsOptions.wnd" );
+	if (!s_graphicsLayout)
 		return;
-	if (!TheWritableGlobalData->m_shaderModelCap.isEmpty())
-		return; // -shadermodel already owns the ceiling
 
-	static const char *const s_envCap = getenv("GENERALSX_SHADERMODEL");
-	if (s_envCap && *s_envCap)
-		return; // the environment override owns the ceiling
+	s_graphicsLayout->runInit();
+	s_graphicsLayout->hide( FALSE );
+	s_graphicsLayout->bringForward();
 
-	OptionPreferences optionsPref;
-	if (optionsPref.getAsciiString( "ShaderModel", AsciiString() ).isEmpty() )
+	GameWindow *root = s_graphicsLayout->getFirstWindow();
+	if (root)
+	{
+		TheWindowManager->winSetModal( root );
+		TheWindowManager->winSetFocus( root );
+	}
+}
+
+static void CloseGraphicsOptionsLayout( Bool save )
+{
+	if (save)
+	{
+		saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls );
+		if (pref)
+		{
+			pref->write();
+			delete pref;
+			pref = nullptr;
+		}
+	}
+	else if (pref)
+	{
+		delete pref;
+		pref = nullptr;
+	}
+
+	if (s_graphicsLayout)
+	{
+		s_graphicsLayout->destroyWindows();
+		deleteInstance( s_graphicsLayout );
+		s_graphicsLayout = nullptr;
+	}
+
+	// the gadget pointers dangled the moment the windows were freed
+	for (Int i = 0; i < GAME_OPTION_COUNT; ++i)
+		s_graphicsOptionControls[i] = nullptr;
+}
+
+// A second entry over the SAME registry rows, opened from the new main-menu button via the
+// declarative "@push Menus/GraphicsOptions.wnd" verb. The layout clones every graphics gadget with
+// the GraphicsOptions.wnd: prefix, so init/save just re-run the generic loops against a second
+// slot array; both pages write identical Options.ini keys and stay consistent because Shell
+// push/pop unloads the page below, and each reopen re-reads the ini through its own init.
+void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
+{
+	if (TheGameEngine->getQuitting())
 		return;
-	setShaderModelCap( optionsPref.getInt( "ShaderModel", 0 ), "Options.ini", FALSE );
+
+	if (!pref)
+		pref = NEW OptionPreferences;
+
+	initGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls,
+		"GraphicsOptions.wnd" );
+
+	// Title label comes from code: the localized string table lives inside a BIG, so the loose
+	// layout keeps TEXT = "[None]" (same pattern as the main-menu Chinese button labels).
+	GameWindow *title = TheWindowManager->winGetWindowFromId( nullptr,
+		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:StaticTextTitle" ) );
+	if (title)
+		GadgetStaticTextSetText( title, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @bugfix Qoder 13/10/2026 Shell::pop() only completes when the layout's shutdown
+// callback reports back via Shell::shutdownComplete(); the retail options page routes its back
+// button through DestroyOptionsLayout instead, so the generated graphics page (pure @pop/@push
+// navigation) hung with every exit button dead until this LAYOUTSHUTDOWN existed.
+void GraphicsOptionsMenuShutdown( WindowLayout *layout, void *userData )
+{
+	// the gadgets die with the layout: drop the cached pointers before the windows are freed
+	for (Int i = 0; i < GAME_OPTION_COUNT; ++i)
+		s_graphicsOptionControls[i] = nullptr;
+
+	// the preferences handle is only persisted on Accept; any other exit discards it
+	if (pref)
+	{
+		delete pref;
+		pref = nullptr;
+	}
+
+	layout->hide( TRUE );
+	TheShell->shutdownComplete( layout );
+}
+
+//-------------------------------------------------------------------------------------------------
+/** graphics options menu window input callback - Esc routes to the @pop back button */
+//-------------------------------------------------------------------------------------------------
+WindowMsgHandledType GraphicsOptionsMenuInput( GameWindow *window, UnsignedInt msg,
+																				 WindowMsgData mData1, WindowMsgData mData2 )
+{
+	if (msg == GWM_CHAR && mData1 == KEY_ESC)
+	{
+		if (BitIsSet((Byte)mData2, KEY_STATE_UP))
+		{
+			// GeneralsX @bugfix Qoder 13/10/2026 In-game the page is a persistent overlay, so Esc
+			// destroys it (back to the pause menu). Only the main-menu shell entry routes Esc to the
+			// "@pop" back button, because there the page really is on the shell stack.
+			if (TheGameLogic && TheGameLogic->isInGame()
+				&& TheGameLogic->getGameMode() != GAME_SHELL)
+			{
+				CloseGraphicsOptionsLayout( FALSE );
+				return MSG_HANDLED;
+			}
+
+			NameKeyType buttonID = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonBack@pop" );
+			GameWindow *button = TheWindowManager->winGetWindowFromId( nullptr, buttonID );
+			TheWindowManager->winSendSystemMsg( window, GBM_SELECTED,
+				(WindowMsgData)button, buttonID );
+		}
+		return MSG_HANDLED;
+	}
+	return MSG_IGNORED;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** graphics options menu window system callback */
+//-------------------------------------------------------------------------------------------------
+WindowMsgHandledType GraphicsOptionsMenuSystem( GameWindow *window, UnsignedInt msg,
+																					WindowMsgData mData1, WindowMsgData mData2 )
+{
+	static NameKeyType buttonGraphicsAccept = NAMEKEY_INVALID;
+	static NameKeyType buttonGraphicsBack = NAMEKEY_INVALID;
+
+	switch( msg )
+	{
+		case GWM_CREATE:
+			buttonGraphicsAccept = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonGraphicsAccept" );
+			buttonGraphicsBack = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonBack@pop" );
+			break;
+
+		case GWM_INPUT_FOCUS:
+			if( mData1 == TRUE )
+				*(Bool *)mData2 = TRUE;
+			return MSG_HANDLED;
+
+		case GBM_SELECTED:
+		{
+			GameWindow *control = (GameWindow *)mData1;
+			if( !control )
+				break;
+
+			// GeneralsX @bugfix Qoder 13/10/2026 In-game the page is a persistent overlay over the
+			// pause menu, so Accept/Back destroy that overlay instead of popping the shell stack (a
+			// shell pop here would expose the shell main menu still linked underneath and kick the
+			// player out to it). Only the main-menu (shell) entry uses the @pop / TheShell->pop path.
+			if (TheGameLogic && TheGameLogic->isInGame()
+				&& TheGameLogic->getGameMode() != GAME_SHELL)
+			{
+				Int inGameControlID = control->winGetWindowId();
+				if (inGameControlID == buttonGraphicsAccept)
+				{
+					CloseGraphicsOptionsLayout( TRUE );
+					return MSG_HANDLED;
+				}
+				if (inGameControlID == buttonGraphicsBack)
+				{
+					CloseGraphicsOptionsLayout( FALSE );
+					return MSG_HANDLED;
+				}
+				// combos / checkboxes / sliders keep their own gadget handling
+				return MSG_IGNORED;
+			}
+
+			// Declarative "@pop" back button (framework verb, no per-button C++ needed).
+			if( MenuCommandRegistry::dispatchControl( control ) )
+				return MSG_HANDLED;
+
+			if( control->winGetWindowId() == buttonGraphicsAccept )
+			{
+				saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls );
+				if (pref)
+				{
+					pref->write();
+					delete pref;
+					pref = nullptr;
+				}
+				TheShell->pop();
+				return MSG_HANDLED;
+			}
+			break;
+		}
+
+		default:
+			break;
+	}
+
+	return MSG_IGNORED;
 }
 
 
@@ -525,8 +805,6 @@ extern Int timer;
 extern void DoResolutionDialog();
 static Bool ignoreSelected = FALSE;
 WindowLayout *OptionsLayout = nullptr;
-
-static OptionPreferences *pref = nullptr;
 
 static void setDefaults()
 {
@@ -780,9 +1058,9 @@ static void saveOptions()
 	}
 
 	//-------------------------------------------------------------------------------------------------
-	// GeneralsX @refactor Qoder 12/10/2026 Registry-driven options (max FPS limit, normal mapping, ...):
-	// read gadgets, persist to Options.ini and run each row's apply() for immediate effect.
-	saveGameOptionControls( pref );
+	// GeneralsX @refactor Qoder 13/10/2026 Registry saving now belongs to the standalone
+	// GraphicsOptions.wnd page only; its .wnd gadgets were removed from this layout, and the
+	// startup application of saved keys (ApplyGameOptionRegistryAtStartup) is unchanged.
 
 	//-------------------------------------------------------------------------------------------------
 	// LOD
@@ -1354,8 +1632,9 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	checkUnlockFpsID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckUnlockFPS" );
 	checkUnlockFps   = TheWindowManager->winGetWindowFromId( nullptr, checkUnlockFpsID);
 
-	// GeneralsX @refactor Qoder 12/10/2026 Registry gadgets: built, labeled and refilled from Options.ini.
-	initGameOptionControls( pref );
+	// GeneralsX @refactor Qoder 13/10/2026 The graphics registry rows moved to the standalone
+	// GraphicsOptions.wnd page; the retail options menu keeps only its original hand-written
+	// controls and no longer runs the registry gadget loops (their .wnd gadgets were removed).
 
 	checkBuildingOcclusionID = TheNameKeyGenerator->nameToKey( "OptionsMenu.wnd:CheckBehindBuilding" );
 	checkBuildingOcclusion   = TheWindowManager->winGetWindowFromId( nullptr, checkBuildingOcclusionID);
