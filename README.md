@@ -30,11 +30,26 @@
 
 GeneralsX modernized the **platform**: SDL3 windowing, DXVK/Vulkan rendering, OpenAL/MiniAudio sound, a 64-bit toolchain and cross-platform online play — so the game runs on today's systems. **General Refresh goes one step further: it modernizes the game itself.** We build on that foundation and push the actual player experience forward:
 
-- 🎇 **A Direct3D9 renderer with a PS 3.0 shader ceiling** — replacing the legacy D3D8/`ps_1_4` pipeline and unlocking modern lighting effects.
-- 🏎️ **Truly smooth high-frame-rate battles** — upstream GeneralsX decoupled rendering from the 30 Hz simulation, but units still stepped on the 30 FPS grid. General Refresh interpolates unit locomotion, steering, turret aiming and firing at the display refresh rate, while the deterministic simulation (and therefore online play, LAN and replays) stays bit-for-bit faithful.
-- 🖱️ **A modern command system** — new quality-of-life controls such as an RA3-style unit selection panel.
-- 🧱 **Normal-mapped (dot3) surfaces** and 🎨 **AI-assisted texture repaints/upscaling** for far crisper visuals.
-- 🖥️ **A native 64-bit Windows build** that breaks the legacy 2GB/4GB address-space ceiling and uses all available RAM and VRAM.
+### 🎨 Visual quality
+
+- 🎨 **AI-refined textures** — repainted & upscaled artwork for crisper visuals.
+- 🧱 **Normal maps (dot3)** — real per-pixel surface depth.
+- 💡 **Per-pixel lighting** — sharper light/shadow transitions everywhere.
+- 🔩 **PBR roughness materials** — physically-based shading with GGX specular.
+
+### 🕹️ Gameplay & experience
+
+- 🏎️ **High frame rates** — battle motion interpolated at your display's refresh rate.
+- 🖱️ **RA3-style selection panel** — one click selects every unit of a type.
+- 🧩 **Reworked mission UI** — a redesigned briefing & selection screen.
+- 🎬 **Quick-launch any mission** — jump in straight from the main menu.
+- 🤖 **Personality-style AI** — 8 Skirmish AI styles plus a neural-AI scaffold.
+
+### 🛠️ Platform & build
+
+- 🎇 **Direct3D9 renderer** — PS 3.0 shader ceiling replaces D3D8/`ps_1_4`.
+- 🖥️ **Native 64-bit build** — breaks the 2GB/4GB wall, uses all RAM & VRAM.
+- 🔊 **Modern audio/video stack** — MiniAudio / OpenAL audio, FFmpeg video.
 
 > *Note: like GeneralsX, this is an engine re-port and requires original game data from a legitimate copy of Command & Conquer: Generals / Zero Hour.*
 
