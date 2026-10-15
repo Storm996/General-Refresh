@@ -492,8 +492,8 @@ UnicodeString Version::getUnicodeProjectWatermark() const
 		snprintf(versionSuffix, sizeof(versionSuffix), " - %s", formattedTag);
 	}
 
-	// GeneralsX @tweak Storm996 11/10/2026 Rebrand project watermark text to General Refresh
-	snprintf(finalCredit, sizeof(finalCredit), "General Refresh%s", versionSuffix);
+	// GeneralsX @tweak Storm996 14/10/2026 Add Storm99 author signature to project watermark
+	snprintf(finalCredit, sizeof(finalCredit), "General Refresh by Storm99%s", versionSuffix);
 
 	UnicodeString watermark;
 	watermark.translate(finalCredit);

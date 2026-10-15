@@ -41,6 +41,8 @@
 #include "dx8caps.h"
 #include "dx8wrapper.h"
 #include "formconv.h"
+// GeneralsX @feature PS3.0 phase2 P3-3 14/10/2026 stderr include for the release-build [CAPS4] probe log
+#include <stdio.h>
 #pragma warning (disable : 4201)		// nonstandard extension - nameless struct
 #include "WWLib/win.h"
 #ifdef _WIN32
@@ -661,6 +663,8 @@ void DX8Caps::Compute_Caps(WW3DFormat display_format, const D3DADAPTER_IDENTIFIE
 	Check_Shader_Support(Caps);
 	Check_Driver_Version_Status();
 	Check_Maximum_Texture_Support(Caps);
+	// GeneralsX @feature PS3.0 phase2 P3-3 14/10/2026 float-RT / particle-mip / volume-RT probes (I4)
+	Check_Float_And_Misc_Capability_Support(display_format,Caps);
 
 	MaxTexturesPerPass=Caps.MaxSimultaneousTextures;
 
@@ -816,6 +820,106 @@ void DX8Caps::Check_Depth_Stencil_Support(WW3DFormat display_format, const D3DCA
 void DX8Caps::Check_Maximum_Texture_Support(const D3DCAPS9& caps)
 {
 	MaxSimultaneousTextures=caps.MaxSimultaneousTextures;
+}
+
+// ----------------------------------------------------------------------------
+//
+// GeneralsX @feature PS3.0 phase2 P3-3 14/10/2026 (I4, report 画质提升总报告 §9)
+// Capability probes the engine never ran: float render targets (the gate for any
+// HDR/precision RT work like the shadow map), mip-mapped point sprites, volume
+// render targets, and the raw Caps3 bitfield. Results are exposed through the
+// Support_* getters in dx8caps.h so future passes can degrade instead of guess.
+// Note the #27 finding: on this runtime the driver's CheckDeviceFormat answers
+// contradicted what pixel shaders could actually sample, so these bits are
+// admission evidence, not a guarantee - consumers must still verify visually.
+//
+// ----------------------------------------------------------------------------
+void DX8Caps::Check_Float_And_Misc_Capability_Support(WW3DFormat display_format,const D3DCAPS9& caps)
+{
+	FloatRTR32F=false;
+	FloatRTR32FFilterable=false;
+	FloatRTA16Filterable=false;
+	MipMapOnParticles=false;
+	VolumeTextureRT=false;
+	Caps3Bits=0;
+
+	if (display_format==WW3D_FORMAT_UNKNOWN || Direct3D==nullptr) {
+		return;
+	}
+
+	D3DFORMAT d3d_display_format=WW3DFormat_To_D3DFormat(display_format);
+
+	// Plain render-target creation (no filter query): would the format latch at all.
+	FloatRTR32F=SUCCEEDED
+	(
+		Direct3D->CheckDeviceFormat
+		(
+			caps.AdapterOrdinal,
+			caps.DeviceType,
+			d3d_display_format,
+			D3DUSAGE_RENDERTARGET,
+			D3DRTYPE_TEXTURE,
+			D3DFMT_R32F
+		)
+	);
+
+	// RENDERTARGET|QUERY_FILTER: can a pixel shader filter-sample the format (what the
+	// shadow-map receiver path actually needs).
+	FloatRTR32FFilterable=SUCCEEDED
+	(
+		Direct3D->CheckDeviceFormat
+		(
+			caps.AdapterOrdinal,
+			caps.DeviceType,
+			d3d_display_format,
+			D3DUSAGE_RENDERTARGET|D3DUSAGE_QUERY_FILTER,
+			D3DRTYPE_TEXTURE,
+			D3DFMT_R32F
+		)
+	);
+
+	FloatRTA16Filterable=SUCCEEDED
+	(
+		Direct3D->CheckDeviceFormat
+		(
+			caps.AdapterOrdinal,
+			caps.DeviceType,
+			d3d_display_format,
+			D3DUSAGE_RENDERTARGET|D3DUSAGE_QUERY_FILTER,
+			D3DRTYPE_TEXTURE,
+			D3DFMT_A16B16G16R16F
+		)
+	);
+
+	// GeneralsX @bugfix PS3.0 phase2 P3-3 14/10/2026 D3DPRASTERCAPS_MIPMAPONPARTICLES was a D3D8 bit and
+	// is absent from the D3D9 SDK (verified against d3d9types.h 10.0.26100): under D3D9 mip-mapping of
+	// point sprites is a plain sampler state (D3DSAMP_MIPFILTER), not a separately reported capability.
+	// Proxy it with "the device offers any mip filtering", which is what the particle path consumes.
+	MipMapOnParticles=!!(caps.TextureCaps&D3DPTEXTURECAPS_MIPMAP);
+	VolumeTextureRT=SUCCEEDED
+	(
+		Direct3D->CheckDeviceFormat
+		(
+			caps.AdapterOrdinal,
+			caps.DeviceType,
+			d3d_display_format,
+			D3DUSAGE_RENDERTARGET,
+			D3DRTYPE_VOLUMETEXTURE,
+			D3DFMT_R32F
+		)
+	);
+	Caps3Bits=caps.Caps3;
+
+	// Release-build evidence line, emitted once per caps computation.
+	fprintf(stderr,"[CAPS4] r32fRT=%d r32fFilterable=%d a16Filterable=%d particleMip=%d volRT=%d caps3=0x%08x\n",
+		(int)FloatRTR32F,(int)FloatRTR32FFilterable,(int)FloatRTA16Filterable,
+		(int)MipMapOnParticles,(int)VolumeTextureRT,Caps3Bits);
+	fflush(stderr);
+
+	DXLOG(("Float RT R32F: %s, R32F filter-sampleable: %s, A16B16G16R16F filter-sampleable: %s\r\n",
+		FloatRTR32F?"Yes":"No",FloatRTR32FFilterable?"Yes":"No",FloatRTA16Filterable?"Yes":"No"));
+	DXLOG(("Mip-mapped point sprites: %s, volume RT (R32F): %s\r\n",
+		MipMapOnParticles?"Yes":"No",VolumeTextureRT?"Yes":"No"));
 }
 
 void DX8Caps::Check_Shader_Support(const D3DCAPS9& caps)

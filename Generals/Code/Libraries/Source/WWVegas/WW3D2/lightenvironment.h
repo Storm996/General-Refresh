@@ -110,7 +110,10 @@ public:
 	static float		Get_Lighting_LOD_Cutoff();
 
 	static int			Get_Max_Lights() { return MAX_LIGHTS; }
-	enum { MAX_LIGHTS = 4 };	//Made this public, so other code can tell how many lights are allowed. - MW
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026 backport: 4 -> 8 in lockstep with the Zero Hour copy
+	// (see GeneralsMD lightenvironment.h for the consumer audit; the shared DX8Wrapper fixed-function
+	// light state was widened to 8 units and clamps the upload to the device's MaxActiveLights).
+	enum { MAX_LIGHTS = 8 };	//Made this public, so other code can tell how many lights are allowed. - MW
 
 protected:
 

@@ -63,7 +63,17 @@ D3DFORMAT WW3DFormatToD3DFormatConversionArray[WW3D_FORMAT_COUNT] = {
 	D3DFMT_DXT2,
 	D3DFMT_DXT3,
 	D3DFMT_DXT4,
-	D3DFMT_DXT5
+	D3DFMT_DXT5,
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 Forward mapping for the HDR/packed formats added to
+	// WW3DFormat. Without these entries WW3DFormat_To_D3DFormat handed D3DFMT_UNKNOWN to the capability
+	// probes in DX8Caps, so the formats could never be reported as supported.
+	D3DFMT_R16F,
+	D3DFMT_G16R16F,
+	D3DFMT_A16B16G16R16F,
+	D3DFMT_R32F,
+	D3DFMT_G32R32F,
+	D3DFMT_A32B32G32R32F,
+	D3DFMT_A2B10G10R10
 };
 
 // adding depth stencil format conversion
@@ -135,6 +145,16 @@ WW3DFormat D3DFormat_To_WW3DFormat(D3DFORMAT d3d_format)
 	case D3DFMT_DXT3: return WW3D_FORMAT_DXT3;
 	case D3DFMT_DXT4: return WW3D_FORMAT_DXT4;
 	case D3DFMT_DXT5: return WW3D_FORMAT_DXT5;
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 The float formats sit above HIGHEST_SUPPORTED_D3DFORMAT
+	// (D3DFMT_X8L8V8U8), so the index-based table below cannot reach them; handle them like the DXT
+	// fourcc codes. D3DFMT_A2B10G10R10 is numerically inside the table range and is wired in
+	// Init_D3D_To_WW3_Conversion instead.
+	case D3DFMT_R16F: return WW3D_FORMAT_R16F;
+	case D3DFMT_G16R16F: return WW3D_FORMAT_G16R16F;
+	case D3DFMT_A16B16G16R16F: return WW3D_FORMAT_A16B16G16R16F;
+	case D3DFMT_R32F: return WW3D_FORMAT_R32F;
+	case D3DFMT_G32R32F: return WW3D_FORMAT_G32R32F;
+	case D3DFMT_A32B32G32R32F: return WW3D_FORMAT_A32B32G32R32F;
 	default:
 		if (d3d_format > HIGHEST_SUPPORTED_D3DFORMAT) {
 			return WW3D_FORMAT_UNKNOWN;
@@ -208,6 +228,9 @@ void Init_D3D_To_WW3_Conversion()
 	D3DFormatToWW3DFormatConversionArray[D3DFMT_V8U8]=WW3D_FORMAT_U8V8;				// Bumpmap
 	D3DFormatToWW3DFormatConversionArray[D3DFMT_L6V5U5]=WW3D_FORMAT_L6V5U5;		// Bumpmap
 	D3DFormatToWW3DFormatConversionArray[D3DFMT_X8L8V8U8]=WW3D_FORMAT_X8L8V8U8;	// Bumpmap
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 A2B10G10R10 is numerically below the table cap, so it can
+	// be reached through the index lookup; the float formats are handled as explicit cases above.
+	D3DFormatToWW3DFormatConversionArray[D3DFMT_A2B10G10R10]=WW3D_FORMAT_A2B10G10R10;
 
 	// init depth stencil conversion
 	for (i=0; i<HIGHEST_SUPPORTED_D3DZFORMAT; i++)

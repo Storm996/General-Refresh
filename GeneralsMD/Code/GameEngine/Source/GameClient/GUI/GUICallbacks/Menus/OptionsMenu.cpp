@@ -338,11 +338,30 @@ static void gameOptionApply_NormalStrength(Int tick)
 	DX8NormalMap::Set_Strength((Real)tick * 0.01f);
 }
 
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 #70 15/10/2026: roughness (PBR) independent of the normal-map toggle.
+// Stored value is the mode itself (0/1/2) so Options.ini "RoughnessMapping" matches the env domain
+// GENERALSX_PBR and the startup read in W3DShaderManager consumes the same encoding.
+//-------------------------------------------------------------------------------------------------
+static Int gameOptionFallback_Roughness()
+{
+	return OptionPreferences().getPBRMode();
+}
+
+static void gameOptionApply_Roughness(Int mode)
+{
+	DX8NormalMap::Set_PBR_Mode(mode);
+}
+
+static const Int s_roughnessValues[] = { 0, 1, 2 };
+static const wchar_t *const s_roughnessTexts[] = { L"\u5173\u95ed", L"\u57fa\u7840\u9ad8\u5149", L"\u5b8c\u6574 PBR" };
+
 static const Int s_shadowSofteningValues[] = { 0, 1, 2, 3 };
 static const wchar_t *const s_shadowSofteningTexts[] = { L"\u5173", L"\u4f4e", L"\u4e2d", L"\u9ad8" };
 
-static const Int s_sunShadowResValues[] = { 256, 512, 1024 };
-static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024" };
+// GeneralsX @feature PS3.0-P3-22 14/10/2026: 2048 joins the sun-map resolution dropdown (S2 tiers).
+static const Int s_sunShadowResValues[] = { 256, 512, 1024, 2048 };
+static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024", L"2048" };
 
 // GeneralsX @feature Qoder 13/10/2026 Control names are the bare gadget names (no layout prefix):
 // the init loop formats "<layoutPrefix>:<name>", so the SAME rows drive both the retail
@@ -360,6 +379,15 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		nullptr, L"\u6cd5\u7ebf\u8d34\u56fe",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_NormalMapping, gameOptionApply_NormalMapping,
+	},
+	// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness toggle (0 off / 1 M1 Blinn /
+	// 2 M2 GGX). Works with normal mapping on OR off; roughness-only mounts the PBR pair with flat
+	// normals, so the two features are orthogonal as the user requested.
+	{
+		GAME_OPTION_COMBO, "RoughnessMapping", "ComboBoxRoughness",
+		"StaticTextRoughness", L"\u7c97\u7cd9\u5ea6\u8d34\u56fe",
+		s_roughnessValues, s_roughnessTexts, (Int)ARRAY_SIZE(s_roughnessValues), 0, 0,
+		gameOptionFallback_Roughness, gameOptionApply_Roughness,
 	},
 	{
 		GAME_OPTION_COMBO, "AntiAliasing", "ComboBoxAntiAliasing",

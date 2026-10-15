@@ -114,7 +114,13 @@ public:
 	static float		Get_Lighting_LOD_Cutoff();
 
 	static int			Get_Max_Lights() { return MAX_LIGHTS; }
-	enum { MAX_LIGHTS = 4 };	//Made this public, so other code can tell how many lights are allowed. - MW
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8. The sorted-insert collection below keeps the
+	// 8 strongest contributors, so night-scene lamps survive a busy light list instead of being cut by
+	// the sun. Every consumer tracks this constant (W3DDisplay/W3DScene arrays, dx8renderer GN gate);
+	// the only hardcoded widening was DX8Wrapper's fixed-function light state (Lights/LightEnable[8],
+	// LIGHT4..7 change bits), and Set_Light_Environment clamps the upload to the device's
+	// MaxActiveLights. Calculate_Fill_Light deliberately still averages only the top 3.
+	enum { MAX_LIGHTS = 8 };	//Made this public, so other code can tell how many lights are allowed. - MW
 
 	bool operator== (const LightEnvironmentClass& that) const
 	{

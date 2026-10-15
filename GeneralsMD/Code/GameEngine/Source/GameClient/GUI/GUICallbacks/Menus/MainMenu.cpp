@@ -446,8 +446,8 @@ static void initLabelVersion()
 	if (TheVersion) {
 		creditText = TheVersion->getUnicodeProjectWatermark();
 	} else {
-		// GeneralsX @tweak Storm996 11/10/2026 Rebrand fallback watermark text to General Refresh
-		creditText.translate("General Refresh");
+		// GeneralsX @tweak Storm996 14/10/2026 Add Storm99 author signature to fallback watermark
+		creditText.translate("General Refresh by Storm99");
 	}
 
 	if (labelVersion)

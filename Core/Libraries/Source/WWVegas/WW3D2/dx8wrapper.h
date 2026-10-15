@@ -227,8 +227,8 @@ struct RenderStateStruct
 	ShaderClass shader;
 	VertexMaterialClass* material;
 	TextureBaseClass * Textures[MAX_TEXTURE_STAGES];
-	D3DLIGHT9 Lights[4];
-	bool LightEnable[4];
+	D3DLIGHT9 Lights[8];	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8, see LightEnvironmentClass::MAX_LIGHTS
+	bool LightEnable[8];
   //unsigned lightsHash;
 	// GeneralsX @refactor BenderAI 10/02/2026
 	// Changed from D3DMATRIX to Matrix4x4 - fighter19 pattern eliminates conversion functions
@@ -271,6 +271,12 @@ class DX8Wrapper
 		TEXTURE1_CHANGED=	1<<7,
 		TEXTURE2_CHANGED=	1<<8,
 		TEXTURE3_CHANGED=	1<<9,
+		// GeneralsX @feature PS3.0-P3-18 14/10/2026: per-slot change bits for light units 4..7,
+		// placed in the 1<<10..1<<13 gap the old layout left unused.
+		LIGHT4_CHANGED	=	1<<10,
+		LIGHT5_CHANGED	=	1<<11,
+		LIGHT6_CHANGED	=	1<<12,
+		LIGHT7_CHANGED	=	1<<13,
 		MATERIAL_CHANGED=	1<<14,
 		SHADER_CHANGED	=	1<<15,
 		VERTEX_BUFFER_CHANGED = 1<<16,
@@ -281,8 +287,21 @@ class DX8Wrapper
 		TEXTURES_CHANGED=
 			TEXTURE0_CHANGED|TEXTURE1_CHANGED|TEXTURE2_CHANGED|TEXTURE3_CHANGED,
 		LIGHTS_CHANGED=
-			LIGHT0_CHANGED|LIGHT1_CHANGED|LIGHT2_CHANGED|LIGHT3_CHANGED,
+			LIGHT0_CHANGED|LIGHT1_CHANGED|LIGHT2_CHANGED|LIGHT3_CHANGED|
+			LIGHT4_CHANGED|LIGHT5_CHANGED|LIGHT6_CHANGED|LIGHT7_CHANGED,
 	};
+
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: the old mark/apply sites computed the per-unit bit as
+	// LIGHT0_CHANGED << index, which silently collided with TEXTURE0..3 once indices passed 3 (the
+	// light bits deliberately live in the 1<<10..1<<13 gap now). Every site looks this up instead.
+	static unsigned Get_Light_Changed_Bit(unsigned index)
+	{
+		static const unsigned bits[8] = {
+			LIGHT0_CHANGED, LIGHT1_CHANGED, LIGHT2_CHANGED, LIGHT3_CHANGED,
+			LIGHT4_CHANGED, LIGHT5_CHANGED, LIGHT6_CHANGED, LIGHT7_CHANGED,
+		};
+		return (index < 8) ? bits[index] : 0;
+	}
 
 	static void Draw_Sorting_IB_VB(
 		unsigned primitive_type,
@@ -318,6 +337,11 @@ public:
 	static bool Is_Initted() { return IsInitted; }
 
 	static bool Has_Stencil ();
+	// GeneralsX @feature PS3.0-P2-7 14/10/2026 I6: expose the Compute_Caps [SM3_CAPS]/[DEPTH_BIAS]
+	// probe results as values so callers (shadow passes, PS3.0 features) can gate on real device
+	// replies instead of only the stderr line. Defaults are conservative (false/0) until probed.
+	static bool Is_Depth_Bias_Available();
+	static unsigned Get_PS20_Caps_Flags();
 	static void Get_Format_Name(unsigned int format, StringClass *tex_format);
 
 	/*
@@ -651,8 +675,13 @@ public:
 
 	static void Invalidate_Cached_Render_States();
 	static void Set_Transform_Dirty();
+	// GeneralsX @refactor PS3.0-P3-33 14/10/2026 Set_Draw_Polygon_Low_Bound_Limit removed with its
+	// dead DrawPolygonLowBoundLimit cull (no caller ever set the limit).
 
-	static void Set_Draw_Polygon_Low_Bound_Limit(unsigned n) { DrawPolygonLowBoundLimit=n; }
+	// GeneralsX @feature PS3.0-P3-25a 14/10/2026 creation-time present interval (0..3) injected by
+	// the device layer from Options.ini VSync (or the GENERALSX_SWAPINTERVAL env). Consumed once in
+	// device creation, before any device exists, so unlike Set_Swap_Interval it never resets.
+	static void	Set_User_Present_Interval(int swap);
 
 protected:
 
@@ -775,7 +804,7 @@ protected:
 	static D3DCOLOR						FogColor;
 
 	static DX8FrameStatistics			FrameStatistics;
-	static bool								CurrentDX8LightEnables[4];
+	static bool								CurrentDX8LightEnables[8];	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8 (light units)
 
 	static unsigned long FrameCount;
 
@@ -790,8 +819,7 @@ protected:
 	static IDirect3DSurface9 *			CurrentDepthBuffer;
 	static IDirect3DSurface9 *			DefaultRenderTarget;
 	static IDirect3DSurface9 *			DefaultDepthBuffer;
-
-	static unsigned							DrawPolygonLowBoundLimit;
+	// GeneralsX @refactor PS3.0-P3-33 14/10/2026 DrawPolygonLowBoundLimit static removed (dead batch-disable hack).
 
 	static bool								IsRenderToTexture;
 
@@ -1987,26 +2015,19 @@ WWINLINE RenderStateStruct& RenderStateStruct::operator= (const RenderStateStruc
 		REF_PTR_SET(Textures[i],src.Textures[i]);
 	}
 
-	LightEnable[0]=src.LightEnable[0];
-	LightEnable[1]=src.LightEnable[1];
-	LightEnable[2]=src.LightEnable[2];
-	LightEnable[3]=src.LightEnable[3];
-	if (LightEnable[0]) {
-		Lights[0]=src.Lights[0];
-		if (LightEnable[1]) {
-			Lights[1]=src.Lights[1];
-			if (LightEnable[2]) {
-				Lights[2]=src.Lights[2];
-				if (LightEnable[3]) {
-					Lights[3]=src.Lights[3];
-				}
-			}
-		}
-
+	// GeneralsX @refactor PS3.0-P3-18 14/10/2026: the hand-written 4-deep enable chain becomes loops
+	// now that the fixed-function state carries 8 light slots. Same early-exit semantics as the retail
+	// nesting: an enabled slot is only copied while every lower slot is enabled too, which is exactly
+	// the order Set_Light_Environment fills them in.
+	for (i = 0; i < 8; ++i) {
+		LightEnable[i] = src.LightEnable[i];
+	}
+	for (i = 0; i < 8; ++i) {
+		if (!LightEnable[i]) break;
+		Lights[i] = src.Lights[i];
+	}
 
     //lightsHash = flimby((char*)(&Lights[0]), sizeof(D3DLIGHT9)-1 );
-
-	}
 
 	shader=src.shader;
 	world=src.world;

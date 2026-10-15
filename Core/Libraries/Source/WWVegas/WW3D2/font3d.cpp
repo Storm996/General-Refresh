@@ -106,9 +106,16 @@ SurfaceClass *Font3DDataClass::Minimize_Font_Image( SurfaceClass *surface )
 	}
 
    int new_height = new_width;
-	//  create a new 4 bit alpha image to build into
+	//  create a new 8 bit alpha image to build into
+	// GeneralsX @tweak PS3.0-P2-2 14/10/2026 I7: optional 8-bit alpha glyph pages. The P2-2 raise
+	// off A4R4G4B4 bands CJK stroke antialiasing differently but also changes perceived glyph
+	// sharpness paired with linear filtering; the user verdict on 14/10/2026 is to keep the retail
+	// 4-bit atlas as the shipping default, so GENERALSX_FONT8=1 is now an opt-in QA leg.
 	// We dont support non-homogeneous copies just yet
-	SurfaceClass	*new_surface = NEW_REF(SurfaceClass,(new_width, new_height,WW3D_FORMAT_A4R4G4B4));
+	// GeneralsX @tweak PS3.0-P2-2 revert-to-retail-default 14/10/2026 default A4R4G4B4
+	extern bool Font8Atlas_Enabled();
+	SurfaceClass	*new_surface = NEW_REF(SurfaceClass,(new_width, new_height,
+		Font8Atlas_Enabled() ? WW3D_FORMAT_A8R8G8B8 : WW3D_FORMAT_A4R4G4B4));
 	//SurfaceClass	*new_surface0 = NEW_REF(SurfaceClass,(new_width, new_height,sd.Format));
 
 	// fill with transparent black

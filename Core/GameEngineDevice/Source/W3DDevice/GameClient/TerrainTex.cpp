@@ -47,6 +47,7 @@
 //-----------------------------------------------------------------------------
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "W3DDevice/GameClient/TerrainTex.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
@@ -62,6 +63,117 @@
 //         Public Functions
 //-----------------------------------------------------------------------------
 
+// GeneralsX @feature PS3.0-P3-6 14/10/2026 atlas precision is now a measured choice instead of a
+// hard-coded revert.  Retail-then-our-10/07 build uploaded the terrain atlas as A8R8G8B8; the
+// 10/10 revert to A1R5G5B5 was justified by a 32-bit-process device-memory wall (two 8192x4096
+// atlases with mip chains ~170 MiB each pushed the battlefield past the ~1.5 GiB DXVK/NVIDIA
+// budget and a 128 MiB vkAllocateMemory was refused).  This binary is x64 with a 16 GiB card, so
+// the wall is gone - but 5-bit green/blue banding in dark gradients (snow, dusk terrain) is not
+// gone, so pick the highest precision this device can actually hold:
+//   * GENERALSX_TERRAIN_ATLAS=16 / =32 are QA overrides that skip the measurement entirely.
+//   * default (auto) requires BOTH an allocation probe of the exact size/level-count in
+//     D3DPOOL_DEFAULT *and* a device-reported headroom test (GetAvailableTextureMem must cover the
+//     extra bytes of the 32-bit chain plus a 256 MiB safety margin for everything allocated after
+//     this point - the historical failure was a LATER allocation, not the atlas itself).
+// A rejected probe or thin headroom leaves the retail-10/10 16-bit behaviour byte-for-byte intact.
+enum TerrainAtlasPrecision
+{
+	TERRAIN_ATLAS_AUTO = 0,	///<measure: 32-bit if it allocates and the device can hold it.
+	TERRAIN_ATLAS_16 = 1,	///<forced A1R5G5B5 (legacy / QA A-B leg).
+	TERRAIN_ATLAS_32 = 2,	///<forced A8R8G8B8 (QA A-B leg, no measurement).
+};
+
+static Int Terrain_Atlas_Precision_Mode()
+{
+	static Int mode = -1;
+	if (mode < 0)
+	{
+		mode = TERRAIN_ATLAS_AUTO;
+		const char* env = getenv("GENERALSX_TERRAIN_ATLAS");
+		if (env != nullptr)
+		{
+			if (strcmp(env, "16") == 0) mode = TERRAIN_ATLAS_16;
+			else if (strcmp(env, "32") == 0) mode = TERRAIN_ATLAS_32;
+		}
+		fprintf(stderr, "[TERRAIN] atlas precision mode: %s\n",
+			mode == TERRAIN_ATLAS_16 ? "forced 16-bit (legacy)"
+			: mode == TERRAIN_ATLAS_32 ? "forced 32-bit (QA override)"
+			: "auto (measure per atlas)");
+		fflush(stderr);
+	}
+	return mode;
+}
+
+// Full mip-chain byte cost of a w x h texture at the given bytes per texel (power-of-two chain
+// down to 1x1; both atlases here are POT in each dimension).
+static unsigned Terrain_Atlas_Bytes(Int width, Int height, Int bytesPerPixel)
+{
+	unsigned bytes = 0;
+	Int w = width, h = height;
+	while (w > 0 && h > 0)
+	{
+		bytes += (unsigned)w * (unsigned)h * (unsigned)bytesPerPixel;
+		if (w == 1 && h == 1) break;
+		if (w > 1) w >>= 1;
+		if (h > 1) h >>= 1;
+	}
+	return bytes;
+}
+
+static Int Terrain_Atlas_Mip_Levels(Int width, Int height)
+{
+	Int levels = 1;
+	while (width > 1 || height > 1)
+	{
+		if (width > 1) width >>= 1;
+		if (height > 1) height >>= 1;
+		++levels;
+	}
+	return levels;
+}
+
+static WW3DFormat Choose_Terrain_Atlas_Format(Int width, Int height, const char* which)
+{
+	const Int mode = Terrain_Atlas_Precision_Mode();
+	if (mode == TERRAIN_ATLAS_16) return WW3D_FORMAT_A1R5G5B5;
+	if (mode == TERRAIN_ATLAS_32) return WW3D_FORMAT_A8R8G8B8;
+
+	IDirect3DDevice9* dev = DX8Wrapper::_Get_D3D_Device8();
+	if (dev == nullptr) return WW3D_FORMAT_A1R5G5B5;
+
+	const Int levels = Terrain_Atlas_Mip_Levels(width, height);
+	IDirect3DTexture9* probe = nullptr;
+	HRESULT hr = dev->CreateTexture(width, height, levels, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &probe, nullptr);
+	if (FAILED(hr) || probe == nullptr)
+	{
+		if (probe != nullptr) probe->Release();
+		fprintf(stderr, "[TERRAIN] atlas %s %dx%d A8R8G8B8 probe REFUSED hr=0x%08X -> 16-bit\n",
+			which, width, height, (unsigned)hr);
+		fflush(stderr);
+		return WW3D_FORMAT_A1R5G5B5;
+	}
+	probe->Release();
+
+	// Headroom: the 32-bit chain costs this much more than the 16-bit one, and everything allocated
+	// after the terrain textures still has to fit (that is what broke on 10/07).  A device that
+	// reports 0 (or an absurdly large value it cannot honour) gets no benefit of the doubt beyond the
+	// probe itself; GetAvailableTextureMem is documented in KB.
+	const unsigned delta = Terrain_Atlas_Bytes(width, height, 4) - Terrain_Atlas_Bytes(width, height, 2);
+	const unsigned margin = 256u * 1024u * 1024u;
+	unsigned availBytes = (unsigned)dev->GetAvailableTextureMem() * 1024u;
+	if (availBytes != 0 && availBytes < delta + margin)
+	{
+		fprintf(stderr, "[TERRAIN] atlas %s %dx%d 32-bit allocates but headroom is thin (%u MiB free, %u MiB needed + margin) -> 16-bit\n",
+			which, width, height, availBytes / (1024u * 1024u), delta / (1024u * 1024u));
+		fflush(stderr);
+		return WW3D_FORMAT_A1R5G5B5;
+	}
+	fprintf(stderr, "[TERRAIN] atlas %s %dx%d x%d mips: 32-bit A8R8G8B8 accepted (probe ok, %u MiB free)\n",
+		which, width, height, levels, availBytes / (1024u * 1024u));
+	fflush(stderr);
+	return WW3D_FORMAT_A8R8G8B8;
+}
+
 //=============================================================================
 // TerrainTextureClass::TerrainTextureClass
 //=============================================================================
@@ -75,13 +187,15 @@ texture of the desired height and mip level. */
 // (vkAllocateMemory 128 MiB refused with only 1.4 GiB allocated). 16-bit
 // A1R5G5B5 halves the atlas footprint while keeping the mip chain for
 // distant terrain sampling.
+// GeneralsX @feature PS3.0-P3-6 supersedes that fixed choice with the measured ladder above.
 TerrainTextureClass::TerrainTextureClass(int height) :
 	TextureClass(TEXTURE_WIDTH, height,
-		WW3D_FORMAT_A1R5G5B5, MIP_LEVELS_ALL )
+		Choose_Terrain_Atlas_Format(TEXTURE_WIDTH, height, "blend"), MIP_LEVELS_ALL )
 {
-	// GeneralsX @bugfix Qoder 10/07/2026 Runtime diagnostic: confirm the
-	// atlas format/mip request actually reaches D3D.
-	fprintf(stderr, "[TERRAIN] ctor: A8R8G8B8 atlas %d x %d requested\n",
+	// GeneralsX @bugfix PS3.0-P3-6 14/10/2026 the old line reported "A8R8G8B8" unconditionally and
+	// was wrong since the 10/10 revert; it now states the format this atlas actually got.
+	fprintf(stderr, "[TERRAIN] ctor: %s atlas %d x %d\n",
+		Get_Texture_Format() == WW3D_FORMAT_A8R8G8B8 ? "A8R8G8B8" : "A1R5G5B5",
 		TEXTURE_WIDTH, height);
 	fflush(stderr);
 }
@@ -95,9 +209,10 @@ texture of the desired height and mip level. */
 // GeneralsX @bugfix Qoder 10/10/2026 Revert the 10/07 32-bit atlas upgrade
 // (see the (height) ctor note above): keeps flat/background terrain textures
 // inside the 32-bit build's device-memory budget.
+// GeneralsX @feature PS3.0-P3-6 14/10/2026 same measured ladder as the blend atlas.
 TerrainTextureClass::TerrainTextureClass(int height, int width) :
 	TextureClass(width, height,
-		WW3D_FORMAT_A1R5G5B5, MIP_LEVELS_ALL )
+		Choose_Terrain_Atlas_Format(width, height, "flat"), MIP_LEVELS_ALL )
 {
 }
 
@@ -604,18 +719,15 @@ void AlphaTerrainTextureClass::Apply(unsigned int stage)
 	// Do the base apply.
 	TextureClass::Apply(stage);
 
-	// Set the bilinear or trilinear filtering.
-	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	} else {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-	}
-	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-	} else {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+	// GeneralsX @feature PS3.0-P3-5 14/10/2026 Alpha-overlay tiles (water edges, transitions) used to
+	// take their sampler filters straight from the retail Bilinear/TrilinearTerrainTex INI bools, both
+	// of which ship FALSE - so these tiles sampled with POINT min/mag/mip whatever the player had
+	// picked in the options menu. The tier tables now drive the stage; the bools remain a floor.
+	// GENERALSX_TERRAIN_FILTER=legacy reproduces the retail rule for A/B evidence legs.
+	{
+		const bool bilinearHint=TheGlobalData ? TheGlobalData->m_bilinearTerrainTex!=FALSE : false;
+		const bool trilinearHint=TheGlobalData ? TheGlobalData->m_trilinearTerrainTex!=FALSE : false;
+		TextureFilterClass::Apply_Player_Filter(stage,bilinearHint,trilinearHint);
 	}
 	// Since we are using multiple distinct tiles, the textures doesn't wrap, so clamp it.
 	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
@@ -1184,11 +1296,22 @@ void CloudMapTerrainTextureClass::restore()
 //=============================================================================
 /** Constructor. Calls parent constructor to load the .tga texture. */
 //=============================================================================
-/// @todo - get "EXScorch01.tga" from not hard coded location.
+// GeneralsX @feature PS3.0-P3-31 14/10/2026: env-overridable scorch atlas name (see ctor note).
+static const char* Scorch_Texture_Name()
+{
+	static const char* cached = nullptr;
+	if (cached == nullptr) {
+		cached = "EXScorch01.tga";
+		const char* ev = getenv("GENERALSX_SCORCH_TEX");
+		if (ev != nullptr && *ev != 0) cached = ev;
+	}
+	return cached;
+}
+// GeneralsX @feature PS3.0-P3-31 14/10/2026 G6: the retail @todo asked for a non-hardcoded texture
+// path. GENERALSX_SCORCH_TEX supplies an alternate atlas texture name for QA/themed mods; the
+// default stays EXScorch01.tga so the shipped look is bit-for-bit.
 ScorchTextureClass::ScorchTextureClass(MipCountType mipLevelCount) :
-	TextureClass("EXScorch01.tga","EXScorch01.tga", mipLevelCount )
-// Hack to disable texture reduction.
-//	TextureClass("EXScorch01.tga","EXScorch01.tga", mipLevelCount,WW3D_FORMAT_UNKNOWN,true,false)
+	TextureClass(Scorch_Texture_Name(),Scorch_Texture_Name(), mipLevelCount )
 {
 }
 
@@ -1204,18 +1327,14 @@ void ScorchTextureClass::Apply(unsigned int stage)
 {
 	// Do the base apply.
 	TextureClass::Apply(stage);
-	// Setup bilinear or trilinear filtering as specified in global data.
-	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	} else {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-	}
-	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-	} else {
-		DX8Wrapper::Set_DX8_Sampler_State(stage, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+	// GeneralsX @feature PS3.0-P3-5 14/10/2026 Scorch decals took their filters from the retail
+	// Bilinear/TrilinearTerrainTex INI bools (both ship FALSE), so craters were nearest mip-pinned
+	// and point-sampled regardless of the player's texture-filtering option. Same tier as everything
+	// else now; the bools act as a floor and GENERALSX_TERRAIN_FILTER=legacy restores retail.
+	{
+		const bool bilinearHint=TheGlobalData ? TheGlobalData->m_bilinearTerrainTex!=FALSE : false;
+		const bool trilinearHint=TheGlobalData ? TheGlobalData->m_trilinearTerrainTex!=FALSE : false;
+		TextureFilterClass::Apply_Player_Filter(stage,bilinearHint,trilinearHint);
 	}
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);

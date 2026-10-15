@@ -556,10 +556,16 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 	// derived classes should use light environment
 	WWASSERT(rinfo.light_environment==nullptr);
 	// Turn off lights in case we have none
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: null the whole widened unit range (4 -> 8). This
+	// light_environment-free scene path must leave no enabled unit behind for the fixed pipeline.
 	DX8Wrapper::Set_Light(0,nullptr);
 	DX8Wrapper::Set_Light(1,nullptr);
 	DX8Wrapper::Set_Light(2,nullptr);
 	DX8Wrapper::Set_Light(3,nullptr);
+	DX8Wrapper::Set_Light(4,nullptr);
+	DX8Wrapper::Set_Light(5,nullptr);
+	DX8Wrapper::Set_Light(6,nullptr);
+	DX8Wrapper::Set_Light(7,nullptr);
 
 // (gth) WWShade only works with light environments.  We need to upgrade LightEnvironment to
 // support real point lights, etc.  It will likely just evolve into "the n most important" lights

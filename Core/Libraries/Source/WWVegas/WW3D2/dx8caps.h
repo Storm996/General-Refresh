@@ -248,9 +248,49 @@ public:
 	int Get_Max_Pixel_Shader_Constants() const { return MaxPixelShaderConst; }
 	int Get_Max_Vertex_Shader_Constants() const { return MaxVertexShaderConst; }
 
+	// GeneralsX @feature PS3.0-P3-3 14/10/2026 I4: capability bits the retail Compute_Caps never
+	// queried. Float render-target support matters because Create_Render_Target can only vet formats
+	// present in the WW3DFormat table, so shadow/HDR passes that bypass it (raw D3DFMT_R32F) had no
+	// way to ask up front whether the target is even filterable by the PS. The probe answers are
+	// creation-time vetting only: the #27 forensics showed a native-d3d9 runtime that declares all
+	// four ladder formats rtFilterSampleable yet returns 0 for PS texture reads in a fixed-function
+	// vertex context, so consumers must still gate on the programmable-VS architecture.
+	bool Support_Float_RT_R32F() const { return FloatRTR32F; }
+	bool Support_Float_RT_R32F_Filterable() const { return FloatRTR32FFilterable; }
+	bool Support_Float_RT_A16B16G16R16F() const { return FloatRTA16Filterable; }
+	bool Support_MipMap_On_Particles() const { return MipMapOnParticles; }
+	bool Support_Volume_Texture_RT() const { return VolumeTextureRT; }
+	unsigned Get_Caps3_Bits() const { return Caps3Bits; }
+
 	bool Support_Texture_Format(WW3DFormat format) const { return SupportTextureFormat[format]; }
 	bool Support_Render_To_Texture_Format(WW3DFormat format) const { return SupportRenderToTextureFormat[format]; }
 	bool Support_Depth_Stencil_Format(WW3DZFormat format) const { return SupportDepthStencilFormat[format]; }
+
+	// GeneralsX @feature PS3.0-P3-3r 14/10/2026 I4 consumer: "can I render into this format AND read it
+	// back with a pixel-shader sample()?" The two questions were answered by different code paths -
+	// Create_Render_Target only ever vetted through Support_Render_To_Texture_Format, while the float
+	// filter-sample probes computed in Compute_Caps were logged and then dropped on the floor. That gap
+	// is exactly how the shell-black shadow bug (see the #27 forensics in
+	// PS3.0 光影升级/光影改造二阶段) happened: an R32F target passed the render-target vetting, was
+	// bound as a sampler, and returned 0 because nothing had asked whether the runtime can filter-sample
+	// it. This helper merges both answers so a caller that intends to sample the target has one honest
+	// question to ask. Non-float formats fall back to the plain render-target table.
+	bool Support_Filterable_Render_Target_Format(WW3DFormat format) const
+	{
+		if (!Support_Render_To_Texture_Format(format)) return false;
+		switch (format)
+		{
+		case WW3D_FORMAT_R32F:
+			return FloatRTR32FFilterable;
+		case WW3D_FORMAT_A16B16G16R16F:
+			return FloatRTA16Filterable;
+		default:
+			// The remaining float members of the table were not separately probed; a runtime that lists
+			// them as render-target capable is treated as sampleable, which matches the retail behaviour
+			// of the raw-D3D paths that used them without vetting.
+			return true;
+		}
+	}
 
 	D3DCAPS9 const & Get_DX8_Caps() const { return Caps; }
 
@@ -285,6 +325,8 @@ private:
 	void Check_Shader_Support(const D3DCAPS9& caps);
 	void Check_Maximum_Texture_Support(const D3DCAPS9& caps);
 	void Check_Driver_Version_Status();
+	// GeneralsX @feature PS3.0-P3-3 14/10/2026 I4: see the Support_*_RT getters above.
+	void Check_Float_And_Misc_Capability_Support(WW3DFormat display_format,const D3DCAPS9& caps);
 	void Vendor_Specific_Hacks(const D3DADAPTER_IDENTIFIER9& adapter_id);
 
 	int MaxDisplayWidth;
@@ -306,6 +348,13 @@ private:
 	bool SupportDot3;
 	bool SupportPointSprites;
 	bool SupportCubemaps;
+	// GeneralsX @feature PS3.0-P3-3 14/10/2026 I4: filled by Check_Float_And_Misc_Capability_Support.
+	bool FloatRTR32F;
+	bool FloatRTR32FFilterable;
+	bool FloatRTA16Filterable;
+	bool MipMapOnParticles;
+	bool VolumeTextureRT;
+	unsigned Caps3Bits;
 	bool CanDoMultiPass;
 	bool IsFogAllowed;
 	int MaxTexturesPerPass;

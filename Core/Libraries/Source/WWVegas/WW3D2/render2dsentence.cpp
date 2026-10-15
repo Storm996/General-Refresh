@@ -41,6 +41,22 @@
 #include "WWDebug/wwmemlog.h"
 #include "dx8wrapper.h"
 #include "PlatformPaths.h"
+#include <cstdlib>
+
+////////////////////////////////////////////////////////////////////////////////////
+// GeneralsX @tweak PS3.0-P2-2 14/10/2026 I7: shared env gate for the 8-bit glyph atlas
+// experiment. The shipping default is the retail 4-bit point-sampled path; GENERALSX_FONT8=1
+// re-enables the 8-bit atlas + bilinear filtering leg for QA. Read once per process.
+bool Font8Atlas_Enabled()
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		const char* ev = getenv("GENERALSX_FONT8");
+		cached = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+	}
+	return cached == 1;
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -359,13 +375,22 @@ Render2DSentenceClass::Build_Textures ()
 		//
 		//	Create the new texture
 		//
-		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width, WW3D_FORMAT_A4R4G4B4, MIP_LEVELS_1);
+		// GeneralsX @tweak PS3.0-P2-2 14/10/2026 I7: opt-in 8-bit alpha glyph atlas + bilinear
+		// sampling. Retail pairs A4R4G4B4 with FILTER_TYPE_NONE (point); the P2-2 raise stays
+		// available behind GENERALSX_FONT8=1 for QA, but the shipping default is back to retail
+		// per the 14/10/2026 user verdict that the linear-filtered CJK glyphs read as blurry.
+		// Mip stays FILTER_TYPE_NONE (MIP_LEVELS_1, UI text is never mipmapped).
+		const bool font8 = Font8Atlas_Enabled();
+		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width,
+			font8 ? WW3D_FORMAT_A8R8G8B8 : WW3D_FORMAT_A4R4G4B4, MIP_LEVELS_1);
 		SurfaceClass *texture_surface = new_texture->Get_Surface_Level ();
 
 		new_texture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
 		new_texture->Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
-		new_texture->Get_Filter().Set_Min_Filter(TextureFilterClass::FILTER_TYPE_NONE);
-		new_texture->Get_Filter().Set_Mag_Filter(TextureFilterClass::FILTER_TYPE_NONE);
+		new_texture->Get_Filter().Set_Min_Filter(font8 ? TextureFilterClass::FILTER_TYPE_FAST
+			: TextureFilterClass::FILTER_TYPE_NONE);
+		new_texture->Get_Filter().Set_Mag_Filter(font8 ? TextureFilterClass::FILTER_TYPE_FAST
+			: TextureFilterClass::FILTER_TYPE_NONE);
 		new_texture->Get_Filter().Set_Mip_Mapping(TextureFilterClass::FILTER_TYPE_NONE);
 
 		//
@@ -676,7 +701,10 @@ Render2DSentenceClass::Allocate_New_Surface (const WCHAR *text, bool justCalcExt
 		//
 		//	Create the new surface
 		//
-		CurSurface = NEW_REF (SurfaceClass, (CurrTextureSize, CurrTextureSize, WW3D_FORMAT_A4R4G4B4));
+		// GeneralsX @tweak PS3.0-P2-2 14/10/2026 I7: staging surface must match the atlas format
+		// (retail 4-bit by default, 8-bit under GENERALSX_FONT8=1).
+		CurSurface = NEW_REF (SurfaceClass, (CurrTextureSize, CurrTextureSize,
+			Font8Atlas_Enabled() ? WW3D_FORMAT_A8R8G8B8 : WW3D_FORMAT_A4R4G4B4));
 		WWASSERT (CurSurface != nullptr);
 		CurSurface->Add_Ref ();
 

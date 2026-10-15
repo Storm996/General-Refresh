@@ -84,7 +84,9 @@ TextureFilterClass::TextureFilterMode OptionPreferences::getTextureFilterMode() 
 {
 	OptionPreferences::const_iterator it = find("TextureFilter");
 	if (it == end())
-		return TextureFilterClass::TEXTURE_FILTER_BILINEAR;
+		// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Fallback for users without a saved key now
+		// matches the raised factory default (Anisotropic); see GlobalData for rationale.
+		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC;
 
 	return TextureFilterClass::getTextureFilterMode(it->second.str());
 }
@@ -93,7 +95,8 @@ TextureFilterClass::AnisotropicFilterMode OptionPreferences::getTextureAnisotrop
 {
 	OptionPreferences::const_iterator it = find("AnisotropyLevel");
 	if (it == end())
-		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_2X;
+		// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Fallback raised 2X -> 4X with the new default mode.
+		return TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_4X;
 
 	TextureFilterClass::AnisotropicFilterMode level = (TextureFilterClass::AnisotropicFilterMode)atoi(it->second.str());
 	level = clamp(TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_2X, level, TextureFilterClass::TEXTURE_FILTER_ANISOTROPIC_16X);
@@ -1117,6 +1120,31 @@ Real OptionPreferences::getNormalMapStrength() const
 	return (Real)tick / 100.0f;
 }
 
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness (PBR) toggle. 0 = off (factory
+// default), 1 = M1 roughness Blinn, 2 = M2 GGX. GENERALSX_PBR wins outright so scripted A/B runs
+// never touch the user's Options.ini.
+//-------------------------------------------------------------------------------------------------
+Int OptionPreferences::getPBRMode() const
+{
+	const char* env = getenv("GENERALSX_PBR");
+	if (env != nullptr && *env != 0)
+	{
+		Int mode = atoi(env);
+		if (mode < 0)
+			mode = 0;
+		if (mode > 2)
+			mode = 2;
+		return mode;
+	}
+	Int mode = getInt("RoughnessMapping", 0);
+	if (mode < 0)
+		mode = 0;
+	if (mode > 2)
+		mode = 2;
+	return mode;
+}
+
 Real OptionPreferences::getBloomIntensity() const
 {
 	const char* env = getenv("GENERALSX_BLOOM_INTENSITY");
@@ -1169,5 +1197,23 @@ Int OptionPreferences::getSunShadowMapResolution() const
 	if (val <= 512)
 		return 512;
 	return 1024;
+}
+
+// GeneralsX @feature PS3.0-P3-25a 14/10/2026 vsync present interval for device creation (restart
+// to take effect).  The GENERALSX_SWAPINTERVAL env stays the QA override with its full 0..3
+// ladder; the user-facing preference is the plain on/off VSync key.
+Int OptionPreferences::getPresentInterval() const
+{
+	const char* env = getenv("GENERALSX_SWAPINTERVAL");
+	if (env != nullptr && env[0] != 0)
+	{
+		Int v = atoi(env);
+		if (v < 0)
+			v = 0;
+		if (v > 3)
+			v = 3;
+		return v;
+	}
+	return (getInt("VSync", 1) != 0) ? 1 : 0;
 }
 

@@ -150,12 +150,17 @@ public:
 	// them persist as integer ticks in the Options.ini S-family (never folded into m_iniCRC, so
 	// replays and LAN matching are safe); the GENERALSX_* environment variables keep overriding
 	// them inside these getters so scripted A/B runs never need to touch the user's file.
-	Real getNormalMapStrength() const;			///< tick 0-200 stored, returned 0.0-2.0 (default 0.8)
+	Real getNormalMapStrength() const;			///< tick 0-200 stored, returned 0.0-2.0 (default 0.8). #69: drives bump deviation, not sun gain.
+	// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness (PBR) toggle, ini key
+	// RoughnessMapping, 0 = off (default) / 1 = M1 roughness Blinn / 2 = M2 GGX; the GENERALSX_PBR
+	// env still wins outright so scripted A/B runs never touch the user's file.
+	Int getPBRMode() const;
 	Real getBloomIntensity() const;				///< tick 0-100 stored, returned 0.0-1.0; env GENERALSX_BLOOM_INTENSITY wins outright (default 0.35)
 	Bool getMultiLightEnabled() const;			///< env GENERALSX_MULTILIGHT=0 forces OFF, else ini MultiLightEffect (default ON)
 	Bool getShadowMapEnabled() const;			///< any GENERALSX_SHADOWMAP with atoi>0 forces ON / =0 forces OFF, else ini ShadowMap (default OFF)
 	Int getShadowMapIntensity() const;			///< 0-100 percent; env GENERALSX_SHADOWMAP_INT wins when set (default 55)
 	Int getSunShadowMapResolution() const;		///< one of 256/512/1024, snap-up (default 1024)
+	Int getPresentInterval() const;				///< GeneralsX @feature PS3.0-P3-25a vsync ticks 0..3; env GENERALSX_SWAPINTERVAL wins, else ini VSync (default 1 = on). Restart to take effect.
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int getSkirmishTickRate() const;
 };

@@ -12,6 +12,7 @@
 
 #include "WWLib/always.h"
 #include "WWMath/vector3.h"
+#include "WWMath/vector4.h"   // GeneralsX @feature PS3.0-P3-14 14/10/2026: Set_Fog carries Vector4 pairs
 
 class Matrix3D;
 class Matrix4x4;
@@ -30,6 +31,21 @@ namespace DX8NormalMap
 	// actually collects at least one point light; without it the single-light path above is used.
 	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
+	// GeneralsX @feature PS3.0-P4-1 15/10/2026 roughness/metalness (PBR) variant pair for the dot3
+	// single-light path.  #70 15/10/2026: the pair compiles unconditionally at shader install and
+	// mounts whenever Set_PBR_Mode(1/2) is armed and the diffuse carries a "<stem>_rp" companion
+	// (R=roughness, G=metalness, see 光影三阶段/粗糙度引擎承接工作清单.md §1) - independently of the
+	// normal-map switch. Without handles, at mode 0, or without the companion, the path below runs
+	// bit-for-bit - zero regression.
+	void Install_PBR(UINT_PTR vs_handle, UINT_PTR ps_handle);
+
+	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth distance haze shared by the GN and ML
+	// per-pixel families. colorStrength carries the haze rgb in xyz and the blend strength in w
+	// (0 leaves every pixel numerically identical to the pre-fog shaders); startInvLen is
+	// (eye-depth fog start, 1/ramp length, -, -). Injected once by the device layer from camera
+	// settings - WW3D2 must not read game-side GlobalData itself. Default state is strength 0.
+	void Set_Fog(const Vector4& colorStrength, const Vector4& startInvLen);
+
 	// Master switch (driven by command line -normalmap / INI). When OFF, Apply is never called.
 	void Set_Enabled(bool on);
 	bool Is_Enabled();
@@ -37,7 +53,20 @@ namespace DX8NormalMap
 	// Determined jointly by handle validity from Install + the switch.
 	bool Ready_To_Render();
 
+	// GeneralsX @feature PS3.0 #70 15/10/2026: the roughness (PBR) toggle is now independent of the
+	// normal-map switch. Mode 0 = off, 1 = M1 roughness-driven Blinn, 2 = M2 GGX metallic-roughness.
+	// The device layer injects it once at shader install (OptionPreferences::getPBRMode, whose own
+	// GENERALSX_PBR env override keeps QA A/B runs working) and the options menu re-arms it live via
+	// gameOptionApply_Roughness. With the normal-map switch OFF but mode > 0, Apply still mounts the
+	// PBR pair on RP_Ready meshes with a FLAT tangent normal (c3=(0,0,0,1)) - roughness specular on
+	// the geometric normal, no bump.
+	void Set_PBR_Mode(int mode);
+	int  Get_PBR_Mode();
+	bool RP_Ready();   // mode > 0 AND the PBR VS/PS pair installed
+
 	// Per-pixel perturbation strength (0..2, default 0.8).
+	// GeneralsX @bugfix PS3.0 #69 15/10/2026: this is now the BUMP deviation slider (PS c3.x),
+	// not the sun-gain multiplier it used to ride on.
 	void Set_Strength(float s);
 	float Get_Strength();
 
@@ -105,6 +134,32 @@ namespace DX8GeomNormal
 	// Scene object ambient (the value fed to Set_Ambient_Light). The GN VS multiplies it by the
 	// material ambient and adds material emissive to rebuild the fixed-pipeline Gouraud base.
 	void Set_Global_Ambient(const Vector3& ambient);
+
+	// GeneralsX @feature PS3.0 P3-21b 14/10/2026 sun shadow map reception INSIDE the GN pass.
+	// Forensics (RECMODE 5/6 discriminator, 14/10): pixel-shader texture reads return 0 for ANY
+	// bound texture in the game layer's raw post-scene receiver draw (constant-PS draw fine,
+	// plain A8R8G8B8 dummy echo reads 0), while every sampling pass that uses a programmable VS
+	// (GN/ML/dot3/bloom) samples correctly. The shadow map therefore gets sampled here.
+	//
+	// Device layer compiles the shadow-aware pair (two VS variants + one PS) and installs it;
+	// zero handles or an uninstalled pair keeps the plain GN shaders. The game layer then feeds
+	// the per-frame state (map texture borrowed until Clear, world->light-clip matrix in the SAME
+	// convention the terrain receiver uses with Matrix4x4::Transform_Vector, tap spread in texels,
+	// depth bias in [0,1] space, strength 0..1). Active only when a non-null map with
+	// strength > 0 is set; Apply then mounts the variant on qualifying batches, binds the map to
+	// texture stage 2 (PS sampler s2), uploads the combined light matrix as VS c7..c10 and the
+	// knobs as PS c15, and attenuates ONLY the light-0 diffuse and specular terms (fill lights,
+	// ambient and the multiplicative terrain decal shadows stay untouched).
+	void Install_Sun_Shadow(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle);
+
+	// GeneralsX @feature PS3.0-P3-22 14/10/2026: optional 25-tap (5x5) PCF pixel shader for the
+	// sun-shadow path. Installed as a sibling of the 3x3 pair; only mounted when the process was
+	// started with GENERALSX_SMAP_PCF=5 AND this handle is valid - otherwise the 3x3 runs unchanged.
+	void Install_Sun_Shadow_PCF5(UINT_PTR ps_handle);
+	void Set_Sun_Shadow(TextureClass* map, const Matrix4x4& worldToLightClip,
+		float spreadTexels, float bias, float strength);
+	void Clear_Sun_Shadow();
+	bool Sun_Shadow_Ready();   // shadow variants installed + GN module enabled (map set not required)
 
 	// Mount before drawing a plain realtime-lit rigid batch: uploads WVP (VS c0..c3), the world
 	// rotation rows (VS c4..c6) and, on the PS, the material-scaled ambient (c4) plus up to four

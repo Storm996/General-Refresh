@@ -1370,7 +1370,10 @@ void DX8SkinFVFCategoryContainer::Render()
 	// through the fixed pipeline (their tangent channels are ignored placeholders). Sorting
 	// batches never upgrade (the dot3 mount excludes SORT), keeping that path untouched.
 	bool nm_batch = false;
-	if (!sorting && DX8NormalMap::Ready_To_Render()) {
+	// GeneralsX @feature PS3.0 #70 15/10/2026: upgrade skinned batches for the tangent layout when
+	// either the bump path or the independent roughness path is armed (the PBR pair VS needs the
+	// tangent streams regardless of which arm mounted it).
+	if (!sorting && (DX8NormalMap::Ready_To_Render() || DX8NormalMap::RP_Ready())) {
 		for (MeshClass* scan = VisibleSkinHead; scan != nullptr; scan = scan->Peek_Next_Visible_Skin()) {
 			if (scan->Peek_Model()->Uses_Normal_Map()) {
 				nm_batch = true;
@@ -1882,6 +1885,23 @@ void DX8TextureCategoryClass::Render()
 	PolyRenderTaskClass * prt = render_task_head;
 	PolyRenderTaskClass * last_prt = nullptr;
 
+	/*
+	** GeneralsX @performance PS3.0 #71 15/10/2026 (第二档): 类别内粘性挂载 (sticky mount).
+	** A texture category already groups every draw that shares the same textures+material+shader+FVF
+	** (one prt per visible instance batch of that material). The old path ran a full Apply + Restore
+	** pair per prt: a ten-instance category paid ten install/teardown cycles, and DX8Wrapper's
+	** Set_Vertex_Shader/Set_Pixel_Shader/Set_Vertex_FVF forward every call to the device WITHOUT
+	** dedup (dx8wrapper.h:866/882/894 - the dedup fast paths were deliberately removed for D3D9
+	** correctness), so each cycle made DXVK re-bind pipeline state several times per frame on every
+	** NM/GN batch. That churn is the "GPU under 40% but 100fps" CPU bottleneck.
+	** Now: the first successful Apply keeps the custom pair installed; same-kind prts reuse it
+	** (their Apply only refreshes the per-instance constants); a task that falls back to the fixed
+	** pipeline unmounts BEFORE it draws; and the category always leaves clean state, exactly like
+	** the old per-prt Restore did. Draw order and every gate condition are unchanged.
+	*/
+	int mountedKind = 0;	// 0 = fixed pipeline, 1 = DX8NormalMap (dot3/PBR), 2 = DX8GeomNormal
+	static unsigned s_stickyPrts = 0, s_stickyInstalls = 0, s_stickyUnmounts = 0;
+
 	while (prt) {
 
 		/*
@@ -2019,7 +2039,9 @@ void DX8TextureCategoryClass::Render()
 		** 开关命中且句柄就绪时挂载自定义 VS/PS; 默认关闭时下面整段短路, 严格走原固定管线 (零回归)。
 		*/
 		bool nmApplied = false;
-		if (DX8NormalMap::Ready_To_Render()
+		// GeneralsX @feature PS3.0 #70 15/10/2026: the roughness path (RP_Ready) may arm this mount
+		// even with the normal-map switch OFF; Apply decides bump vs flat-normal PBR per texture.
+		if ((DX8NormalMap::Ready_To_Render() || DX8NormalMap::RP_Ready())
 			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNDUV1TG3 || Get_Container()->Is_Normal_Map_Batch())
 			&& mesh->Peek_Model()->Uses_Normal_Map()
 			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
@@ -2098,6 +2120,27 @@ void DX8TextureCategoryClass::Render()
 					Peek_Texture(0) ? Peek_Texture(0)->Get_Texture_Name().str() : "(none)");
 				fflush(stderr);
 			}
+		}
+
+		/*
+		** GeneralsX @performance PS3.0 #71: sticky-mount bookkeeping (see the block above the loop).
+		** NM and GN can never alternate inside one category - the FVF test that gates each of them is
+		** a category-level constant - so the only transitions are mount<->fixed. Unmount BEFORE a
+		** fallback task draws; otherwise stay installed for the next same-kind task.
+		*/
+		if (nmApplied || gnApplied) {
+			if (mountedKind == 0) ++s_stickyInstalls;
+			mountedKind = nmApplied ? 1 : 2;
+		} else if (mountedKind != 0) {
+			if (mountedKind == 1) DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
+			else DX8GeomNormal::Restore(Get_Container()->Get_FVF());
+			++s_stickyUnmounts;
+			mountedKind = 0;
+		}
+		if ((++s_stickyPrts & 0x3FFu) == 0u) {
+			fprintf(stderr, "[NMSWITCH] prts=%u installs=%u unmounts=%u\n",
+				s_stickyPrts, s_stickyInstalls, s_stickyUnmounts);
+			fflush(stderr);
 		}
 
 
@@ -2181,15 +2224,11 @@ void DX8TextureCategoryClass::Render()
         }
 
 		/*
-		** GeneralsX @feature T3-0 M4 (段E): 恢复固定管线 (FVF + 无 PS), 避免污染后续 category。
+		** GeneralsX @performance PS3.0 #71: the old per-prt Restore pair (T3-0 M4 段E / L2) is gone -
+		** that teardown/rewire round-trip between same-kind tasks was the switching cost. The sticky
+		** bookkeeping above unmounts when a task falls back to the fixed pipeline, and the category
+		** exit below guarantees no custom VS/PS leaks into the next category or render pass.
 		*/
-		if (nmApplied) {
-			DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
-		}
-		// GeneralsX @feature PS3.0 L2: restore the fixed pipeline after a GN batch too.
-		if (gnApplied) {
-			DX8GeomNormal::Restore(Get_Container()->Get_FVF());
-		}
 
 		/*
 		** Move to the next render task.  Note that the delete should be fast because prt's are pooled
@@ -2205,6 +2244,12 @@ void DX8TextureCategoryClass::Render()
 
 		delete prt;
 		prt = next_prt;
+	}
+
+	if (mountedKind == 1) {
+		DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
+	} else if (mountedKind == 2) {
+		DX8GeomNormal::Restore(Get_Container()->Get_FVF());
 	}
 
 	if (!renderTasksRemaining)

@@ -53,4 +53,12 @@ class W3DSunShadowMap
 		// ReAcquireResources so the map's POOL_DEFAULT textures never outlive the device.
 		static void releaseResources();
 		static void reAcquireResources();
+
+		// GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 three-layer composition queries.  True while
+		// the GN pass currently receives this frame's map (P3-21b armed path); receptionStrength() is the
+		// premultiplied darkening the GNS shaders apply to light 0 (Options.ini ShadowMapIntensity/100).
+		// The volumetric-shadow screen pass halves its own darkening when both are active so a mesh
+		// pixel never gets multiplied twice into "twice-dark" black (the S3 overlap the report warns of).
+		static bool isReceptionActive();
+		static float receptionStrength();
 };

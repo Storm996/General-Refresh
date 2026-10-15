@@ -53,6 +53,8 @@
 #include "Common/DrawModule.h"
 #include "W3DDevice/GameClient/W3DVolumetricShadow.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+// GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 composition queries for the sun shadow map reception.
+#include "W3DDevice/GameClient/W3DSunShadowMap.h"
 #include "WW3D2/statistics.h"
 #include "GameLogic/TerrainLogic.h"
 #include "WW3D2/dx8caps.h"
@@ -3425,6 +3427,26 @@ void W3DVolumetricShadowManager::renderStencilShadows()
     v[1].color = TheW3DShadowManager->getShadowColor();
     v[2].color = TheW3DShadowManager->getShadowColor();
     v[3].color = TheW3DShadowManager->getShadowColor();
+
+    // GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 three-layer composition rule.  When the real sun
+    // shadow map is currently being received by the GN per-pixel pass, a mesh pixel is already darkened
+    // there (light-0 attenuation).  The volumetric layer is a screen-space multiply (SRCBLEND=DESTCOLOR);
+    // stacking it at full strength over the sun map gives the "twice-dark" black the report warns about.
+    // So when both layers are live, this pass lerps its own darkening halfway toward white - one shadow
+    // factor per pixel across the two layers.  No-op when the sun map is off (retail look unchanged).
+    if (W3DSunShadowMap::isReceptionActive())
+    {
+        const float half = 0.5f;                     // compose only volumetric + sun map, not a third layer
+        const Int a = (v[0].color >> 24) & 0xFF;
+        Int rgb[3];
+        rgb[0] = (v[0].color      ) & 0xFF;          // B
+        rgb[1] = (v[0].color >>  8) & 0xFF;          // G
+        rgb[2] = (v[0].color >> 16) & 0xFF;          // R
+        for (Int c = 0; c < 3; ++c)
+            rgb[c] = (Int)(255.0f - (255.0f - (float)rgb[c]) * half);
+        v[0].color = v[1].color = v[2].color = v[3].color =
+            (a << 24) | ((UnsignedInt)rgb[2] << 16) | ((UnsignedInt)rgb[1] << 8) | (UnsignedInt)rgb[0];
+    }
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.

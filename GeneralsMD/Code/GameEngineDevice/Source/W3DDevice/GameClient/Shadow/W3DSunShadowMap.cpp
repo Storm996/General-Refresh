@@ -60,6 +60,13 @@
 #include "Lib/BaseType.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/dx8wrapper.h"
+#include "WW3D2/texture.h"					// GeneralsX @feature PS3.0-P3-21b wrapper for the map
+#include "WW3D2/dx8normalmap.h"				// GeneralsX @feature PS3.0-P3-21b DX8GeomNormal sun-shadow API
+// GeneralsX @feature PS3.0-P3-3r 14/10/2026 Cached capability answers (the [CAPS4] probes) and the
+// D3DFORMAT <-> WW3DFormat bridge, so the map-format ladder can ask the engine instead of re-querying
+// the device for every rung.
+#include "WW3D2/dx8caps.h"
+#include "WW3D2/formconv.h"
 #include "WW3D2/rinfo.h"
 #include "WW3D2/sunsink.h"
 #include "WWMath/matrix3d.h"
@@ -73,6 +80,7 @@
 #include "GameLogic/TerrainLogic.h"		// MAP_XY_FACTOR / MAP_HEIGHT_SCALE
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <vector>
 
@@ -80,7 +88,7 @@
 // ---- generated shader programs (runtime HLSL, same boundary as the T2 blur pass) ------------
 
 // Writes the occluder's [0,1] depth, carried in TEXCOORD0.x by the RHW sink vertex, into the red
-// channel of the R32F map.
+// channel of the float depth map (format chosen by the RT+filter-sampleable ladder).
 static const char* kDepthWriteShader =
 	"float4 main(float2 dv : TEXCOORD0) : COLOR\n"
 	"{\n"
@@ -101,6 +109,12 @@ static const char* kFillFarShader =
 // GeneralsX @bugfix note: strict mode (D3DCOMPILE_ENABLE_STRICTNESS, the runtime-identical flags the
 // compile ladder uses) rejects the deprecated sampler2D keyword - Texture2D + SamplerState register
 // syntax is required, same as the live [SMAP] failure 13/10/2026 showed.
+// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the depth axis is now guarded as well as uv.  Shell
+// forensics (2026-10-14, GENERALSX_SHADOWMAP=1 at the menu): sun-space depths above 1.0 (pxbox z max
+// 1.218..1.713) made every PCF comparison fail for those texels, so the multiplicative receiver shaded
+// the WHOLE visible terrain (mean 13/255 ON vs 77/255 OFF, only the UI layer stayed lit).  Any fragment
+// whose remapped depth lands outside [0,1] is outside the ortho slab along the sun axis and is forced
+// fully lit instead of sampling clamped edge texels.
 static const char* kPcfReceiveShader =
 	"Texture2D mapTex : register(t0);\n"
 	"SamplerState samp : register(s0);\n"
@@ -108,7 +122,7 @@ static const char* kPcfReceiveShader =
 	"float4 main(float2 uv : TEXCOORD0, float2 md : TEXCOORD1) : COLOR\n"
 	"{\n"
 	"	float shade = 1.0;\n"
-	"	if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0)\n"
+	"	if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && md.x >= 0.0 && md.x <= 1.0)\n"
 	"	{\n"
 	"		float myDepth = md.x;\n"
 	"		float count = 0.0;\n"
@@ -125,11 +139,38 @@ static const char* kPcfReceiveShader =
 	"	}\n"
 	"	return float4(shade, shade, shade, 1.0);\n"
 	"}\n";
+
+// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the receiver's pixel-shader texture reads return 0 in
+// the fixed-function-vertex + pixel-shader combination on this runtime - the constant-PS probe (no
+// texture) dims the scene exactly x0.75 while echo probes against the map AND against a plain
+// 191-filled A8R8G8B8 dummy both sample 0 (P2W0n forensics).  Every working sampling pass in the
+// engine (GN/ML/bloom/dot3) uses a programmable vertex shader, so the receiver now submits through
+// this pass-through VS.  GeneralsX @bugfix PS3.0-P3-21a 14/10/2026: the vertices carry the CPU-side
+// clip-space product of view*proj WITHOUT the perspective divide - the divide and the near-plane clip
+// belong to the rasterizer, and feeding it an already-divided triple with w=0 left the grid with no
+// valid 1/w to interpolate, which is why the receiver drew nothing at all.
+static const char* kRecvPassthroughVSShader =
+	"struct VS_OUT\n"
+	"{\n"
+	"	float4 clip : POSITION;\n"
+	"	float2 uv : TEXCOORD0;\n"
+	"	float2 md : TEXCOORD1;\n"
+	"};\n"
+	"VS_OUT main(float3 pos : POSITION, float2 uv : TEXCOORD0, float2 md : TEXCOORD1)\n"
+	"{\n"
+	"	VS_OUT o;\n"
+	"	o.clip = float4(pos, md.y);\n"	// true clip coords; md.y carries w so the rasterizer clips and divides
+	"	o.uv = uv;\n"
+	"	o.md = float2(md.x, 0.0);\n"		// md.x = own depth in the map convention, unchanged
+	"	return o;\n"
+	"}\n";
 #endif // _WIN32
 
 // ---- module state ----------------------------------------------------------------------------
 
-static const int kMapSizeLadder[3] = { 1024, 512, 256 };
+// GeneralsX @feature PS3.0-P3-22 14/10/2026: 2048 joins the ladder at the top (S2 tier request);
+// creation failure still steps down exactly like before.
+static const int kMapSizeLadder[4] = { 2048, 1024, 512, 256 };
 
 static Int		g_mapSize			= 0;		// edge that actually got created
 static bool		g_wantMap				= false;	// env gate, read once
@@ -141,6 +182,13 @@ static IDirect3DSurface9*			g_depthSurface		= nullptr;
 static IDirect3DPixelShader9*		g_depthPS			= nullptr;
 static IDirect3DPixelShader9*		g_fillPS			= nullptr;
 static IDirect3DPixelShader9*		g_pcfPS			= nullptr;
+static IDirect3DVertexShader9*		g_recvVS		= nullptr;	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026 pass-through VS
+static D3DFORMAT			g_mapFmt		= D3DFMT_UNKNOWN;	// format that passed RT+filter-sample query and got created
+// GeneralsX @feature PS3.0-P3-21b 14/10/2026: TextureClass shell that adopts g_mapTex (AlphaTerrainTextureClass
+// precedent, TerrainTex.cpp) so DX8GeomNormal can bind the map through the wrapper's cached Set_Texture path -
+// the raw device SetTexture the overlay used bypasses that cache and is what the runtime punishes with
+// zero reads.  Borrowed pointer between Set_Sun_Shadow and Clear_Sun_Shadow.
+static TextureClass*		g_mapTexWrapper	= nullptr;
 #endif
 static bool		g_resourcesReady	= false;
 static bool		g_initAttempted		= false;
@@ -153,6 +201,11 @@ static Real						g_sunHalfWidth		= 0.0f;		// ortho half extent in world units
 static Vector3				g_sunDir;					// unit: terrain -> sun
 static AABoxClass			g_sunBox;					// texel-snapped visible-terrain box
 static bool						g_frameActive			= false;		// map valid for THIS frame's receiver
+// GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 composition flags. g_gnArmed mirrors "GN reception is
+// mounted for THIS frame" and g_gnStrength carries its premultiplied darkening; both are read by the
+// volumetric shadow pass (W3DVolumetricShadow) so the two screen layers compose instead of stacking.
+static bool						g_gnArmed				= false;
+static float					g_gnStrength			= 0.0f;
 
 static Int						g_statCastors			= 0;
 static Int						g_statTris				= 0;
@@ -174,7 +227,118 @@ static bool sunShadowMapEnabled()
 	return g_wantMap;
 }
 
+// GeneralsX @feature PS3.0-P3-21b 14/10/2026: GN-reception mode, default ON (GENERALSX_SMAP_GNRECV=0
+// forces the old terrain overlay back for A/B runs).  The RECMODE 5/6 discriminator legs (14/10) proved
+// the raw overlay draw cannot sample ANY texture on this runtime - it paints its ~75% screen grid BLACK -
+// so while GN reception is mounted the overlay is parked and the map is pushed to DX8GeomNormal instead:
+// buildings and units (the rigid XYZNUV1/2 batches the GN pass already lights per-pixel) now receive each
+// other's sun shadows, with the light-0-only attenuation the S-line spec asks for.
+static bool sunShadowGNReception()
+{
+	static int s_gn = -1;
+	if (s_gn < 0)
+	{
+		const char* e = getenv("GENERALSX_SMAP_GNRECV");
+		s_gn = (e != nullptr && strcmp(e, "0") == 0) ? 0 : 1;
+	}
+	return s_gn != 0;
+}
+
+// GeneralsX @feature PS3.0-P3-22 14/10/2026: PCF kernel tier for the GN reception variants -
+// GENERALSX_SMAP_PCF=5 selects the 5x5 (25-tap) pixel shader, anything else (default) keeps the
+// 3x3 (9-tap) one.  The penumbra spread handed to the shader scales with the kernel so both tiers
+// blur the same world-space width at equal map size, and the 1/mapSize factor keeps softening
+// proportionate when the resolution dropdown moves between 512/1024/2048 (S2 "比例软化").
+static int sunShadowPCFTaps()
+{
+	static int s_pcf = -1;
+	if (s_pcf < 0)
+	{
+		const char* e = getenv("GENERALSX_SMAP_PCF");
+		s_pcf = (e != nullptr && atoi(e) == 5) ? 5 : 3;
+	}
+	return s_pcf;
+}
+
+// GeneralsX @feature PS3.0-P3-22 14/10/2026: QA-only map-size override so A/B legs can pin a tier
+// without editing Options.ini; 0 = follow the user dropdown. Creation failure still steps down.
+static int sunShadowMapSizeOverride()
+{
+	static int s_sz = -1;
+	if (s_sz < 0)
+	{
+		const char* e = getenv("GENERALSX_SMAP_SIZE");
+		s_sz = e ? atoi(e) : 0;
+	}
+	return s_sz;
+}
+
 #ifdef _WIN32
+
+// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: name for the [SMAP] install line.
+static const char* mapFmtName(D3DFORMAT fmt)
+{
+	switch ((unsigned)fmt)
+	{
+	case D3DFMT_R32F:				return "R32F";
+	case D3DFMT_A16B16G16R16F:	return "A16B16G16R16F";
+	case D3DFMT_R16F:				return "R16F";
+	case D3DFMT_A2B10G10R10:		return "A2B10G10R10";
+	default:							return "unknown";
+	}
+}
+
+// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: shell-black forensics proved the R32F map content is
+// visible to a GetRenderTargetData readback (0.75 marker test) while the PS sampler reads 0 on this
+// native d3d9 runtime.  D3DFMT_R32F textures are not guaranteed sampleable/filterable by the D3D9
+// capability model, so the map format is now chosen from a ladder whose members are each vetted at
+// creation time for render-target + filter-sample support.
+static bool rtFormatFilterSampleable(IDirect3DDevice9* dev, D3DFORMAT fmt)
+{
+	// The D3D9 device itself has no CheckDeviceFormat / GetPresentationParameters - query the
+	// IDirect3D9 that created it, with adapter ordinal/type from GetCreationParameters and the
+	// adapter format from GetDisplayMode.
+	IDirect3D9* d3d = nullptr;
+	if (FAILED(dev->GetDirect3D(&d3d)) || !d3d)
+		return false;
+	D3DDISPLAYMODE mode;
+	D3DDEVICE_CREATION_PARAMETERS cp;
+	const bool haveMode = SUCCEEDED(dev->GetDisplayMode(0, &mode));
+	const bool haveCp = SUCCEEDED(dev->GetCreationParameters(&cp));
+	bool ok = false;
+	if (haveMode && haveCp)
+	{
+		ok = SUCCEEDED(d3d->CheckDeviceFormat(cp.AdapterOrdinal, cp.DeviceType, mode.Format,
+			D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_FILTER, D3DRTYPE_TEXTURE, fmt)) ? true : false;
+	}
+	d3d->Release();
+	return ok;
+}
+
+// GeneralsX @feature PS3.0-P3-3r 14/10/2026 I4 consumer for the cached capability answers: DX8Caps now
+// keeps the render-target table (which since P3-9 includes the float formats) together with the
+// R32F / A16B16G16R16F filter-sample probes, so a ladder rung that the engine already knows is
+// un-sampleable is skipped without touching the driver. Rungs the caps table does not cover (R16F,
+// A2B10G10R10) still fall through to the live CheckDeviceFormat probe below.
+static bool mapFormatFilterSampleable(IDirect3DDevice9* dev, D3DFORMAT fmt, const char** source = nullptr)
+{
+	if (source) *source = "driver";
+	const DX8Caps* caps=DX8Wrapper::Get_Current_Caps();
+	if (caps)
+	{
+		const WW3DFormat ww3dFormat=D3DFormat_To_WW3DFormat(fmt);
+		switch (ww3dFormat)
+		{
+		case WW3D_FORMAT_R32F:
+		case WW3D_FORMAT_A16B16G16R16F:
+			if (source) *source = "cachedCaps";
+			return caps->Support_Filterable_Render_Target_Format(ww3dFormat);
+		default:
+			break;
+		}
+	}
+	return rtFormatFilterSampleable(dev,fmt);
+}
 
 static bool ensureResources(IDirect3DDevice9* dev)
 {
@@ -194,6 +358,10 @@ static bool ensureResources(IDirect3DDevice9* dev)
 	if (g_pcfPS == nullptr &&
 		SUCCEEDED(W3DShaderManager::compileShaderAtBestProfile(kPcfReceiveShader, false, "[SMAP]", &profile, &handle)) && handle)
 		g_pcfPS = (IDirect3DPixelShader9*)handle;
+	handle = nullptr;
+	if (g_recvVS == nullptr &&
+		SUCCEEDED(W3DShaderManager::compileShaderAtBestProfile(kRecvPassthroughVSShader, true, "[SMAP]", &profile, &handle)) && handle)
+		g_recvVS = (IDirect3DVertexShader9*)handle;
 	if (!g_depthPS || !g_fillPS || !g_pcfPS)
 		return false;
 
@@ -204,33 +372,70 @@ static bool ensureResources(IDirect3DDevice9* dev)
 	static int s_startTier = -1;
 	if (s_startTier < 0)
 	{
-		int requested = OptionPreferences().getSunShadowMapResolution();
-		s_startTier = (requested <= 256) ? 2 : (requested <= 512) ? 1 : 0;
+		// GeneralsX @feature PS3.0-P3-22 14/10/2026: ladder now tops out at 2048; the QA env
+		// GENERALSX_SMAP_SIZE pins a tier for A/B legs, the dropdown still decides the default.
+		int requested = sunShadowMapSizeOverride();
+		if (requested <= 0)
+			requested = OptionPreferences().getSunShadowMapResolution();
+		s_startTier = (requested <= 256) ? 3 : (requested <= 512) ? 2 : (requested <= 1024) ? 1 : 0;
 	}
-	for (int ladder = s_startTier; ladder < 3; ++ladder)
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: format ladder.  The 0.75-marker forensics
+	// (20261014-110939 leg) proved the PS cannot read this USAGE_RENDERTARGET R32F texture on the
+	// native d3d9 runtime even though GetRenderTargetData sees the content - D3D9 only requires
+	// drivers to filter-sample formats that pass the QUERY_FILTER capability check, and R32F
+	// render targets were created here without ever passing it.  Candidates are ordered by
+	// shadow-map pedigree: A16B16G16R16F (the d3d9-era standard) first, R32F only as a last
+	// resort and only when the driver declares it RT+filter sampleable.
+	static const D3DFORMAT kFmtLadder[4] = { D3DFMT_A16B16G16R16F, D3DFMT_R16F, D3DFMT_A2B10G10R10, D3DFMT_R32F };
+	// GeneralsX @feature PS3.0-P3-3r 14/10/2026 Two passes. The first binds only formats that pass the
+	// shared RT+filter-sample vetting (the cached DX8Caps answer when the engine probed the format, the
+	// live CheckDeviceFormat otherwise) - that vetting used to exist for R32F alone, which let an
+	// un-sampleable A16B16G16R16F map be bound and produce the same black-receiver failure. If a runtime
+	// rejects every candidate, the second pass falls back to the old unvetted behaviour so the feature
+	// degrades to "shadows look like before" instead of switching itself off, and says so on the console.
+	for (int attempt = 0; attempt < 2 && g_mapSize == 0; ++attempt)
 	{
-		int size = kMapSizeLadder[ladder];
-		IDirect3DTexture9* tex = nullptr;
-		if (FAILED(dev->CreateTexture(size, size, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &tex, nullptr)) || !tex)
-			continue;
-		IDirect3DSurface9* surface = nullptr;
-		if (FAILED(tex->GetSurfaceLevel(0, &surface)) || !surface)
+		const bool vettedOnly = (attempt == 0);
+		for (int ladder = s_startTier; ladder < 4; ++ladder)
 		{
-			tex->Release();
-			continue;
+			int size = kMapSizeLadder[ladder];
+			for (int fi = 0; fi < 4; ++fi)
+			{
+				const D3DFORMAT fmt = kFmtLadder[fi];
+				if (vettedOnly && !mapFormatFilterSampleable(dev, fmt))
+					continue;	// never bind an unqualified float map - that was the shell-black bug
+				IDirect3DTexture9* tex = nullptr;
+				if (FAILED(dev->CreateTexture(size, size, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &tex, nullptr)) || !tex)
+					continue;
+				IDirect3DSurface9* surface = nullptr;
+				if (FAILED(tex->GetSurfaceLevel(0, &surface)) || !surface)
+				{
+					tex->Release();
+					continue;
+				}
+				IDirect3DSurface9* depth = nullptr;
+				if (FAILED(dev->CreateDepthStencilSurface(size, size, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &depth, nullptr)) || !depth)
+				{
+					surface->Release();
+					tex->Release();
+					continue;
+				}
+				g_mapTex = tex;
+				g_mapSurface = surface;
+				g_depthSurface = depth;
+				g_mapSize = size;
+				g_mapFmt = fmt;
+				break;
+			}
+			if (g_mapSize != 0)
+				break;
 		}
-		IDirect3DSurface9* depth = nullptr;
-		if (FAILED(dev->CreateDepthStencilSurface(size, size, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &depth, nullptr)) || !depth)
+		if (!vettedOnly && g_mapSize != 0)
 		{
-			surface->Release();
-			tex->Release();
-			continue;
+			fprintf(stderr, "[SMAP] no float map format passed RT+filter vetting, bound %s unvetted\n",
+				mapFmtName(g_mapFmt));
+			fflush(stderr);
 		}
-		g_mapTex = tex;
-		g_mapSurface = surface;
-		g_depthSurface = depth;
-		g_mapSize = size;
-		break;
 	}
 
 	if (g_mapSize == 0)
@@ -241,9 +446,22 @@ static bool ensureResources(IDirect3DDevice9* dev)
 	if (!g_sunCam)
 		return false;
 
+	// GeneralsX @feature PS3.0-P3-21b 14/10/2026: wrapper carrying the map into DX8Wrapper::Set_Texture
+	// (8x8 throwaway + adopt, the AlphaTerrainTextureClass trick - the wrapper AddRefs the RT texture,
+	// so release order below is safe).
+	if (g_mapTexWrapper == nullptr)
+	{
+		g_mapTexWrapper = NEW_REF(TextureClass, (8, 8, WW3D_FORMAT_A1R5G5B5, MIP_LEVELS_1));
+		if (g_mapTexWrapper != nullptr)
+			g_mapTexWrapper->Set_D3D_Base_Texture(g_mapTex);
+		if (g_mapTexWrapper == nullptr)
+			fprintf(stderr, "[SMAP] PROBLEM map wrapper allocation failed, GN reception off\n");
+	}
+
 	g_resourcesReady = true;
 	g_initAttempted = true;
-	fprintf(stderr, "[SMAP] installed size=%d profile=%s\n", g_mapSize, profile ? profile : "?");
+	fprintf(stderr, "[SMAP] installed size=%d fmt=%s profile=%s recvVS=%d\n",
+		g_mapSize, mapFmtName(g_mapFmt), profile ? profile : "?", g_recvVS ? 1 : 0);
 	fflush(stderr);
 	return true;
 }
@@ -436,6 +654,21 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	if (!hmap)
 		return;
 
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the receiver cannot run without the pass-through VS
+	// (fixed-function-vertex + PS texture reads return 0 on this runtime), so disable the pass entirely
+	// rather than draw a black shell.
+	if (!g_recvVS)
+	{
+		static bool s_vsMissingWarned = false;
+		if (!s_vsMissingWarned)
+		{
+			s_vsMissingWarned = true;
+			fprintf(stderr, "[SMAP] PROBLEM pass-through VS unavailable - receiver disabled\n");
+			fflush(stderr);
+		}
+		return;
+	}
+
 	// Terrain cell window of the snapped sun box, clamped to the map and capped at 128 cells per
 	// side by widening the stride (16-bit UP indices limit the grid to 129*129 vertices).
 	Int startX = (Int)floor((g_sunBox.Center.X - g_sunBox.Extent.X) / MAP_XY_FACTOR);
@@ -460,12 +693,26 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 
 	struct RecvV
 	{
-		float x, y, z;			// world surface, lifted a hair off the terrain like the decal path
+		float x, y, z;			// clip xyz (pre-divide); the pass-through VS pairs it with pad as w
 		float u, v;				// TEXCOORD0: sun-map uv
-		float depth, pad;		// TEXCOORD1.x: this vertex's own depth in the map convention
+		float depth, pad;		// TEXCOORD1.x own depth in the map convention, .y clip.w
 	};
 	static const DWORD kRecvFVF = D3DFVF_XYZ | D3DFVF_TEX2 |
 		D3DFVF_TEXCOORDSIZE2(0) | D3DFVF_TEXCOORDSIZE2(1);
+
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the draw goes through a real vertex shader, so
+	// build view*proj on the CPU here (same matrices the FF path used) and pre-divide each vertex.
+	Matrix3D view;
+	sceneCamera->Get_View_Matrix(&view);
+	Matrix4x4 proj;
+	sceneCamera->Get_D3D_Projection_Matrix(&proj);
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: engine composition order is proj*view, exactly
+	// like the proven g_sunM = sunProj * sunView for the occluder pass (matrix4.h operator* with
+	// Transform_Vector's row-dot application reproduces the device's row-vector v*V*P chain).
+	// An initial view*proj draft transformed in the wrong order - the receiver draw then landed
+	// entirely off-screen and looked "not darkening".
+	Matrix4x4 vpM = proj * Matrix4x4(view);
+	const float lift = 0.01f * MAP_XY_FACTOR;
 
 	std::vector<RecvV> verts((size_t)gw * gh);
 	const float zSpan = g_sunZFarDist - g_sunZNearDist;
@@ -486,13 +733,32 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 			float cz = g_sunM[2][0]*wx + g_sunM[2][1]*wy + g_sunM[2][2]*hz + g_sunM[2][3];
 
 			RecvV& o = verts[n++];
-			o.x = wx;
-			o.y = wy;
-			o.z = hz + 0.01f * MAP_XY_FACTOR;		// same lift the shadow decals use against z-fight
+			// GeneralsX @bugfix PS3.0-P3-21a 14/10/2026: submit TRUE clip coordinates and hand the
+			// rasterizer its w.
+			//
+			// The previous revision divided on the CPU and left pad=0.0f, so the pass-through VS built
+			// float4(ndc, 0) - a clip vector with w==0. Every fixed point the rasterizer then computes
+			// comes from a division by w, so on the native-d3d9 runtime the whole receiver grid was
+			// either discarded or mapped through a degenerate 1/0, which is the third layer of the
+			// "#27 receiver" failure: the echo probes proved the sampler worked and the constant-PS probe
+			// proved the draw happened, yet nothing darkened, because the primitive never survived
+			// clipping. Passing (clip.xyz, w) instead restores the exact hardware behaviour the retail
+			// fixed-function path had, and lets vertices behind the near plane be clipped properly rather
+			// than folded through the divide.
+			float lz = hz + lift;						// same lift the shadow decals use against z-fight
+			Vector4 worldV4(wx, wy, lz, 1.0f);
+			Vector4 clipCam;
+			Matrix4x4::Transform_Vector(vpM, worldV4, &clipCam);
+			float ow = clipCam.W;
+			if (ow < 0.001f && ow > -0.001f)
+				ow = (ow < 0.0f) ? -0.001f : 0.001f;	// degenerate near-plane guard; hardware clips the row
+			o.x = clipCam.X;
+			o.y = clipCam.Y;
+			o.z = clipCam.Z;
 			o.u = 0.5f * (cx + 1.0f);					// identical mapping to SunShadowSinkImpl::Submit
 			o.v = 0.5f * (1.0f - cy);
 			o.depth = 0.5f * cz + 0.5f;
-			o.pad = 0.0f;
+			o.pad = ow;									// consumed as clip.w by kRecvPassthroughVSShader
 		}
 	}
 
@@ -515,21 +781,27 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	if (triCount <= 0)
 		return;
 
-	// Fixed-function pipeline with the scene camera - the same approach the decal flush uses, but
-	// the transforms are set explicitly so multi-view layouts use the primary view this pass was
-	// planned for.
-	Matrix3D view;
-	sceneCamera->Get_View_Matrix(&view);
-	Matrix4x4 proj;
-	sceneCamera->Get_D3D_Projection_Matrix(&proj);
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the receiver submits through a pass-through vertex
+	// shader (see kRecvPassthroughVSShader).  GeneralsX @bugfix PS3.0-P3-21a 14/10/2026: what it submits
+	// is now true clip xyz + w rather than a CPU post-divided NDC triple, which is what the shader's
+	// float4(pos, md.y) has always expected.  The WORLD/VIEW/PROJECTION sets are kept because multi-view
+	// layouts must leave the device holding the primary view this pass was planned for, same contract as
+	// the old fixed-function draw.
 	Matrix3D world(true);
 	DX8Wrapper::Set_Transform(D3DTS_WORLD, world);
 	DX8Wrapper::Set_Transform(D3DTS_VIEW, view);
 	DX8Wrapper::Set_Transform(D3DTS_PROJECTION, proj);
 
 	dev->SetTexture(0, g_mapTex);
-	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: POINT taps for PCF.  The shell-black root cause was
+	// the fixed-function-vertex + pixel-shader combination: its PS texture reads return 0 for ANY bound
+	// texture on this runtime (P2W0n probes: constant-PS draw fine, map echo and plain-dummy echo both
+	// read 0).  The receiver now runs through a pass-through vertex shader; POINT + NONE mip filtering
+	// stays because the D3D9 capability model does not guarantee LINEAR for float RT formats and the
+	// 3x3 taps at 1.25-texel spread do not need it.
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);	// single-level RT texture; stale LINEAR mip state must not leak in
 	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
@@ -541,11 +813,12 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	static float s_intensityCached = -1.0f;
 	if (s_intensityCached < 0.0f)
 		s_intensityCached = (float)OptionPreferences().getShadowMapIntensity() * 0.01f;
-	float strength = s_intensityCached;
+	const float strength = s_intensityCached;
+
 	float c0[4] = { spread, spread, bias, strength };
 	dev->SetPixelShaderConstantF(0, c0, 1);
 
-	dev->SetVertexShader(nullptr);
+	dev->SetVertexShader(g_recvVS);
 	dev->SetPixelShader(g_pcfPS);
 	dev->SetFVF(kRecvFVF);
 
@@ -563,20 +836,27 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 
-	HRESULT drawHr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)triCount,
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the raw DIPUP below uses whatever the DEVICE
+	// actually holds, while DX8Wrapper::Set_Transform only defers WORLD/VIEW (dirty flags, applied by
+	// the sorting renderer) and writes PROJECTION through - the transforms are set through the wrapper
+	// above so the multi-view layouts leave the device holding the primary view this pass planned for.
+	const HRESULT drawHr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)triCount,
 		&indices[0], D3DFMT_INDEX16, &verts[0], sizeof(RecvV));
 
-	static bool s_recvLogged = false;
-	if (!s_recvLogged)
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: a once-only log hid a later-frame failure; repeat
+	// the hr for the first four receiver draws.
+	static int s_recvLogged = 0;
+	if (s_recvLogged < 4)
 	{
-		s_recvLogged = true;
-		fprintf(stderr, "[SMAP] recv grid=%dx%d stride=%d tris=%d hr=0x%08X halfW=%.1f zSpan=%.1f cells=[%d..%d]x[%d..%d]\n",
-			gw, gh, stride, triCount, (unsigned)drawHr, (double)g_sunHalfWidth, (double)zSpan,
-			startX, endX, startY, endY);
+		++s_recvLogged;
+		fprintf(stderr, "[SMAP] recv#%d grid=%dx%d stride=%d tris=%d hr=0x%08X strength=%.2f halfW=%.1f zSpan=%.1f cells=[%d..%d]x[%d..%d]\n",
+			s_recvLogged, gw, gh, stride, triCount, (unsigned)drawHr, (double)strength,
+			(double)g_sunHalfWidth, (double)zSpan, startX, endX, startY, endY);
 		fflush(stderr);
 	}
 
 	dev->SetPixelShader(nullptr);
+	dev->SetVertexShader(nullptr);
 	dev->SetTexture(0, nullptr);
 	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 	dev->SetRenderState(D3DRS_COLORWRITEENABLE,
@@ -598,6 +878,13 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 	IDirect3DDevice9* dev = DX8Wrapper::_Get_D3D_Device8();
 	if (!dev || dev->TestCooperativeLevel() != D3D_OK)
 		return;
+
+	// GeneralsX @feature PS3.0-P3-21b 14/10/2026: default the GN reception OFF every frame and re-arm
+	// it at the bottom of this function only when the occluder pass actually filled the map - any of
+	// the early returns above (feature off, device lost, sun too shallow, no visible terrain box) then
+	// leaves meshes on the plain GN shaders rather than sampling a stale map.
+	DX8GeomNormal::Clear_Sun_Shadow();
+	g_gnArmed = false;   // GeneralsX @feature PS3.0-P3-23: re-armed below only on a fresh push.
 
 	if (!ensureResources(dev))
 		return;
@@ -633,7 +920,14 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 	g_sunHalfWidth = radius;
 	float eyeDist = radius + 600.0f;
 	g_sunZNearDist = 10.0f;
-	g_sunZFarDist = 2.0f * radius + 600.0f + 100.0f;
+	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the receiver grid spans the visible box's X/Y window,
+	// but terrain inside that window can sit far above/below the box's Z extent - the shell demo camera
+	// produced rebased sun depths up to 1.713 (pxbox), and every PCF compare for those texels failed,
+	// multiplying the whole visible terrain dark (menu mean 13/255 vs 77/255 with the pass off).  The
+	// depth slab is therefore widened by the map's full height span so grid depths land inside [0,1];
+	// the receiver shader guard added in the same change keeps anything still outside fully lit.
+	float heightSpan = (WorldHeightMap::getMaxHeightValue() - WorldHeightMap::getMinHeightValue()) * MAP_HEIGHT_SCALE;
+	g_sunZFarDist = 2.0f * radius + 600.0f + 100.0f + heightSpan;
 
 	// Texel-snap the center onto the map grid so the projected box does not shimmer frame to
 	// frame while the camera and sun move slowly.
@@ -669,45 +963,44 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 	renderOccluderPass(dev);
 	g_frameActive = true;
 
-	// GeneralsX @bugfix Qoder 13/10/2026 T6 diag: sampling only the first three frames missed every
-	// caster - the projected-shadow lists populate well after the loadsave frame.  Re-sample early
-	// AND at the same cadence as the stats line so map content and caster counts correlate.
+	// GeneralsX @feature PS3.0-P3-21b 14/10/2026: hand the freshly filled map to the GN pass.
+	// Same numbers the terrain overlay used: 1.25-texel PCF spread, 1.5 world units of depth bias
+	// over the ortho slab, Options.ini ShadowMapIntensity as strength (0 parks the overlay anyway
+	// because Apply then keeps the plain GN shaders).
+	if (sunShadowGNReception() && g_mapTexWrapper != nullptr && DX8GeomNormal::Sun_Shadow_Ready())
 	{
-		if (g_frameCounter < 3 || (g_frameCounter % 300) == 299)
+		static float s_gnIntensity = -1.0f;
+		if (s_gnIntensity < 0.0f)
+			s_gnIntensity = (float)OptionPreferences().getShadowMapIntensity() * 0.01f;
+		const float zSpan = g_sunZFarDist - g_sunZNearDist;
+		// GeneralsX @feature PS3.0-P3-22 14/10/2026: proportionate softening - the kernel half-width
+		// is 1.25 texels for 3x3 and 2.5 for 5x5, and dividing by the map edge keeps the world-space
+		// penumbra constant when the resolution tier moves (512 -> 2048).
+		const float spreadFactor = (sunShadowPCFTaps() == 5) ? 2.5f : 1.25f;
+		DX8GeomNormal::Set_Sun_Shadow(g_mapTexWrapper, g_sunM,
+			spreadFactor / (float)g_mapSize, (zSpan > 1.0f) ? 1.5f / zSpan : 0.0f, s_gnIntensity);
+		g_gnArmed = true;         // GeneralsX @feature PS3.0-P3-23: composition queries see reception live
+		g_gnStrength = s_gnIntensity;
+		static bool s_gnPushedLogged = false;
+		if (!s_gnPushedLogged)
 		{
-			IDirect3DTexture9* staging = nullptr;
-			if (SUCCEEDED(dev->CreateTexture(g_mapSize, g_mapSize, 1, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &staging, nullptr)))
-			{
-				IDirect3DSurface9* stgSurf = nullptr;
-				if (SUCCEEDED(staging->GetSurfaceLevel(0, &stgSurf)) &&
-					SUCCEEDED(dev->GetRenderTargetData(g_mapSurface, stgSurf)))
-				{
-					D3DLOCKED_RECT lr;
-					if (SUCCEEDED(stgSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
-					{
-						const float* pixels = (const float*)lr.pBits;
-						const int pitchFloats = (int)(lr.Pitch / sizeof(float));
-						int below = 0; int total = 0;
-						for (int yy = 0; yy < g_mapSize; yy += 16)
-						{
-							for (int xx = 0; xx < g_mapSize; xx += 16)
-							{
-								float v = pixels[yy * pitchFloats + xx];
-								if (v < 0.99f) ++below;
-								++total;
-							}
-						}
-						float center = pixels[(g_mapSize / 2) * pitchFloats + g_mapSize / 2];
-						stgSurf->UnlockRect();
-						fprintf(stderr, "[SMAP] mapcheck@%d frac<0.99=%.3f center=%.3f casters=%d tris=%d\n",
-							g_frameCounter, (float)below / (float)total, center,
-							g_statCastors, g_sink.m_triTotal);
-						fflush(stderr);
-					}
-				}
-				if (stgSurf) stgSurf->Release();
-				staging->Release();
-			}
+			s_gnPushedLogged = true;
+			fprintf(stderr, "[SMAP] GN reception armed (map=%s %d, pcf=%dx%d, spread=%.5f, bias=%.5f, strength=%.2f)\n",
+				mapFmtName(g_mapFmt), g_mapSize, sunShadowPCFTaps(), sunShadowPCFTaps(),
+				(double)(spreadFactor / (float)g_mapSize),
+				(double)((zSpan > 1.0f) ? 1.5f / zSpan : 0.0f), (double)s_gnIntensity);
+			fflush(stderr);
+		}
+	}
+	else if (sunShadowGNReception())
+	{
+		static bool s_gnMissWarned = false;
+		if (!s_gnMissWarned)
+		{
+			s_gnMissWarned = true;
+			fprintf(stderr, "[SMAP] GN reception unavailable (wrapper=%d ready=%d), overlay stays active\n",
+				g_mapTexWrapper != nullptr ? 1 : 0, DX8GeomNormal::Sun_Shadow_Ready() ? 1 : 0);
+			fflush(stderr);
 		}
 	}
 
@@ -731,6 +1024,20 @@ void W3DSunShadowMap::renderTerrainReceiver(CameraClass *sceneCamera)
 #ifdef _WIN32
 	if (!g_frameActive || !sceneCamera)
 		return;
+	// GeneralsX @feature PS3.0-P3-21b 14/10/2026: with GN reception armed the overlay would double-darken
+	// meshes AND still paint its black grid over the terrain (its texture reads return 0), so park it.
+	// GENERALSX_SMAP_GNRECV=0 restores the pre-P3-21b behaviour for A/B forensics.
+	if (sunShadowGNReception() && g_mapTexWrapper != nullptr && DX8GeomNormal::Sun_Shadow_Ready())
+	{
+		static bool s_parkedLogged = false;
+		if (!s_parkedLogged)
+		{
+			s_parkedLogged = true;
+			fprintf(stderr, "[SMAP] terrain overlay receiver parked (GN reception active)\n");
+			fflush(stderr);
+		}
+		return;
+	}
 	IDirect3DDevice9* dev = DX8Wrapper::_Get_D3D_Device8();
 	if (!dev || dev->TestCooperativeLevel() != D3D_OK)
 		return;
@@ -738,18 +1045,38 @@ void W3DSunShadowMap::renderTerrainReceiver(CameraClass *sceneCamera)
 #endif // _WIN32
 }
 
+// GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 composition queries (see header).  These read the frame
+// flags set in preSceneUpdate so the volumetric screen pass can halve its darkening while GN reception is
+// active; on a non-Windows / feature-off build the flags are always false/0 (the whole occluder path lives
+// under _WIN32), which is exactly the "no sun map, keep volumetric full-strength" behaviour.
+bool W3DSunShadowMap::isReceptionActive()
+{
+	return g_gnArmed;
+}
+
+float W3DSunShadowMap::receptionStrength()
+{
+	return g_gnStrength;
+}
+
 void W3DSunShadowMap::releaseResources()
 {
 #ifdef _WIN32
+	// GeneralsX @feature PS3.0-P3-21b: drop the GN reception state BEFORE the raw texture goes away -
+	// the wrapper is a borrowed pointer to DX8GeomNormal.
+	DX8GeomNormal::Clear_Sun_Shadow();
+	if (g_mapTexWrapper) { REF_PTR_RELEASE(g_mapTexWrapper); }
 	if (g_mapSurface) { g_mapSurface->Release(); g_mapSurface = nullptr; }
 	if (g_depthSurface) { g_depthSurface->Release(); g_depthSurface = nullptr; }
 	if (g_mapTex) { g_mapTex->Release(); g_mapTex = nullptr; }
 	if (g_depthPS) { g_depthPS->Release(); g_depthPS = nullptr; }
 	if (g_fillPS) { g_fillPS->Release(); g_fillPS = nullptr; }
 	if (g_pcfPS) { g_pcfPS->Release(); g_pcfPS = nullptr; }
+	if (g_recvVS) { g_recvVS->Release(); g_recvVS = nullptr; }	// GeneralsX @bugfix PS3.0-P3-23: the overlay VS was missing here - it leaks on every device reset otherwise.
 	g_resourcesReady = false;
 	g_initAttempted = false;
 	g_mapSize = 0;
+	g_mapFmt = D3DFMT_UNKNOWN;
 	g_frameActive = false;
 #endif
 }

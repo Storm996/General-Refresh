@@ -42,4 +42,8 @@ class W3DSunShadowMap
 		static void renderTerrainReceiver(CameraClass *) {}
 		static void releaseResources() {}
 		static void reAcquireResources() {}
+		// GeneralsX @feature PS3.0-P3-23 14/10/2026: no-op stubs for the S4 composition queries
+		// (base game never runs the sun-map pass, so reception is always inactive).
+		static bool isReceptionActive() { return false; }
+		static float receptionStrength() { return 0.0f; }
 };

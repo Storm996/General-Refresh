@@ -51,6 +51,7 @@ static void drawFramerateBar();
 #include "Common/FramePacer.h"
 #include "Common/ThingFactory.h"
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"	// GeneralsX @feature PS3.0-P3-25a 14/10/2026 VSync present interval
 #include "Common/PerfTimer.h"
 #include "Common/FileSystem.h"
 #include "Common/LocalFileSystem.h"
@@ -1032,8 +1033,27 @@ void W3DDisplay::init()
 		WW3D::Set_Prelit_Mode( WW3D::PRELIT_MODE_LIGHTMAP_MULTI_PASS );
 		WW3D::Set_Collision_Box_Display_Mask(0x00);	///<set to 0xff to make collision boxes visible
 		WW3D::Enable_Static_Sort_Lists(true);
-		WW3D::Set_Thumbnail_Enabled(false);
+		// GeneralsX @feature PS3.0-P2-3 14/10/2026 T8: the thumbnail chain (ww3d default true) is
+		// still disabled at runtime, so load decodes every texture full-size. Re-enabling it can
+		// also decode synchronously on first in-game use (dx8texman invalidate path), which needs
+		// hitch/VRAM measurement before it can ship as default. Opt-in knob for that A/B:
+		// GENERALSX_THUMBNAIL=1 enables the thumbnail fallback storage.
+		{
+			const char* thumbEnv = getenv("GENERALSX_THUMBNAIL");
+			const Bool thumbEnabled = (thumbEnv != nullptr && thumbEnv[0] == '1');
+			WW3D::Set_Thumbnail_Enabled(thumbEnabled);
+			if (thumbEnabled)
+			{
+				fprintf(stderr, "[T8] thumbnail storage ENABLED (load-time full decode skipped)\n");
+				fflush(stderr);
+			}
+		}
 		WW3D::Set_Screen_UV_Bias( TRUE );  ///< this makes text look good :)
+
+	// GeneralsX @feature PS3.0-P3-25a 14/10/2026 vsync from Options.ini (VSync=0/1, restart to
+	// take effect; GENERALSX_SWAPINTERVAL=0..3 still overrides inside the getter).  Injected here,
+	// before the device is created below, so Set_Render_Device consumes it without a Reset.
+	DX8Wrapper::Set_User_Present_Interval(OptionPreferences().getPresentInterval());
 
 		fprintf(stderr, "[DEBUG-WIN] W3DDisplay::init() - TheGlobalData->m_windowed=%d\n", (int)TheGlobalData->m_windowed);
 		setWindowed( TheGlobalData->m_windowed );

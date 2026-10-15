@@ -27,6 +27,33 @@
 #include <cstring>
 #include <cmath>
 
+// GeneralsX @feature PS3.0-P3-12 14/10/2026: hemispherical ambient strength (master report L5).
+// The engine's ambient is a flat constant; multiplying an ambient*hemiscale tint by the WORLD-up
+// component of the pixel normal (W3D is Z-up - see DX8NormalMap's g_FallbackDir) lifts sky-facing
+// surfaces and leaves downward faces on the plain ambient, so shadowed ground no longer reads as
+// the same value as an upward-lit wall. Uploaded as the GN-family PS c16 / ML PS c8 hemi rgb.
+// READ ONCE per process; GENERALSX_HEMI=0 restores the flat-ambient look bit-for-bit.
+static float Hemi_Ambient_K()
+{
+	static float cached = -1.0f;
+	if (cached < 0.0f) {
+		cached = 0.35f;
+		const char* ev = getenv("GENERALSX_HEMI");
+		if (ev != nullptr && *ev != 0) cached = (float)atof(ev);
+		if (cached < 0.0f) cached = 0.0f;
+	}
+	return cached;
+}
+
+// GeneralsX @feature PS3.0-P3-14 14/10/2026: per-pixel distance fog for the GN family
+// (PS c25/c26) and the multi-light dot3 path (PS c9/c10). WW3D2 must not read the game
+// layer's GlobalData, so the display layer injects the pair through DX8NormalMap::Set_Fog
+// (same layering precedent as Set_Sun_Shadow). colorStrength.w == 0 keeps every pixel
+// bit-for-bit identical to the pre-fog shader (lerp with t=0). File-scope so both
+// namespaces' Apply paths read the same state.
+static Vector4 g_FogColorStrength(0.0f, 0.0f, 0.0f, 0.0f);   // rgb haze tint, w = strength
+static Vector4 g_FogRamp(0.0f, 1.0f, 0.0f, 0.0f);            // x = eye-depth start, y = 1/length
+
 namespace DX8NormalMap
 {
 	// GeneralsX  d3d9 port 11/10/2026 - D3D9 shader handles are interface pointers (UINT_PTR carries them on x64).
@@ -53,6 +80,72 @@ namespace DX8NormalMap
 			cached = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
 		}
 		return cached == 1 && g_VS_ML != 0 && g_PS_ML != 0;
+	}
+
+	// GeneralsX @feature PS3.0-P4-1 15/10/2026 roughness/metalness (PBR) variant for the dot3
+	// single-light path (光影三阶段/粗糙度引擎承接工作清单.md M1+M2).  The pair is compiled by the
+	// device layer and carries the SAME VS constant layout as g_VS/g_PS (c0..c3 WVP, c4 model-space
+	// light, c5 model-space eye, c9 model-space fill); the PS adds sampler s2 (the "<stem>_rp"
+	// companion: R=roughness, G=metalness) and c8=(mode, LI, ENV, -) where mode selects the branch:
+	//   0 = off (this pair never mounts), 1 = M1 roughness-driven Blinn, 2 = M2 GGX metallic-roughness.
+	// Mounting additionally requires the diffuse to have a companion _rp texture; without one, without
+	// handles, or without GENERALSX_PBR=1/2 in the process environment, the single-light path runs
+	// bit-for-bit - zero regression.  The ML branch keeps priority: a mesh with live point lights
+	// uses g_VS_ML/g_PS_ML exactly as before (the ML shader has no rp support by design).
+	static UINT_PTR g_VS_PBR = 0;
+	static UINT_PTR g_PS_PBR = 0;
+
+	// GeneralsX @feature PS3.0 #70 15/10/2026: the PBR mode became runtime state armed by the device
+	// layer (OptionPreferences::getPBRMode at shader install, options menu re-arms live). The env
+	// read moved into the getter, and the mode no longer requires the normal-map switch: at mode>0
+	// with the bump path off, Apply still mounts the PBR pair with a flat tangent normal (roughness
+	// specular on the geometric normal). Default OFF keeps the single-light path bit-for-bit.
+	static int g_PBRMode = 0;
+	static int PBR_Mode()
+	{
+		return g_PBRMode;
+	}
+
+	// Radiance scaler for the diffuse lobe (bakes the 0..1 lambert into the legacy brightness;
+	// GENERALSX_PBR_LI).
+	// GeneralsX @tweak PS3.0 #70 15/10/2026: retuned 3.2 -> 1.0. The old value was calibrated in the
+	// lighting-preview studio against *un-baked albedo*, but in-game the diffuse stage is still the
+	// retail texture with baked lighting, so the GGX lambert rides on top of the baked light and
+	// 3.2 doubled the light ("everything glows" report). 1.0 keeps parity with the retail look;
+	// re-evaluate upward once un-baked albedo ships. The studio mirrors this default (viewer.html).
+	static float PBR_LI()
+	{
+		static float cached = -1.0f;
+		if (cached < 0.0f) {
+			cached = 1.0f;
+			const char* ev = getenv("GENERALSX_PBR_LI");
+			if (ev != nullptr && *ev != 0) cached = (float)atof(ev);
+			if (cached < 0.0f) cached = 0.0f;
+		}
+		return cached;
+	}
+
+	// Constant-hemisphere environment strength for the M2 ambient term (c8.z * F0; no IBL cubemap
+	// at RTS scale, see 工作清单 §2 M2). GENERALSX_PBR_ENV, default 0.06.
+	static float PBR_ENV()
+	{
+		static float cached = -1.0f;
+		if (cached < 0.0f) {
+			cached = 0.06f;
+			const char* ev = getenv("GENERALSX_PBR_ENV");
+			if (ev != nullptr && *ev != 0) cached = (float)atof(ev);
+			if (cached < 0.0f) cached = 0.0f;
+		}
+		return cached;
+	}
+
+	void Install_PBR(UINT_PTR vs_handle, UINT_PTR ps_handle)
+	{
+		g_VS_PBR = vs_handle;
+		g_PS_PBR = ps_handle;
+		fprintf(stderr, "[PBR] variant pair installed vs=%p ps=%p mode=%d\n",
+			(void*)vs_handle, (void*)ps_handle, PBR_Mode());
+		fflush(stderr);
 	}
 
 	// GeneralsX @feature T3-0 P1: global sun fallback (direction TOWARD the light source - same
@@ -82,6 +175,14 @@ namespace DX8NormalMap
 		g_FillColor = color;
 	}
 
+	// GeneralsX @feature PS3.0-P3-14 14/10/2026: store the injected fog pair (see file-scope g_Fog*
+	// above). Called by the display layer once per setting change; both Apply paths upload it.
+	void Set_Fog(const Vector4& colorStrength, const Vector4& startInvLen)
+	{
+		g_FogColorStrength = colorStrength;
+		g_FogRamp = startInvLen;
+	}
+
 	// GeneralsX @tweak T3-0 showcase mode: GENERALSX_NORMALMAP_SHOWCASE=1 exaggerates the bump
 	// (6x in-plane normal deviation + fixed oblique tangent-space light + low ambient) so the
 	// dot3 pipeline effect is unmistakably visible for verification. Never active by default.
@@ -95,9 +196,41 @@ namespace DX8NormalMap
 		return cached == 1;
 	}
 
-	// Simple single-slot cache: avoid re-deriving/re-looking-up when consecutive meshes share a diffuse.
-	static const char* g_LastDiffuse = nullptr;
-	static TextureClass* g_CachedNormal = nullptr;
+		// GeneralsX @performance PS3.0 #71 15/10/2026: the old single-slot caches (g_LastDiffuse/
+		// g_CachedNormal, g_LastRPDiffuse/g_CachedRP) thrashed whenever consecutive meshes used
+		// different diffuses - every miss re-ran 2-4 Get_File/Open/Is_Available BIG-archive probes on
+		// the render thread per frame, which is the main CPU cost behind the "GPU <40% but 100fps"
+		// report. Replaced by a 256-entry direct-index hash per channel, keyed on the diffuse file
+		// name and caching NEGATIVE results too (most retail diffuses have no companion: first probe
+		// stores nullptr, later frames are one strcmp). Collisions evict the older entry (correct,
+		// just re-probes). TextureClass* lifetime assumption is unchanged from the slot caches: the
+		// asset manager owns the instance for the session.
+		struct Companion_Cache {
+			struct Entry { char key[256]; TextureClass* tex; bool used; };
+			Entry slots[256];
+			Companion_Cache() { for (int i = 0; i < 256; ++i) { slots[i].key[0] = 0; slots[i].tex = nullptr; slots[i].used = false; } }
+			static unsigned Hash(const char* s) {
+				unsigned h = 2166136261u;
+				for (; *s; ++s) h = (h ^ (unsigned char)*s) * 16777619u;
+				return h & 255u;
+			}
+			// Returns the cached texture (nullptr = cached miss) and sets *hit.
+			TextureClass* Peek(const char* key, bool& hit) {
+				const int idx = (int)Hash(key);
+				Entry& e = slots[idx];
+				hit = e.used && strcmp(e.key, key) == 0;
+				return hit ? e.tex : nullptr;
+			}
+			void Put(const char* key, TextureClass* tex) {
+				if (strlen(key) >= sizeof(Entry::key)) return;   // pathological name: stay uncached
+				Entry& e = slots[(int)Hash(key)];
+				strcpy(e.key, key);
+				e.tex = tex;
+				e.used = true;
+			}
+		};
+		static Companion_Cache g_NmCache;
+		static Companion_Cache g_RPCache;
 
 	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle)
 	{
@@ -109,8 +242,39 @@ namespace DX8NormalMap
 	bool Is_Enabled()              { return g_Enabled; }
 	bool Ready_To_Render()         { return g_Enabled && g_VS != 0 && g_PS != 0; }
 
+	// GeneralsX @feature PS3.0 #70 15/10/2026: independent roughness toggle (see header).
+	void Set_PBR_Mode(int mode)    { g_PBRMode = (mode >= 1 && mode <= 2) ? mode : 0; }
+	int  Get_PBR_Mode()            { return g_PBRMode; }
+	bool RP_Ready()                { return g_PBRMode > 0 && g_VS_PBR != 0 && g_PS_PBR != 0; }
+
 	void Set_Strength(float s)     { g_Strength = s; }
 	float Get_Strength()           { return g_Strength; }
+
+	// GeneralsX @bugfix PS3.0-P4 #68 15/10/2026: team-colour skins must never take the dot3/PBR path.
+	// Vehicles/buildings tint their HOUSECOLOR parts through the VertexMaterialClass diffuse/ambient
+	// (W3DAssetManager::Recolor_Vertex_Material clones one tinted prototype per colour). The custom
+	// dot3/PBR shaders light from the injected sun/ambient constants and the vertex COLOR0 stream and
+	// do NOT read that material tint, so mounting a companion normal map on a house-colour skin drops
+	// the team colour (the exact "all non-infantry house colours vanished" regression the full-library
+	// _nm rollout detonated). ZHCD* are the exporter-generated house-colour diffuse atlases
+	// (DIFFUSE_HOUSECOLOR_TEXTURE_PREFIX); "*housecolor*" covers the retail atlas names (housecolor2…).
+	// Infantry skins (ZHCa_/ZHCd_) bake the colour into the texture variant on the CPU, so they stay
+	// mountable. Skipping the companion here falls the part back to the fixed pipeline, material tint
+	// included, bit-for-bit retail.
+	static bool Is_TeamColor_Skin(const char* base)
+	{
+		if (base == nullptr) return true;
+		char low[256];
+		int i = 0;
+		for (; base[i] != 0 && i < 255; ++i) {
+			const char c = base[i];
+			low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+		}
+		low[i] = 0;
+		if (i >= 255) return true;   // pathological name: refuse to mount
+		if (strncmp(low, "zhcd", 4) == 0) return true;
+		return strstr(low, "housecolor") != nullptr;
+	}
 
 	// Derive the companion-normal name from the diffuse name and fetch the cached texture object
 	// (M1 already loaded it under the same name into the asset hash).
@@ -121,10 +285,10 @@ namespace DX8NormalMap
 		const char* raw = (const char*)dn;
 		if (raw == nullptr || raw[0] == 0) return nullptr;
 
-		// Cache hit?
-		if (g_CachedNormal != nullptr && g_LastDiffuse != nullptr && strcmp(g_LastDiffuse, raw) == 0) {
-			return g_CachedNormal;
-		}
+		// Hash-cache lookup first: a hit (including a cached negative) skips all file probes.
+		bool cacheHit = false;
+		TextureClass* cachedNm = g_NmCache.Peek(raw, cacheHit);
+		if (cacheHit) return cachedNm;
 
 		char base[256];
 		int i = 0;
@@ -132,6 +296,7 @@ namespace DX8NormalMap
 		base[i] = 0;
 		char* dot = strrchr(base, '.');
 		if (dot != nullptr) *dot = 0;
+		if (Is_TeamColor_Skin(base)) { g_NmCache.Put(raw, nullptr); return nullptr; }   // #68: house-colour skins keep the fixed pipeline
 		const int baseLen = (int)strlen(base);
 		if (baseLen >= 3 && strcmp(base + baseLen - 3, "_nm") == 0) return nullptr;
 		if (baseLen >= 6 && strcmp(base + baseLen - 6, "_nm_ai") == 0) return nullptr;
@@ -153,7 +318,7 @@ namespace DX8NormalMap
 				}
 			}
 		}
-		if (found == nullptr) return nullptr;
+		if (found == nullptr) { g_NmCache.Put(raw, nullptr); return nullptr; }
 
 		// Load the companion as full RGB (A8R8G8B8) so the blue Z channel survives. The earlier
 		// U8V8 (2-channel bump) request dropped Z, so the shader's _bx2 read Z as -1 (backward normal),
@@ -162,10 +327,60 @@ namespace DX8NormalMap
 		if (am == nullptr) return nullptr;
 		TextureClass* nm = am->Get_Texture(found, MIP_LEVELS_ALL, WW3D_FORMAT_A8R8G8B8);
 
-		g_LastDiffuse = raw;   // the diffuse name is owned by its object, outliving this cache slot
-		g_CachedNormal = nm;
+		g_NmCache.Put(raw, nm);
 
 		return nm;
+	}
+
+	// GeneralsX @feature PS3.0-P4-1 15/10/2026: companion roughness/metalness probe, mirroring
+	// Find_Companion_Normal's pattern (loose/BIG "<base>_rp" .tga then .dds, full RGB load so R and
+	// G survive, 256-entry hash cache with negative results, same contract as the normal probe).
+	// The asset contract (工作清单 §1): R=roughness, G=metalness, B=0, A=255, 32bpp, same size as
+	// the retail diffuse.
+
+	static TextureClass* Find_Companion_RP(TextureClass* diffuse)
+	{
+		if (diffuse == nullptr) return nullptr;
+		const StringClass& dn = diffuse->Get_Texture_Name();
+		const char* raw = (const char*)dn;
+		if (raw == nullptr || raw[0] == 0) return nullptr;
+
+		bool cacheHit = false;
+		TextureClass* cachedRp = g_RPCache.Peek(raw, cacheHit);
+		if (cacheHit) return cachedRp;
+
+		char base[256];
+		int i = 0;
+		for (; raw[i] != 0 && i < 255; ++i) base[i] = raw[i];
+		base[i] = 0;
+		char* dot = strrchr(base, '.');
+		if (dot != nullptr) *dot = 0;
+		if (Is_TeamColor_Skin(base)) { g_RPCache.Put(raw, nullptr); return nullptr; }   // #68/#70: roughness must skip house-colour skins too
+		const int baseLen = (int)strlen(base);
+		if (baseLen >= 3 && strcmp(base + baseLen - 3, "_rp") == 0) return nullptr;   // never probe our own output
+
+		static const char* const kExts[] = { ".tga", ".dds" };
+		const char* found = nullptr;
+		char candidate[300];
+		for (int e = 0; e < 2 && found == nullptr; ++e) {
+			snprintf(candidate, sizeof(candidate), "%s_rp%s", base, kExts[e]);
+			FileClass* file = _TheFileFactory->Get_File(candidate);
+			if (file != nullptr) {
+				file->Open();
+				bool avail = file->Is_Available();
+				file->Close();
+				_TheFileFactory->Return_File(file);
+				if (avail) found = candidate;
+			}
+		}
+		if (found == nullptr) { g_RPCache.Put(raw, nullptr); return nullptr; }
+
+		WW3DAssetManager* am = WW3DAssetManager::Get_Instance();
+		if (am == nullptr) return nullptr;
+		TextureClass* rp = am->Get_Texture(found, MIP_LEVELS_ALL, WW3D_FORMAT_A8R8G8B8);
+
+		g_RPCache.Put(raw, rp);
+		return rp;
 	}
 
 	bool Apply(const Matrix3D& world, LightEnvironmentClass* lenv, TextureClass* diffuse)
@@ -175,14 +390,29 @@ namespace DX8NormalMap
 		// and ambient below. The old guard rejected it, so such meshes intermittently skipped
 		// Apply frame-to-frame (NULL/non-NULL lenv alternation) and flickered between the
 		// dot3 pass and the fixed pipeline - the "snow/plain texture swap" flicker the user saw.
-		if (!Ready_To_Render() || diffuse == nullptr) {
+		// GeneralsX @feature PS3.0 #70 15/10/2026: the bump path needs the normal-map switch; the
+		// roughness path only needs the PBR pair + an rp companion. Either arm alone (or both)
+		// mounts this pass; with nm==nullptr the PBR pair runs on a FLAT tangent normal.
+		if (diffuse == nullptr) {
 			return false;
 		}
-
-		// --- bind companion normal texture to stage1 ---
-		TextureClass* nm = Find_Companion_Normal(diffuse);
-		if (nm == nullptr) {
+		const bool bumpOn = Ready_To_Render();
+		if (!bumpOn && !RP_Ready()) {
 			return false;
+		}
+		TextureClass* nm = bumpOn ? Find_Companion_Normal(diffuse) : nullptr;
+		TextureClass* rp = RP_Ready() ? Find_Companion_RP(diffuse) : nullptr;
+		if (nm == nullptr && rp == nullptr) {
+			return false;
+		}
+		// Roughness-only mode never had the point-light ML pair to offer: if this mesh's light
+		// environment collects point lights, leave it to the fixed pipeline (which still lights
+		// them) instead of mounting the single-light PBR pair and losing those lights.
+		if (nm == nullptr && lenv != nullptr) {
+			const int total = lenv->Get_Light_Count();
+			for (int i = 0; i < total; ++i) {
+				if (lenv->isPointLight(i)) return false;
+			}
 		}
 
 		// --- WVP for the custom vertex shader ---
@@ -269,24 +499,32 @@ namespace DX8NormalMap
 		c9fill.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(9, &c9fill, 1);  // c9 = model-space fill direction
 
-		// --- PS constants: c1 = strength, c2 = ambient, c5 = flat normal for NOSTAGE1 diag ---
+		// --- PS constants: c1 = sun gain (fixed), c2 = ambient, c3 = bump deviation, c5 = flat normal for NOSTAGE1 diag ---
 		Vector4 c5(0.0f, 0.0f, 1.0f, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(5, &c5, 1);
 
 		const Vector3& amb = (lenv != nullptr) ? lenv->Get_Equivalent_Ambient() : g_FallbackAmbient;
 		float ambient = (amb.X + amb.Y + amb.Z) * (1.0f / 3.0f);
-		float strength = g_Strength;
 		Vector3 ambColor(ambient, ambient, ambient);
+		// GeneralsX @bugfix PS3.0 #69 15/10/2026: the options-menu "normal strength" slider was wired
+		// to PS c1, which the shaders multiply onto the SUN lambert term (col = base*(ndl*c1 + ambient…))
+		// — so the bump slider was really a brightness knob and cranking it blew the buildings out.
+		// c1 is now the fixed calibrated sun gain (0.8 = the shipped default slider value, so every A/B
+		// photo stays reproducible); the slider drives the actual bump deviation c3.x instead, scaled so
+		// the old default 0.8 reproduces the previous hard-coded xyScale 2.5 exactly (0 -> flat, 2 -> 6.25).
+		const float lightGain = 0.8f;
+		float bumpK = g_Strength * 3.125f;
+		if (bumpK < 0.0f) bumpK = 0.0f;
 		if (showcase) {
 			// GeneralsX @tweak Qoder 11/10/2026 T3-0: the exaggerated showcase params are gone;
 			// they caused the harsh light/dark cliff on low-poly faces (near-black backfaces +
 			// 2.2x frontfaces + ultra-oblique light). The showcase flag now only bumps strength
 			// slightly and keeps the REAL sun direction + REAL ambient, so rotation no longer
 			// snaps faces between black and blown-out.
-			strength = 0.9f;
+			bumpK = 0.9f * 3.125f;
 		}
-		Vector4 sc(strength, 0.0f, 0.0f, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(1, &sc, 1);          // c1 = strength
+		Vector4 sc(lightGain, 0.0f, 0.0f, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(1, &sc, 1);          // c1 = fixed sun gain (slider no longer rides it)
 		Vector4 ac(ambColor.X, ambColor.Y, ambColor.Z, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(2, &ac, 1);          // c2 = ambient
 
@@ -294,11 +532,10 @@ namespace DX8NormalMap
 		// (pairs with the VS c9 -> TEXCOORD3 fill direction above). Black = feature off.
 		Vector4 fc7(g_FillColor.X, g_FillColor.Y, g_FillColor.Z, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(7, &fc7, 1);         // c7 = fill color
-		const float xyScale = 2.5f;
-		// GeneralsX @tweak Qoder 11/10/2026 T3-0: c3 = (k, 0, 1, 0) feeds the PS exaggeration
-		// (mad r3.xy = r1_bx2.xy * k ; mad r3.z = r1_bx2.z * 1). k=2.5 makes building bumps clearly
-		// visible under the RTS top-down camera.
-		Vector4 bs(xyScale, 0.0f, 1.0f, 0.0f);
+		// GeneralsX @tweak PS3.0 #69 15/10/2026: c3.x (the tangent-space xy deviation, i.e. the REAL
+		// bump strength the shader applies to the normal map) now comes from the options slider via
+		// bumpK instead of the old hard-coded 2.5; default slider 0.8 maps to the same 2.5.
+		Vector4 bs(bumpK, 0.0f, 1.0f, 0.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(3, &bs, 1);          // c3 = xy exaggeration k, z passthrough
 
 		// GeneralsX @feature PS3.0 T1 13/10/2026: c6 = (specPow, specIntensity, -, -) for the Blinn-Phong
@@ -327,12 +564,14 @@ namespace DX8NormalMap
 		// and the device layer installed the ML pair, bind that instead - the PS loops over up to
 		// four lights per pixel with radius falloff.  No point lights (the overwhelming common
 		// case) or GENERALSX_MULTILIGHT=0 keeps the T1 single-light path bit-for-bit.
-		if (lenv != nullptr && ML_Enabled())
+		if (nm != nullptr && lenv != nullptr && ML_Enabled())
 		{
-			Vector4 mlLights[8];
+			// GeneralsX @feature PS3.0-P3-18 14/10/2026: the collection cap follows the engine's
+			// widened MAX_LIGHTS (4 -> 8); the ML PS loop and mlights[16] (c17..c32) match.
+			Vector4 mlLights[16];
 			int mlCount = 0;
 			const int total = lenv->Get_Light_Count();
-			for (int i = 0; i < total && mlCount < 4; ++i)
+			for (int i = 0; i < total && mlCount < 8; ++i)
 			{
 				if (!lenv->isPointLight(i)) continue;
 				const Vector3& c = lenv->getPointCenter(i);
@@ -364,13 +603,57 @@ namespace DX8NormalMap
 				DX8Wrapper::Set_Pixel_Shader_Constant(5, &eyeWorld, 1);
 				Vector4 cnt((float)mlCount, 0.0f, 0.0f, 0.0f);
 				DX8Wrapper::Set_Pixel_Shader_Constant(16, &cnt, 1);
-				DX8Wrapper::Set_Pixel_Shader_Constant(17, &mlLights[0], 8);
+				DX8Wrapper::Set_Pixel_Shader_Constant(17, &mlLights[0], 16);   // 8 pairs, c17..c32
+				// GeneralsX @feature PS3.0-P3-12 14/10/2026: ML PS reads c8 = hemi ambient rgb,
+				// multiplied by the world-up component of the perturbed normal (n.z, W3D Z-up).
+				// ambColor is the same scalar ambient the dot3 path already uses for c2.
+				{
+					const float hk = Hemi_Ambient_K();
+					Vector4 hemi(ambColor.X * hk, ambColor.Y * hk, ambColor.Z * hk, 0.0f);
+					DX8Wrapper::Set_Pixel_Shader_Constant(8, &hemi, 1);        // c8 = hemi ambient
+				}
+				// GeneralsX @feature PS3.0-P3-14 14/10/2026: c9/c10 = eye-depth fog ramp (see file-scope
+				// g_Fog*). strength w=0 (the default until the display layer injects) is a shader no-op.
+				DX8Wrapper::Set_Pixel_Shader_Constant(9, &g_FogColorStrength, 1);
+				DX8Wrapper::Set_Pixel_Shader_Constant(10, &g_FogRamp, 1);
 
 				DX8Wrapper::Set_Texture(1, nm);
 				DX8Wrapper::Set_Vertex_Shader(g_VS_ML);
 				DX8Wrapper::Set_Pixel_Shader(g_PS_ML);
 				return true;
 			}
+		}
+
+		// GeneralsX @feature PS3.0-P4-1 15/10/2026: PBR variant mount (see Install_PBR block above).
+		// Only the single-light path reaches here (the ML branch returned first, by design).  The
+		// variant VS reads the c0..c5/c9 constants uploaded above unchanged; the PS additionally
+		// samples stage2 (the _rp companion) and reads c8=(mode, LI, ENV, -).
+		// GeneralsX @feature PS3.0 #70 15/10/2026: rp was probed up-front, so this branch now runs
+		// with or without the normal-map switch.  Roughness-only (nm == nullptr) leaves stage1
+		// unbound and re-uploads c3=(0,0,0,1): the PS discards whatever the (unbound) s1 sample
+		// returns and shades with the FLAT tangent normal, i.e. the interpolated geometric normal.
+		if (rp != nullptr)
+		{
+			static int s_pbrMounted = 0;
+			if (s_pbrMounted < 8)
+			{
+				++s_pbrMounted;
+				fprintf(stderr, "[PBR] mode=%d mounted on diffuse='%s' with rp='%s' bump=%d\n",
+					PBR_Mode(), (const char*)diffuse->Get_Texture_Name(), (const char*)rp->Get_Texture_Name(),
+					nm != nullptr ? 1 : 0);
+				fflush(stderr);
+			}
+			const Vector4 c8pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(8, &c8pbr, 1);   // c8 = (mode, LI, ENV, -)
+			if (nm == nullptr) {
+				const Vector4 flat(0.0f, 0.0f, 0.0f, 1.0f);
+				DX8Wrapper::Set_Pixel_Shader_Constant(3, &flat, 1); // c3: tangent normal forced to (0,0,1)
+			}
+			DX8Wrapper::Set_Texture(1, nm);
+			DX8Wrapper::Set_Texture(2, rp);
+			DX8Wrapper::Set_Vertex_Shader(g_VS_PBR);
+			DX8Wrapper::Set_Pixel_Shader(g_PS_PBR);
+			return true;
 		}
 
 		DX8Wrapper::Set_Texture(1, nm);
@@ -391,6 +674,10 @@ namespace DX8NormalMap
 		// fixed-pipeline format must go through Set_Vertex_FVF (SetFVF), not Set_Vertex_Shader.
 		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);
 		DX8Wrapper::Set_Texture(1, nullptr);
+		// GeneralsX @feature PS3.0-P4-1 15/10/2026: unbind the rp companion stage too (no-op when the
+		// plain single-light pair ran), so the wrapper cache can never hand a stale _rp to a later
+		// multi-stage material - same precedent as the GN sun-shadow stage2 unbind.
+		DX8Wrapper::Set_Texture(2, nullptr);
 	}
 }
 
@@ -427,6 +714,19 @@ namespace DX8GeomNormal
 	// vertex-color channel - FVF 0x112).
 	static Vector3  g_Ambient(0.0f, 0.0f, 0.0f);
 
+	// GeneralsX @feature PS3.0 P3-21b 14/10/2026 sun shadow map reception state (see dx8normalmap.h).
+	// The texture pointer is BORROWED - the game layer keeps the wrapper alive between Set and Clear.
+	static UINT_PTR g_SunVS_DUV1 = 0;
+	static UINT_PTR g_SunVS_DUV2 = 0;
+	static UINT_PTR g_SunPS      = 0;
+	static UINT_PTR g_SunPS5     = 0;   // GeneralsX @feature PS3.0-P3-22: optional 5x5 (25-tap) PCF variant
+	static TextureClass* g_sunTex = nullptr;
+	static Matrix4x4 g_sunM;                       // world -> light clip (Transform_Vector convention)
+	static float  g_sunSpread = 0.0f;              // PCF tap offset in UV units
+	static float  g_sunBias   = 0.0f;              // acne guard in [0,1] depth
+	static float  g_sunStrength = 0.0f;            // 0 disables the variant (plain GN shaders run)
+	static bool   g_sunBoundThisBatch = false;     // Restore only unbinds stage 2 after a shadow batch
+
 	void Install(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle)
 	{
 		g_VS_DUV1 = vs_duv1;
@@ -442,6 +742,56 @@ namespace DX8GeomNormal
 	bool Ready_To_Render()
 	{
 		return g_Enabled && g_PS != 0 && (g_VS_DUV1 != 0 || g_VS_DUV2 != 0);
+	}
+
+	// GeneralsX @feature PS3.0 P3-21b 14/10/2026 - sun shadow reception in the GN pass (see header).
+	void Install_Sun_Shadow(UINT_PTR vs_duv1, UINT_PTR vs_duv2, UINT_PTR ps_handle)
+	{
+		g_SunVS_DUV1 = vs_duv1;
+		g_SunVS_DUV2 = vs_duv2;
+		g_SunPS      = ps_handle;
+		fprintf(stderr, "[GN] sun-shadow variants installed vs1=%p vs2=%p ps=%p\n",
+			(void*)vs_duv1, (void*)vs_duv2, (void*)ps_handle);
+		fflush(stderr);
+	}
+
+	// GeneralsX @feature PS3.0-P3-22 14/10/2026: optional 5x5 PCF pixel shader for the shadow path.
+	// When present AND GENERALSX_SMAP_PCF=5 was set at startup, Apply mounts this instead of the 3x3;
+	// any other combination keeps the 9-tap program, so a compile failure here degrades softening,
+	// never correctness.
+	void Install_Sun_Shadow_PCF5(UINT_PTR ps_handle)
+	{
+		g_SunPS5 = ps_handle;
+		fprintf(stderr, "[GN] sun-shadow PCF5 variant installed ps=%p\n", (void*)ps_handle);
+		fflush(stderr);
+	}
+
+	void Set_Sun_Shadow(TextureClass* map, const Matrix4x4& worldToLightClip,
+		float spreadTexels, float bias, float strength)
+	{
+		g_sunTex = map;
+		g_sunM = worldToLightClip;
+		g_sunSpread = spreadTexels;
+		g_sunBias = bias;
+		g_sunStrength = strength;
+	}
+
+	void Clear_Sun_Shadow()
+	{
+		g_sunTex = nullptr;
+		g_sunStrength = 0.0f;
+	}
+
+	static bool sunShadowActive()
+	{
+		return g_Enabled && g_sunTex != nullptr && g_sunStrength > 0.0f && g_SunPS != 0;
+	}
+
+	bool Sun_Shadow_Ready()
+	{
+		// Reports the MODULE side only (the game layer asks this before parking its own receiver
+		// overlay); whether a map is currently pushed is sunShadowActive().
+		return g_Enabled && g_SunPS != 0 && (g_SunVS_DUV1 != 0 || g_SunVS_DUV2 != 0);
 	}
 
 	void Set_Global_Key_Light(const Vector3& world_dir, const Vector3& color)
@@ -470,6 +820,18 @@ namespace DX8GeomNormal
 		}
 	}
 
+	// GeneralsX @feature PS3.0 P3-21b 14/10/2026: one object point through the two proven transforms
+	// into the sun camera's clip space (ortho: w stays 1).  Used by Apply's finite-difference row solve.
+	static Vector4 lightClip(const Matrix3D& world, float x, float y, float z)
+	{
+		Vector3 wpt;
+		Matrix3D::Transform_Vector(world, Vector3(x, y, z), &wpt);
+		Vector4 in(wpt.X, wpt.Y, wpt.Z, 1.0f);
+		Vector4 out;
+		Matrix4x4::Transform_Vector(g_sunM, in, &out);
+		return out;
+	}
+
 	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv)
 	{
 		if (!Ready_To_Render()) return false;
@@ -478,6 +840,26 @@ namespace DX8GeomNormal
 		else if (fvf == (int)DX8_FVF_XYZNUV2) vs = g_VS_DUV2;
 		else return false;
 		if (vs == 0) return false;
+
+		// GeneralsX @feature PS3.0 P3-21b 14/10/2026: prefer the shadow-aware variants when a sun map
+		// is active and a variant exists for this FVF; otherwise the plain GN pair runs unchanged.
+		bool useShadow = false;
+		UINT_PTR psSel = g_PS;
+		if (sunShadowActive()) {
+			const UINT_PTR svs = (fvf == (int)DX8_FVF_XYZNUV1) ? g_SunVS_DUV1 : g_SunVS_DUV2;
+			if (svs != 0) {
+				vs = svs;
+				psSel = g_SunPS;
+				// GeneralsX @feature PS3.0-P3-22: PCF kernel tier (same env the game layer read for
+				// the spread scale - both decide once at startup, so shader and constants always agree).
+				static const int s_pcf5 = []() {
+					const char* e = getenv("GENERALSX_SMAP_PCF");
+					return e != nullptr && atoi(e) == 5;
+				}();
+				if (s_pcf5 && g_SunPS5 != 0) psSel = g_SunPS5;
+				useShadow = true;
+			}
+		}
 
 		// Same WVP convention as DX8NormalMap::Apply (raw DX8 transforms, transpose once);
 		// see the water-shader precedent comment there.
@@ -497,6 +879,36 @@ namespace DX8GeomNormal
 		const float* m = reinterpret_cast<const float*>(&wmDx8);
 		DX8Wrapper::Set_Vertex_Shader_Constant(4, m, 3);             // VS c4..c6 = world rotation rows (normal -> world)
 
+		if (useShadow) {
+			// object -> light-clip rows (VS c7..c10), composed by finite differences through the two
+			// conventions that are each PROVEN on the device: Matrix3D::Transform_Vector(world, .) for
+			// object->world (every engine transform uses it) and Matrix4x4::Transform_Vector(g_sunM, .)
+			// for world->light-clip (the terrain receiver's CPU vertex math uses exactly this and lands
+			// the grid on the map). The chain is affine, so four evaluations recover the four rows
+			// without guessing operator* transposition conventions.
+			const Vector4 L0 = lightClip(world, 0.0f, 0.0f, 0.0f);
+			const Vector4 LX = lightClip(world, 1.0f, 0.0f, 0.0f);
+			const Vector4 LY = lightClip(world, 0.0f, 1.0f, 0.0f);
+			const Vector4 LZ = lightClip(world, 0.0f, 0.0f, 1.0f);
+			float sun[16];
+			sun[0]  = LX.X - L0.X; sun[1]  = LY.X - L0.X; sun[2]  = LZ.X - L0.X; sun[3]  = L0.X;
+			sun[4]  = LX.Y - L0.Y; sun[5]  = LY.Y - L0.Y; sun[6]  = LZ.Y - L0.Y; sun[7]  = L0.Y;
+			sun[8]  = LX.Z - L0.Z; sun[9]  = LY.Z - L0.Z; sun[10] = LZ.Z - L0.Z; sun[11] = L0.Z;
+			sun[12] = LX.W - L0.W; sun[13] = LY.W - L0.W; sun[14] = LZ.W - L0.W; sun[15] = L0.W;
+			DX8Wrapper::Set_Vertex_Shader_Constant(7, sun, 4);       // VS c7..c10 = object -> light clip rows
+
+			Vector4 c15(g_sunSpread, g_sunSpread, g_sunBias, g_sunStrength);
+			DX8Wrapper::Set_Pixel_Shader_Constant(15, &c15, 1);      // PS c15 = (spread, spread, bias, strength)
+			DX8Wrapper::Set_Texture(2, g_sunTex);                    // PS sampler s2 = the float sun map
+			g_sunBoundThisBatch = true;
+			static unsigned s_gnShadowMounted = 0;
+			if ((s_gnShadowMounted++ % 4096u) == 0u) {
+				fprintf(stderr, "[GN] sun-shadow batch #%u spread=%.5f bias=%.5f strength=%.2f\n",
+					s_gnShadowMounted, (double)g_sunSpread, (double)g_sunBias, (double)g_sunStrength);
+				fflush(stderr);
+			}
+		}
+
 		// The fixed pipeline multiplied every light's diffuse by the material diffuse before the
 		// vertex lambert sum, and used D3DRS_AMBIENT = Get_Equivalent_Ambient() scaled by the
 		// material ambient, plus material emissive. We mirror that exactly, but as a per-pixel sum
@@ -507,8 +919,11 @@ namespace DX8GeomNormal
 		Vector3 me(0.0f, 0.0f, 0.0f);
 		if (vm != nullptr) { vm->Get_Diffuse(&md); vm->Get_Ambient(&ma); vm->Get_Emissive(&me); }
 
-		Vector4 dirs[4];
-		Vector4 cols[4];
+		// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8 slots, mirroring the widened MAX_LIGHTS.
+		// PS layout: dirs c5..c8 + c17..c20, matDiffuse-scaled colors c9..c12 + c21..c24 (c13..c16
+		// carry eye/spec/shadow/hemi), so lights 4..7 upload in the second const pair.
+		Vector4 dirs[8];
+		Vector4 cols[8];
 		Vector3 amb(0.0f, 0.0f, 0.0f);
 		int n = 0;
 
@@ -518,7 +933,7 @@ namespace DX8GeomNormal
 			amb.Y = ma.Y * envAmb.Y + me.Y;
 			amb.Z = ma.Z * envAmb.Z + me.Z;
 			int lc = lenv->Get_Light_Count();
-			if (lc > 4) lc = 4;
+			if (lc > 8) lc = 8;
 			for (int li = 0; li < lc; ++li) {
 				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
 				Normalize(d);
@@ -547,15 +962,29 @@ namespace DX8GeomNormal
 		}
 
 		// Zero the unused light slots: saturate(dot(n,0))=0 and color=0, so they contribute nothing.
-		for (int li = n; li < 4; ++li) {
+		for (int li = n; li < 8; ++li) {
 			dirs[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
 			cols[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
 		}
 
 		Vector4 c4amb(amb.X, amb.Y, amb.Z, 1.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(4, &c4amb, 1);          // PS c4 = material-scaled ambient
-		DX8Wrapper::Set_Pixel_Shader_Constant(5, &dirs[0], 4);        // PS c5..c8 = up to 4 world light dirs
-		DX8Wrapper::Set_Pixel_Shader_Constant(9, &cols[0], 4);        // PS c9..c12 = matDiffuse-scaled colors
+		DX8Wrapper::Set_Pixel_Shader_Constant(5, &dirs[0], 4);        // PS c5..c8 = world light dirs 0..3
+		DX8Wrapper::Set_Pixel_Shader_Constant(9, &cols[0], 4);        // PS c9..c12 = matDiffuse-scaled colors 0..3
+		DX8Wrapper::Set_Pixel_Shader_Constant(17, &dirs[4], 4);       // PS c17..c20 = world light dirs 4..7 (P3-18)
+		DX8Wrapper::Set_Pixel_Shader_Constant(21, &cols[4], 4);       // PS c21..c24 = matDiffuse-scaled colors 4..7 (P3-18)
+		// GeneralsX @feature PS3.0-P3-12 14/10/2026: PS c16 = hemi ambient rgb, multiplied by the
+		// world-up component (n.z) in the GN/GNS/GNS5 shaders. GENERALSX_HEMI=0 zeroes it and the
+		// extra term is a numerical no-op (flat-ambient parity).
+		{
+			const float hk = Hemi_Ambient_K();
+			Vector4 c16hemi(amb.X * hk, amb.Y * hk, amb.Z * hk, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(16, &c16hemi, 1);   // PS c16 = hemi ambient
+		}
+		// GeneralsX @feature PS3.0-P3-14 14/10/2026: PS c25/c26 = eye-depth fog ramp for the GN
+		// shaders. Injected state (DX8NormalMap::Set_Fog); w=0 is the exact pre-fog pixel.
+		DX8Wrapper::Set_Pixel_Shader_Constant(25, &g_FogColorStrength, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(26, &g_FogRamp, 1);
 
 		// GeneralsX @feature PS3.0 L2 14/10/2026: per-pixel Blinn-Phong on light 0, the one term the
 		// old GN pass omitted. The FF feed (dx8wrapper.cpp Set_Light_Environment) gives light0 a white
@@ -592,12 +1021,18 @@ namespace DX8GeomNormal
 		}
 
 		DX8Wrapper::Set_Vertex_Shader(vs);
-		DX8Wrapper::Set_Pixel_Shader(g_PS);
+		DX8Wrapper::Set_Pixel_Shader(psSel);
 		return true;
 	}
 
 	void Restore(UINT_PTR fvf)
 	{
+		// GeneralsX @feature PS3.0 P3-21b: unbind the sun map from stage 2 after a shadow batch so the
+		// wrapper cache cannot hand a stale map pointer to a later multi-stage material.
+		if (g_sunBoundThisBatch) {
+			DX8Wrapper::Set_Texture(2, nullptr);
+			g_sunBoundThisBatch = false;
+		}
 		DX8Wrapper::Set_Pixel_Shader(0);
 		DX8Wrapper::Set_Vertex_Shader(0);
 		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);

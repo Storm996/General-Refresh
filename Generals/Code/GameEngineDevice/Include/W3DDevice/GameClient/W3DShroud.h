@@ -120,6 +120,13 @@ protected:
 	W3DShroudLevel m_boderShroudLevel;			///<color used to clear the shroud border
 	W3DShroudLevel *m_finalFogData;			///<copy of logical shroud in an easier to access array.
 	W3DShroudLevel *m_currentFogData;		///<copy of intermediate logical shroud while it's interpolated.
+	// GeneralsX @feature PS3.0-P3-11 14/10/2026 A4: un-blurred authoritative fog level per cell.
+	// softenShroudTexture() regenerates the whole src texture from this field each frame so the
+	// 3x3 kernel is idempotent (blurring a blurred texture would keep diffusing the band wider).
+	// NULL when GENERALSX_SHROUD_BLUR=0 - the retail per-cell write path then stays bit-identical.
+	// GeneralsX backport of the GeneralsMD P3-11 change, same shape in both trees.
+	W3DShroudLevel *m_rawLevelField;			///<P3-11: raw per-cell fog levels the softening pass blurs from.
 	void interpolateFogLevels(RECT *rect);		///<fade current fog levels to actual logic side levels.
+	void softenShroudTexture();					///<P3-11: 3x3 softened rebuild of the shroud src texture.
 	void fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
 };

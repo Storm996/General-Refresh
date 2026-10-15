@@ -93,6 +93,28 @@ enum WW3DFormat {
 	WW3D_FORMAT_DXT3,
 	WW3D_FORMAT_DXT4,
 	WW3D_FORMAT_DXT5,
+	// GeneralsX @feature PS3.0-P3-9 14/10/2026 High-dynamic-range and packed-10-bit storage formats.
+	// These were probed as raw D3DFMT_* values by DX8Caps (the [CAPS4] evidence line) but sat outside
+	// the WW3DFormat table, so DX8Wrapper::Create_Render_Target - which vettes formats through
+	// Support_Render_To_Texture_Format - could never hand one out, and the shadow/HDR passes had to
+	// bypass the wrapper and create their D3D textures behind its back. Adding them here makes the
+	// existing capability loops in DX8Caps::Check_Texture_Format_Support and
+	// Check_Render_To_Texture_Support probe them automatically, and gives every format-aware helper
+	// (Get_Bytes_Per_Pixel, Has_Alpha, name lookup) a real answer instead of an assert.
+	//
+	// Deliberately NOT added: BC4/BC5 (ATI1/AT2/DXN single- and two-channel compression). They have no
+	// D3DFMT in the D3D9 API at all - the SDK 10.0.26100 headers stop at D3DFMT_DXT5/ATI2 fourcc-less -
+	// so a D3D9-level engine cannot consume them; a native Vulkan/D3D11 backend would be a prerequisite.
+	// sRGB is likewise not a format here: D3D9 expresses it through D3DSAMP_SRGBTEXTURE and
+	// D3DRS_SRGBWRITEENABLE on ordinary A8R8G8B8/A8L8 surfaces, and that gets wired where it has a
+	// consumer (P3-24 render-time gamma).
+	WW3D_FORMAT_R16F,
+	WW3D_FORMAT_G16R16F,
+	WW3D_FORMAT_A16B16G16R16F,
+	WW3D_FORMAT_R32F,
+	WW3D_FORMAT_G32R32F,
+	WW3D_FORMAT_A32B32G32R32F,
+	WW3D_FORMAT_A2B10G10R10,
 	WW3D_FORMAT_COUNT	// Used only to determine number of surface formats
 };
 
@@ -126,6 +148,10 @@ inline bool Has_Alpha(WW3DFormat format) {
 		case WW3D_FORMAT_DXT3:
 		case WW3D_FORMAT_DXT4:
 		case WW3D_FORMAT_DXT5:
+		// GeneralsX @feature PS3.0-P3-9 14/10/2026 The alpha-bearing members of the new HDR/packed set.
+		case WW3D_FORMAT_A16B16G16R16F:
+		case WW3D_FORMAT_A32B32G32R32F:
+		case WW3D_FORMAT_A2B10G10R10:
 			return true;
 			break;
 		default:
@@ -154,6 +180,14 @@ inline int Alpha_Bits(WW3DFormat format) {
 		case WW3D_FORMAT_DXT2:
 			return 1;
 			break;
+		// GeneralsX @feature PS3.0-P3-9 14/10/2026 Floating-point alpha is not a bit count; report the
+		// mantissa width, which is the closest meaningful answer for the callers that only compare >0.
+		case WW3D_FORMAT_A16B16G16R16F:
+			return 16;
+		case WW3D_FORMAT_A32B32G32R32F:
+			return 32;
+		case WW3D_FORMAT_A2B10G10R10:
+			return 2;
 		default:
 			return 0;
 			break;

@@ -51,6 +51,8 @@
 #endif
 
 #include "dx8wrapper.h"
+// GeneralsX @build PS3.0-P2-8 14/10/2026 needed for getenv/atoi in the swap-interval env override.
+#include <stdlib.h>
 // GeneralsX @build BenderAI 10/02/2026 - Need LoadLibrary/GetProcAddress/FreeLibrary for dynamic loading
 #ifndef _WIN32
 #include "module_compat.h"
@@ -107,6 +109,10 @@ const D3DMULTISAMPLE_TYPE DEFAULT_MSAA = D3DMULTISAMPLE_NONE;
 
 static D3DPRESENT_PARAMETERS _PresentParameters;
 
+// GeneralsX @feature PS3.0-P3-25a 14/10/2026 present interval (0..3) the device layer injects
+// from Options.ini VSync before the device is created; -1 = nothing injected (retail default).
+static int s_UserPresentInterval = -1;
+
 // GeneralsX @bugfix Copilot 24/08/2026 Fall back through supported MSAA sample counts instead of disabling AA immediately.
 static D3DMULTISAMPLE_TYPE Normalize_MSAA_Mode(D3DMULTISAMPLE_TYPE mode)
 {
@@ -161,6 +167,31 @@ static bool Is_MSAA_Mode_Supported(
 			windowed,
 			mode,
 			&qualityLevels));
+}
+
+// GeneralsX @feature PS3.0-P3-1 14/10/2026 I1: the quality-levels out-param of
+// CheckDeviceMultiSampleType was accepted above but never used, so MultiSampleQuality stayed at 0.
+// This helper reports the tier count actually available for a mode (the smaller of the backbuffer
+// and depth-format answers) so Set_Render_Device can clamp a user-requested tier to it.
+static unsigned Query_MSAA_Quality_Levels(
+	IDirect3D9 *direct3D,
+	unsigned adapter,
+	D3DFORMAT backBufferFormat,
+	D3DFORMAT depthStencilFormat,
+	BOOL windowed,
+	D3DMULTISAMPLE_TYPE mode)
+{
+	if (mode == D3DMULTISAMPLE_NONE)
+		return 0;
+
+	DWORD bbLevels = 0;
+	DWORD dsLevels = 0;
+	if (FAILED(direct3D->CheckDeviceMultiSampleType(adapter, D3DDEVTYPE_HAL, backBufferFormat, windowed, mode, &bbLevels)))
+		return 0;
+	if (FAILED(direct3D->CheckDeviceMultiSampleType(adapter, D3DDEVTYPE_HAL, depthStencilFormat, windowed, mode, &dsLevels)))
+		return 0;
+
+	return (bbLevels < dsLevels) ? (unsigned)bbLevels : (unsigned)dsLevels;
 }
 
 // --- Pillarbox: render game to offscreen RT, blit centered onto backbuffer ---
@@ -468,7 +499,7 @@ IDirect3DSurface9 *			DX8Wrapper::DefaultDepthBuffer						= nullptr;
 bool								DX8Wrapper::IsRenderToTexture							= false;
 
 unsigned							DX8Wrapper::_MainThreadID								= 0;
-bool								DX8Wrapper::CurrentDX8LightEnables[4];
+bool								DX8Wrapper::CurrentDX8LightEnables[8];	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8 (light units)
 bool								DX8Wrapper::IsDeviceLost;
 int								DX8Wrapper::ZBias;
 // GeneralsX @feature PS3.0 batch7 13/10/2026 hardware depth bias mirror values, see DX8Wrapper::Set_Depth_Bias
@@ -482,8 +513,9 @@ Matrix4x4						DX8Wrapper::DX8Transforms[D3DTS_WORLD+1];
 
 DX8Caps*							DX8Wrapper::CurrentCaps = nullptr;
 
-// Hack test... this disables rendering of batches of too few polygons.
-unsigned							DX8Wrapper::DrawPolygonLowBoundLimit=0;
+// GeneralsX @refactor PS3.0-P3-33 14/10/2026 removed the dead "too few polygons" batch-disable
+// hack (DX8Wrapper::DrawPolygonLowBoundLimit): no code ever set the limit, so the counter stayed
+// 0 and its early-out never culled anything.
 
 D3DADAPTER_IDENTIFIER9		DX8Wrapper::CurrentAdapterIdentifier;
 
@@ -632,7 +664,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	IsWindowed = false;
 	DX8Wrapper_IsWindowed = false;
 
-	for (int light=0;light<4;++light) CurrentDX8LightEnables[light]=false;
+	for (int light=0;light<8;++light) CurrentDX8LightEnables[light]=false;	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8
 
 	//old_vertex_shader; TODO
 	//old_sr_shader;
@@ -945,6 +977,20 @@ bool DX8Wrapper::Create_Device()
 
 	Vertex_Processing_Behavior=(caps.DevCaps&D3DDEVCAPS_HWTRANSFORMANDLIGHT) ?
 		D3DCREATE_MIXED_VERTEXPROCESSING : D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+
+	// GeneralsX @feature PS3.0-P3-33 14/10/2026 I10 evaluation: MIXED keeps the DX8-era per-shader
+	// vertex-processing switch, which shows up as pipeline boundaries under DXVK. GENERALSX_HWVP=1
+	// asks for D3DCREATE_HARDWARE_VERTEXPROCESSING on devices that advertise HW T&L; the screen-space
+	// RHW quads (bloom/water filter passes) are not affected by the choice. Default stays retail MIXED.
+	{
+		const char* hwvp = getenv("GENERALSX_HWVP");
+		if ((caps.DevCaps & D3DDEVCAPS_HWTRANSFORMANDLIGHT) && hwvp != nullptr && atoi(hwvp) != 0)
+		{
+			Vertex_Processing_Behavior = D3DCREATE_HARDWARE_VERTEXPROCESSING;
+			fprintf(stderr, "[HWVP] hardware vertex processing requested at device creation\n");
+			fflush(stderr);
+		}
+	}
 
 	// enable this when all 'get' dx calls are removed KJM
 	/*if (caps.DevCaps&D3DDEVCAPS_PUREDEVICE)
@@ -1429,6 +1475,36 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	_PresentParameters.PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
 	_PresentParameters.FullScreen_RefreshRateInHz = D3DPRESENT_RATE_DEFAULT;
 
+	// GeneralsX @feature PS3.0-P2-8 14/10/2026 I8a: the present interval was fixed at device creation
+	// and the engine-side Set_Swap_Interval had no caller, so vsync was not configurable without a UI
+	// session. GENERALSX_SWAPINTERVAL=0..3 now selects IMMEDIATE/ONE/TWO/THREE here (0 = uncapped).
+	// Applied before the device is created, so no Reset_Device() is needed. The Options panel wiring
+	// is left to the settings session; the engine already consumes the value.
+	// GeneralsX @feature PS3.0-P3-25a 14/10/2026 that wiring landed: the device layer injects the
+	// Options.ini VSync key (env still wins) through Set_User_Present_Interval before creation, and
+	// it is consumed here under the same rules.
+	{
+		const char* env = getenv("GENERALSX_SWAPINTERVAL");
+		int v = -1;
+		if (env != nullptr && env[0] != 0)
+			v = atoi(env);
+		else if (s_UserPresentInterval >= 0)
+			v = s_UserPresentInterval;
+		if (v >= 0)
+		{
+			switch (v)
+			{
+				case 0: _PresentParameters.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE; break;
+				case 2: _PresentParameters.PresentationInterval = D3DPRESENT_INTERVAL_TWO; break;
+				case 3: _PresentParameters.PresentationInterval = D3DPRESENT_INTERVAL_THREE; break;
+				case 1:
+				default: _PresentParameters.PresentationInterval = D3DPRESENT_INTERVAL_ONE; break;
+			}
+			fprintf(stderr, "[SWAP] present interval override = %d\n", v);
+			fflush(stderr);
+		}
+	}
+
 	/*
 	** Set up the buffer formats.  Several issues here:
 	** - if in windowed mode, the backbuffer must use the current display format.
@@ -1529,6 +1605,36 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 	}
 
 	_PresentParameters.MultiSampleType = MultiSampleAntiAliasing;
+
+	// GeneralsX @feature PS3.0-P3-1 14/10/2026 I1: GENERALSX_MSAA_QUALITY picks the MSAA quality tier
+	// ("max", or a 0-based index) for the mode that survived the downgrade loop above. Default stays
+	// tier 0, i.e. today's behavior; the request is clamped to the levels the adapter reports and the
+	// outcome is logged once so harness runs can attribute any difference.
+	if (MultiSampleAntiAliasing > D3DMULTISAMPLE_NONE) {
+		const char* msaaQualEnv = getenv("GENERALSX_MSAA_QUALITY");
+		if (msaaQualEnv != nullptr && msaaQualEnv[0] != 0) {
+			const unsigned levels = Query_MSAA_Quality_Levels(
+				D3DInterface,
+				CurRenderDevice,
+				_PresentParameters.BackBufferFormat,
+				_PresentParameters.AutoDepthStencilFormat,
+				IsWindowed,
+				MultiSampleAntiAliasing);
+			unsigned quality = 0;
+			if (levels > 0) {
+				if (msaaQualEnv[0]=='m' || msaaQualEnv[0]=='M')
+					quality = levels - 1;
+				else {
+					quality = (unsigned)atoi(msaaQualEnv);
+					if (quality > levels - 1) quality = levels - 1;
+				}
+			}
+			_PresentParameters.MultiSampleQuality = quality;
+			fprintf(stderr, "[MSAA] mode=%u levels=%u quality=%u request=%s\n",
+				(unsigned)MultiSampleAntiAliasing, levels, quality, msaaQualEnv);
+			fflush(stderr);
+		}
+	}
 
 	/*
 	** Time to actually create the device.
@@ -1632,6 +1738,18 @@ void DX8Wrapper::Set_Swap_Interval(int swap)
 int DX8Wrapper::Get_Swap_Interval()
 {
 	return _PresentParameters.PresentationInterval;
+}
+
+// GeneralsX @feature PS3.0-P3-25a 14/10/2026 store-only: Set_Render_Device's creation block
+// consumes this when no GENERALSX_SWAPINTERVAL env is present. Calling it after the device exists
+// has no effect until the next creation (vsync changes are a restart-to-take-effect option).
+void DX8Wrapper::Set_User_Present_Interval(int swap)
+{
+	if (swap < -1)
+		swap = -1;
+	if (swap > 3)
+		swap = 3;
+	s_UserPresentInterval = swap;
 }
 
 bool DX8Wrapper::Has_Stencil()
@@ -2479,7 +2597,9 @@ void DX8Wrapper::Draw(
 	unsigned short min_vertex_index,
 	unsigned short vertex_count)
 {
-	if (DrawPolygonLowBoundLimit && DrawPolygonLowBoundLimit>=polygon_count) return;
+	// GeneralsX @refactor PS3.0-P3-33 14/10/2026 the DrawPolygonLowBoundLimit cull was removed:
+	// its only setter had no caller in either game tree, so the counter was permanently 0 and the
+	// early-out dead code.
 
 	DX8_THREAD_ASSERT();
 	SNAPSHOT_SAY(("DX8 - draw"));
@@ -2709,9 +2829,11 @@ void DX8Wrapper::Apply_Render_State_Changes()
 
 	if (render_state_changed&LIGHTS_CHANGED)
 	{
-		unsigned mask=LIGHT0_CHANGED;
-		for (unsigned index=0;index<4;++index,mask<<=1) {
-			if (render_state_changed&mask) {
+		// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8 units; the per-unit bit comes from the
+		// class lookup table because a plain LIGHT0_CHANGED<<index shift would land on the
+		// TEXTURE0..3 change bits for index 4..7.
+		for (unsigned index=0;index<8;++index) {
+			if (render_state_changed&Get_Light_Changed_Bit(index)) {
 				SNAPSHOT_SAY(("DX8 - apply light %d",index));
 				if (render_state.LightEnable[index]) {
 #if defined(DEBUG_CRASHING) || defined(DEBUG_LOGGING)
@@ -3428,6 +3550,22 @@ void DX8Wrapper::_Update_Texture(TextureClass *system, TextureClass *video)
 	DX8CALL(UpdateTexture(system->Peek_D3D_Base_Texture(),video->Peek_D3D_Base_Texture()));
 }
 
+// GeneralsX @feature PS3.0-P2-7 14/10/2026 I6 - Capability probe results used to be log-only, so
+// no consumer could act on them. Compute_Caps now stores the depth-bias behavior check and the
+// pixel-shader caps word here; the accessors in dx8wrapper.h expose them for auto-degrade paths.
+static bool s_depthBiasAvailable=false;
+static unsigned s_ps20CapsFlags=0;
+
+bool DX8Wrapper::Is_Depth_Bias_Available()
+{
+	return s_depthBiasAvailable;
+}
+
+unsigned DX8Wrapper::Get_PS20_Caps_Flags()
+{
+	return s_ps20CapsFlags;
+}
+
 void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 {
 	DX8_THREAD_ASSERT();
@@ -3485,6 +3623,8 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 			s_sm3Logged=true;
 			const D3DCAPS9& c=CurrentCaps->Get_DX8_Caps();
 			unsigned psCaps=c.PS20Caps.Caps;
+			// GeneralsX @feature PS3.0-P2-7 14/10/2026 I6: publish the probe for callers (Get_PS20_Caps_Flags).
+			s_ps20CapsFlags=psCaps;
 			fprintf(stderr,"[SM3_CAPS] PS flow(dynamic %d, static %d) temps %d slots %d | "
 				"VS flow(dynamic %d, static %d) temps %d | SM3 slots PS %d VS %d | "
 				"PS options%s%s%s%s%s\n",
@@ -3524,6 +3664,8 @@ void DX8Wrapper::Compute_Caps(WW3DFormat display_format)
 			fprintf(stderr,"[DEPTH_BIAS] asked slope %.3f / constant %.3f, device echoes %.3f / %.3f -> %s\n",
 				testSlope,testConstant,*asFloatSlope,*asFloatConstant,
 				(*asFloatSlope==testSlope && *asFloatConstant==testConstant)?"accepted":"NOT echoed - treat as unavailable");
+			// GeneralsX @feature PS3.0-P2-7 14/10/2026 I6: publish the probe for callers (Is_Depth_Bias_Available).
+			s_depthBiasAvailable=(*asFloatSlope==testSlope && *asFloatConstant==testConstant);
 
 			Set_Slope_Scale_Depth_Bias(0.0f);
 			Set_Depth_Bias(0.0f);
@@ -3548,6 +3690,12 @@ void DX8Wrapper::Report_Shader_Constant_Range(const char* setter,int reg,int cou
 
 void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT9* light)
 {
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: guard the widened slot range (the old code relied on
+	// every caller staying below 4; now MAX_LIGHTS=8 flows here straight from LightEnvironment).
+	if (index >= 8) {
+		WWASSERT(index < 8);
+		return;
+	}
 	if (light) {
 		render_state.Lights[index]=*light;
 		render_state.LightEnable[index]=true;
@@ -3555,7 +3703,7 @@ void DX8Wrapper::Set_Light(unsigned index, const D3DLIGHT9* light)
 	else {
 		render_state.LightEnable[index]=false;
 	}
-	render_state_changed|=(LIGHT0_CHANGED<<index);
+	render_state_changed|=Get_Light_Changed_Bit(index);
 }
 
 void DX8Wrapper::Set_Light(unsigned index,const LightClass &light)
@@ -3642,7 +3790,26 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 
 	if (light_env)
 	{
+		// GeneralsX @feature PS3.0-P3-18 14/10/2026: LightEnvironment can now hand us up to 8 lights.
+		// The fixed-function path stays inside what the device advertises: MaxActiveLights is read once
+		// and cached (4 if the caps query ever fails). Anything above the cap keeps retail's fate under
+		// the old 4-slot world: its ambient is already inside D3DRS_AMBIENT via Get_Equivalent_Ambient,
+		// only the per-unit diffuse term is dropped, and lenv's sort keeps that for the strongest ones.
+		static int s_maxFFLights = -1;
+		if (s_maxFFLights < 0) {
+			s_maxFFLights = 4;
+			IDirect3DDevice9* dev = _Get_D3D_Device8();
+			if (dev != nullptr) {
+				D3DCAPS9 caps;
+				if (SUCCEEDED(dev->GetDeviceCaps(&caps))) {
+					s_maxFFLights = (caps.MaxActiveLights >= 8) ? 8 : ((caps.MaxActiveLights >= 4) ? (int)caps.MaxActiveLights : 4);
+				}
+			}
+			fprintf(stderr, "[FFLIGHT] fixed-function light unit cap = %d\n", s_maxFFLights);
+			fflush(stderr);
+		}
 		int light_count = light_env->Get_Light_Count();
+		if (light_count > s_maxFFLights) light_count = s_maxFFLights;
 		unsigned int color=Convert_Color(light_env->Get_Equivalent_Ambient(),0.0f);
 		if (RenderStates[D3DRS_AMBIENT]!=color)
 		{
@@ -3701,7 +3868,7 @@ void DX8Wrapper::Set_Light_Environment(LightEnvironmentClass* light_env)
 			Set_Light(l,&light);
 		}
 
-		for (;l<4;++l) {
+		for (;l<8;++l) {	// GeneralsX @feature PS3.0-P3-18 14/10/2026: disable the widened unit range
 			Set_Light(l,nullptr);
 		}
 	}
@@ -3746,6 +3913,56 @@ SurfaceClass * DX8Wrapper::_Get_DX8_Back_Buffer(unsigned int num)
 }
 
 
+// GeneralsX @feature PS3.0-P3-4 14/10/2026 Both Create_Render_Target overloads used to run every
+// request through Find_POT and then collapse width and height onto that single value, so a 1680x1050
+// shadow map or an off-res post-process target silently became a 1024x1024 square - the caller kept
+// projecting into the box it asked for and got a cropped, rescaled result with no diagnostic. Modern
+// D3D9 runtimes (DXVK included) place no such requirement on render targets: the retail RTT
+// post-process and the back-buffer copy in this very file already create native-size, non-power-of-two
+// targets directly through the device. The clamp is now driven by what the device actually declares:
+//   - D3DPTEXTURECAPS_POW2      : every texture, RT included, must be power-of-two
+//   - D3DPTEXTURECAPS_SQUAREONLY: RTs must additionally be square
+// and the dimension cap per axis is applied separately instead of through the shared square value.
+// GENERALSX_RT_POT=legacy restores the retail clamp for one process, which is how the A/B evidence
+// legs in 光影改造二阶段/实测对比 are produced.
+static void Apply_Render_Target_Size_Clamp(int& width,int& height)
+{
+	const D3DCAPS9& dx8caps=DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps();
+
+	static bool legacyModeQueried=false;
+	static bool legacyMode=false;
+	if (!legacyModeQueried)
+	{
+		legacyModeQueried=true;
+		const char* env=getenv("GENERALSX_RT_POT");
+		legacyMode=(env!=nullptr && stricmp(env,"legacy")==0);
+		fprintf(stderr,"[RTPOT] render target sizing: %s (texCaps=0x%08x pot=%d square=%d max=%ux%u)\n",
+			legacyMode?"retail square POT clamp":"device-declared (non-POT allowed)",
+			(unsigned)dx8caps.TextureCaps,
+			(dx8caps.TextureCaps&D3DPTEXTURECAPS_POW2)?1:0,
+			(dx8caps.TextureCaps&D3DPTEXTURECAPS_SQUAREONLY)?1:0,
+			(unsigned)dx8caps.MaxTextureWidth,(unsigned)dx8caps.MaxTextureHeight);
+		fflush(stderr);
+	}
+
+	const bool potRequired=legacyMode || !!(dx8caps.TextureCaps&D3DPTEXTURECAPS_POW2);
+	const bool squareRequired=legacyMode || !!(dx8caps.TextureCaps&D3DPTEXTURECAPS_SQUAREONLY);
+
+	if (potRequired || squareRequired)
+	{
+		// Keep the retail behaviour: shrink to the smallest axis, then to a power of two when asked.
+		float poweroftwosize=width;
+		if (height>0 && height<width) poweroftwosize=height;
+		if (potRequired) poweroftwosize=::Find_POT(poweroftwosize);
+		width=height=(int)poweroftwosize;
+	}
+
+	if (width>dx8caps.MaxTextureWidth) width=dx8caps.MaxTextureWidth;
+	if (height>dx8caps.MaxTextureHeight) height=dx8caps.MaxTextureHeight;
+	if (width<1) width=1;
+	if (height<1) height=1;
+}
+
 TextureClass *
 DX8Wrapper::Create_Render_Target (int width, int height, WW3DFormat format)
 {
@@ -3767,25 +3984,9 @@ DX8Wrapper::Create_Render_Target (int width, int height, WW3DFormat format)
 	}
 
 	//
-	//	Note: We're going to force the width and height to be powers of two and equal
+	//	Note: sized through the device-declared render-target constraints (see the helper).
 	//
-	const D3DCAPS9& dx8caps=Get_Current_Caps()->Get_DX8_Caps();
-	float poweroftwosize = width;
-	if (height > 0 && height < width) {
-		poweroftwosize = height;
-	}
-	poweroftwosize = ::Find_POT (poweroftwosize);
-
-	if (poweroftwosize>dx8caps.MaxTextureWidth) {
-		poweroftwosize=dx8caps.MaxTextureWidth;
-	}
-	if (poweroftwosize>dx8caps.MaxTextureHeight) {
-		poweroftwosize=dx8caps.MaxTextureHeight;
-	}
-
-	width = height = poweroftwosize;
-
-	//
+	Apply_Render_Target_Size_Clamp(width,height);	//
 	//	Attempt to create the render target
 	//
 	TextureClass * tex = NEW_REF(TextureClass,(width,height,format,MIP_LEVELS_1,TextureClass::POOL_DEFAULT,true));
@@ -3838,26 +4039,8 @@ void DX8Wrapper::Create_Render_Target
 		return;
 	}
 
-	//	Note: We're going to force the width and height to be powers of two and equal
-	const D3DCAPS9& dx8caps=Get_Current_Caps()->Get_DX8_Caps();
-	float poweroftwosize = width;
-	if (height > 0 && height < width)
-	{
-		poweroftwosize = height;
-	}
-	poweroftwosize = ::Find_POT (poweroftwosize);
-
-	if (poweroftwosize>dx8caps.MaxTextureWidth)
-	{
-		poweroftwosize=dx8caps.MaxTextureWidth;
-	}
-
-	if (poweroftwosize>dx8caps.MaxTextureHeight)
-	{
-		poweroftwosize=dx8caps.MaxTextureHeight;
-	}
-
-	width = height = poweroftwosize;
+	//	Note: sized through the device-declared render-target constraints (see the helper above).
+	Apply_Render_Target_Size_Clamp(width,height);
 
 	//	Attempt to create the render target
 	TextureClass* tex=NEW_REF(TextureClass,(width,height,format,MIP_LEVELS_1,TextureClass::POOL_DEFAULT,true));
@@ -4337,7 +4520,21 @@ void DX8Wrapper::Apply_Default_State()
 	Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 	Set_DX8_Render_State(D3DRS_ALPHAREF, 0);
 	Set_DX8_Render_State(D3DRS_ALPHAFUNC, D3DCMP_LESSEQUAL);
-	Set_DX8_Render_State(D3DRS_DITHERENABLE, FALSE);
+	// GeneralsX @feature PS3.0-P3-1 14/10/2026 I1: dither was hard-off. D3D only applies it when a
+	// render target below 8 bits/channel is written, so on the usual 32-bit backbuffer this is a
+	// no-op, while any 16-bit target (legacy D16 depth paths, r5g5b5 experiments) gets banding relief
+	// for free. GENERALSX_DITHER=0 restores the legacy OFF state.
+	{
+		const char* ditherEnv = getenv("GENERALSX_DITHER");
+		const DWORD ditherOn = (ditherEnv != nullptr && ditherEnv[0]=='0') ? FALSE : TRUE;
+		Set_DX8_Render_State(D3DRS_DITHERENABLE, ditherOn);
+	}
+	// GeneralsX @feature PS3.0-P3-1 14/10/2026 I1: alpha-to-coverage was tried here and is NOT possible
+	// through this stack: D3DRS_ALPHATOCONVERENABLE is a D3D8-era render state that the D3D9 headers
+	// (Windows Kits 10.0.26100 d3d9types.h, verified by grep) no longer declare at all, so the enum
+	// itself does not compile. D3D9 only reaches coverage-modulated alpha through per-sample masks or
+	// SSAA, which is I2's territory. Recorded as skipped in the phase-2 ledger; MSAA quality tier and
+	// dither above remain the landed half of I1.
 	Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
 	Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
 	Set_DX8_Render_State(D3DRS_SPECULARENABLE, FALSE);
