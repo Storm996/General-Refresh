@@ -44,18 +44,26 @@ GeneralsX modernized the **platform**: SDL3 windowing, DXVK/Vulkan rendering, Op
 
 The following are **already implemented and playable**:
 
-- 🖱️ **RA3-style unit selection panel** — when multiple units are selected, the bottom-left panel groups them by unit type with a live per-type count (e.g. *Overlord Tank x2*, *Battlemaster Tank x2*). Clicking one type icon selects every unit of that type at once, which makes commanding large mixed armies dramatically easier.
-- 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
-- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — no 32-bit D3D8 shims needed anymore: the Direct3D9 renderer runs on the native 64-bit runtime.
-- 🏎️ **High-frame-rate gameplay** — the battle itself now runs smooth: unit locomotion, steering, turret aiming, weapon fire and animation are interpolated at the display refresh rate in Skirmish, Campaign and cinematic views — all as a presentation-layer improvement on top of the unchanged deterministic simulation, so online play, LAN and replays stay bit-for-bit faithful.
+### 🎨 Visual quality
+
+- 🎨 **Texture repaints / upscaling** — unit and terrain artwork has been re-painted and upscaled through an AI-assisted texture pipeline, replacing blurry low-res retail textures with crisper, higher-detail maps.
 - 🧱 **Normal-mapped (dot3) rendering** — a tangent-space dot3 normal-mapping path is wired into the W3D renderer, giving surfaces real per-pixel lighting depth. It can be toggled live from **Options → the "Normal Mapping" checkbox** without a restart.
 - 💡 **Per-pixel lighting** — rigid battlefield meshes are lit per pixel instead of per vertex: each batch's own directional lights (up to 4) are re-evaluated against interpolated world-space geometric normals with Blinn-Phong specular, sharpening light/shadow transitions on tanks and buildings; the ambient floor ships at 0.5 for stronger contrast. Enabled by default (`GENERALSX_GEOMNORMAL=0` reverts to per-vertex).
-- 🎨 **Texture repaints / upscaling** — unit and terrain artwork has been re-painted and upscaled through an AI-assisted texture pipeline, replacing blurry low-res retail textures with crisper, higher-detail maps.
+- 🔩 **Physically-based material (PBR roughness) rendering** — a metallic-roughness PBR path is wired into the dot3 lighting pipeline: `GENERALSX_PBR=1` selects the rough-Blinn variant and `=2` the GGX variant; surfaces missing the `_rp` material map fall back to constant rough/metal values. Assets are produced by an AI texture-decomposition pipeline (CHORD) that splits diffuse art into basecolor / normal / roughness / metalness channels, packed into engine `_rp.tga` maps — verified on real hardware with `[PBR] variant compiled/installed/mounted` and replay-CRC-proven logic independence.
+
+### 🕹️ Gameplay & experience
+
+- 🏎️ **High-frame-rate gameplay** — the battle itself now runs smooth: unit locomotion, steering, turret aiming, weapon fire and animation are interpolated at the display refresh rate in Skirmish, Campaign and cinematic views — all as a presentation-layer improvement on top of the unchanged deterministic simulation, so online play, LAN and replays stay bit-for-bit faithful.
+- 🖱️ **RA3-style unit selection panel** — when multiple units are selected, the bottom-left panel groups them by unit type with a live per-type count (e.g. *Overlord Tank x2*, *Battlemaster Tank x2*). Clicking one type icon selects every unit of that type at once, which makes commanding large mixed armies dramatically easier.
 - 🧩 **Mission UI rework** — the mission briefing / selection interface has been redesigned.
 - 🎬 **Quick-launch any mission** — pick **any mission directly from the main menu** and jump straight into it, without walking through the full campaign progression.
-- 🔊 **Audio & video backend modernization** — shipped together with the 64-bit switch: audio moved fully from the 32-bit Miles engine to **MiniAudio / OpenAL (x64)**, and intro/cutscene video is decoded by **FFmpeg**, completing the 64-bit platform layer.
-- 🔩 **Physically-based material (PBR roughness) rendering** — a metallic-roughness PBR path is wired into the dot3 lighting pipeline: `GENERALSX_PBR=1` selects the rough-Blinn variant and `=2` the GGX variant; surfaces missing the `_rp` material map fall back to constant rough/metal values. Assets are produced by an AI texture-decomposition pipeline (CHORD) that splits diffuse art into basecolor / normal / roughness / metalness channels, packed into engine `_rp.tga` maps — verified on real hardware with `[PBR] variant compiled/installed/mounted` and replay-CRC-proven logic independence.
 - 🤖 **AI personality-style drivers** — Skirmish AI now ships with 8 distinct personality styles on top of the difficulty layer (Offensive, Defensive, Support, Rush, Blitz, Horde, Fortress, Sneak) plus a neural-AI scaffold, selectable per AI slot. Brutal difficulty is also strengthened (halved team tempo, earlier rally windows), and a `GENERALX_AI_TRACE=1` trace channel records driver dispatch, team activation and fortification events for verification.
+
+### 🛠️ Platform & build
+
+- 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
+- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — no 32-bit D3D8 shims needed anymore: the Direct3D9 renderer runs on the native 64-bit runtime.
+- 🔊 **Audio & video backend modernization** — shipped together with the 64-bit switch: audio moved fully from the 32-bit Miles engine to **MiniAudio / OpenAL (x64)**, and intro/cutscene video is decoded by **FFmpeg**, completing the 64-bit platform layer.
 
 ---
 
