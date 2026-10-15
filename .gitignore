@@ -187,3 +187,10 @@ references/GameServer/
 *smoke_stderr.txt
 *smoke_stdout.txt
 *buildimports.txt
+
+# Private asset tooling and local experiment folders (kept out of git)
+/T4 贴图分解工具/
+/_tmp_probe_units.py
+/光照预览工作室/
+/多线程优化/
+/画质提升调研/
