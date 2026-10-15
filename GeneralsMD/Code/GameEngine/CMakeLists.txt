@@ -235,6 +235,7 @@ set(GAMEENGINE_SRC
     Include/GameLogic/AIPlayer.h
     Include/GameLogic/AISkirmishPlayer.h
     Include/GameLogic/AIStylePersona.h
+    Include/GameLogic/AITrace.h
     Include/GameLogic/AIDefensivePlayer.h
     Include/GameLogic/AIOffensivePlayer.h
     Include/GameLogic/AISupportPlayer.h

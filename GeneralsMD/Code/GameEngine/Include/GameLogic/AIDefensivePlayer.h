@@ -45,4 +45,13 @@ public:
 	AIDefensivePlayer( Player *p );			///< constructor
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_DEFENSIVE; }
+
+	virtual const char *getDriverName() const override { return "AIDefensive"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Defensive personality behavior:
+	// holds rallied teams 90s (retail 60s) and periodically extends a real fortification
+	// ring around its base using the previously-unused skirmish base-defense builder.
+	virtual void update() override;
+
+	virtual Int getRallyTimeoutFrames() const override;
 };

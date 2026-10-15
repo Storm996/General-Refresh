@@ -82,6 +82,7 @@
 #include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/AIOffensivePlayer.h"	// GeneralsX @feature ai-upgrade 07/10/2026
 #include "GameLogic/AIDefensivePlayer.h"	// GeneralsX @feature ai-upgrade 07/10/2026
+#include "GameLogic/AITrace.h"				// GeneralsX @feature ai-upgrade 14/10/2026 forensic stderr channel
 #include "GameLogic/AISupportPlayer.h"		// GeneralsX @feature ai-upgrade 07/10/2026
 #include "GameLogic/AIRushPlayer.h"		// GeneralsX @feature ai-upgrade 07/10/2026
 #include "GameLogic/AIBlitzPlayer.h"		// GeneralsX @feature ai-upgrade 07/10/2026
@@ -796,6 +797,16 @@ void Player::setPlayerType(PlayerType t, Bool skirmish)
 		} else {
 			// create AIPlayer and attach to this Player
 			m_ai = newInstance(AIPlayer)( this );
+		}
+
+		// GeneralsX @feature ai-upgrade 14/10/2026 Dispatch forensic line: proves which driver
+		// subclass the style actually produced for this slot (style/driver mismatch in the log
+		// would mean the wiring is broken). Logging only, no simulation effect.
+		if (m_ai)
+		{
+			aiTrace("[AIDISPATCH]", "player='%s' skirmishAI=%d style=%d driver=%s",
+				m_playerName.str(), (Int)(skirmish || TheAI->getAiData()->m_forceSkirmishAI),
+				(Int)m_aiStyle, m_ai->getDriverName());
 		}
 	}
 }

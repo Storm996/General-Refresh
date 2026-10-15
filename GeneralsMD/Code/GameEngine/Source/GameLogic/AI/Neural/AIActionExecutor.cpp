@@ -78,11 +78,12 @@ static Object* aiNeuralLiveEnemy( const std::vector<Object*>& enemyRef, Int inde
 }
 
 // ---------------------------------------------------------------------------
-void AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /*obs*/, Player* self,
+Int AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /*obs*/, Player* self,
 	std::vector<Object*>& ownRef, std::vector<Object*>& enemyRef )
 {
+	Int applied = 0;
 	if ( !self )
-		return;
+		return applied;
 
 	for ( Int i = 0; i < sink.count; ++i )
 	{
@@ -105,6 +106,7 @@ void AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /
 				pos.y = a.targetY;
 				pos.z = actor->getPosition() ? actor->getPosition()->z : 0.0f;
 				ai->aiMoveToPosition( &pos, CMD_FROM_AI );
+				++applied;
 			}
 			break;
 
@@ -115,6 +117,7 @@ void AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /
 				pos.y = a.targetY;
 				pos.z = actor->getPosition() ? actor->getPosition()->z : 0.0f;
 				ai->aiAttackMoveToPosition( &pos, NO_MAX_SHOTS_LIMIT, CMD_FROM_AI );
+				++applied;
 			}
 			break;
 
@@ -122,7 +125,10 @@ void AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /
 			{
 				Object* victim = aiNeuralLiveEnemy( enemyRef, a.enemyIndex, self );
 				if ( victim )
+				{
 					ai->aiAttackObject( victim, NO_MAX_SHOTS_LIMIT, CMD_FROM_AI );
+					++applied;
+				}
 			}
 			break;
 
@@ -130,4 +136,6 @@ void AIActionExecutor::execute( const AIActionSink& sink, const AIObservation& /
 				break;
 		}
 	}
+
+	return applied;
 }

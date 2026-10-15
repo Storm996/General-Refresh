@@ -195,6 +195,11 @@ public:
 	// difficulty. Overridden by the skirmish style subclasses; the base returns AI_STYLE_HEURISTIC,
 	// preserving the original AIPlayer / AISkirmishPlayer behavior for all existing content.
 	virtual AIStyleType getAIStyle() const { return AI_STYLE_HEURISTIC; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Driver class name for the [AIPLAYER]/[AITEAM] forensic
+	// lines (never used by the simulation). Overridden by every subclass; kept virtual rather than
+	// RTTI to stay light and MSVC6-legacy friendly.
+	virtual const char *getDriverName() const { return "AIPlayer"; }
 	void buildBySupplies(Int minimumCash, const AsciiString &thingName ); ///< Builds a building by supplies.
 	void buildSpecificBuildingNearestTeam( const AsciiString &thingName, const Team *team );
 	void buildUpgrade(const AsciiString &upgrade ); ///< Builds an upgrade.
@@ -211,6 +216,19 @@ public:
 	void guardSupplyCenter( Team *team, Int minSupplies );
 
 	void setTeamDelaySeconds(Int delay) {m_teamSeconds = delay;}
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Per-driver tunables used by the personality
+	// subclasses (and the difficulty layer of the default skirmish AI) WITHOUT touching the
+	// retail decision flow. Both return integers only; the base implementations reproduce the
+	// original hard-coded behavior, so AIPlayer / untouched AISkirmishPlayer stay retail-identical.
+
+	/// How long a ready team waits at its rally point before committing (frames).
+	/// Retail behavior was a fixed 60 seconds; aggressive personas shorten it, turtles lengthen it.
+	virtual Int getRallyTimeoutFrames() const;
+
+	/// Extra supply gatherers desired per supply center on top of the difficulty INI row.
+	/// Base returns 0 (retail behavior); economy-oriented personas return a positive integer.
+	virtual Int getGathererBonus() const { return 0; }
 
 	/// Calculates the closest construction zone location based on a template.
 	Bool calcClosestConstructionZoneLocation( const ThingTemplate *constructTemplate, Coord3D *location );

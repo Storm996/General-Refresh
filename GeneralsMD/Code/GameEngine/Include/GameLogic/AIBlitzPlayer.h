@@ -47,6 +47,11 @@ public:
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_BLITZ; }
 
+	virtual const char *getDriverName() const override { return "AIBlitz"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 The armored spearhead commits after 40s (retail 60s).
+	virtual Int getRallyTimeoutFrames() const override;
+
 protected:
 	// GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: blitz refuses pure foot teams
 	// to force mechanized / armored spearheads (see AIStylePersona.h). Base gate still runs first.

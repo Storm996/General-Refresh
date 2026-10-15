@@ -31,6 +31,8 @@
 #include "Common/Player.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/AIDefensivePlayer.h"
+#include "GameLogic/AITrace.h"
+#include "GameLogic/GameLogic.h"				// TheGameLogic::getFrame()
 
 //-------------------------------------------------------------------------------------------------
 AIDefensivePlayer::AIDefensivePlayer( Player *p ) :
@@ -50,4 +52,48 @@ AISkirmishPlayer( p )
 AIDefensivePlayer::~AIDefensivePlayer()
 {
 	// Base AISkirmishPlayer destructor already disbands teams and releases queued work orders.
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Turtle timing: rallied teams hold 90s (retail 60s)
+// so the defensive line is dug in before forces commit. Integer frame math only (determinism
+// red line).
+Int AIDefensivePlayer::getRallyTimeoutFrames() const
+{
+	return 90 * LOGICFRAMES_PER_SECOND;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Fortification loop. Retail only grew the base-defense
+// ring from scripted campaign triggers, which skirmish maps never fire - this persona activates
+// that dormant builder on a fixed frame cadence: every 90s of sim time it adds one structure to
+// the ring, alternating front / flank arcs, capped so the ring stops at a sane size. All triggers
+// are pure functions of TheGameLogic->getFrame(), so every peer replays identical decisions.
+void AIDefensivePlayer::update()
+{
+	AISkirmishPlayer::update();
+
+	const Int interval = 90 * LOGICFRAMES_PER_SECOND;
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	if (frame == 0 || frame < 2 * interval || frame % interval != 0)
+		return;
+
+	if ((frame / interval) & 1)
+	{
+		if (m_curFlankBaseDefense < 4)
+		{
+			buildAIBaseDefense(true);
+			aiTrace("[AIFORT]", "%s flank fortification frame=%u flankCount=%d",
+				getDriverName(), frame, m_curFlankBaseDefense);
+		}
+	}
+	else
+	{
+		if (m_curFrontBaseDefense < 4)
+		{
+			buildAIBaseDefense(false);
+			aiTrace("[AIFORT]", "%s front fortification frame=%u frontCount=%d",
+				getDriverName(), frame, m_curFrontBaseDefense);
+		}
+	}
 }

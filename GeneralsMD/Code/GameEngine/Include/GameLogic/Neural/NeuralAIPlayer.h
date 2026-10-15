@@ -56,6 +56,9 @@ public:
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_NEURAL; }
 
+	// GeneralsX @feature ai-upgrade 14/10/2026 Forensic driver name for [AIPLAYER]/[AITEAM] lines.
+	virtual const char *getDriverName() const override { return "NeuralAI"; }
+
 	///< Swap in a different policy (takes ownership; used by P1 to mount an OnnxPolicy).
 	void setPolicy( NeuralPolicy* policy );
 

@@ -46,4 +46,15 @@ public:
 	AIFortressPlayer( Player *p );			///< constructor
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_FORTRESS; }
+
+	virtual const char *getDriverName() const override { return "AIFortress"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Fortress personality behavior: slowest commit
+	// window (120s), an extra gatherer per supply center to pay for the wall of defenses it
+	// grows every 60s via the base-defense ring builder.
+	virtual void update() override;
+
+	virtual Int getRallyTimeoutFrames() const override;
+
+	virtual Int getGathererBonus() const override { return 1; }
 };

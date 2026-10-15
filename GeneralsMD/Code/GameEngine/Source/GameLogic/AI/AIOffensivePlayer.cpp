@@ -51,3 +51,11 @@ AIOffensivePlayer::~AIOffensivePlayer()
 {
 	// Base AISkirmishPlayer destructor already disbands teams and releases queued work orders.
 }
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Sustained pressure: rallied teams commit after 40s
+// instead of the retail 60s. Integer frame math only (determinism red line).
+Int AIOffensivePlayer::getRallyTimeoutFrames() const
+{
+	return 40 * LOGICFRAMES_PER_SECOND;
+}

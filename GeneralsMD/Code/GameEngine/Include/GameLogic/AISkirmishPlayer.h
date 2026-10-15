@@ -68,6 +68,12 @@ public:	// AIPlayer interface methods.
 
 	virtual Bool isSkirmishAI() override {return true;}
 
+	// GeneralsX @feature ai-upgrade 14/10/2026 Forensic driver name + difficulty-aware rally
+	// window. See AIPlayer::getRallyTimeoutFrames for semantics.
+	virtual const char *getDriverName() const override { return "AISkirmishPlayer"; }
+
+	virtual Int getRallyTimeoutFrames() const override;
+
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
 	virtual Player *getAiEnemy() override;	///< Solo AI attacks based on scripting.  Only skirmish auto-acquires an enemy at this point.  jba.

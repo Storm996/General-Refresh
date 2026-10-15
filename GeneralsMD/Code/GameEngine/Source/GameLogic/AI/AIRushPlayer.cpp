@@ -54,6 +54,14 @@ AIRushPlayer::~AIRushPlayer()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Mad-dog timing: the first waves leave the rally
+// point after only 30s (retail 60s), so the early game is a continuous drumbeat.
+Int AIRushPlayer::getRallyTimeoutFrames() const
+{
+	return 30 * LOGICFRAMES_PER_SECOND;
+}
+
+//-------------------------------------------------------------------------------------------------
 // GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: the mad-dog layers a cheap-foot
 // filter on top of the base gate, so it spams low-cost infantry instead of saving for heavy tech.
 Bool AIRushPlayer::isAGoodIdeaToBuildTeam( TeamPrototype *proto )

@@ -46,7 +46,10 @@ public:
 	 * Execute sink's actions against the slot reference lists produced alongside obs by
 	 * AIObservationProvider. Every slot is re-validated (range / alive / still ours / still
 	 * orderable) before its command is issued; stale or illegal actions are silently dropped.
+	 * Returns the number of actions that actually reached the command channel, so the caller
+	 * can log applied vs scheduled (Gate C forensics: applied==0 with scheduled>0 means the
+	 * decoder is issuing commands the engine refuses).
 	 */
-	void execute( const AIActionSink& sink, const AIObservation& obs, Player* self,
+	Int execute( const AIActionSink& sink, const AIObservation& obs, Player* self,
 		std::vector<Object*>& ownRef, std::vector<Object*>& enemyRef );
 };

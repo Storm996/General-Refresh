@@ -95,7 +95,7 @@ void NeuralAIPlayer::update()
 	m_policy->act( m_obs, m_player, m_sink );
 
 	// --- act: revalidated slot addressing on the regular CMD_FROM_AI channel --------------
-	m_executor.execute( m_sink, m_obs, m_player, m_ownRef, m_enemyRef );
+	const Int applied = m_executor.execute( m_sink, m_obs, m_player, m_ownRef, m_enemyRef );
 
 #ifdef AI_TRAINING_DUMP
 	// Dev-only sidecar (NOT part of the shipped simulation path, never reaches release):
@@ -117,7 +117,9 @@ void NeuralAIPlayer::update()
 	if ( m_trace )
 	{
 		// Gate evidence line; logging only, zero simulation side effects.
-		fprintf( stderr, "[NEURAL] frame=%u policy=%s own=%d enemy=%d scalars=%d actions=%d\n",
-			frame, m_policy->getName(), m_obs.ownCount, m_obs.enemyCount, m_obs.scalarCount, m_sink.count );
+		// applied < actions means the decoder's commands were dropped by slot revalidation
+		// (Gate C signal); applied == actions with legal moves proves the injection channel works.
+		fprintf( stderr, "[NEURAL] frame=%u policy=%s own=%d enemy=%d scalars=%d actions=%d applied=%d\n",
+			frame, m_policy->getName(), m_obs.ownCount, m_obs.enemyCount, m_obs.scalarCount, m_sink.count, applied );
 	}
 }

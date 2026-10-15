@@ -48,6 +48,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/AIPlayer.h"
+#include "GameLogic/AITrace.h"		// GeneralsX @feature ai-upgrade 14/10/2026 forensic stderr channel
 #include "GameLogic/SidesList.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/AIPathfind.h"
@@ -105,6 +106,16 @@ m_curWarehouseID(INVALID_ID)
 AIPlayer::~AIPlayer()
 {
 	clearTeamsInQueue();
+}
+
+// ------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Retail behavior was a hard-coded 60 second rally wait
+// inside checkReadyTeams(). Exposed as a virtual so personality drivers (and the difficulty layer
+// of the default skirmish AI) can tune it; the base keeps the original 60s value verbatim.
+// ------------------------------------------------------------------------------------------------
+Int AIPlayer::getRallyTimeoutFrames() const
+{
+	return 60 * LOGICFRAMES_PER_SECOND;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -213,7 +224,9 @@ void AIPlayer::checkForSupplyCenter( BuildListInfo *info, Object *bldg )
 		}
 		info->setSupplyBuilding(true);
 		info->setCurrentGatherers(-1);
-		info->setDesiredGatherers(desiredGatherers+1); // get a freebie with the supply depots.
+		// GeneralsX @feature ai-upgrade 14/10/2026 economy personas (Support/Fortress) get a small
+		// integer bonus of extra gatherers per supply center; base returns 0 = retail behavior.
+		info->setDesiredGatherers(desiredGatherers+1+getGathererBonus()); // get a freebie with the supply depots.
 	}
 }
 
@@ -2781,8 +2794,10 @@ void AIPlayer::checkReadyTeams()
 		for ( DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamReadyQueue(); !iter.done(); iter.advance())
 		{
 			TeamInQueue *team = iter.cur();
-			// If 60 seconds passed, start anyway.
-			Bool timeExpired = team->m_frameStarted+60*LOGICFRAMES_PER_SECOND < TheGameLogic->getFrame();
+			// If the driver-specific rally window passed, start anyway.
+			// GeneralsX @feature ai-upgrade 14/10/2026 was a hard-coded 60s; now a per-driver
+			// virtual (the base returns the original 60s, so default behavior stays retail-identical).
+			Bool timeExpired = team->m_frameStarted+getRallyTimeoutFrames() < TheGameLogic->getFrame();
 			Bool allIdle=TRUE;
 			Bool anyIdle = FALSE;
 			if (team->m_reinforcement) {
@@ -2838,6 +2853,11 @@ void AIPlayer::checkReadyTeams()
 					if (isSkirmishAI()) {
 						TheScriptEngine->clearTeamFlags();
 					}
+					// GeneralsX @feature ai-upgrade 14/10/2026 forensic: a combat team just left
+					// its rally point and went active — proof the strategy layer really runs.
+					aiTrace("[AITEAM]", "%s style=%d activated team=%s frame=%u rallyWait=%d",
+						getDriverName(), (Int)getAIStyle(), team->m_team->getPrototype()->getName().str(),
+						TheGameLogic->getFrame(), getRallyTimeoutFrames());
 					if (TheGlobalData->m_debugAI) {
 						AsciiString teamName = team->m_team->getPrototype()->getName();
 						teamName.concat(" - team activated.");

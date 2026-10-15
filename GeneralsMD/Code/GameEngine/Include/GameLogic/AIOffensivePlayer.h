@@ -45,4 +45,9 @@ public:
 	AIOffensivePlayer( Player *p );			///< constructor
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_OFFENSIVE; }
+
+	virtual const char *getDriverName() const override { return "AIOffensive"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Commits rallied teams after 40s (retail: 60s).
+	virtual Int getRallyTimeoutFrames() const override;
 };

@@ -54,6 +54,14 @@ AISneakPlayer::~AISneakPlayer()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Infiltrators wait for an opening: 75s at the rally
+// point (retail 60s) instead of stampeding straight into threats.
+Int AISneakPlayer::getRallyTimeoutFrames() const
+{
+	return 75 * LOGICFRAMES_PER_SECOND;
+}
+
+//-------------------------------------------------------------------------------------------------
 // GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: sneak rejects heavy armored blobs
 // on top of the base gate, staying light for hit-and-run / economic harassment.
 Bool AISneakPlayer::isAGoodIdeaToBuildTeam( TeamPrototype *proto )

@@ -43,6 +43,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/AISkirmishPlayer.h"
+#include "GameLogic/AITrace.h"
 #include "GameLogic/SidesList.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/AIPathfind.h"
@@ -958,6 +959,18 @@ void AISkirmishPlayer::update()
 }
 
 //----------------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Difficulty-aware rally window for the default
+// skirmish AI: Brutal commits rallied teams after 45s instead of the retail 60s, tightening
+// the aggression loop purely through integer frame math (determinism red line). Personality
+// subclasses override this again with their own fixed window.
+Int AISkirmishPlayer::getRallyTimeoutFrames() const
+{
+	if (getAIDifficulty() == DIFFICULTY_HARD)
+		return 45 * LOGICFRAMES_PER_SECOND;
+	return AIPlayer::getRallyTimeoutFrames();
+}
+
+//----------------------------------------------------------------------------------------------------------
 /**
  * Adjusts the build list to match the starting position.
  */
@@ -1106,6 +1119,24 @@ void AISkirmishPlayer::newMap()
 			info->incrementNumRebuilds(); // the initial build in the normal build list consumes a rebuild, so add one.
 		}
 	}
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Difficulty tempo for the default skirmish AI:
+	// Brutal halves the team build cadence, but only when the driver still runs the raw INI
+	// tempo (personality subclasses set their own pacing in their constructors and keep it).
+	// Recomputed from the INI on every call -> idempotent even if newMap runs more than once.
+	if (getAIDifficulty() == DIFFICULTY_HARD)
+	{
+		Int iniTempo = (Int)TheAI->getAiData()->m_teamSeconds;
+		if (m_teamSeconds == iniTempo && iniTempo > 1)
+			setTeamDelaySeconds(iniTempo / 2);
+	}
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Startup forensic line proving which AI driver
+	// instance actually took the slot, together with the personality knobs in effect.
+	// Logging only (stderr, release-safe); zero simulation side effects.
+	aiTrace("[AIPLAYER]", "driver=%s style=%d difficulty=%d frame=%u teamTempo=%ds rallyFrames=%d gatherBonus=%d",
+		getDriverName(), (Int)getAIStyle(), (Int)getAIDifficulty(),
+		TheGameLogic->getFrame(), m_teamSeconds, getRallyTimeoutFrames(), getGathererBonus());
 }
 
 //----------------------------------------------------------------------------------------------------------

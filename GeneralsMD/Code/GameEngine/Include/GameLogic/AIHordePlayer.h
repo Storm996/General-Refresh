@@ -46,6 +46,13 @@ public:
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_HORDE; }
 
+	virtual const char *getDriverName() const override { return "AIHorde"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Waves leave the rally at 45s so pressure stays
+	// continuous; the gate override below also lets a second concurrent instance of an
+	// already-queued team flow when the bank can pay for it twice (sustained attrition).
+	virtual Int getRallyTimeoutFrames() const override;
+
 protected:
 	// GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: horde keeps cheap + light
 	// forces and rejects heavy tech blobs for endless attrition waves (see AIStylePersona.h).

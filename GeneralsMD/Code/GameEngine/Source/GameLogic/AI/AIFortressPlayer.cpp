@@ -31,6 +31,8 @@
 #include "Common/Player.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/AIFortressPlayer.h"
+#include "GameLogic/AITrace.h"
+#include "GameLogic/GameLogic.h"				// TheGameLogic::getFrame()
 
 //-------------------------------------------------------------------------------------------------
 AIFortressPlayer::AIFortressPlayer( Player *p ) :
@@ -50,4 +52,46 @@ AISkirmishPlayer( p )
 AIFortressPlayer::~AIFortressPlayer()
 {
 	// Base AISkirmishPlayer destructor already disbands teams and releases queued work orders.
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Extreme turtle timing: teams hold 120s at the rally
+// (retail 60s) - the fortress wants its static defense line fully manned before anything moves.
+Int AIFortressPlayer::getRallyTimeoutFrames() const
+{
+	return 120 * LOGICFRAMES_PER_SECOND;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 Fortress wall-building loop: same dormant base-defense
+// ring builder the Defensive persona activated, but on a 60s cadence and with larger caps, so the
+// turtle literally walls up over time. Frame-modulo trigger only (no new serialized state), so
+// x86_64 / ARM64 peers replay bit-identical decisions.
+void AIFortressPlayer::update()
+{
+	AISkirmishPlayer::update();
+
+	const Int interval = 60 * LOGICFRAMES_PER_SECOND;
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	if (frame == 0 || frame < 2 * interval || frame % interval != 0)
+		return;
+
+	if ((frame / interval) & 1)
+	{
+		if (m_curFlankBaseDefense < 4)
+		{
+			buildAIBaseDefense(true);
+			aiTrace("[AIFORT]", "%s flank fortification frame=%u flankCount=%d",
+				getDriverName(), frame, m_curFlankBaseDefense);
+		}
+	}
+	else
+	{
+		if (m_curFrontBaseDefense < 8)
+		{
+			buildAIBaseDefense(false);
+			aiTrace("[AIFORT]", "%s front fortification frame=%u frontCount=%d",
+				getDriverName(), frame, m_curFrontBaseDefense);
+		}
+	}
 }

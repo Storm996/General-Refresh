@@ -47,6 +47,12 @@ public:
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_SNEAK; }
 
+	virtual const char *getDriverName() const override { return "AISneak"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Infiltrators linger 75s before committing
+	// (retail 60s): sneaky teams wait for an opening rather than stampeding at threats.
+	virtual Int getRallyTimeoutFrames() const override;
+
 protected:
 	// GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: sneak avoids heavy armored
 	// blobs and sticks to light hit-and-run forces (see AIStylePersona.h). Base gate runs first.

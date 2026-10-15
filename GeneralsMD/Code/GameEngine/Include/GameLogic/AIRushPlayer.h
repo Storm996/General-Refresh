@@ -46,6 +46,11 @@ public:
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_RUSH; }
 
+	virtual const char *getDriverName() const override { return "AIRush"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Rushes hit after only 30s at the rally point.
+	virtual Int getRallyTimeoutFrames() const override;
+
 protected:
 	// GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: the mad-dog only fields its
 	// cheapest foot-soldier teams (see AIStylePersona.h). The base gate still enforces

@@ -55,6 +55,14 @@ AIBlitzPlayer::~AIBlitzPlayer()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature ai-upgrade 14/10/2026 The armored spearhead commits after 40s at the rally
+// point (retail 60s): fast, but slightly more concentrated than rush.
+Int AIBlitzPlayer::getRallyTimeoutFrames() const
+{
+	return 40 * LOGICFRAMES_PER_SECOND;
+}
+
+//-------------------------------------------------------------------------------------------------
 // GeneralsX @feature ai-upgrade 07/10/2026 P1 composition bias: blitz refuses pure foot teams on
 // top of the base gate, pushing mechanized / armored spearheads for a single fast breakthrough.
 Bool AIBlitzPlayer::isAGoodIdeaToBuildTeam( TeamPrototype *proto )

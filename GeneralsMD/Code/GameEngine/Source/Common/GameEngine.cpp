@@ -367,12 +367,169 @@ Bool GameEngine::isGameHalted()
 	return false;
 }
 
+// GeneralsX @feature ai-upgrade 14/10/2026 QA auto-skirmish hook.
+// When GENERALX_QA_SKIRMISH="map.map;aiCount;diff;style;seed" is present, replicate the
+// SkirmishGameOptionsMenu start sequence without any UI: one human slot plus aiCount AI slots,
+// each AI slot carrying the given personality style (0..9) and difficulty state
+// (e*asy/m*ed/b*rutal -> SLOT_*_AI). The game then starts immediately at max logic speed so
+// headless forensic scripts can A/B-test AI drivers by parsing the [AIPLAYER]/[AIDISPATCH]/
+// [AITEAM] trace lines. This only feeds the normal MSG_NEW_GAME path - no gameplay code,
+// no new serialized state, determinism untouched for every other launch.
+static Bool s_qaSkirmishClaimed = FALSE;
+static void checkQAAutoSkirmish()
+{
+	const char *spec = getenv("GENERALX_QA_SKIRMISH");
+	if (!spec || !*spec)
+		return;
+
+	// Never fight the -file auto-start; the command line wins.
+	if (!TheGlobalData->m_initialFile.isEmpty())
+		return;
+
+	char work[512];
+	Int wi = 0;
+	while (spec[wi] != 0 && wi < (Int)sizeof(work) - 1)
+	{
+		work[wi] = spec[wi];
+		++wi;
+	}
+	work[wi] = 0;
+
+	char *mapTok   = strtok(work, ";");
+	char *cntTok   = strtok(NULL, ";");
+	char *diffTok  = strtok(NULL, ";");
+	char *styleTok = strtok(NULL, ";");
+	char *seedTok  = strtok(NULL, ";");
+	if (!mapTok || !cntTok)
+	{
+		fprintf(stderr, "[QASKIRM] bad spec '%s' (want map;aiCount;diff;style;seed)\n", spec);
+		fflush(stderr);
+		return;
+	}
+
+	Int aiCount = atoi(cntTok);
+	if (aiCount < 1)
+		aiCount = 1;
+	if (aiCount > MAX_SLOTS - 1)
+		aiCount = MAX_SLOTS - 1;
+
+	SlotState aiState = SLOT_BRUTAL_AI;
+	if (diffTok)
+	{
+		if (diffTok[0] == 'e' || diffTok[0] == 'E')
+			aiState = SLOT_EASY_AI;
+		else if (diffTok[0] == 'm' || diffTok[0] == 'M' || diffTok[0] == 'n' || diffTok[0] == 'N')
+			aiState = SLOT_MED_AI;
+	}
+	const Int aiStyle = styleTok ? atoi(styleTok) : 0;
+	const Int seed = seedTok ? atoi(seedTok) : 12345;
+
+	// GeneralsX @feature ai-upgrade 15/10/2026 Optional 6th field: logic FPS cap
+	// ("map;count;diff;style;seed;fps"). QA forensics keep the historic 1000 (run full
+	// speed); live spectate demos pass 30 for retail pacing. Clamped to a sane range.
+	const char *fpsTok = strtok(nullptr, ";");
+	Int fpsCap = 1000;
+	if (fpsTok)
+	{
+		const Int v = atoi(fpsTok);
+		if (v >= 30 && v <= 1000)
+			fpsCap = v;
+	}
+
+	// GeneralsX @feature ai-upgrade 15/10/2026 The style field now accepts a comma-separated
+	// per-slot list (e.g. "4,6" = slot1 Rush vs slot2 Horde). A single value still applies
+	// to every AI slot, so existing 12/13-script specs are unchanged. Pure integer scan,
+	// no buffer mutation (styleTok points into the strtok'd work array).
+	Int styles[MAX_SLOTS];
+	Int nStyles = 0;
+	if (styleTok && *styleTok)
+	{
+		const char *p = styleTok;
+		while (p && *p && nStyles < MAX_SLOTS - 1)
+		{
+			styles[nStyles++] = atoi(p);
+			p = strchr(p, ',');
+			if (p)
+				++p;
+		}
+	}
+	if (nStyles == 0)
+		styles[nStyles++] = 0;
+
+	if (!TheSkirmishGameInfo)
+		TheSkirmishGameInfo = NEW SkirmishGameInfo;
+	SkirmishGameInfo *sgi = TheSkirmishGameInfo;
+
+	// Same sequence SkirmishGameOptionsMenu::Init uses, minus all UI.
+	sgi->init();
+	sgi->clearSlotList();
+	sgi->reset();
+	sgi->setLocalIP(sgi->getSlot(0)->getIP());
+	sgi->enterGame();
+
+	GameSlot humanSlot;
+	UnicodeString humanName;
+	humanName.set(L"QA");
+	humanSlot.setState(SLOT_PLAYER, humanName);
+	humanSlot.setColor(0);
+	humanSlot.setPlayerTemplate(PLAYERTEMPLATE_RANDOM);
+	humanSlot.setStartPos(0);
+	humanSlot.setAccept();
+	sgi->setSlot(0, humanSlot);
+
+	for (Int i = 1; i <= aiCount; ++i)
+	{
+		GameSlot aiSlot;
+		aiSlot.setState(aiState);
+		aiSlot.setColor(i);
+		aiSlot.setPlayerTemplate(PLAYERTEMPLATE_RANDOM);
+		aiSlot.setStartPos(i);
+		aiSlot.setAIStyle((nStyles > 1 && (i - 1) < nStyles) ? styles[i - 1] : styles[0]);
+		aiSlot.setAccept();
+		sgi->setSlot(i, aiSlot);
+	}
+
+	sgi->setSeed(seed);
+	sgi->setSuperweaponRestriction(1);
+	AsciiString mapName(mapTok);
+	sgi->setMap(mapName);
+	const MapMetaData *md = TheMapCache ? TheMapCache->findMap(mapName) : nullptr;
+	if (md)
+	{
+		sgi->setMapCRC(md->m_CRC);
+		sgi->setMapSize(md->m_filesize);
+	}
+
+	// GeneralsX @bugfix ai-upgrade 15/10/2026 Suppress the 3D shell map. onNewGame() rejects any
+	// MSG_NEW_GAME that arrives while the shell map is still loading (isInGame()/isLoadingMap()
+	// guard, active because RETAIL_COMPATIBLE_CRC==0), so a bare GAME_SKIRMISH queued here loses
+	// the race to Shell::showShellMap()'s GAME_SHELL and the launch stalls on the main menu.
+	// Setting m_initialFile makes showShellMap() early-return (Shell.cpp) exactly like the proven
+	// -file auto-start path, so our skirmish message is the only new-game command in the queue.
+	TheWritableGlobalData->m_initialFile = mapName;
+	s_qaSkirmishClaimed = TRUE;	// keeps the -file auto-start block below from double-queuing
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_pendingFile = mapName;
+
+	InitRandom(seed);
+
+	GameMessage *msg = TheMessageStream->appendMessage( GameMessage::MSG_NEW_GAME );
+	msg->appendIntegerArgument(GAME_SKIRMISH);
+	msg->appendIntegerArgument(DIFFICULTY_NORMAL);	// per-slot difficulty rides on the SlotState
+	msg->appendIntegerArgument(0);
+	msg->appendIntegerArgument(fpsCap);							// 1000 = QA full speed; 30 = retail pacing
+
+	fprintf(stderr, "[QASKIRM] auto-start map=%s aiCount=%d diff=%d style=%d(%s) seed=%d fps=%d\n",
+		mapTok, aiCount, (Int)aiState, aiStyle, styleTok ? styleTok : "-", seed, fpsCap);
+	fflush(stderr);
+}
+
 /** -----------------------------------------------------------------------------------------------
  * Initialize the game engine by initializing the GameLogic and GameClient.
  */
 void GameEngine::init()
-{
-	try {
+{	try {
 		//create an INI object to use for loading stuff
 		INI ini;
 
@@ -837,11 +994,21 @@ void GameEngine::init()
 			m_quitting = TRUE;
 		}
 
+		// GeneralsX @feature ai-upgrade 14/10/2026 QA auto-skirmish (no-op unless the env var is set).
+		// MUST run before the MainMenu push below: MainMenuInit calls Shell::showShellMap(TRUE),
+		// which only early-returns when m_initialFile is already set. Queuing GAME_SKIRMISH after
+		// the push loses the race - the shell's GAME_SHELL message is first in the list, consumes
+		// our m_pendingFile as its background map, and onNewGame() then rejects our message via
+		// the isLoadingMap() guard (RETAIL_COMPATIBLE_CRC==0), stranding the launch on the menu.
+		checkQAAutoSkirmish();
+
 		// load the initial shell screen
 		TheShell->push( "Menus/MainMenu.wnd" );
 
 		// This allows us to run a map from the command line
-		if (TheGlobalData->m_initialFile.isEmpty() == FALSE)
+		// GeneralsX @bugfix ai-upgrade 15/10/2026 skip when the QA skirmish hook already
+		// claimed the launch (it borrows m_initialFile only to suppress the shell map).
+		if (TheGlobalData->m_initialFile.isEmpty() == FALSE && !s_qaSkirmishClaimed)
 		{
 			AsciiString fname = TheGlobalData->m_initialFile;
 			fname.toLower();

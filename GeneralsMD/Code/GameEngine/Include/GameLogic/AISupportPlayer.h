@@ -45,4 +45,10 @@ public:
 	AISupportPlayer( Player *p );			///< constructor
 
 	virtual AIStyleType getAIStyle() const override { return AI_STYLE_SUPPORT; }
+
+	virtual const char *getDriverName() const override { return "AISupport"; }
+
+	// GeneralsX @feature ai-upgrade 14/10/2026 Economy-first: one extra gatherer per supply
+	// center on top of the difficulty INI row, funding the (expensive) support teams it prefers.
+	virtual Int getGathererBonus() const override { return 1; }
 };
