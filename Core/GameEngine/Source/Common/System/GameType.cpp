@@ -42,6 +42,12 @@ const char *const WeatherNames[] =
 {
 	"NORMAL",
 	"SNOWY",
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: appended to match the Weather enum.
+	// Order is load-bearing - INI::parseIndexList resolves "Weather = RAINY" by position.
+	"RAINY",
+	"STORM",
+	"THUNDER",
+	"BLIZZARD",
 
 	nullptr
 };

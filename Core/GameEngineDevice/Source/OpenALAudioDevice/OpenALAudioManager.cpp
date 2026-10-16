@@ -2103,6 +2103,8 @@ AudioEventRTS* OpenALAudioManager::findLowestPrioritySound(AudioEventRTS* event)
 			if (!itEvent) continue; // GeneralsX @bugfix BenderAI 11/03/2026
 			const AudioEventInfo* itInfo = itEvent->getAudioEventInfo();
 			if (!itInfo) continue;
+			// GeneralsX @bugfix PS3.0-voice 16/10/2026 ST_VOICE exemption (see isPlayingLowerPriority).
+			if (itInfo->m_type & ST_VOICE) continue;
 			AudioPriority itPriority = itInfo->m_priority;
 			if (itPriority < priority)
 			{
@@ -2127,6 +2129,8 @@ AudioEventRTS* OpenALAudioManager::findLowestPrioritySound(AudioEventRTS* event)
 			if (!itEvent) continue; // GeneralsX @bugfix BenderAI 11/03/2026
 			const AudioEventInfo* itInfo = itEvent->getAudioEventInfo();
 			if (!itInfo) continue;
+			// GeneralsX @bugfix PS3.0-voice 16/10/2026 ST_VOICE exemption (see isPlayingLowerPriority).
+			if (itInfo->m_type & ST_VOICE) continue;
 			AudioPriority itPriority = itInfo->m_priority;
 			if (itPriority < priority)
 			{
@@ -2163,7 +2167,12 @@ Bool OpenALAudioManager::isPlayingLowerPriority(AudioEventRTS* event) const
 		for (it = m_playingSounds.begin(); it != m_playingSounds.end(); ++it) {
 			if (!(*it)->m_audioEventRTS) continue; // GeneralsX @bugfix BenderAI 11/03/2026
 			const AudioEventInfo* info = (*it)->m_audioEventRTS->getAudioEventInfo();
-			if (info && info->m_priority < priority) {
+			// GeneralsX @bugfix PS3.0-voice 16/10/2026 Never preempt ST_VOICE samples: unit
+			// voicelines are AT_SoundEffect events carrying the ST_VOICE bit, so the MiniAudio
+			// soundType shield (12/10/2026) alone left them dying mid-sentence when the 2-D pool
+			// filled up. Retail Miles never kills through this path (its setHandleToKill is
+			// commented out). MiniAudio/OpenAL parity per project rule 4.
+			if (info && info->m_priority < priority && !(info->m_type & ST_VOICE)) {
 				event->setHandleToKill((*it)->m_audioEventRTS->getPlayingHandle());
 				return true;
 			}
@@ -2174,7 +2183,8 @@ Bool OpenALAudioManager::isPlayingLowerPriority(AudioEventRTS* event) const
 		for (it = m_playing3DSounds.begin(); it != m_playing3DSounds.end(); ++it) {
 			if (!(*it)->m_audioEventRTS) continue; // GeneralsX @bugfix BenderAI 11/03/2026
 			const AudioEventInfo* info = (*it)->m_audioEventRTS->getAudioEventInfo();
-			if (info && info->m_priority < priority) {
+			// GeneralsX @bugfix PS3.0-voice 16/10/2026 ST_VOICE exemption, see 2-D branch above.
+			if (info && info->m_priority < priority && !(info->m_type & ST_VOICE)) {
 				event->setHandleToKill((*it)->m_audioEventRTS->getPlayingHandle());
 				return true;
 			}

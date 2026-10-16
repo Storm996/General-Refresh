@@ -261,6 +261,49 @@ static void Strip_State_Variant_Suffix(char* name)
 	*us = 0;
 }
 
+// GeneralsX @bugfix Qoder 16/10/2026 #87: read the short side of a TGA or DDS from its file header
+// only - no pixel decode, no texture init - so the load probe can enforce the surface detail
+// contract before any mount flag exists. Returns false when the format is not recognised, which
+// the caller must treat as "dimension unknown", never as "reject".
+static bool Peek_Image_Min_Side(const char* filename, int& minSide)
+{
+	minSide = 0;
+	if (filename == nullptr || filename[0] == 0) {
+		return false;
+	}
+	FileClass* file = _TheFileFactory->Get_File(filename);
+	if (file == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	file->Open();
+	if (file->Is_Available()) {
+		unsigned char hdr[20];
+		if (file->Read(hdr, 20) == 20) {
+			if (hdr[0] == 'D' && hdr[1] == 'D' && hdr[2] == 'S' && hdr[3] == ' ') {
+				// DDS_HEADER: dwHeight at 12, dwWidth at 16, little-endian 32-bit.
+				const int h = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16) | (hdr[15] << 24);
+				const int w = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | (hdr[19] << 24);
+				if (w > 0 && h > 0) {
+					minSide = (w < h) ? w : h;
+					ok = true;
+				}
+			} else {
+				// TGA: fixed 18-byte header, width at 12, height at 14, little-endian 16-bit.
+				const int w = hdr[12] | (hdr[13] << 8);
+				const int h = hdr[14] | (hdr[15] << 8);
+				if (w > 0 && h > 0) {
+					minSide = (w < h) ? w : h;
+					ok = true;
+				}
+			}
+		}
+	}
+	file->Close();
+	_TheFileFactory->Return_File(file);
+	return ok;
+}
+
 // GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (段D)
 // Look for a "_nm" companion for the pass-0 / stage-0 diffuse texture(s). Naming rule is strict:
 // only "_nm" and "_nm_ai" are recognised (NOT "_n", which Zero Hour already uses for its 124
@@ -383,6 +426,35 @@ void MeshModelClass::Detect_And_Build_Normal_Map()
 		fprintf(stderr, "[NM_MISS] mesh='%s' diffuse='%s' tried=%s\n", Get_Name(), (const char*)diffuse_name, tried);
 		fflush(stderr);
 		return;
+	}
+
+	// GeneralsX @bugfix Qoder 16/10/2026 #87: SURFACE DETAIL CONTRACT.
+	// The full-library companion rollout gave every diffuse stem an "_nm"/"_rp" file, so
+	// "companion exists" no longer says a mesh is a lit SURFACE - it only says a file was
+	// dropped. Baked sprite parts (bayonet sparkles, glow backpacks, flag cloth, 32-64px
+	// soldier skins, 16px FX) therefore mounted dot3/PBR and got re-lit by the injected sun
+	// constants on top of their baked shading - the floating colored patches seen between
+	// facing infantry and against the sky whenever infantry spawn. Two asset-intrinsic tests
+	// replace file existence as the mount authority:
+	//   1) diffuse AND companion must be >= 128px on the short side: at battlefield zoom a
+	//      normal/RP map below that cannot resolve as surface detail - it is noise by
+	//      construction;
+	//   2) the mesh must have >= 48 polygons: anything built from a handful of quads is a
+	//      sprite/overlay/decal, not a surface, and tangent-space re-lighting there replaces
+	//      art-authored shading (unit bodies are 900+ polys, the offending parts 8-35).
+	// Class-level by construction: no per-file moves, and both feature arms stay fully on.
+	{
+		const int polys = Get_Polygon_Count();
+		int nmSide = 0;
+		int diffuseSide = 0;
+		const bool nmKnown = Peek_Image_Min_Side(companion, nmSide);
+		const bool diffuseKnown = Peek_Image_Min_Side((const char*)diffuse_name, diffuseSide);
+		if ((nmKnown && nmSide < 128) || (diffuseKnown && diffuseSide < 128) || polys < 48) {
+			fprintf(stderr, "[NM_MESH] mesh='%s' diffuse='%s' companion='%s' REJECT contract nmSide=%d diffuseSide=%d polys=%d\n",
+				Get_Name(), (const char*)diffuse_name, companion, nmSide, diffuseSide, polys);
+			fflush(stderr);
+			return;
+		}
 	}
 
 	if (Compute_Mesh_Tangents(this, &VertexTangent, &VertexBinormal)) {

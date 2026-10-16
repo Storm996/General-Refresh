@@ -730,7 +730,10 @@ Bool WorldHeightMap::ParseWorldDictDataChunk(DataChunkInput &file, DataChunkInfo
 	Bool exists;
 	Int theWeather = MapObject::getWorldDict()->getInt(TheKey_weather, &exists);
 	if (exists) {
-		TheWritableGlobalData->m_weather = (Weather) theWeather;
+		// GeneralsX @bugfix Storm996 16/10/2026 PS3.0 Weather W1: a map authored by a newer WorldBuilder
+		// can carry a weather index this build does not know. Retail took the raw value, which would
+		// index past WeatherNames/the profile table; clamp to NORMAL instead so foreign maps stay playable.
+		TheWritableGlobalData->m_weather = Weather_ClampToKnown(theWeather);
 	}
 	return true;
 }

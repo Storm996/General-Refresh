@@ -3897,6 +3897,26 @@ void ScriptActions::doWeather(Bool showWeather)
 }
 
 //-------------------------------------------------------------------------------------------------
+/** doWeatherType */
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: mission scripts could only ever turn the
+// one map-authored recipe on or off. This writes the logic-side weather value, exactly like a map's
+// GameData "Weather" key or its world-dict entry does - the render layer then picks up the matching
+// recipe (Core/GameEngine/Source/GameClient/Snow.cpp) on its next client update. Script actions run
+// identically on every peer and are recorded in replays, so this stays deterministic.
+//-------------------------------------------------------------------------------------------------
+
+void ScriptActions::doWeatherType(Int weatherType)
+{
+	TheWritableGlobalData->m_weather = Weather_ClampToKnown(weatherType);
+	// The type is only rendered when the map's weather is also switched on, so a script that picks a
+	// type implicitly asks for it to be visible - otherwise the action would look like a no-op.
+	if (TheSnowManager != nullptr && weatherType != WEATHER_NORMAL)
+	{
+		TheSnowManager->setVisible(TRUE);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Freeze time */
 //-------------------------------------------------------------------------------------------------
 void ScriptActions::doFreezeTime()
@@ -7096,6 +7116,10 @@ void ScriptActions::executeAction( ScriptAction *pAction )
 			return;
 		case ScriptAction::SHOW_WEATHER:
 			doWeather(pAction->getParameter(0)->getInt());
+			return;
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1
+		case ScriptAction::SHOW_WEATHER_TYPE:
+			doWeatherType(pAction->getParameter(0)->getInt());
 			return;
 		case ScriptAction::CAMERA_MOTION_BLUR:
 			doCameraMotionBlur(pAction->getParameter(0)->getInt(), pAction->getParameter(1)->getInt());

@@ -85,6 +85,8 @@
 
 #include "GameClient/ClientInstance.h"
 #include "GameClient/FXList.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights (backported to Generals)
+#include "GameClient/LampList.h"
 #include "GameClient/GameClient.h"
 #include "GameClient/Keyboard.h"
 #include "GameClient/Shell.h"
@@ -563,6 +565,10 @@ void GameEngine::init()
 		initSubsystem(ThePlayerTemplateStore,"ThePlayerTemplateStore", MSGNEW("GameEngineSubsystem") PlayerTemplateStore(), &xferCRC, "Data\\INI\\Default\\PlayerTemplate", "Data\\INI\\PlayerTemplate");
 		initSubsystem(TheParticleSystemManager,"TheParticleSystemManager", createParticleSystemManager(TheGlobalData->m_headless), nullptr);
 		initSubsystem(TheFXListStore,"TheFXListStore", MSGNEW("GameEngineSubsystem") FXListStore(), &xferCRC, "Data\\INI\\Default\\FXList", "Data\\INI\\FXList");
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights (render-side only, backported to Generals)
+		// TheSuperHackers @lesson path1 must stay nullptr: INI::loadFileDirectory throws INI_CANT_OPEN_FILE
+		// even in Release when a registered path yields zero files; a missing Default\LampList dir would crash startup.
+		initSubsystem(TheLampStore,"TheLampStore", MSGNEW("GameEngineSubsystem") LampStore(), &xferCRC, nullptr, "Data\\INI\\LampList");
 		initSubsystem(TheWeaponStore,"TheWeaponStore", MSGNEW("GameEngineSubsystem") WeaponStore(), &xferCRC, nullptr, "Data\\INI\\Weapon");
 		initSubsystem(TheObjectCreationListStore,"TheObjectCreationListStore", MSGNEW("GameEngineSubsystem") ObjectCreationListStore(), &xferCRC, "Data\\INI\\Default\\ObjectCreationList", "Data\\INI\\ObjectCreationList");
 		initSubsystem(TheLocomotorStore,"TheLocomotorStore", MSGNEW("GameEngineSubsystem") LocomotorStore(), &xferCRC, nullptr, "Data\\INI\\Locomotor");

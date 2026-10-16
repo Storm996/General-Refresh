@@ -119,6 +119,8 @@ static const BlockParse theTypeTable[] =
 	{ "GameData",                       INI::parseGameDataDefinition },
 	{ "HeaderTemplate",                 INI::parseHeaderTemplateDefinition },
 	{ "InGameUI",                       INI::parseInGameUIDefinition },
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+	{ "LampList",                       INI::parseLampListDefinition },
 	{ "LODPreset",                      INI::parseLODPreset },
 	{ "Language",                       INI::parseLanguageDefinition },
 	{ "Locomotor",                      INI::parseLocomotorTemplateDefinition },
@@ -154,6 +156,8 @@ static const BlockParse theTypeTable[] =
 	{ "WaterTransparency",              INI::parseWaterTransparencyDefinition },
 	{ "Weapon",                         INI::parseWeaponTemplateDefinition },
 	{ "Weather",                        INI::parseWeatherDefinition },
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: per-type weather recipe.
+	{ "WeatherType",                    INI::parseWeatherTypeDefinition },
 	{ "WebpageURL",                     INI::parseWebpageURLDefinition },
 	{ "WindowTransition",               INI::parseWindowTransitions },
 };

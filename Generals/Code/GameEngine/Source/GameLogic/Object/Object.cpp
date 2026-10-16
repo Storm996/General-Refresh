@@ -2754,7 +2754,8 @@ void Object::friend_bindToDrawable( Drawable *draw )
 
 			if (TheGlobalData->m_forceModelsToFollowWeather)
 			{
-				set.set(MODELCONDITION_SNOW, (TheGlobalData->m_weather == WEATHER_SNOWY) ? 1 : 0);
+				// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1 backport: blizzard carries snow skins too.
+				set.set(MODELCONDITION_SNOW, Weather_IsSnowFamily(TheGlobalData->m_weather) ? 1 : 0);
 			}
 		}
 		m_drawable->clearAndSetModelConditionFlags(clr, set);

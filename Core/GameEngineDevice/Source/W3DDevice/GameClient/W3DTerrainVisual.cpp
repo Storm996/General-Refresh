@@ -1073,7 +1073,8 @@ void W3DTerrainVisual::addProp(const ThingTemplate *tTemplate, const Coord3D *po
 {
 	ModelConditionFlags state;
 	state.clear();
-	if (TheGlobalData->m_weather == WEATHER_SNOWY)
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: snow-caked props also belong to blizzards.
+	if (Weather_IsSnowFamily(TheGlobalData->m_weather))
 	{
 		state.set(MODELCONDITION_SNOW);
 	}

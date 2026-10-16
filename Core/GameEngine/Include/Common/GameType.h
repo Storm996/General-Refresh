@@ -81,11 +81,32 @@ enum Weather CPP_11(: Int)
 {
 	WEATHER_NORMAL = 0,
 	WEATHER_SNOWY = 1,
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: new weather types are APPENDED only.
+	// The retail values (0/1) and their order are frozen because .map files store the index in
+	// TheKey_weather and INI "Weather" keys resolve through WeatherNames by position - renumbering
+	// would silently reinterpret every shipped map. Unknown (>= WEATHER_COUNT) indices clamp to
+	// WEATHER_NORMAL on load, which keeps forward-authored maps playable on older builds.
+	WEATHER_RAINY = 2,			///< light rain: streak particles + screen drizzle + dimmed key light.
+	WEATHER_STORM = 3,			///< heavy rain: denser/longer slanted streaks, stronger dimming.
+	WEATHER_THUNDER = 4,		///< thunderstorm: heavy rain + device-side lightning strikes.
+	WEATHER_BLIZZARD = 5,		///< blizzard: fast drifting snow, high fog, snow model skins.
 
 	WEATHER_COUNT
 };
 
 extern const char *const WeatherNames[];
+
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: snow-caked surfaces are shared by the
+// snow types. Call sites used to compare against WEATHER_SNOWY, which left blizzard maps bare.
+inline Bool Weather_IsSnowFamily(Weather w) { return w == WEATHER_SNOWY || w == WEATHER_BLIZZARD; }
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: wet (rain) surfaces share one recipe.
+inline Bool Weather_IsRainFamily(Weather w) { return w == WEATHER_RAINY || w == WEATHER_STORM || w == WEATHER_THUNDER; }
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: clamp a raw index (from a .map dict or an
+// INI index list) to a type this build knows about.
+inline Weather Weather_ClampToKnown(Int raw)
+{
+	return (raw >= WEATHER_NORMAL && raw < WEATHER_COUNT) ? (Weather)raw : WEATHER_NORMAL;
+}
 
 enum Scorches CPP_11(: Int)
 {

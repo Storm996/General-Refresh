@@ -2041,16 +2041,37 @@ void DX8TextureCategoryClass::Render()
 		bool nmApplied = false;
 		// GeneralsX @feature PS3.0 #70 15/10/2026: the roughness path (RP_Ready) may arm this mount
 		// even with the normal-map switch OFF; Apply decides bump vs flat-normal PBR per texture.
+		// GeneralsX @bugfix Qoder 16/10/2026 T3-0 white-flicker CLASS fix (was: per-texture file moves):
+		// the dot3/PBR pair may only take over a batch when the custom pipeline can reproduce the
+		// ENTIRE render semantics of that batch. Forensics on the CB civilian buildings (w3d_matdump.py
+		// over 4800 assets) showed their "white snow flicker" material: multi-pass W3D meshes where
+		// pass 0 = LAKEDUSK.tga sky-reflection base layer (ENVIRONMENT-mapped, opaque ONE/ZERO, writes
+		// depth) and pass 1 = the building shell (SRC_ALPHA/INV_SRC_ALPHA, NO depth write) composited
+		// on top. That recipe draws the same triangles twice per frame BY DESIGN - "画了两遍". The old
+		// 11/10 note mislabelled pass 0 as alpha-blended glass; it is opaque, so the blend-only gate
+		// never excluded it. Our custom VS/PS breaks two invariants of the recipe at once: (1) it only
+		// rewrites pass 0's output, so pass 1's alpha composite blends over a different base than the
+		// asset was authored against, and (2) the VS samples raw vertex UVs - every non-plain texture
+		// mapper (ENVIRONMENT/CHEAP_ENVIRONMENT/LINEAR_OFFSET/SCREEN/...) whose UVs are generated
+		// per-frame from view vectors or animated offsets silently degenerates to static UV. Either
+		// alone changes the look; together with the animated water background it reads as flicker.
+		// Exclusions below are per-material SEMANTICS (same rule set the GN gate already ships):
+		// multi-pass composites and mapper-generated UVs stay on the fixed pipeline; single-pass plain
+		// UV batches (tanks, hulls, roofs) keep the normal-map upgrade. No asset file is excluded.
+		// The Alpha_Override / MATERIAL_OVERRIDE parity conditions close the other half of the
+		// original flicker theory: the retail per-prt alpha swap (below) installs theAlphaShader AFTER
+		// this gate decided, so a mounted custom pair could be drawn alpha-blended with our raw
+		// texture-alpha - now such prts never mount, and the swap always runs on the fixed pipeline.
+		bool nmMapperPlain = (vmaterial == nullptr)
+			|| (vmaterial->Peek_Mapper(0) == nullptr && vmaterial->Peek_Mapper(1) == nullptr);
 		if ((DX8NormalMap::Ready_To_Render() || DX8NormalMap::RP_Ready())
 			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNDUV1TG3 || Get_Container()->Is_Normal_Map_Batch())
 			&& mesh->Peek_Model()->Uses_Normal_Map()
 			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
-			// GeneralsX @bugfix Qoder 11/10/2026 T3-0 flicker: only mount dot3 on OPAQUE
-			// meshes (Src=ONE, Dst=ZERO). Civilian glass (sky-reflection textures like
-			// lakedusk.tga) is alpha-blended; our PS outputs texture-alpha while the fixed
-			// pipeline also folds vertex alpha / material opacity, and the mismatch makes the
-			// blended result depend on the animated background (water/shroud), which reads as
-			// a white "snow-like" flicker on lake-side civilian buildings.
+			&& mesh->Peek_Model()->Get_Pass_Count() == 1
+			&& mesh->Get_Alpha_Override() == 1.0f
+			&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
+			&& nmMapperPlain
 			&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
 			&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO) {
 			// lenv may be null on battlefield objects (they rely on the global sun); Apply falls

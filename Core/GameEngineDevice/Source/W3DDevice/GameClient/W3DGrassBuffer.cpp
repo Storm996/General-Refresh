@@ -102,7 +102,10 @@ W3DGrassBuffer::W3DGrassBuffer()
 	m_texture = nullptr;
 	m_builtSig = -1;
 	m_quadCount = 0;
-	m_enabled = true;
+	// GeneralsX @tweak Qoder 15/10/2026 Default OFF until the layer passes field
+	// acceptance. updateIniSettings() re-reads TheWeatherSetting every frame, so an
+	// INI "GrassEnabled = yes" re-activates the whole layer without a code change.
+	m_enabled = false;
 	m_hasResources = false;
 	m_densityPercent = GRASS_DEFAULT_DENSITY;
 	m_clumps.reserve(GRASS_MAX_CLUMPS);

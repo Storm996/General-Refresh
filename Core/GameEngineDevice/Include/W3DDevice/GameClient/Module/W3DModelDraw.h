@@ -61,6 +61,9 @@ class RenderObjClass;
 class Shadow;
 class TerrainTracksRenderObjClass;
 class HAnimClass;
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+class W3DDynamicLight;
+class LampSet;
 enum GameLODLevel CPP_11(: Int);
 //-------------------------------------------------------------------------------------------------
 /** The default client update module */
@@ -525,6 +528,17 @@ private:
 	// keeps the recoil duration independent of the render frame rate.
 	UnsignedInt						m_recoilLastTimeMs;
 	Real									m_recoilTickAccumMs;
+
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: static building lamp lights (render-side only).
+	// LampSet is looked up once (by ThingTemplate name) from TheLampStore; each lamp gets a pooled
+	// W3DDynamicLight the first time the drawable is drawn. Never serialized.
+	const LampSet*					m_lampSet;										///< cached lookup result, nullptr = none for this object
+	Bool									m_lampSetResolved;								///< lazy lookup already attempted (avoids a hash lookup every frame)
+	std::vector<W3DDynamicLight*>		m_lampLights;										///< one held pool light per LampSet entry (nullptr = not yet acquired)
+	Real									m_lampFlickerPhase;							///< per-instance random phase so lamps don't blink in sync
+
+	void updateLamps(const Matrix3D& worldMtx);		///< acquire/refresh held lamps; called from doDrawModule each render frame
+	void releaseLamps();									///< fade out and drop all held pool lights (dtor + when effectively hidden)
 
 	void adjustAnimation(const ModelConditionInfo* prevState, Real prevAnimFraction);
 	Real getCurrentAnimFraction() const;

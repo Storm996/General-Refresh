@@ -1300,6 +1300,13 @@ AudioEventRTS *MiniAudioManager::findLowestPrioritySound(AudioEventRTS *event)
 		// this filter a crowded effect pool would kill the currently playing music or voiceline
 		// via handleToKill (music cutting out after ~8s in the main menu and mid-speech in-game).
 		if (itInfo->m_soundType != AT_SoundEffect) continue;
+		// GeneralsX @bugfix PS3.0-voice 16/10/2026 Finish the 12/10/2026 shield: unit voicelines
+		// are parsed as plain Sound events (AT_SoundEffect) carrying the ST_VOICE type bit, so the
+		// soundType filter above does not cover them. Without this line a full 2D pool
+		// (SampleCount2D is tiny) still killed the speaking voiceline via handleToKill a few
+		// seconds into playback. Retail Miles never kills through this path at all (its
+		// setHandleToKill is commented out), so exempting voices restores reference behaviour.
+		if (itInfo->m_type & ST_VOICE) continue;
 		AudioPriority itPriority = itInfo->m_priority;
 		if (itPriority < priority) {
 			if (!lowestPriorityEvent || lowestPriority > itPriority) {
@@ -1327,7 +1334,11 @@ Bool MiniAudioManager::isPlayingLowerPriority(AudioEventRTS *event) const
 		// speech live in the same m_playingSounds list here (unlike the Miles/OpenAL backends),
 		// any higher-priority effect request used to kill the active music track or voiceline,
 		// which is why music cut out after ~8s in the menus and speech died mid-sentence in-game.
-		if (info && info->m_soundType == AT_SoundEffect && info->m_priority < priority) {
+		// GeneralsX @bugfix PS3.0-voice 16/10/2026 Also exempt ST_VOICE sound effects: unit
+		// voicelines are AT_SoundEffect events with the ST_VOICE bit (INIAudioEventInfo parses
+		// Type=Voice into m_type, not into a separate AudioType), so the soundType check alone
+		// left them dying a few seconds into playback whenever the small 2D pool filled up.
+		if (info && info->m_soundType == AT_SoundEffect && !(info->m_type & ST_VOICE) && info->m_priority < priority) {
 			event->setHandleToKill((*it)->m_audioEventRTS->getPlayingHandle());
 			return true;
 		}

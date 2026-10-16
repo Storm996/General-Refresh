@@ -193,7 +193,31 @@ bool Compute_Mesh_Tangents(MeshModelClass* mesh, Vector3** out_tangent, Vector3*
 		}
 		t.Normalize();
 
+		// GeneralsX @bugfix PS3.0-#76 16/10/2026 preserve the UV chart handedness. The old code
+		// rebuilt every binormal as the right-handed n x t, silently discarding the accumulated
+		// (signed) bitangent. On a mirrored (negative-determinant) UV chart the true bitangent is
+		// -(n x t), so shipping n x t there puts the second tangent axis backwards: the tangent-space
+		// light keeps its T and N components but its B component flips sign, i.e. the green channel of
+		// the normal map mirrors across those faces and the bump relief (and the Blinn/PBR specular
+		// lobe that rides on the same basis) reads as lit from the opposite side of the bump. A LOCAL
+		// detail error on the affected faces - which is all this fix claims to repair.
+		// Scope note, corrected after #76b: this defect CANNOT be the "building lit by a light from
+		// another direction" report. It leaves dot(L,N) untouched, so it cannot swing the macro
+		// diffuse with the mesh placement angle, and it cannot affect roughness-only batches at all
+		// (nm == nullptr runs with a flat (0,0,1) tangent normal, so the B row is never read). The
+		// rotating-light symptom - reproduced by both normal maps and roughness - was the world ->
+		// model rotate in DX8NormalMap::Apply; see @bugfix PS3.0-#76b in Core/.../dx8normalmap.cpp.
+		// The earlier draft of this comment quoted mirror_chart_probe.py negative-triangle counts and
+		// a lighting-preview-studio A/B as evidence for the rotating-light symptom. Neither was
+		// reproduced here, so both citations are dropped; the handedness fix stands on the derivation
+		// above alone and matches what the skinned path already did in dx8renderer.cpp.
+		// side = sign(dot(n x t, binAccum)) is the studio formula expressed in file-V UV space
+		// (the studio flips V at load; dot(N x T, B_file) == dot(T x N, B_flipV) keeps them equal).
+		// side == 0 (mixed-hand seam vertices) falls back to +1 exactly like the studio.
 		Vector3 b = XP(n, t);
+		if (Vector3::Dot_Product(b, binAccum[v]) < 0.0f) {
+			b = -b;	// mirrored chart: keep the authored left-handed basis
+		}
 		b.Normalize();
 
 		outT[v] = t;

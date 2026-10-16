@@ -171,6 +171,8 @@ protected:
 	void doBlackWhiteMode(Bool startBWMode, Int frames);	// if true, start it. If false, end it.
 	void doSkyBox(Bool showSkyBox);	// if true, start it. If false, end it.
 	void doWeather(Bool showWeather);	// if true, show weather effects defined in INI file.
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: switch the live weather type.
+	void doWeatherType(Int weatherType);	// index into WeatherNames, clamped to what this build knows.
 
 	void doFreezeTime();
 	void doUnfreezeTime();

@@ -169,8 +169,29 @@ void W3DGameClient::createRayEffectByTemplate( const Coord3D *start,
 //-------------------------------------------------------------------------------------------------
 /**  Tell all the drawables what time of day it is now */
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 4C 16/10/2026 render-side TOD override (backported to Generals):
+// GENERALSX_TOD_OVERRIDE=<1..4> re-points the RENDER consumers at another TimeOfDay slot of
+// the retail TerrainObjectsLighting data; logic keeps reading TheGlobalData->m_timeOfDay
+// untouched (determinism, Golden Rule 7). See 光影四阶段/调研/03 for the full design.
+static TimeOfDay renderTimeOfDayOverride(TimeOfDay tod)
+{
+	static int ov = -1;
+	if (ov < 0) {
+		const char* ev = getenv("GENERALSX_TOD_OVERRIDE");
+		ov = (ev != nullptr && *ev != 0) ? atoi(ev) : 0;
+		if (ov < 0 || ov >= TIME_OF_DAY_COUNT) ov = 0;
+		if (ov != 0) {
+			fprintf(stderr, "[TOD] render override active: %d (logic TOD stays %d)\n", ov, (Int)tod);
+			fflush(stderr);
+		}
+	}
+	return ov != 0 ? (TimeOfDay)ov : tod;
+}
+
 void W3DGameClient::setTimeOfDay( TimeOfDay tod )
 {
+
+	tod = renderTimeOfDayOverride(tod);
 
 	GameClient::setTimeOfDay(tod);
 

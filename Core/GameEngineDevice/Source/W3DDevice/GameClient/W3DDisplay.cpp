@@ -132,6 +132,12 @@ static Real theLightYOffset = 0.07f;
 static Int theFlashCount = 0;
 #endif
 
+// GeneralsX @feature PS3.0-4A agent 16/10/2026 forward decl of the shared pulse transport
+// (defined next to createLightPulse; used earlier by the W3DDisplay::update test leg).
+static void applyLightPulse(RTS3DScene* scene, const Coord3D *pos, const RGBColor *color,
+                            Real innerRadius, Real attenuationWidth,
+                            UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime);
+
 //*****************************************************************************************
 //*****************************************************************************************
 //**** Start Statistical Dump *************************************************************
@@ -2090,6 +2096,33 @@ void W3DDisplay::update()
 			TheTerrainTracksRenderObjClassSystem->update();
 	}
 
+	// GeneralsX @feature PS3.0-4A agent 16/10/2026 explosion-lighting same-process A/B leg.
+	// GENERALSX_PULSE_TEST=1 spawns one explosion-sized orange pulse at the camera look-at
+	// point every 90 frames. It calls the transport directly, bypassing both the FXList INI
+	// data and the GENERALSX_LIGHTPULSE gate, so render-side response can be screenshotted
+	// deterministically (ON vs OFF runs). Default OFF, zero effect on normal play.
+	{
+		static const Bool s_pulseTest = (getenv("GENERALSX_PULSE_TEST") != nullptr) && (atoi(getenv("GENERALSX_PULSE_TEST")) != 0);
+		if (s_pulseTest && m_3DScene != nullptr && TheTacticalView != nullptr)
+		{
+			static UnsignedInt s_pulseTickCounter = 0;
+			if (++s_pulseTickCounter >= 90)
+			{
+				s_pulseTickCounter = 0;
+				Coord3D lookAt = TheTacticalView->getPosition();
+				lookAt.z += 6.0f;
+				RGBColor testColor;
+				testColor.red = 1.0f;
+				testColor.green = 0.47f;
+				testColor.blue = 0.16f;
+				applyLightPulse(m_3DScene, &lookAt, &testColor, 1.0f, 40.0f, 0, 45);
+				fprintf(stderr, "[LPULSE-TEST] explosion-light test pulse at (%.0f,%.0f,%.0f)\n",
+				        lookAt.x, lookAt.y, lookAt.z);
+				fflush(stderr);
+			}
+		}
+	}
+
 	WW3D::Update_Logic_Frame_Time(TheFramePacer->getLogicTimeStepMilliseconds());
 
 	// TheSuperHackers @info This binds the WW3D update to the logic update.
@@ -2516,18 +2549,19 @@ Bool W3DDisplay::isLetterBoxed()
 /** Create a "light pulse" which is a dynamic light that grows, decays
 	* and vanishes over several frames */
 //=============================================================================
-void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
-																	 Real innerRadius, Real attenuationWidth,
-																	 UnsignedInt increaseFrameTime,
-																	 UnsignedInt decayFrameTime//, Bool donut
-																	 )
+// GeneralsX @feature PS3.0-4A agent 16/10/2026 shared pulse transport.
+// Takes one pooled W3DDynamicLight from the RTS3DScene pool and arms its
+// increase/decay frame curve. Split out of createLightPulse so the QA test
+// leg below can spawn pulses without going through the FXList data channel.
+static void applyLightPulse(RTS3DScene* scene, const Coord3D *pos, const RGBColor *color,
+                            Real innerRadius, Real attenuationWidth,
+                            UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime)
 {
-	if (m_3DScene == nullptr)
+	W3DDynamicLight * theDynamicLight = scene->getADynamicLight();
+	if (theDynamicLight == nullptr)
+	{
 		return;
-	if (innerRadius+attenuationWidth<2.0*PATHFIND_CELL_SIZE_F + 1.0f) {
-		return; // it basically won't make any visual difference.  jba.
 	}
-	W3DDynamicLight * theDynamicLight = m_3DScene->getADynamicLight();
 	// turn it on.
 	theDynamicLight->setEnabled(true);
 
@@ -2541,6 +2575,40 @@ void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
 	//theDynamicLight->setDonut(donut);
 	// (gth) CNC3 enable far attenuation.  C&C3 defaults to disabled.  Must enable to match Generals. MW 8-06-03
 	theDynamicLight->Set_Flag(LightClass::FAR_ATTENUATION,true);
+}
+
+void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
+																	 Real innerRadius, Real attenuationWidth,
+																	 UnsignedInt increaseFrameTime,
+																	 UnsignedInt decayFrameTime//, Bool donut
+																	 )
+{
+	// GeneralsX @feature PS3.0-4A agent 16/10/2026 dynamic light pulse gate.
+	// The retail LightPulse channel (FXList LightPulseFXNugget -> here -> pooled W3DDynamicLight)
+	// is the transport for explosion/muzzle lighting in lighting stage four.
+	// GENERALSX_LIGHTPULSE=0 kills the whole channel (QA A/B leg); default ON = retail parity.
+	// GENERALSX_LIGHTPULSE_LOG=1 prints every accepted pulse for on-hardware evidence.
+	static const Bool s_pulseOn = (getenv("GENERALSX_LIGHTPULSE") == nullptr) || (atoi(getenv("GENERALSX_LIGHTPULSE")) != 0);
+	static const Bool s_pulseLog = (getenv("GENERALSX_LIGHTPULSE_LOG") != nullptr) && (atoi(getenv("GENERALSX_LIGHTPULSE_LOG")) != 0);
+	if (!s_pulseOn)
+	{
+		return;
+	}
+
+	if (m_3DScene == nullptr)
+		return;
+	if (innerRadius+attenuationWidth<2.0*PATHFIND_CELL_SIZE_F + 1.0f) {
+		return; // it basically won't make any visual difference.  jba.
+	}
+	if (s_pulseLog)
+	{
+		fprintf(stderr, "[LPULSE] rgb=(%d,%d,%d) radius=%.0f inc=%u dec=%u pos=(%.0f,%.0f,%.0f)\n",
+		        (Int)(color->red * 255.0f), (Int)(color->green * 255.0f), (Int)(color->blue * 255.0f),
+		        innerRadius + attenuationWidth, increaseFrameTime, decayFrameTime,
+		        pos ? pos->x : 0.0f, pos ? pos->y : 0.0f, pos ? pos->z : 0.0f);
+		fflush(stderr);
+	}
+	applyLightPulse(m_3DScene, pos, color, innerRadius, attenuationWidth, increaseFrameTime, decayFrameTime);
 }
 
 void W3DDisplay::toggleLetterBox()
@@ -2594,6 +2662,36 @@ void W3DDisplay::enableLetterBox(Bool enable)
 //=============================================================================
 void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 {
+	// GeneralsX @feature PS3.0 4C 16/10/2026 render-side TOD override (光影四阶段/调研/03): same
+	// GENERALSX_TOD_OVERRIDE contract as W3DGameClient::setTimeOfDay - clamped here too because the
+	// init path (see L~966) calls this function directly, bypassing the GameClient fan-out.
+	// Idempotent: the override maps every input to the same slot. Logic TOD state is untouched.
+	{
+		static int s_todOv = -1;
+		if (s_todOv < 0) {
+			const char* ev = getenv("GENERALSX_TOD_OVERRIDE");
+			s_todOv = (ev != nullptr && *ev != 0) ? atoi(ev) : 0;
+			if (s_todOv < 0 || s_todOv >= TIME_OF_DAY_COUNT) s_todOv = 0;
+		}
+		if (s_todOv != 0) {
+			tod = (TimeOfDay)s_todOv;
+			// The terrain rasterizer (BaseHeightMap::doTheLight), water, tracks, snow and scorch
+			// decals all light from the GlobalData-DERIVED m_terrainAmbient/m_terrainDiffuse/
+			// m_terrainLightPos arrays, which only the logic-side GlobalData::setTimeOfDay refills -
+			// with the UNCLAMPED logic TOD that left the ground in retail afternoon while the object
+			// slots below went night (measured 16/10: civilian buildings crushed to black, grass
+			// untouched). Mirror the retail refill here for the overridden slot. Presentation-only:
+			// grep 16/10 confirmed zero GameLogic consumers and no xfer of these arrays, so Golden
+			// Rule 7 (determinism) holds; a later scripted TOD change re-fills from logic tod and the
+			// ensuing GameClient->setTimeOfDay fan-out re-applies this override - stays in step.
+			for (Int t = 0; t < MAX_GLOBAL_LIGHTS; t++) {
+				TheWritableGlobalData->m_terrainAmbient[t]   = TheGlobalData->m_terrainLighting[tod][t].ambient;
+				TheWritableGlobalData->m_terrainDiffuse[t]   = TheGlobalData->m_terrainLighting[tod][t].diffuse;
+				TheWritableGlobalData->m_terrainLightPos[t]  = TheGlobalData->m_terrainLighting[tod][t].lightPos;
+			}
+		}
+	}
+
 	const GlobalData::TerrainLighting *ol=&TheGlobalData->m_terrainObjectsLighting[tod][0];
 
 	if( m_3DScene )

@@ -543,6 +543,11 @@ public:
 		TEAM_SET_BOOBYTRAPPED,										///< Add boobytrap to all units on team.
 		SHOW_WEATHER,															///< show map defined weather.
 		AI_PLAYER_BUILD_TYPE_NEAREST_TEAM,				///< Tell the ai player to build an object nearest team.
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: SHOW_WEATHER only toggles the map's
+		// single authored recipe on/off, so a mission could never step from rain to a thunderstorm.
+		// Appended after the last retail action - inserting above would shift every following action's
+		// serialized index and break shipped maps.
+		SHOW_WEATHER_TYPE,											///< Switch the map to one of the weather types.
 		// add new items here, please
 		NUM_ITEMS
 	};

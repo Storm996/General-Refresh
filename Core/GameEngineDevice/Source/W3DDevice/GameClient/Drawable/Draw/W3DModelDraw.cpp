@@ -47,6 +47,8 @@
 #include "Common/Xfer.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/FXList.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+#include "GameClient/LampList.h"
 #include "GameClient/Shadow.h"
 #include "GameLogic/GameLogic.h"		// for real-time frame
 #include "GameLogic/Object.h"
@@ -58,6 +60,8 @@
 #include "W3DDevice/GameClient/W3DAssetManager.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+#include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/GameClient/W3DTerrainTracks.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
@@ -1764,10 +1768,17 @@ W3DModelDraw::W3DModelDraw(Thing *thing, const ModuleData* moduleData) : DrawMod
 	m_recoilLastTimeMs = m_turretSampleTimeMs;
 	m_recoilTickAccumMs = 0.0f;
 
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights (render-side only).
+	m_lampSet = nullptr;
+	m_lampSetResolved = false;
+	m_lampFlickerPhase = GameClientRandomValueReal(0, 6.2831853f);
+
 	// only validate the current time-of-day and weather conditions by default.
 	getW3DModelDrawModuleData()->validateStuffForTimeAndWeather(getDrawable(),
 											TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT,
-											TheGlobalData->m_weather == WEATHER_SNOWY);
+											// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: blizzard cakes
+											// props with snow too, so the test is the family, not the single retail value.
+											Weather_IsSnowFamily(TheGlobalData->m_weather));
 
 	ModelConditionFlags emptyFlags;
 	const ModelConditionInfo* info = findBestInfo(emptyFlags);
@@ -1807,13 +1818,18 @@ void W3DModelDraw::onDrawableBoundToObject()
 {
 	getW3DModelDrawModuleData()->validateStuffForTimeAndWeather(getDrawable(),
 											TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT,
-											TheGlobalData->m_weather == WEATHER_SNOWY);
+											// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: blizzard cakes
+											// props with snow too, so the test is the family, not the single retail value.
+											Weather_IsSnowFamily(TheGlobalData->m_weather));
 }
 
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 W3DModelDraw::~W3DModelDraw()
 {
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: fade out any held lamp lights; the scene pool re-uses them.
+	releaseLamps();
+
 	if (m_trackRenderObject && TheTerrainTracksRenderObjClassSystem)
 	{
 		TheTerrainTracksRenderObjClassSystem->unbindTrack(m_trackRenderObject);
@@ -2121,6 +2137,9 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
 		Matrix3D mtx = *transformMtx;
 		adjustTransformMtx(mtx);
 		m_renderObject->Set_Transform(mtx);
+
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: refresh held lamp lights on the adjusted world transform.
+		updateLamps(mtx);
 	}
 
 	handleClientTurretPositioning();
@@ -2134,6 +2153,125 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
   handleClientRecoil();
 
 }
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: static building lamp light driver.
+// Lamp definitions come from the INI-driven TheLampStore (LampList blocks keyed by ThingTemplate
+// name). Each lamp holds one pooled W3DDynamicLight, refreshed every render frame on the drawable's
+// adjusted world transform; this is pure render-side work, never serialized (determinism rule 7).
+// GENERALSX_LAMPLIGHT=0 kills the whole lamp channel (QA A/B leg); default ON.
+// GENERALSX_LAMPLIGHT_LOG=1 prints each lamp-set acquisition for on-hardware evidence.
+// Kept intensity <=0.6 by data convention so stage-4A explosion pulses win LightEnvironment slots.
+//-------------------------------------------------------------------------------------------------
+void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
+{
+	static const Bool s_lampOn = (getenv("GENERALSX_LAMPLIGHT") == nullptr) || (atoi(getenv("GENERALSX_LAMPLIGHT")) != 0);
+	if (!s_lampOn || TheLampStore == nullptr)
+		return;
+
+	Drawable* draw = getDrawable();
+	if (draw == nullptr || draw->getTemplate() == nullptr)
+		return;
+
+	// hidden by fog-of-war/shroud or explicit hide: fade out any held lamps.
+	if (draw->isDrawableEffectivelyHidden() || m_fullyObscuredByShroud)
+	{
+		releaseLamps();
+		return;
+	}
+
+	if (!m_lampSetResolved)
+	{
+		// lazy one-time lookup; the store never removes entries at runtime, so caching the pointer is safe.
+		m_lampSetResolved = true;
+		m_lampSet = TheLampStore->findLampSet(draw->getTemplate()->getName().str());
+		if (m_lampSet != nullptr && m_lampSet->getNumLamps() > 0)
+		{
+			m_lampLights.resize(m_lampSet->getNumLamps(), nullptr);
+			static const Bool s_lampLog = (getenv("GENERALSX_LAMPLIGHT_LOG") != nullptr) && (atoi(getenv("GENERALSX_LAMPLIGHT_LOG")) != 0);
+			if (s_lampLog)
+			{
+				fprintf(stderr, "[LAMP] %s lampCount=%d\n", draw->getTemplate()->getName().str(), m_lampSet->getNumLamps());
+				fflush(stderr);
+			}
+		}
+	}
+
+	if (m_lampSet == nullptr || m_lampSet->getNumLamps() <= 0)
+		return;
+
+	if (W3DDisplay::m_3DScene == nullptr)
+		return;
+
+	// global render-frame clock; only used as a phase reference for flicker (render-side, no determinism impact).
+	static UnsignedInt s_lampFrameClock = 0;
+	++s_lampFrameClock;
+
+	const Int lampCount = m_lampSet->getNumLamps();
+	for (Int i = 0; i < lampCount; ++i)
+	{
+		const LampDef* def = m_lampSet->getLamp(i);
+		if (def == nullptr)
+			continue;
+
+		W3DDynamicLight* light = m_lampLights[i];
+		if (light == nullptr)
+		{
+			// borrow a light from the scene pool (same lifecycle pattern as W3DPoliceCarDraw)
+			light = W3DDisplay::m_3DScene->getADynamicLight();
+			if (light == nullptr)
+				break; // pool exhausted this frame; retry on the next one
+			m_lampLights[i] = light;
+			light->setEnabled(TRUE);
+			light->setFrameFade(0, 0);	// 0 decay time = lasts forever; we own this lamp's lifecycle
+		}
+
+		// lamp position is model-local; transform to world with the adjusted drawable matrix
+		Vector3 localPos(def->m_position.x, def->m_position.y, def->m_position.z);
+		Vector3 worldPos = worldMtx.Rotate_Vector(localPos);
+		worldPos += worldMtx.Get_Translation();
+
+		Real intensity = def->m_intensity;
+		if (def->m_flickerPeriodFrames > 0 && def->m_flickerAmp > 0.0f)
+		{
+			// smooth periodic breathing; per-instance random phase + per-lamp offset desynchronizes lamps
+			const Real phase = (6.2831853f * (Real)s_lampFrameClock) / (Real)def->m_flickerPeriodFrames
+							 + m_lampFlickerPhase + (Real)i * 1.7f;
+			intensity *= (1.0f + def->m_flickerAmp * sinf(phase));
+		}
+		if (intensity < 0.0f)
+			intensity = 0.0f;
+		if (intensity > 1.0f)
+			intensity = 1.0f;
+
+		light->Set_Intensity(intensity);
+		light->Set_Ambient(Vector3(def->m_color.red * 0.5f, def->m_color.green * 0.5f, def->m_color.blue * 0.5f));
+		light->Set_Diffuse(Vector3(def->m_color.red, def->m_color.green, def->m_color.blue));
+		light->Set_Far_Attenuation_Range(2.0f, (def->m_radius > 3.0f) ? def->m_radius : 3.0f);
+		light->Set_Position(worldPos);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: drop held lamps with a short fade;
+// On_Frame_Update disables them when the fade completes and the scene pool re-uses them later.
+//-------------------------------------------------------------------------------------------------
+void W3DModelDraw::releaseLamps()
+{
+	for (size_t i = 0; i < m_lampLights.size(); ++i)
+	{
+		W3DDynamicLight* light = m_lampLights[i];
+		if (light != nullptr)
+		{
+			// Have it fade out over 5 frames.
+			light->setFrameFade(0, 5);
+			light->setDecayRange();
+			light->setDecayColor();
+		}
+	}
+	m_lampLights.clear();
+}
+
 
 //-------------------------------------------------------------------------------------------------
 const ModelConditionInfo* W3DModelDraw::findTransitionForSig(TransitionSig sig) const

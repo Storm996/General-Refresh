@@ -217,6 +217,9 @@ public:
 	static void parseWaterSettingDefinition( INI *ini );
 	static void parseWaterTransparencyDefinition( INI *ini );
 	static void parseWeatherDefinition( INI *ini );
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: per-type weather recipes
+	// ("WeatherType = RAINY" ... End) on top of the retail snow-only block.
+	static void parseWeatherTypeDefinition( INI *ini );
 	static void parseMappedImageDefinition( INI *ini );
 	static void parseArmorDefinition( INI *ini );
 	static void parseDamageFXDefinition( INI *ini );
@@ -226,6 +229,8 @@ public:
 	static void parseTerrainBridgeDefinition( INI *ini );
 	static void parseMetaMapDefinition( INI *ini );
 	static void parseFXListDefinition( INI *ini );
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+	static void parseLampListDefinition( INI* ini );
 	static void parseObjectCreationListDefinition( INI* ini );
 	static void parseMultiplayerSettingsDefinition( INI* ini );
 	static void parseMultiplayerColorDefinition( INI* ini );

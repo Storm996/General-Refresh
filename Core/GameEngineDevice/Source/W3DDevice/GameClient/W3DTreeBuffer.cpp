@@ -279,7 +279,7 @@ static const char* kTreePS30 =
 	"    float4 c   = i.vc * tex;\n"                          // stage0: GRADIENT_MODULATE
 	"    c.rgb      = c.rgb * tex2D(s1, i.shr).rgb;\n"        // stage1: shroud MODULATE
 	"    float a    = tex.a * i.vc.a;\n"                      // stage1 ALPHAOP SELECTARG2 = current
-	"    float fogf = saturate((i.dep.z - c1.x) * c1.y) * c0.w;\n"
+	"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"   // batch23: camera z is negative ahead (D3D -Z); batch8 form folded to zero
 	"    return float4(lerp(c.rgb, c0.rgb, fogf), a);\n"
 	"}\n";
 static IDirect3DPixelShader9* s_treeHlslPS = nullptr;

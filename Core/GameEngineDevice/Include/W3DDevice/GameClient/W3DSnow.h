@@ -42,6 +42,9 @@ class W3DSnowManager : public SnowManager
 	void	render(RenderInfoClass &rinfo);
 	void	renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int cubeOriginY, Int cubeDimX, Int cubeDimY);
 	void	renderSubBox(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY );
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W3: rain falls as world-space line segments
+	// instead of sprites, so it gets its own leaf pass beside the two retail ones.
+	void	renderRainLines(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY );
 	void	ReleaseResources();
 	Bool	ReAcquireResources();
 

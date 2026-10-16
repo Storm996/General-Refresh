@@ -2812,7 +2812,21 @@ Int TerrainShaderPixelShader::init()
 				// relay as the only per-pixel depth channel for fixed-function geometry. All three
 				// compiles must succeed to swap; any failure keeps the retail .pso behaviour untouched.
 				// GENERALSX_TERRAIN30=0 opts out; SM3 tier hardware is the other gate (BWFILTER pattern).
+				// GeneralsX @bugfix PS3.0 batch23 16/10/2026: two mirror defects found by reading the
+				// retail disasm against the DX9 ISA docs. (1) Operand order: MS Learn lrp---ps states
+				// "lrp dst, src0, src1, src2 -> dst = src0*src1 + (1-src0)*src2", so retail
+				// "lrp r0, v0.w, t1, t0" means weight*v0.w*t1 + (1-v0.w)*t0 = lerp(t0, t1, vc.a) =
+				// lerp(base, det, a). Batch8 wrote lerp(det, base, a), swapping base/detail wherever the
+				// per-vertex blend weight was not 0.5 - the exact shape of the batch22 "square grey
+				// patches" verdict (vertex alpha is the blend weight, quantised on the terrain patch
+				// grid). (2) Fog sign: the COUNT3 relay passes camera-space z, negative in front of the
+				// camera (D3D -Z convention), while c1.x is a positive distance, so the batch8 ramp
+				// saturate((negative - positive) * positive) folded to zero - the haze was silently a
+				// no-op, and every batch22 symptom came from defect (1). Fixed by ramping on -dep.z.
+				// "// d3d-target" below is an HLSL comment, ignored by fxc; it lets the verbatim-extract
+				// (extract_hlsl.py) feed the pixel probe for the <=1 LSB parity gate.
 				static const char* kTerrainPS30Base =
+					"// d3d-target: ps_3_0\n"
 					"sampler s0 : register(s0);\n"                 // atlas (stage0, uv0, clamped)
 					"sampler s1 : register(s1);\n"                 // detail (stage1, uv1, clamped)
 					"float4 c0 : register(c0);\n"                  // haze rgb, w = fog strength
@@ -2828,11 +2842,12 @@ Int TerrainShaderPixelShader::init()
 					"{\n"
 					"    float4 base = tex2D(s0, i.uv0);\n"
 					"    float4 det  = tex2D(s1, i.uv1);\n"
-					"    float4 c = lerp(det, base, i.vc.a) * i.vc;\n"   // terrain.pso: lrp r0,v0.w,t1,t0; mul r0,v0
-					"    float fogf = saturate((i.dep.z - c1.x) * c1.y) * c0.w;\n"
+					"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"   // terrain.pso: lrp r0,v0.w,t1,t0; mul r0,v0
+					"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
 					"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
 					"}\n";
 				static const char* kTerrainPS30Noise =
+					"// d3d-target: ps_3_0\n"
 					"sampler s0 : register(s0);\n"
 					"sampler s1 : register(s1);\n"
 					"sampler s2 : register(s2);\n"                 // noise / lightmap (stage2, dep.xy)
@@ -2849,12 +2864,13 @@ Int TerrainShaderPixelShader::init()
 					"{\n"
 					"    float4 base = tex2D(s0, i.uv0);\n"
 					"    float4 det  = tex2D(s1, i.uv1);\n"
-					"    float4 c = lerp(det, base, i.vc.a) * i.vc;\n"
+					"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
 					"    c = c * tex2D(s2, i.dep.xy);\n"               // terrainnoise.pso: mul r0,r0,t2
-					"    float fogf = saturate((i.dep.z - c1.x) * c1.y) * c0.w;\n"
+					"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
 					"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
 					"}\n";
 				static const char* kTerrainPS30Noise12 =
+					"// d3d-target: ps_3_0\n"
 					"sampler s0 : register(s0);\n"
 					"sampler s1 : register(s1);\n"
 					"sampler s2 : register(s2);\n"                 // cloud noise (stage2, dep.xy)
@@ -2873,10 +2889,10 @@ Int TerrainShaderPixelShader::init()
 					"{\n"
 					"    float4 base = tex2D(s0, i.uv0);\n"
 					"    float4 det  = tex2D(s1, i.uv1);\n"
-					"    float4 c = lerp(det, base, i.vc.a) * i.vc;\n"
+					"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
 					"    c = c * tex2D(s2, i.dep.xy);\n"               // terrainnoise2.pso: mul r0,t2; mul r0,t3
 					"    c = c * tex2D(s3, i.uv3);\n"
-					"    float fogf = saturate((i.dep.z - c1.x) * c1.y) * c0.w;\n"
+					"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
 					"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
 					"}\n";
 
@@ -3247,6 +3263,7 @@ Int RoadShaderPixelShader::init()
 			// generator with an identity matrix. Compile failure keeps the retail .pso; GENERALSX_ROAD30=0
 			// opts out (same gate style as GENERALSX_TERRAIN30).
 			static const char* kRoadPS30 =
+				"// d3d-target: ps_3_0\n"
 				"sampler s0 : register(s0);\n"                 // road atlas (stage0, uv0)
 				"sampler s1 : register(s1);\n"                 // noise 1 (stage1, TC1.xy)
 				"sampler s2 : register(s2);\n"                 // noise 2 (stage2, TC2.xy)
@@ -3263,7 +3280,7 @@ Int RoadShaderPixelShader::init()
 				"float4 main(PS_IN i) : COLOR\n"
 				"{\n"
 				"    float4 c = tex2D(s0, i.uv0) * tex2D(s1, i.n1) * tex2D(s2, i.n2) * i.vc;\n"
-				"    float fogf = saturate((i.dep.z - c1.x) * c1.y) * c0.w;\n"
+				"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"   // batch23: camera z is negative ahead (D3D -Z); see kTerrainPS30Base note
 				"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
 				"}\n";
 
@@ -3675,10 +3692,13 @@ static void InitNormalMapShaders()
 	// direction - rotate it into tangent space with the vertex basis (tangent, binormal, normal) and
 	// emit it as TEXCOORD1, so every surface gets its own light angle (per-face shading) instead of
 	// one constant tangent-space light that made all faces render the same flat darkness.
-	// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong: c5 = MODEL-SPACE eye direction (camera +Z axis,
-	// scene->eye; constant across the RTS view). The VS rotates it into tangent space exactly like c4 and
-	// emits the UNNORMALISED light+eye sum as TEXCOORD2; the PS normalises per pixel (the half vector must
-	// be re-normalised after interpolation, which is the ps_3_0 nrm/normalize win over the ps_2_0 pair).
+	// The VS does no correcting of its own: whatever frame c4/c5/c9 arrive in is the frame that gets
+	// shaded, so their world -> model rotate must be exact (see @bugfix PS3.0-#76b in dx8normalmap.cpp).
+	// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong: c5 = MODEL-SPACE eye direction (the camera's
+	// +Z world axis, read out of the DX8 view matrix by dx8normalmap.cpp; constant across the RTS view).
+	// The VS rotates it into tangent space exactly like c4 and emits the UNNORMALISED light+eye sum as
+	// TEXCOORD2; the PS normalises per pixel (the half vector must be re-normalised after interpolation,
+	// which is the ps_3_0 nrm/normalize win over the ps_2_0 pair).
 	// GeneralsX @feature PS3.0 L1 13/10/2026 three-point lighting: c9 = MODEL-SPACE sky-fill
 	// direction (dx8normalmap rotates g_FillDir world->model exactly like c4). It rides the same
 	// per-vertex TBN into TEXCOORD3 so the fill shades per-face just like the key.
@@ -3708,9 +3728,24 @@ static void InitNormalMapShaders()
 		"    o.uv = uv0;\n"
 		"    o.light = float3(dot(c4.xyz, tangent), dot(c4.xyz, binormal), dot(c4.xyz, normal));\n"
 		"    float3 eT = float3(dot(c5.xyz, tangent), dot(c5.xyz, binormal), dot(c5.xyz, normal));\n"
+		// GeneralsX @bugfix PS3.0-#73 16/10/2026 two-sided flip. Retail W3D building assemblies mix
+		// parts whose vertex normals face INTO the mesh (Lambert probe 16/10: power plant back wall
+		// reads RED toward the sun, same on the barracks back fence). Single-sided dot3 then shades
+		// those faces pitch black once bump/PBR mount. Flipping the tangent-space z of L/E/F by
+		// sign(dot(eyeDir, normal)) reflects the shading normal through the tangent plane -
+		// mathematically identical to "turn the normal toward the camera" - without touching the PS or
+		// the Lambert probe. This is the per-VERTEX stand-in for D3D's per-triangle back-face normal
+		// reversal: it agrees with the fixed pipeline on any face whose two-sided decision is uniform
+		// across its vertices, and only an edge-on face (where the eye test flips mid-triangle) can
+		// disagree. With the default D3DCULL_CW, geometry wound away from the camera never reaches the
+		// PS at all, so the flip only ever fires on inward-normal faces that ARE visible.
+		"    float facing = (dot(c5.xyz, normal) < 0.0) ? -1.0 : 1.0;\n"
+		"    o.light.z *= facing;\n"
+		"    eT.z *= facing;\n"
 		"    float3 hsum = o.light + eT;\n"
 		"    o.hvec = (dot(hsum, hsum) < 1e-6) ? float3(0.0, 0.0, 1.0) : hsum;\n"  // degenerate guard: PS normalize(0) would NaN the specular
 		"    float3 fT = float3(dot(c9.xyz, tangent), dot(c9.xyz, binormal), dot(c9.xyz, normal));\n"
+		"    fT.z *= facing;\n"
 		"    o.fill = (dot(fT, fT) < 1e-6) ? float3(0.0, 0.0, 1.0) : fT;\n"        // fill off (c9 zero): unit up-vector, c7 black makes it a no-op
 		"    return o;\n"
 		"}\n";
@@ -3757,7 +3792,13 @@ static void InitNormalMapShaders()
 		"    lit += saturate(dot(n, F)) * c7.rgb;\n"  // c7 black keeps the single-key look bit-for-bit
 		"    float ndh = saturate(dot(n, normalize(i.hvec)));\n"
 		"    float spec = pow(ndh, c6.x) * c6.y * ndl;\n"
-		"    return float4(base.rgb * lit + spec, base.a);\n" // albedo detail always preserved (alpha kept)
+		// GeneralsX @bugfix Qoder 16/10/2026 T3-0 white-flicker hardening: the fixed pipeline's
+		// stage-0 MODULATE multiplies the texel alpha by the VERTEX (DCG) alpha too, so an
+		// ALPHATEST_ENABLE material whose draw order / opacity comes through vertex alpha (single-pass
+		// wire/foliage meshes) clipped differently once dot3 mounted and output the raw texel alpha.
+		// Reproduce the FF chain: base.a * i.diffuse.a. Cosmetic no-op whenever DCG alpha is 255
+		// (all diffuse mounts shipped today), faithful otherwise.
+		"    return float4(base.rgb * lit + spec, base.a * i.diffuse.a);\n" // albedo detail always preserved (alpha = texel x vertex, FF parity)
 		"}\n";
 
 	// Diagnostic variant: flat (0,0,1) normal - isolates stage1 sampling as the flicker source.
@@ -3777,7 +3818,7 @@ static void InitNormalMapShaders()
 		"    float4 base = tex2D(s0, i.uv);\n"
 		"    base.rgb *= i.diffuse.rgb;\n"
 		"    float3 lit = saturate(dot(c5.xyz, i.light)) * c1.xxx + c2.rgb;\n"
-		"    return float4(base.rgb * lit, base.a);\n"
+		"    return float4(base.rgb * lit, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
 		"}\n";
 
 	// GeneralsX @debug T3-0 raw-visual probe: emits the sampled normal map directly. Any mesh
@@ -3794,6 +3835,43 @@ static void InitNormalMapShaders()
 		"    return float4(n, base.a);\n"              // raw tangent-space normal visualization
 		"}\n";
 
+	// GeneralsX @debug PS3.0 15/10/2026 Lambert goniometer probe (see the LAMBERT env block below).
+	// v2 (same day): v1 painted the fill lobe into G, but with the sky fill off the VS guard feeds
+	// fill=(0,0,1)=tangent up, so EVERY surface read G~1 and the screen washed green over red.
+	// v2 is a sign view of the KEY-LOBE only (R = faces the sun, B = faces away, near-black = edge-on,
+	// G stays 0); "two-lobe" was v1's wording - the fill lobe is gone from this source.
+	// PS_IN declares only COLOR0/TEXCOORD0/1: a valid subset of BOTH the dot3 VS and the PBR VS
+	// outputs, so this one source swaps into either compile site.
+	// GeneralsX @bugfix PS3.0-#73 16/10/2026 note: this probe reuses the shipped VS, so since the
+	// two-sided flip landed it reports the FLIPPED shading normal - and only on the faces the flip
+	// fires on: outward normals keep sign(dot(eye,normal) > 0) = +1 and look exactly as before, while
+	// inward-normal faces (the ones facing= -1 reflects) swap RED <-> BLUE. The raw asset view survives
+	// in GENERALSX_GEOMNORMAL_RAW (kPixelShaderGNRaw, untouched single-sided).
+	// GeneralsX @bugfix PS3.0-#76b: the pre/flip comparisons recorded for #73 were made while the
+	// model-space c4 light still carried the mesh's doubled rotation, so a swapped RED/BLUE reading
+	// may have been the matrix step rather than the flip. Recapture on the fixed build to re-read.
+	static const char* kPixelShaderLambertRaw =
+		"sampler s0 : register(s0);\n"                 // diffuse for the alpha clip
+		"sampler s1 : register(s1);\n"                 // tangent-space normal map
+		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): same bump scaling as the shipped PS
+		"struct PS_IN\n"
+		"{\n"
+		"    float4 diffuse : COLOR0;\n"
+		"    float2 uv      : TEXCOORD0;\n"
+		"    float3 light   : TEXCOORD1;\n"
+		"};\n"
+		"float4 main(PS_IN i) : COLOR\n"
+		"{\n"
+		"    float4 base = tex2D(s0, i.uv);\n"
+		"    float3 n = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
+		"    n.xy = n.xy * c3.x + c3.y;\n"
+		"    n.z  = n.z  * c3.z + c3.w;\n"
+		"    n = normalize(n);\n"
+		"    float d = dot(n, normalize(i.light));\n"
+		"    return float4(saturate(d), 0.0, saturate(-d), base.a);\n"
+		"}\n";
+
+	bool nmLambertProbe = false;   // set by the LAMBERT env branch, consumed at the PBR compile site
 	const char* pixelShaderSrc = kPixelShader;
 	{
 		const char* rawEnv = getenv("GENERALSX_NORMALMAP_RAW");
@@ -3802,11 +3880,35 @@ static void InitNormalMapShaders()
 			fprintf(stderr, "[DOT3] raw-visual mode ON (emitting normal map directly)\n");
 			fflush(stderr);
 		} else {
-			const char* ns1Env = getenv("GENERALSX_NORMALMAP_NOSTAGE1");
-			if (ns1Env != nullptr && ns1Env[0] != 0 && strcmp(ns1Env, "0") != 0) {
-				pixelShaderSrc = kPixelShaderNoStage1;
-				fprintf(stderr, "[DOT3] NOSTAGE1 diag mode ON (flat normal, no stage1 sample)\n");
+			// GeneralsX @debug PS3.0 15/10/2026 (Qoder): Lambert goniometer probe for the "building lit
+			// from its shadow side" report. The NORMALMAP_RAW probe shows the texel, which cannot answer
+			// whether the mesh's TBN basis points outward; this one shows the ACTUAL lighting angle.
+			// v2 coding (see kPixelShaderLambertRaw): R = the tangent-space normal faces the key light,
+			// B = it faces away, G is unused - the v1 "R=key lobe, G=fill lobe" note in the ON message
+			// below is left over from v1 and no longer matches what the probe paints.
+			// What a RED wall means, corrected after #76b: it shows dot(bumpN, tangentSpaceLight) > 0,
+			// and the light got into tangent space through the VS-side TBN and the model-space c4 upload.
+			// So red-on-a-shadowed-face has TWO possible readings - an inward vertex normal, or a c4 that
+			// was rotated into the wrong model frame (that was #76b, and it made the whole lobe pattern
+			// ride on the mesh's placement angle). The probe cannot tell those apart on its own; only
+			// the DOT3-vs-fixed-pipeline comparison can. The old wording claimed it "proved" the normal
+			// was inverted, which is what sent #73 hunting an asset defect instead of the matrix step.
+			// Covers both mounted pairs: swapped in here for the plain dot3 PS and at the PBR compile
+			// site below; the ML pair is intentionally not probed (buildings carry no point lights in
+			// their light environment, so ML never mounts on them).
+			const char* lamEnv = getenv("GENERALSX_NORMALMAP_LAMBERT");
+			if (lamEnv != nullptr && lamEnv[0] != 0 && strcmp(lamEnv, "0") != 0) {
+				pixelShaderSrc = kPixelShaderLambertRaw;
+				nmLambertProbe = true;
+				fprintf(stderr, "[DOT3] lambert-goniometer mode ON (R=key lobe, G=fill lobe)\n");
 				fflush(stderr);
+			} else {
+				const char* ns1Env = getenv("GENERALSX_NORMALMAP_NOSTAGE1");
+				if (ns1Env != nullptr && ns1Env[0] != 0 && strcmp(ns1Env, "0") != 0) {
+					pixelShaderSrc = kPixelShaderNoStage1;
+					fprintf(stderr, "[DOT3] NOSTAGE1 diag mode ON (flat normal, no stage1 sample)\n");
+					fflush(stderr);
+				}
 			}
 		}
 	}
@@ -3825,7 +3927,7 @@ static void InitNormalMapShaders()
 		"float4 c1 : register(c1);\n"
 		"float4 c2 : register(c2);\n"
 		"float4 c3 : register(c3);\n"
-		"float4 c7 : register(c7);\n"                  //world matrix rows (wmDx8, translation in .w of c7..c9)
+		"float4 c7 : register(c7);\n"                  //Westwood world matrix ROWS (see @bugfix PS3.0-#76b; was wmDx8 rows = world->model)
 		"float4 c8 : register(c8);\n"
 		"float4 c9 : register(c9);\n"
 		"struct VS_OUT\n"
@@ -3913,7 +4015,7 @@ static void InitNormalMapShaders()
 		"        float ndh2 = (h2l > 0.001) ? saturate(dot(n, h2 / h2l)) : 0.0;\n"
 		"        col += on * att * (base.rgb * (ndl2 * c1.xxx) * lc.rgb + pow(ndh2, c6.x) * c6.y * ndl2);\n"
 		"    }\n"
-		"    return float4(lerp(col, c9.rgb, saturate((i.eye - c10.x) * c10.y) * c9.w), base.a);\n"	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth haze, c9.w=0 keeps the pixel exact (batch8 P0: VS-relayed TEXCOORD depth, POSITION inputs are X4502)
+		"    return float4(lerp(col, c9.rgb, saturate((i.eye - c10.x) * c10.y) * c9.w), base.a * i.diffuse.a);\n"	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth haze, c9.w=0 keeps the pixel exact (batch8 P0: VS-relayed TEXCOORD depth, POSITION inputs are X4502). GeneralsX @bugfix Qoder 16/10/2026: FF-parity alpha (texel x vertex), see kPixelShader.
 		"}\n";
 
 	// GeneralsX @feature PS3.0-P4-1 15/10/2026 PBR (roughness/metalness) variant pair for the dot3
@@ -3950,10 +4052,16 @@ static void InitNormalMapShaders()
 		"    o.uv = uv0;\n"
 		"    o.light = float3(dot(c4.xyz, tangent), dot(c4.xyz, binormal), dot(c4.xyz, normal));\n"
 		"    float3 eT = float3(dot(c5.xyz, tangent), dot(c5.xyz, binormal), dot(c5.xyz, normal));\n"
+		// GeneralsX @bugfix PS3.0-#73 16/10/2026 two-sided flip (mirrors kVertexShader; see the note
+		// there). Flip applied BEFORE o.eye/hsum so V and H stay consistent with the reflected N.
+		"    float facing = (dot(c5.xyz, normal) < 0.0) ? -1.0 : 1.0;\n"
+		"    o.light.z *= facing;\n"
+		"    eT.z *= facing;\n"
 		"    o.eye = (dot(eT, eT) < 1e-6) ? float3(0.0, 0.0, 1.0) : eT;\n"          // degenerate guard: PS normalize(0) would NaN V
 		"    float3 hsum = o.light + eT;\n"
 		"    o.hvec = (dot(hsum, hsum) < 1e-6) ? float3(0.0, 0.0, 1.0) : hsum;\n"
 		"    float3 fT = float3(dot(c9.xyz, tangent), dot(c9.xyz, binormal), dot(c9.xyz, normal));\n"
+		"    fT.z *= facing;\n"
 		"    o.fill = (dot(fT, fT) < 1e-6) ? float3(0.0, 0.0, 1.0) : fT;\n"
 		"    return o;\n"
 		"}\n";
@@ -4005,7 +4113,7 @@ static void InitNormalMapShaders()
 		"    {\n"
 		"        float ndh0 = saturate(dot(n, normalize(i.hvec)));\n"
 		"        float spec0 = pow(ndh0, c6.x) * c6.y * ndl;\n"
-		"        return float4(base.rgb * lit + spec0, base.a);\n"
+		"        return float4(base.rgb * lit + spec0, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
 		"    }\n"
 		"    float2 rm = tex2D(s2, i.uv).xy;\n"        // R=roughness, G=metalness (0..1, packer §1)
 		"    if (c8.x < 1.5)\n"
@@ -4013,7 +4121,7 @@ static void InitNormalMapShaders()
 		"        float shin = lerp(8.0, 128.0, 1.0 - rm.x);\n"
 		"        float ndh1 = saturate(dot(n, normalize(i.hvec)));\n"
 		"        float spec1 = pow(ndh1, shin) * c6.y * (1.0 - rm.x) * ndl;\n"
-		"        return float4(base.rgb * lit + spec1, base.a);\n"
+		"        return float4(base.rgb * lit + spec1, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
 		"    }\n"
 		"    float3 F0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, rm.y);\n"
 		"    float3 V = normalize(i.eye);\n"
@@ -4031,7 +4139,96 @@ static void InitNormalMapShaders()
 		"    float G = (ndl / max(ndl * (1.0 - kk) + kk, 1e-3)) * (vnd / max(vnd * (1.0 - kk) + kk, 1e-3));\n"
 		"    float3 spec = D * fres * G * 0.25;\n"
 		"    float3 col = base.rgb * kd * lit * c8.y + c8.z * F0 + spec * c8.y * ndl;\n"
-		"    return float4(col, base.a);\n"
+		"    return float4(col, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
+		"}\n";
+
+	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pixel shader (光影四阶段/调研/03):
+	// the ML world-TBN skeleton (c4/c5 world sun/eye, hemi c8, fog c9/c10, c16 count + c17..c32
+	// mlight pairs, static 8-step masked loop) upgraded with the M2 GGX lobe from kPixelShaderPBR:
+	// the sun AND every collected point light get D*F*G specular and (1-F)(1-M) kd, sampling the
+	// "<stem>_rp" companion on stage2.  c11 = (mode, LI, ENV, -) mirrors the single-light PBR c8
+	// contract in a free register (c8 stays the ML hemi).  Mounted by dx8normalmap only when
+	// PBR mode == 2 with an rp companion and >=1 point light; GENERALSX_PBRML=0 forces it off.
+	// The V is the world eye constant (c5), not per-pixel - the same approximation the proven ML
+	// Blinn term already makes; at RTS distances the lobes are indistinguishable.
+	static const char* kPixelShaderPBRML =
+		"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
+		"sampler s1 : register(s1);\n"                 // tangent-space normal map (stage1)
+		"sampler s2 : register(s2);\n"                 // rp companion: R=roughness, G=metalness (stage2)
+		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
+		"float4 c2 : register(c2);\n"                  // ambient rgb
+		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): bump xy/z scaling
+		"float4 c4 : register(c4);\n"                  // world sun direction (toward the light)
+		"float4 c5 : register(c5);\n"                  // world eye direction (camera +Z)
+		"float4 c8 : register(c8);\n"                  // hemi ambient rgb, scaled by world-up n.z
+		"float4 c9 : register(c9);\n"                  // fog rgb haze color, w = blend strength
+		"float4 c10 : register(c10);\n"                // fog x = eye-depth start, y = 1/ramp length
+		"float4 c11 : register(c11);\n"                // (mode, LI, ENV, -)  GGX contract (cf. PBR c8)
+		"float4 c16 : register(c16);\n"                // x = number of active point lights (0..8)
+		"float4 mlights[16] : register(c17);\n"        // pairs: (center.xyz, innerRadius), (diffuse.rgb, outerRadius)
+		"struct PS_IN\n"
+		"{\n"
+		"    float4 diffuse : COLOR0;\n"
+		"    float2 uv      : TEXCOORD0;\n"
+		"    float3 wpos    : TEXCOORD1;\n"
+		"    float3 tT      : TEXCOORD2;\n"
+		"    float3 tB      : TEXCOORD3;\n"
+		"    float3 tN      : TEXCOORD4;\n"
+		"    float eye      : TEXCOORD5;\n"
+		"};\n"
+		"float3 ggxLobe(float3 n, float3 L, float3 E, float3 F0, float metal, float a2, float kk, float ndl, out float3 kd)\n"
+		"{\n"
+		"    float3 H = normalize(L + E);\n"
+		"    float ndh = saturate(dot(n, H));\n"
+		"    float vnd = max(dot(n, E), 0.05);\n"      // grazing-V clamp (same as kPixelShaderPBR)
+		"    float vnh = saturate(dot(E, H));\n"
+		"    float3 fres = F0 + (1.0 - F0) * pow(1.0 - vnh, 5.0);\n"
+		"    kd = (1.0 - fres) * (1.0 - metal);\n"
+		"    float dnom = ndh * ndh * (a2 - 1.0) + 1.0;\n"
+		"    float D = a2 / max(dnom * dnom, 1e-4);\n"
+		"    float G = (ndl / max(ndl * (1.0 - kk) + kk, 1e-3)) * (vnd / max(vnd * (1.0 - kk) + kk, 1e-3));\n"
+		"    return D * fres * G * 0.25;\n"
+		"}\n"
+		"float4 main(PS_IN i) : COLOR\n"
+		"{\n"
+		"    float4 base = tex2D(s0, i.uv);\n"
+		"    base.rgb *= i.diffuse.rgb;\n"
+		"    float3 tn = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
+		"    tn.xy = tn.xy * c3.x + c3.y;\n"
+		"    tn.z  = tn.z  * c3.z + c3.w;\n"
+		"    tn = normalize(tn);\n"
+		"    float3 T = normalize(i.tT);\n"
+		"    float3 B = normalize(i.tB);\n"
+		"    float3 N = normalize(i.tN);\n"
+		"    float3 n = tn.x * T + tn.y * B + tn.z * N;\n"   // world-space perturbed normal
+		"    float3 E = normalize(c5.xyz);\n"
+		"    float3 L = normalize(c4.xyz);\n"
+		"    float ndl = saturate(dot(n, L));\n"
+		"    float2 rm = tex2D(s2, i.uv).xy;\n"        // R=roughness, G=metalness
+		"    float3 F0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, rm.y);\n"
+		"    float a = rm.x * rm.x;\n"
+		"    float a2 = a * a;\n"
+		"    float kk = (rm.x + 1.0) * (rm.x + 1.0) * 0.125;\n"
+		"    float3 kd;\n"
+		"    float3 sunSpec = ggxLobe(n, L, E, F0, rm.y, a2, kk, ndl, kd);\n"
+		"    float3 lit = ndl * c1.xxx + c2.rgb + c8.rgb * n.z;\n"   // sun lambert + ambient + hemi (ML convention)
+		"    float3 col = base.rgb * kd * lit * c11.y + c11.z * F0 + sunSpec * c11.y * ndl;\n"
+		"    for (int k = 0; k < 8; k++)\n"
+		"    {\n"
+		"        float4 lp = mlights[2 * k];\n"
+		"        float4 lc = mlights[2 * k + 1];\n"
+		"        float on = ((float)k < c16.x) ? 1.0 : 0.0;\n"	//static loop + mask: ps_2_0 has no dynamic break
+		"        float3 Lv = lp.xyz - i.wpos;\n"
+		"        float dist = length(Lv);\n"
+		"        float att = saturate((lc.w - dist) / max(lc.w - lp.w, 0.0001));\n"
+		"        att *= att;\n"
+		"        float3 Ld = Lv / max(dist, 0.0001);\n"
+		"        float ndl2 = saturate(dot(n, Ld));\n"
+		"        float3 kd2;\n"
+		"        float3 spec2 = ggxLobe(n, Ld, E, F0, rm.y, a2, kk, ndl2, kd2);\n"
+		"        col += on * att * lc.rgb * (base.rgb * kd2 * (ndl2 * c1.xxx) * c11.y + spec2 * c11.y * ndl2);\n"
+		"    }\n"
+		"    return float4(lerp(col, c9.rgb, saturate((i.eye - c10.x) * c10.y) * c9.w), base.a * i.diffuse.a);\n"	// FF-parity alpha (texel x vertex), see kPixelShader
 		"}\n";
 
 	// GeneralsX @feature PS3.0 batch7 13/10/2026 the pair is emitted through the shared ladder: on a
@@ -4077,6 +4274,21 @@ static void InitNormalMapShaders()
 					DX8NormalMap::Install_ML((UINT_PTR)mlVS, (UINT_PTR)mlPS);
 					fprintf(stderr, "[ML] multi-light shaders installed vs=%s ps=%s (max 8 point lights)\n",
 						mlVSProfile, mlPSProfile);
+
+					// GeneralsX @feature PS3.0 4C 16/10/2026: compile the GGX multi-light PS on top of
+					// the ML pair it reuses the VS from. Purely additive - on failure dx8normalmap keeps
+					// mounting the plain Blinn ML pair, and GENERALSX_PBRML=0 skips this at runtime.
+					IDirect3DPixelShader9* pbrmlPS = nullptr;
+					const char* pbrmlProfile = nullptr;
+					HRESULT pbrmlHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderPBRML, false, "[PBRML]", &pbrmlProfile, (void**)&pbrmlPS);
+					if (SUCCEEDED(pbrmlHR) && pbrmlPS != nullptr) {
+						DX8NormalMap::Install_PBRML((UINT_PTR)pbrmlPS);
+						fprintf(stderr, "[PBRML] GGX multi-light PS compiled ps=%s\n", pbrmlProfile);
+					} else {
+						if (pbrmlPS != nullptr) pbrmlPS->Release();
+						fprintf(stderr, "[PBRML] compile failed (hr=0x%08X), ML stays Blinn-only\n", (unsigned)pbrmlHR);
+					}
+					fflush(stderr);
 				} else {
 					if (mlVS != nullptr) mlVS->Release();
 					if (mlPS != nullptr) mlPS->Release();
@@ -4099,8 +4311,12 @@ static void InitNormalMapShaders()
 				const char* pbrVSProfile = nullptr;
 				const char* pbrPSProfile = nullptr;
 				HRESULT pbrHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderPBR, true, "[PBR]", &pbrVSProfile, (void**)&pbrVS);
-				if (SUCCEEDED(pbrHR) && pbrVS != nullptr)
-					pbrHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderPBR, false, "[PBR]", &pbrPSProfile, (void**)&pbrPS);
+				if (SUCCEEDED(pbrHR) && pbrVS != nullptr) {
+					// Lambert goniometer probe swaps the PBR pixel shader too - roughness-equipped
+					// buildings mount this pair, not the plain dot3 one (see the LAMBERT env block).
+					const char* pbrPsSrc = nmLambertProbe ? kPixelShaderLambertRaw : kPixelShaderPBR;
+					pbrHR = W3DShaderManager::compileShaderAtBestProfile(pbrPsSrc, false, "[PBR]", &pbrPSProfile, (void**)&pbrPS);
+				}
 				if (SUCCEEDED(pbrHR) && pbrVS != nullptr && pbrPS != nullptr) {
 					DX8NormalMap::Install_PBR((UINT_PTR)pbrVS, (UINT_PTR)pbrPS);
 					fprintf(stderr, "[PBR] variant compiled vs=%s ps=%s (mode set at option install below)\n", pbrVSProfile, pbrPSProfile);
@@ -4183,6 +4399,11 @@ static void InitNormalMapShaders()
 				"    return o;\n"
 				"}\n";
 
+			// PS: per-vertex geometry normal re-light (the "flat normal" dot3 stand-in).
+			// GeneralsX @bugfix Qoder 16/10/2026: this family intentionally keeps the raw texel
+			// alpha (no * i.diffuse.a FF-parity chain like the dot3 pair above) because the GN
+			// vertex shaders carry no COLOR0 at all - wiring vertex alpha in would change the VS
+			// input/output signature and register budget for a cosmetic no-op on today's assets.
 			static const char* kPixelShaderGN =
 				"sampler s0 : register(s0);\n"                 // diffuse texture (bound by the category)
 				"float4 c4 : register(c4);\n"                  // ambient: matAmbient*envAmbient + emissive
@@ -4218,6 +4439,12 @@ static void InitNormalMapShaders()
 				"    float4 base = tex2D(s0, i.uv);\n"
 				"    float l = length(i.wn);\n"
 				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				// GeneralsX @bugfix PS3.0-#73 16/10/2026 two-sided flip: retail building assemblies mix
+				// parts with vertex normals facing INTO the mesh (Lambert probe: power plant back wall reads
+				// red toward the sun). c13.xyz is the world dir toward the camera, so reflect any normal
+				// facing away from the viewer through its tangent plane before lighting. Matches the
+				// dot3/PBR VS-side flip (kVertexShader) and lets every visible surface catch its lobes.
+				"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
 				"    float ndl0 = saturate(dot(n, c5.xyz));\n"
 				"    float3 col = c4.rgb + n.z * c16.rgb\n"
 				"        + c9.rgb  * ndl0\n"
@@ -4236,13 +4463,22 @@ static void InitNormalMapShaders()
 				"}\n";
 
 			// GeneralsX @debug PS3.0 L2 coverage probe: GENERALSX_GEOMNORMAL_RAW=1 swaps the PS for
-			// one that emits the first two per-light Lambert terms as R/G. Mounted meshes read red =
-			// light0-facing, green = light1-facing, black = not mounted - the unmistakable signal that
-			// tells "GN never mounts" apart from "GN mounts but the change is invisible".
+			// one that emits the key-light lobe SIGN view - RED = normal faces light0 (sun), BLUE =
+			// faces away, near-black = edge-on. v2 15/10/2026: the old R=l0/G=l1 coding washed green
+			// over everything (fill lobe reads high on all surfaces), this matches the dot3 LAMBERT
+			// probe so both shader families tell the same story. Also tells "GN never mounts" apart
+			// from "GN mounts but the change is invisible" - unmounted meshes keep ordinary colors.
+			// GeneralsX @bugfix PS3.0-#73 16/10/2026 note: this PS deliberately keeps NO two-sided flip
+			// (unlike kPixelShaderGN), so it stays the raw goniometer of the asset's own vertex normal -
+			// flipping in kPixelShaderGN does not hide the inward-normal cases from here.
+			// GeneralsX @bugfix PS3.0-#76b 16/10/2026 correction: the "power plant back walls stay RED
+			// even after the shipped shaders started flipping" reading was captured while the GN VS
+			// c4..c6 upload still rotated the normal by the transposed world matrix, so every lobe angle
+			// here carried the mesh's 2*theta error. Re-capture this probe before judging any asset
+			// normal direction from it; on the fixed build RED means the true world normal faces the sun.
 			static const char* kPixelShaderGNRaw =
 				"sampler s0 : register(s0);\n"
 				"float4 c5 : register(c5);\n"
-				"float4 c6 : register(c6);\n"
 				"struct PS_IN\n"
 				"{\n"
 				"    float2 uv : TEXCOORD0;\n"
@@ -4253,9 +4489,8 @@ static void InitNormalMapShaders()
 				"    float4 base = tex2D(s0, i.uv);\n"
 				"    float l = length(i.wn);\n"
 				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
-				"    float l0 = saturate(dot(n, c5.xyz));\n"
-				"    float l1 = saturate(dot(n, c6.xyz));\n"
-				"    return float4(l0, l1, 0.0, base.a);\n"
+				"    float d = dot(n, c5.xyz);\n"
+				"    return float4(saturate(d), 0.0, saturate(-d), base.a);\n"
 				"}\n";
 
 			// GeneralsX @feature PS3.0 P3-21b 14/10/2026 sun-shadow reception variants of the GN pair.
@@ -4373,6 +4608,9 @@ static void InitNormalMapShaders()
 				"    float4 base = tex2D(s0, i.uv);\n"
 				"    float l = length(i.wn);\n"
 				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				// GeneralsX @bugfix PS3.0-#73 16/10/2026 two-sided flip (same as kPixelShaderGN; the
+				// shadow lookup rides on i.sv from the vertex position and is unaffected by n).
+				"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
 				"    float ndl0 = saturate(dot(n, c5.xyz));\n"
 				"    float inside = (i.sv.x >= 0.0 && i.sv.x <= 1.0 && i.sv.y >= 0.0 && i.sv.y <= 1.0\n"
 				"        && i.sv.z >= 0.0 && i.sv.z <= 1.0) ? 1.0 : 0.0;\n"
@@ -4447,6 +4685,9 @@ static void InitNormalMapShaders()
 				"    float4 base = tex2D(s0, i.uv);\n"
 				"    float l = length(i.wn);\n"
 				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				// GeneralsX @bugfix PS3.0-#73 16/10/2026 two-sided flip (same as kPixelShaderGN; the
+				// shadow lookup rides on i.sv from the vertex position and is unaffected by n).
+				"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
 				"    float ndl0 = saturate(dot(n, c5.xyz));\n"
 				"    float inside = (i.sv.x >= 0.0 && i.sv.x <= 1.0 && i.sv.y >= 0.0 && i.sv.y <= 1.0\n"
 				"        && i.sv.z >= 0.0 && i.sv.z <= 1.0) ? 1.0 : 0.0;\n"

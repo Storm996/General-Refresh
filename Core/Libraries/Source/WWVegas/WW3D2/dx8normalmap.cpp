@@ -23,6 +23,7 @@
 #include "d3d9.h"
 
 #include <cstdio>
+#include <cstring>   // GeneralsX @feature PS3.0-#75: strcmp/strncpy for the render-time sun probe
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -148,6 +149,28 @@ namespace DX8NormalMap
 		fflush(stderr);
 	}
 
+	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pair (see dx8normalmap.h).  PS-only:
+	// the branch reuses g_VS_ML, so Install_ML must have run (it does - the device layer installs
+	// the ML pair first).  Failure/absence leaves g_PS_PBRML at 0 and the plain ML path runs.
+	static UINT_PTR g_PS_PBRML = 0;
+
+	void Install_PBRML(UINT_PTR ps_handle)
+	{
+		g_PS_PBRML = ps_handle;
+		fprintf(stderr, "[PBRML] GGX multi-light PS installed ps=%p\n", (void*)ps_handle);
+		fflush(stderr);
+	}
+
+	static bool PBRML_Enabled()
+	{
+		static int cached = -1;
+		if (cached < 0) {
+			const char* ev = getenv("GENERALSX_PBRML");
+			cached = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
+		}
+		return cached == 1 && g_PS_PBRML != 0 && g_VS_ML != 0;
+	}
+
 	// GeneralsX @feature T3-0 P1: global sun fallback (direction TOWARD the light source - same
 	// convention as LightEnvironmentClass::Get_Light_Direction - plus object ambient) for meshes
 	// that carry no per-mesh light environment (battlefield objects). Injected by
@@ -159,6 +182,42 @@ namespace DX8NormalMap
 	{
 		g_FallbackDir = world_dir;
 		g_FallbackAmbient = ambient;
+		// GeneralsX @feature PS3.0 probe round 6 16/10/2026: one-shot console proof of the injected
+		// probe sun (was it ever called on mission load, and with which vector?). Release-safe log.
+		fprintf(stderr, "[FALLBACK] dir=(%.3f,%.3f,%.3f) amb=(%.3f,%.3f,%.3f)\n",
+			world_dir.X, world_dir.Y, world_dir.Z, ambient.X, ambient.Y, ambient.Z);
+		fflush(stderr);
+	}
+
+	// GeneralsX @feature PS3.0-#75 16/10/2026 render-time sun probe (user-directed): print the light
+	// direction and ambient each shader path ACTUALLY shades the batch with, one line per distinct
+	// quantized state (path + tag + dir@0.02 + amb@0.005). DOT3 keys on the diffuse texture name,
+	// GN keys on the per-batch LightEnvironment pointer + light count.
+	// What the output CAN prove (corrected in #76b): both tags report a WORLD-space direction, so
+	// the probe compares light SOURCES (injected global sun vs per-mesh environment) and per-asset
+	// ambient. Every DOT3 line carries the same dir by construction (Lw is the single g_FallbackDir),
+	// so two DOT3 lines can never "disagree" about the sun - the informative pairing is DOT3 vs GN.
+	// What it CANNOT show: the #76b bug lived in the per-mesh world -> model ROTATE, so the world
+	// direction stayed identical for every building and no amount of [SUNDBG] lines could expose it.
+	// Capped at 400 distinct lines; release-safe stderr+fflush per AGENTS.md.
+	static void log_sun_once(const char* path, const char* tag, const Vector3& dir, const Vector3& amb)
+	{
+		static char seen[400][128];
+		static int seen_n = 0;
+		if (seen_n >= 400) return;
+		char key[128];
+		_snprintf(key, sizeof(key), "%s|%s|%d,%d,%d|%d,%d,%d", path, (tag != nullptr) ? tag : "?",
+			(int)(dir.X * 50.0f), (int)(dir.Y * 50.0f), (int)(dir.Z * 50.0f),
+			(int)(amb.X * 200.0f), (int)(amb.Y * 200.0f), (int)(amb.Z * 200.0f));
+		for (int i = 0; i < seen_n; ++i) {
+			if (strcmp(seen[i], key) == 0) return;
+		}
+		strncpy(seen[seen_n], key, sizeof(seen[0]) - 1);
+		seen[seen_n][sizeof(seen[0]) - 1] = 0;
+		++seen_n;
+		fprintf(stderr, "[SUNDBG] %s tag=%s dir=(%.3f,%.3f,%.3f) amb=(%.3f,%.3f,%.3f)\n",
+			path, (tag != nullptr) ? tag : "?", dir.X, dir.Y, dir.Z, amb.X, amb.Y, amb.Z);
+		fflush(stderr);
 	}
 
 	// GeneralsX @feature PS3.0 L1 13/10/2026: global sky fill for the dot3 single-light path.
@@ -276,6 +335,47 @@ namespace DX8NormalMap
 		return strstr(low, "housecolor") != nullptr;
 	}
 
+	// GeneralsX @bugfix Qoder 16/10/2026 #87: short-side probe from the file header only (TGA:12/14
+	// LE16, DDS:16/12 LE32), shared by both companion lookups. False = format not recognised, which
+	// callers treat as "unknown", never as "reject". Mirrors the load-time helper in
+	// MeshModelClass::Detect_And_Build_Normal_Map (GeneralsMD tree) for the render-side belt.
+	static bool Peek_Image_Min_Side(const char* filename, int& minSide)
+	{
+		minSide = 0;
+		if (filename == nullptr || filename[0] == 0) {
+			return false;
+		}
+		FileClass* file = _TheFileFactory->Get_File(filename);
+		if (file == nullptr) {
+			return false;
+		}
+		bool ok = false;
+		file->Open();
+		if (file->Is_Available()) {
+			unsigned char hdr[20];
+			if (file->Read(hdr, 20) == 20) {
+				if (hdr[0] == 'D' && hdr[1] == 'D' && hdr[2] == 'S' && hdr[3] == ' ') {
+					const int h = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16) | (hdr[15] << 24);
+					const int w = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | (hdr[19] << 24);
+					if (w > 0 && h > 0) {
+						minSide = (w < h) ? w : h;
+						ok = true;
+					}
+				} else {
+					const int w = hdr[12] | (hdr[13] << 8);
+					const int h = hdr[14] | (hdr[15] << 8);
+					if (w > 0 && h > 0) {
+						minSide = (w < h) ? w : h;
+						ok = true;
+					}
+				}
+			}
+		}
+		file->Close();
+		_TheFileFactory->Return_File(file);
+		return ok;
+	}
+
 	// Derive the companion-normal name from the diffuse name and fetch the cached texture object
 	// (M1 already loaded it under the same name into the asset hash).
 	static TextureClass* Find_Companion_Normal(TextureClass* diffuse)
@@ -319,6 +419,20 @@ namespace DX8NormalMap
 			}
 		}
 		if (found == nullptr) { g_NmCache.Put(raw, nullptr); return nullptr; }
+
+		// GeneralsX @bugfix Qoder 16/10/2026 #87: render-side belt of the surface detail contract
+		// (dimension arm only; the polygon arm lives in the load probe where the mesh is visible).
+		// Companions dropped after model load never re-run Detect_And_Build_Normal_Map, so a
+		// sub-128px FX-sprite companion must never become a live stage-1 binding from here either.
+		{
+			int cSide = 0;
+			int dSide = 0;
+			if ((Peek_Image_Min_Side(found, cSide) && cSide < 128)
+				|| (Peek_Image_Min_Side(raw, dSide) && dSide < 128)) {
+				g_NmCache.Put(raw, nullptr);
+				return nullptr;
+			}
+		}
 
 		// Load the companion as full RGB (A8R8G8B8) so the blue Z channel survives. The earlier
 		// U8V8 (2-channel bump) request dropped Z, so the shader's _bx2 read Z as -1 (backward normal),
@@ -375,12 +489,51 @@ namespace DX8NormalMap
 		}
 		if (found == nullptr) { g_RPCache.Put(raw, nullptr); return nullptr; }
 
+		// GeneralsX @bugfix Qoder 16/10/2026 #87: same render-side dimension belt as
+		// Find_Companion_Normal - a sub-128px _rp companion is an FX sprite's roughness map and
+		// must never bind to stage 2.
+		{
+			int cSide = 0;
+			int dSide = 0;
+			if ((Peek_Image_Min_Side(found, cSide) && cSide < 128)
+				|| (Peek_Image_Min_Side(raw, dSide) && dSide < 128)) {
+				g_RPCache.Put(raw, nullptr);
+				return nullptr;
+			}
+		}
+
 		WW3DAssetManager* am = WW3DAssetManager::Get_Instance();
 		if (am == nullptr) return nullptr;
 		TextureClass* rp = am->Get_Texture(found, MIP_LEVELS_ALL, WW3D_FORMAT_A8R8G8B8);
 
 		g_RPCache.Put(raw, rp);
 		return rp;
+	}
+
+	// GeneralsX @feature PS3.0-#76 Qoder 16/10/2026: targeted branch forensics for the four-plant
+	// sun-consistency bench. The [PBR] mount counter caps at 8 and the case-mixed duplicate texture
+	// names (ABPwrPlant.tga vs abpwrplant.tga) make the existing logs inconclusive about which
+	// shading branch (or rejection) the power plant actually takes. This fires one stderr line per
+	// branch visit for any diffuse whose name contains "abpwrplant" (case-insensitive), so a T1
+	// recapture answers "DOT3 vs PBR vs fixed pipeline" from runtime evidence, not guesswork.
+	static void Log_Bench_Path(const char* verdict, TextureClass* diffuse, TextureClass* nm, TextureClass* rp)
+	{
+		static int s_logged = 0;
+		if (s_logged >= 12 || diffuse == nullptr) return;
+		const char* dn = (const char*)diffuse->Get_Texture_Name();
+		if (dn == nullptr || dn[0] == 0) return;
+		char low[64];
+		int i = 0;
+		for (; dn[i] != 0 && i < 63; ++i) {
+			const char c = dn[i];
+			low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+		}
+		low[i] = 0;
+		if (strstr(low, "abpwrplant") == nullptr) return;
+		++s_logged;
+		fprintf(stderr, "[BENCH76] %s diffuse='%s' nm=%s rp=%s\n", verdict, dn,
+			nm != nullptr ? "yes" : "no", rp != nullptr ? "yes" : "no");
+		fflush(stderr);
 	}
 
 	bool Apply(const Matrix3D& world, LightEnvironmentClass* lenv, TextureClass* diffuse)
@@ -398,11 +551,13 @@ namespace DX8NormalMap
 		}
 		const bool bumpOn = Ready_To_Render();
 		if (!bumpOn && !RP_Ready()) {
+			Log_Bench_Path("reject:paths-off", diffuse, nullptr, nullptr);   // GeneralsX @feature PS3.0-#76
 			return false;
 		}
 		TextureClass* nm = bumpOn ? Find_Companion_Normal(diffuse) : nullptr;
 		TextureClass* rp = RP_Ready() ? Find_Companion_RP(diffuse) : nullptr;
 		if (nm == nullptr && rp == nullptr) {
+			Log_Bench_Path("reject:no-companions", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
 			return false;
 		}
 		// Roughness-only mode never had the point-light ML pair to offer: if this mesh's light
@@ -411,7 +566,10 @@ namespace DX8NormalMap
 		if (nm == nullptr && lenv != nullptr) {
 			const int total = lenv->Get_Light_Count();
 			for (int i = 0; i < total; ++i) {
-				if (lenv->isPointLight(i)) return false;
+				if (lenv->isPointLight(i)) {
+					Log_Bench_Path("reject:pointlight-roughness-only", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
+					return false;
+				}
 			}
 		}
 
@@ -453,20 +611,34 @@ namespace DX8NormalMap
 			if (dl2 > 1e-6f) { Lw.X /= dl2; Lw.Y /= dl2; Lw.Z /= dl2; }
 		}
 
-		// Lm = wmDx8^T * Lw (rotation only). wmDx8 is col-major (m[r][c] at flat[r + 4c]), so
-		// Lm[r] = sum_c wmDx8[c][r] * Lw[c] = sum_c m[c + 4r] * Lw[c].
+		// GeneralsX @bugfix PS3.0-#76b 16/10/2026: world -> model is Inverse_Rotate_Vector(wm, Lw).
+		// Matrix4x4 stores Vector4 Row[4] (row-major, stride 4) and wmDx8 = wm.Transpose(), so
+		// wmDx8[r][c] lives at flat[4r + c] and Lm[r] = sum_c wmDx8[r][c] * Lw[c] is the ROW step.
+		// The old column step (m[0],m[4],m[8]) summed wmDx8[c][r] = wm[r][c], i.e. Rotate_Vector --
+		// model -> world -- so every mesh's own placement rotation doubled into the light direction
+		// (2-theta error). What that predicts, and how to falsify it: a mesh at theta = 0 or 180 deg
+		// keeps the right lit face (2*theta is a full turn), a mesh at 90/270 deg reads lit from the
+		// opposite side, and rotating an already-wrong building by 90 deg must flip its shading by
+		// 180 deg. That is the mechanism behind the reported "some buildings wrong, some right";
+		// the four-plant {1,3}/{2,4} grouping is this code's explanation of the user's report, not a
+		// re-measurement on this build.
 		const float* m = reinterpret_cast<const float*>(&wmDx8);
 		Vector4 c4;
-		c4.X = m[0] * Lw.X + m[4] * Lw.Y + m[8] * Lw.Z;
-		c4.Y = m[1] * Lw.X + m[5] * Lw.Y + m[9] * Lw.Z;
-		c4.Z = m[2] * Lw.X + m[6] * Lw.Y + m[10] * Lw.Z;
+		c4.X = m[0] * Lw.X + m[1] * Lw.Y + m[2] * Lw.Z;
+		c4.Y = m[4] * Lw.X + m[5] * Lw.Y + m[6] * Lw.Z;
+		c4.Z = m[8] * Lw.X + m[9] * Lw.Y + m[10] * Lw.Z;
 		c4.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(4, &c4, 1);   // c4 = model-space light (VS rotates via TBN)
 
 		// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong eye vector. The camera's +Z axis in world
-		// space (scene->eye; it looks down -Z) is, in the raw DX8 view format, the same "axis r lives at
-		// flat[r], flat[r+4], flat[r+8]" pattern the light above uses, with r=2. Rotated into model space
-		// exactly like c4 and fed to the VS as c5, where it joins the light to form the half-vector sum.
+		// space (the camera looks down its own -Z) is COLUMN 2 of the raw DX8 view matrix, so the eye
+		// extraction below uses the column step flat[r + 4c] with c=2: vm[2], vm[6], vm[10]. Reading a
+		// column of the DX8 matrix is what pulls a world axis out of it, because Set_Transform(D3DTS_VIEW)
+		// stored the Westwood view already transposed and _Get_DX8_Transform hands that back untransposed.
+		// (Comment corrected in #76b: this used to claim "the same pattern the light above uses" - after
+		// #76b the world -> model rotates are ROW steps, only this view-axis pull is a COLUMN step.)
+		// The world eye is then rotated into model space exactly like c4 and fed to the VS as c5, where
+		// it joins the light to form the half-vector sum.
 		const float* vm = reinterpret_cast<const float*>(&view);
 		Vector3 Ew(vm[2], vm[6], vm[10]);
 		{
@@ -475,9 +647,10 @@ namespace DX8NormalMap
 			else { Ew = Vector3(0.0f, 0.0f, 1.0f); }   // degenerate view matrix: headlight fallback
 		}
 		Vector4 c5eye;
-		c5eye.X = m[0] * Ew.X + m[4] * Ew.Y + m[8] * Ew.Z;
-		c5eye.Y = m[1] * Ew.X + m[5] * Ew.Y + m[9] * Ew.Z;
-		c5eye.Z = m[2] * Ew.X + m[6] * Ew.Y + m[10] * Ew.Z;
+		// GeneralsX @bugfix PS3.0-#76b: row step (world -> model), same fix as c4 above.
+		c5eye.X = m[0] * Ew.X + m[1] * Ew.Y + m[2] * Ew.Z;
+		c5eye.Y = m[4] * Ew.X + m[5] * Ew.Y + m[6] * Ew.Z;
+		c5eye.Z = m[8] * Ew.X + m[9] * Ew.Y + m[10] * Ew.Z;
 		c5eye.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(5, &c5eye, 1); // c5 = model-space eye direction
 
@@ -493,9 +666,10 @@ namespace DX8NormalMap
 			else { Fw = Vector3(0.0f, 0.0f, 0.0f); }
 		}
 		Vector4 c9fill;
-		c9fill.X = m[0] * Fw.X + m[4] * Fw.Y + m[8] * Fw.Z;
-		c9fill.Y = m[1] * Fw.X + m[5] * Fw.Y + m[9] * Fw.Z;
-		c9fill.Z = m[2] * Fw.X + m[6] * Fw.Y + m[10] * Fw.Z;
+		// GeneralsX @bugfix PS3.0-#76b: row step (world -> model), same fix as c4 above.
+		c9fill.X = m[0] * Fw.X + m[1] * Fw.Y + m[2] * Fw.Z;
+		c9fill.Y = m[4] * Fw.X + m[5] * Fw.Y + m[6] * Fw.Z;
+		c9fill.Z = m[8] * Fw.X + m[9] * Fw.Y + m[10] * Fw.Z;
 		c9fill.W = 1.0f;
 		DX8Wrapper::Set_Vertex_Shader_Constant(9, &c9fill, 1);  // c9 = model-space fill direction
 
@@ -504,6 +678,11 @@ namespace DX8NormalMap
 		DX8Wrapper::Set_Pixel_Shader_Constant(5, &c5, 1);
 
 		const Vector3& amb = (lenv != nullptr) ? lenv->Get_Equivalent_Ambient() : g_FallbackAmbient;
+		// GeneralsX @feature PS3.0-#75 16/10/2026: render-time sun probe for this batch.
+		{
+			const char* tname = (diffuse != nullptr) ? (const char*)diffuse->Get_Texture_Name() : nullptr;
+			log_sun_once("DOT3", tname, Lw, amb);
+		}
 		float ambient = (amb.X + amb.Y + amb.Z) * (1.0f / 3.0f);
 		Vector3 ambColor(ambient, ambient, ambient);
 		// GeneralsX @bugfix PS3.0 #69 15/10/2026: the options-menu "normal strength" slider was wired
@@ -593,9 +772,19 @@ namespace DX8NormalMap
 					fprintf(stderr, "[ML] multi-light branch mounted: %d point light(s) on this mesh\n", mlCount);
 					fflush(stderr);
 				}
-				// VS c7..c10 = world matrix rows (wmDx8 carries the translation in .w of the
-				// position rows, matching the dot(pos, row) convention the WVP upload uses).
-				DX8Wrapper::Set_Vertex_Shader_Constant(7, m, 4);
+				// GeneralsX @bugfix PS3.0-#76b 16/10/2026: the ML VS (kVertexShaderML) builds its world
+				// position and world TBN by dot-ing the object vectors with c7/c8/c9 only - the 4-wide
+				// upload below does reserve c10, but no ML shader line reads it - and the shader-constant
+				// convention that matches the (proven) WVP upload is "dot with a WESTWOOD ROW":
+				// dot(pos4, wm.Row r) = Transform_Vector (object -> world; POSITION arrives as float4
+				// with w = 1, which is why the translation rides in the .w of c7..c9 and a 4th row is
+				// not needed) and dot(normal, wm.Row r) = Rotate_Vector.
+				// The old upload sent wmDx8 rows (= wm columns): the world position lost its translation
+				// (wm row 3 is (0,0,0,1), so wmDx8 row r has .w = wm[3][r] = 0 for r < 3) and rotated by
+				// -theta, and the world TBN flipped the same way the GN c4..c6 upload did. Same
+				// transposition family as the c4/c5/c9 fix above.
+				const float* wmRows = reinterpret_cast<const float*>(&wm);
+				DX8Wrapper::Set_Vertex_Shader_Constant(7, wmRows, 4);
 				// PS c4/c5 = WORLD-space sun/eye (the single-light pair uses model-space VS copies).
 				Vector4 sunWorld(Lw.X, Lw.Y, Lw.Z, 0.0f);
 				DX8Wrapper::Set_Pixel_Shader_Constant(4, &sunWorld, 1);
@@ -617,9 +806,31 @@ namespace DX8NormalMap
 				DX8Wrapper::Set_Pixel_Shader_Constant(9, &g_FogColorStrength, 1);
 				DX8Wrapper::Set_Pixel_Shader_Constant(10, &g_FogRamp, 1);
 
+				// GeneralsX @feature PS3.0 4C 16/10/2026: GGX multi-light upgrade.  With PBR mode 2
+				// armed, an _rp companion present and the PBRML PS installed, shade this lit mesh with
+				// the GGX lobe for the sun AND every collected point light instead of the Blinn ML path
+				// (which used to swallow the PBR look whenever any lamp/explosion touched the mesh).
+				// c11 = (mode, LI, ENV, -) mirrors the single-light PBR c8 contract in a free register.
+				const bool pbrml = (PBR_Mode() == 2 && PBRML_Enabled() && rp != nullptr);
+				if (pbrml)
+				{
+					static int s_pbrmlMounted = 0;
+					if (s_pbrmlMounted < 5)
+					{
+						++s_pbrmlMounted;
+						fprintf(stderr, "[PBRML] GGX multi-light mounted: %d point light(s) on diffuse='%s'\n",
+							mlCount, (const char*)diffuse->Get_Texture_Name());
+						fflush(stderr);
+					}
+					const Vector4 c11pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), 0.0f);
+					DX8Wrapper::Set_Pixel_Shader_Constant(11, &c11pbr, 1);
+					DX8Wrapper::Set_Texture(2, rp);
+				}
+
+				Log_Bench_Path(pbrml ? "mount:PBRML" : "mount:ML", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
 				DX8Wrapper::Set_Texture(1, nm);
 				DX8Wrapper::Set_Vertex_Shader(g_VS_ML);
-				DX8Wrapper::Set_Pixel_Shader(g_PS_ML);
+				DX8Wrapper::Set_Pixel_Shader(pbrml ? g_PS_PBRML : g_PS_ML);
 				return true;
 			}
 		}
@@ -649,6 +860,7 @@ namespace DX8NormalMap
 				const Vector4 flat(0.0f, 0.0f, 0.0f, 1.0f);
 				DX8Wrapper::Set_Pixel_Shader_Constant(3, &flat, 1); // c3: tangent normal forced to (0,0,1)
 			}
+			Log_Bench_Path("mount:PBR", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
 			DX8Wrapper::Set_Texture(1, nm);
 			DX8Wrapper::Set_Texture(2, rp);
 			DX8Wrapper::Set_Vertex_Shader(g_VS_PBR);
@@ -656,6 +868,7 @@ namespace DX8NormalMap
 			return true;
 		}
 
+		Log_Bench_Path("mount:DOT3", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
 		DX8Wrapper::Set_Texture(1, nm);
 		DX8Wrapper::Set_Vertex_Shader(g_VS);
 		DX8Wrapper::Set_Pixel_Shader(g_PS);
@@ -876,8 +1089,17 @@ namespace DX8GeomNormal
 
 		const float* s = reinterpret_cast<const float*>(&wvp);
 		DX8Wrapper::Set_Vertex_Shader_Constant(0, s, 4);              // VS c0..c3 = WVP
-		const float* m = reinterpret_cast<const float*>(&wmDx8);
-		DX8Wrapper::Set_Vertex_Shader_Constant(4, m, 3);             // VS c4..c6 = world rotation rows (normal -> world)
+		// GeneralsX @bugfix PS3.0-#76b 16/10/2026: the GN VS builds the world normal as
+		// dot(normal, c4..c6), so the three uploaded rows must be the Westwood world matrix ROWS
+		// (Rotate_Vector convention: object -> world). The old wmDx8 upload sent its rows, which are
+		// the wm columns = Inverse_Rotate = world -> model, so rotated meshes lit with a 2-theta error.
+		// Same error, seen from the other side of the dot product: Apply over-rotated the light
+		// (dot(n, R*Lw)), GN under-rotated the normal (dot(R^T*n, Lw)) - the two are equal, so both
+		// families put the brightest face on the world normal R^2*Lw and both disagreed with the
+		// fixed pipeline on exactly the same meshes, by exactly the same amount. That is why GN was
+		// never a valid "correct reference" to diff the dot3 path against.
+		const float* m = reinterpret_cast<const float*>(&wm);
+		DX8Wrapper::Set_Vertex_Shader_Constant(4, m, 3);             // VS c4..c6 = world matrix rows (normal -> world)
 
 		if (useShadow) {
 			// object -> light-clip rows (VS c7..c10), composed by finite differences through the two
@@ -965,6 +1187,19 @@ namespace DX8GeomNormal
 		for (int li = n; li < 8; ++li) {
 			dirs[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
 			cols[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+
+		// GeneralsX @feature PS3.0-#75 16/10/2026: render-time sun probe for this GN batch. The tag
+		// carries the per-batch LightEnvironment pointer + light count, so distinct lenvs that hand out
+		// different dir0 print one line each - that is what this line can prove (light-source selection).
+		// Corrected in #76b: it is NOT the smoking gun for "same frame, half the base dark". GN lights
+		// with WORLD-space dirs and rotates the vertex normal by the world rows, so a per-mesh rotate
+		// error never shows up here; that bug only appeared in the model-space c4/c5/c9 uploads.
+		{
+			char tag[48];
+			_snprintf(tag, sizeof(tag), "lenv=%p lc=%d", (const void*)lenv, n);
+			const Vector3 d0(dirs[0].X, dirs[0].Y, dirs[0].Z);
+			DX8NormalMap::log_sun_once("GN", tag, d0, amb);
 		}
 
 		Vector4 c4amb(amb.X, amb.Y, amb.Z, 1.0f);

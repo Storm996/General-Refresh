@@ -39,6 +39,13 @@ namespace DX8NormalMap
 	// bit-for-bit - zero regression.
 	void Install_PBR(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
+	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pair (光影四阶段/调研/03): the ML world-TBN
+	// VS reused with a PS that keeps the point-light loop but shades every light (sun + up to 8 point
+	// lights) with the M2 GGX lobe and samples the "_rp" companion.  Mounted only inside the ML branch
+	// when PBR mode == 2, the mesh carries an _rp texture and GENERALSX_PBRML != 0; otherwise the plain
+	// ML pair runs bit-for-bit as before.  PS-only install: the VS handle comes from Install_ML.
+	void Install_PBRML(UINT_PTR ps_handle);
+
 	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth distance haze shared by the GN and ML
 	// per-pixel families. colorStrength carries the haze rgb in xyz and the blend strength in w
 	// (0 leaves every pixel numerically identical to the pre-fog shaders); startInvLen is

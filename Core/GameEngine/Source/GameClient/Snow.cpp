@@ -30,15 +30,243 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the Game
 #include "GameClient/Snow.h"
 #include "GameClient/View.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the render layer observes the logic-side
+// weather value here (one-way read; it is never written back, so replay/CRC state is untouched).
+#include "Common/GlobalData.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1/W4: render-side weather state owner.
+#include "GameClient/WeatherFX.h"
 
 
 SnowManager *TheSnowManager=nullptr;
+
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: one profile per weather type. Index is the
+// Weather enum value. Slot WEATHER_SNOWY is the retail "Weather" INI block (and every override of it);
+// the other slots only exist once a "WeatherType" block authors them, or once applyTypeDefaults hands a
+// map a tuned recipe for a type that shipped with no data at all.
+static WeatherSetting *s_weatherProfiles[WEATHER_COUNT] = { nullptr };
+static Weather s_activeWeatherType = WEATHER_NORMAL;
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: authored baseline for each new type.
+// These are the "looks right on a generic map" numbers - a WeatherType block overrides any field.
+// Note the particle count this generates: emitters = (BoxDimensions * BoxDensity)^2, and the
+// per-particle height noise table holds SNOW_NOISE_X * SNOW_NOISE_Y entries, so a type that wants a
+// denser box must stay inside that budget or the pattern repeats visibly (128x128 = 16384).
+//-------------------------------------------------------------------------------------------------
+void WeatherSetting::applyTypeDefaults(Weather type)
+{
+	m_weatherType = type;
+	switch (type)
+	{
+		case WEATHER_RAINY:
+			m_particleKind = PARTICLE_RAIN;
+			m_weatherEnabled = TRUE;
+			m_snowEnabled = TRUE;				//render-side gate is shared with the retail recipe.
+			m_snowTexture = "EXRainStreak.tga";
+			m_snowBoxDimensions = 110.0f;
+			m_snowBoxDensity = 0.85f;
+			m_snowVelocity = 42.0f;
+			m_snowAmplitude = 0.6f;
+			m_snowFrequencyScaleX = 0.02f;
+			m_snowFrequencyScaleY = 0.02f;
+			m_streakLength = 3.2f;
+			m_streakThickness = 0.06f;
+			m_opacity = 0.55f;
+			m_falloffStart = 180.0f;
+			m_falloffEnd = 420.0f;
+			m_windX = 2.0f;
+			m_windY = 1.0f;
+			m_usePointSprites = FALSE;
+			m_minShade = 0.55f;
+			m_particleTint.red = 0.78f; m_particleTint.green = 0.85f; m_particleTint.blue = 1.0f;
+			m_ambientScale = 0.85f;
+			m_keyScale = 0.75f;
+			m_fogScale = 1.35f;
+			m_wetness = 0.45f;
+			m_screenTint.red = 0.86f; m_screenTint.green = 0.90f; m_screenTint.blue = 0.98f;
+			m_screenDarken = 0.88f;
+			m_screenWispDensity = 0.35f;
+			m_screenVignette = 0.12f;
+			m_lightningChance = 0.0f;
+			break;
+
+		case WEATHER_STORM:
+			m_particleKind = PARTICLE_RAIN;
+			m_weatherEnabled = TRUE;
+			m_snowEnabled = TRUE;
+			m_snowTexture = "EXRainStreak.tga";
+			m_snowBoxDimensions = 110.0f;
+			m_snowBoxDensity = 1.25f;
+			m_snowVelocity = 60.0f;
+			m_snowAmplitude = 1.2f;
+			m_swayScale = 2.2f;
+			m_streakLength = 5.5f;
+			m_streakThickness = 0.08f;
+			m_opacity = 0.65f;
+			m_falloffStart = 200.0f;
+			m_falloffEnd = 460.0f;
+			m_windX = 7.0f;
+			m_windY = 4.0f;
+			m_usePointSprites = FALSE;
+			m_minShade = 0.50f;
+			m_particleTint.red = 0.72f; m_particleTint.green = 0.78f; m_particleTint.blue = 0.95f;
+			m_ambientScale = 0.68f;
+			m_keyScale = 0.55f;
+			m_fogScale = 1.7f;
+			m_wetness = 0.65f;
+			m_screenTint.red = 0.76f; m_screenTint.green = 0.80f; m_screenTint.blue = 0.92f;
+			m_screenDarken = 0.74f;
+			m_screenWispDensity = 0.62f;
+			m_screenVignette = 0.26f;
+			m_lightningChance = 0.0f;
+			break;
+
+		case WEATHER_THUNDER:
+			applyTypeDefaults(WEATHER_STORM);
+			m_weatherType = WEATHER_THUNDER;
+			m_ambientScale = 0.58f;
+			m_keyScale = 0.48f;
+			m_screenDarken = 0.66f;
+			m_lightningChance = 6.0f;			///<expected strikes/minute - device-side RNG only.
+			m_lightningIntensity = 1.0f;
+			break;
+
+		case WEATHER_BLIZZARD:
+			m_particleKind = PARTICLE_SNOW;
+			m_weatherEnabled = TRUE;
+			m_snowEnabled = TRUE;
+			m_snowTexture = "EXSnowFlake.tga";
+			m_snowBoxDimensions = 150.0f;
+			m_snowBoxDensity = 0.62f;
+			m_snowVelocity = 26.0f;
+			m_snowAmplitude = 12.0f;
+			m_swayScale = 2.6f;
+			m_snowPointSize = 1.3f;
+			m_snowMaxPointSize = 48.0f;
+			m_usePointSprites = TRUE;
+			m_windX = 16.0f;
+			m_windY = 5.0f;
+			m_opacity = 0.95f;
+			m_falloffStart = 120.0f;
+			m_falloffEnd = 330.0f;
+			m_minShade = 0.60f;
+			m_particleTint.red = 0.92f; m_particleTint.green = 0.95f; m_particleTint.blue = 1.0f;
+			m_ambientScale = 0.80f;
+			m_keyScale = 0.70f;
+			m_fogScale = 2.4f;
+			m_wetness = 0.0f;
+			m_screenTint.red = 0.93f; m_screenTint.green = 0.96f; m_screenTint.blue = 1.0f;
+			m_screenDarken = 0.92f;
+			m_screenWispDensity = 0.75f;
+			m_screenVignette = 0.35f;
+			m_lightningChance = 0.0f;
+			break;
+
+		case WEATHER_SNOWY:
+		{
+			// GeneralsX @tweak PS3.0 Weather W1: the retail snow recipe gains only the new screen-layer
+			// identity values here - a map that never writes a WeatherType block renders exactly as before.
+			m_weatherType = WEATHER_SNOWY;
+			m_particleKind = PARTICLE_SNOW;
+			m_minShade = 0.45f;					///<matches the literal floor the PS3.0-P3-26 tint used.
+			break;
+		}
+
+		case WEATHER_NORMAL:
+		default:
+			m_weatherType = WEATHER_NORMAL;
+			m_weatherEnabled = FALSE;
+			m_snowEnabled = FALSE;
+			break;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: profile access + type switching.
+// Every type lazily materializes its own base object, so render code can dereference a profile
+// unconditionally. Recursion is avoided by never routing through this function while building one.
+//-------------------------------------------------------------------------------------------------
+WeatherSetting *getWeatherProfile(Weather type)
+{
+	const Int index = (type >= WEATHER_NORMAL && type < WEATHER_COUNT) ? (Int)type : (Int)WEATHER_NORMAL;
+	if (s_weatherProfiles[index] == nullptr)
+	{
+		WeatherSetting *fresh = newInstance(WeatherSetting);
+		WeatherSetting *snowBase = s_weatherProfiles[WEATHER_SNOWY];
+		if (snowBase != nullptr)
+		{
+			// Inherit the system-level recipe (texture, grass toggles, point-sprite preference),
+			// then let the type's own baseline decide what actually renders.
+			*fresh = *snowBase;
+		}
+		fresh->applyTypeDefaults((Weather)index);
+		s_weatherProfiles[index] = fresh;
+	}
+	return s_weatherProfiles[index];
+}
+
+Weather getActiveWeatherType()
+{
+	return s_activeWeatherType;
+}
+
+void applyWeatherType(Weather type)
+{
+	const Int index = (type >= WEATHER_NORMAL && type < WEATHER_COUNT) ? (Int)type : (Int)WEATHER_NORMAL;
+	WeatherSetting *profile = getWeatherProfile((Weather)index);
+
+	// The profile table always owns the base object of each chain (that is what a destructor frees);
+	// TheWeatherSetting is the "active" view, i.e. the last override a map authored for that profile.
+	// friend_getFinalOverride() walks to the end of the chain and returns the base when there is none.
+	TheWeatherSetting = (WeatherSetting *)profile->friend_getFinalOverride();
+	s_activeWeatherType = (Weather)index;
+
+	if (TheSnowManager != nullptr)
+	{
+		TheSnowManager->setWeatherType((Weather)index);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: render-layer gates. Both read the
+// environment once and never touch logic state, so they are QA legs, not gameplay state:
+//   GENERALSX_WEATHER=0        - kills the whole weather render layer (retail parity A/B leg).
+//   GENERALSX_WEATHER_TYPE=n   - forces type n for this run (0..5); unset = follow the map/script.
+//-------------------------------------------------------------------------------------------------
+Bool isWeatherRenderEnabled()
+{
+	static const Bool s_on = [] {
+		const char *ev = getenv("GENERALSX_WEATHER");
+		return ev == nullptr || atoi(ev) != 0;
+	}();
+	return s_on;
+}
+
+Weather readMapWeatherOverride()
+{
+	static const Int s_cached = [] {
+		const char *ev = getenv("GENERALSX_WEATHER_TYPE");
+		return ev != nullptr && *ev != 0 ? atoi(ev) : -1;
+	}();
+	if (s_cached < 0)
+	{
+		return WEATHER_NORMAL;
+	}
+	return Weather_ClampToKnown(s_cached);
+}
+
+Bool hasWeatherTypeOverride()
+{
+	static const Bool s_set = getenv("GENERALSX_WEATHER_TYPE") != nullptr;
+	return s_set;
+}
 
 SnowManager::SnowManager()
 {
 	m_time = 0;
 	m_velocity = 1;
 	m_isVisible = TRUE;	//default to showing if it's enabled via INI.
+	m_weatherType = WEATHER_SNOWY;	//GeneralsX @feature PS3.0 Weather W1: retail only ever had snow.
 }
 
 void SnowManager::init()
@@ -48,14 +276,82 @@ void SnowManager::init()
 	m_startingHeights=NEW Real [ SNOW_NOISE_X * SNOW_NOISE_Y];
 	m_time = 0;
 
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the retail build only ever had one
+	// recipe, so "active type" used to be implicit. Materialize the snowy profile and point the
+	// active view at it before anything reads TheWeatherSetting.
+	applyWeatherType(WEATHER_SNOWY);
 	updateIniSettings();
+
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: create the render-side weather state
+	// after the recipe exists, and reset it with every game the client starts (TheWeatherManager is
+	// created next to TheSnowManager in GameClient::init, so this is the one shared hook).
+	if (TheWeatherFX == nullptr)
+	{
+		TheWeatherFX = NEW WeatherFX;
+	}
+	TheWeatherFX->reset();
+}
+
+void SnowManager::setWeatherType(Weather type)
+{
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: render-side mirror of the logic-side
+	// weather value. Re-resolves the recipe (a map may have overridden that type's block), then
+	// reloads the particle parameters so the swap is visible from the next frame.
+	const Weather previous = m_weatherType;
+	m_weatherType = type;
+	applyWeatherType(type);
+	if (type != previous)
+	{
+		m_time = 0;	//start the new type's fall cycle from the top of its box.
+	}
+	updateIniSettings();
+}
+
+void SnowManager::update()
+{
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: mirror the logic-side weather value into
+	// the render recipe once per client frame. Reading GlobalData here is one-way (render observes
+	// logic, never writes it), so the value stays out of the CRC stream and replays are unaffected.
+	// The compare is a single enum test when nothing changed, which is the common case.
+	const Weather forced = readMapWeatherOverride();
+	const Weather wanted = hasWeatherTypeOverride()
+		? forced
+		: TheGlobalData != nullptr ? TheGlobalData->m_weather : WEATHER_NORMAL;
+
+	if (wanted != m_weatherType)
+	{
+		setWeatherType(Weather_ClampToKnown((Int)wanted));
+	}
+
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1/W4: the render-side scalars (dimming,
+	// wetness, screen tint, lightning envelope) are derived here so every consumer - the light refill,
+	// the particle pass and the screen filter - reads one coherent set of numbers per frame.
+	if (TheWeatherFX != nullptr)
+	{
+		TheWeatherFX->update();
+	}
 }
 
 void SnowManager::updateIniSettings()
 {
+	// GeneralsX @bugfix Storm996 16/10/2026 PS3.0 Weather W1: a WeatherType block can legally arrive
+	// before the manager exists, and BaseHeightMap device-loss paths call in around resets.
+	if (TheWeatherSetting == nullptr)
+	{
+		applyWeatherType(WEATHER_SNOWY);
+	}
+	if (m_startingHeights == nullptr)
+	{
+		return;
+	}
+
 	Real *dst=m_startingHeights;
 	//initialize a table of random starting positions for each particle.
 	Int boxDimensions = (Int)TheWeatherSetting->m_snowBoxDimensions;
+	if (boxDimensions < 1)
+	{
+		boxDimensions = 1;	//modulo-by-zero guard for an authored SnowBoxDimensions of 0.
+	}
 	for (Int y=0; y<SNOW_NOISE_Y; y++)
 	{
 		for (Int x=0; x<SNOW_NOISE_X; x++)
@@ -68,16 +364,20 @@ void SnowManager::updateIniSettings()
 	m_velocity = TheWeatherSetting->m_snowVelocity;
 	m_frequencyScaleX = TheWeatherSetting->m_snowFrequencyScaleX;
 	m_frequencyScaleY = TheWeatherSetting->m_snowFrequencyScaleY;
-	m_amplitude	= TheWeatherSetting->m_snowAmplitude;
+	m_amplitude	= TheWeatherSetting->m_snowAmplitude * TheWeatherSetting->m_swayScale;
 	m_pointSize = TheWeatherSetting->m_snowPointSize;
 	m_quadSize	= TheWeatherSetting->m_snowQuadSize;
 	m_boxDimensions	= TheWeatherSetting->m_snowBoxDimensions;
-	m_emitterSpacing = 1.0f/TheWeatherSetting->m_snowBoxDensity;
+	// GeneralsX @bugfix Storm996 16/10/2026: guard the divides. A 0 velocity/density in an authored
+	// block used to produce Inf here, and Inf timing on ARM64 vs x86 is a documented desync source
+	// (AGENTS.md Cross-Platform Determinism 2) as soon as anything downstream casts it.
+	m_emitterSpacing = TheWeatherSetting->m_snowBoxDensity > 0.0001f
+		? 1.0f/TheWeatherSetting->m_snowBoxDensity : 1.0f;
 	m_maxPointSize = TheWeatherSetting->m_snowMaxPointSize;
 	m_minPointSize = TheWeatherSetting->m_snowMinPointSize;
 
 	//Time for snow flake to make it from top to bottom of rendered cube around camera.
-	m_fullTimePeriod = m_boxDimensions/m_velocity;
+	m_fullTimePeriod = m_velocity > 0.0001f ? m_boxDimensions/m_velocity : m_boxDimensions;
 }
 
 void SnowManager::setVisible(Bool showWeather)
@@ -88,6 +388,12 @@ void SnowManager::setVisible(Bool showWeather)
 void SnowManager::reset()
 {
 	m_isVisible = TRUE;	//default to showing if it's enabled via INI.
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W4: a new game must not inherit the last
+	// one's lightning schedule or a half-faded screen flash.
+	if (TheWeatherFX != nullptr)
+	{
+		TheWeatherFX->reset();
+	}
 }
 
 SnowManager::~SnowManager()
@@ -96,8 +402,27 @@ SnowManager::~SnowManager()
 	m_startingHeights=nullptr;
 
 	// TheSuperHackers @fix Mauller 13/04/2025 Delete the instance of the weather settings
-	deleteInstance((WeatherSetting*)TheWeatherSetting.getNonOverloadedPointer());
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: that instance is now the snowy base of
+	// a table with one chain per weather type, so free every base (deleteInstance recurses into the
+	// override chain) and clear the active view before any of them dangles.
+	for (Int i=0; i<WEATHER_COUNT; ++i)
+	{
+		if (s_weatherProfiles[i] != nullptr)
+		{
+			deleteInstance(s_weatherProfiles[i]);
+			s_weatherProfiles[i] = nullptr;
+		}
+	}
 	TheWeatherSetting=nullptr;
+	s_activeWeatherType = WEATHER_NORMAL;
+
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the render state is owned here because
+	// its lifetime is exactly "a client with weather to draw"; GameClient deletes TheSnowManager last.
+	if (TheWeatherFX != nullptr)
+	{
+		delete TheWeatherFX;
+		TheWeatherFX = nullptr;
+	}
 }
 
 OVERRIDE<WeatherSetting> TheWeatherSetting = nullptr;
@@ -121,37 +446,137 @@ const FieldParse WeatherSetting::m_weatherSettingFieldParseTable[] =
 	// GeneralsX @feature Qoder 11/10/2026 Grass layer toggles (same weather INI block).
 	{ "GrassEnabled",							INI::parseBool,nullptr,			offsetof( WeatherSetting, m_grassEnabled ) },
 	{ "GrassDensity",							INI::parseReal,nullptr,			offsetof( WeatherSetting, m_grassDensity ) },
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the world/screen/light knobs that turn
+	// the single retail snow block into a per-type recipe. Defaults keep the shipped snow look.
+	// m_weatherType is deliberately NOT parseable: the type comes from the block that declared it
+	// ("Weather" = snowy, "WeatherType NAME" = NAME), so a map can never retarget a block by accident.
+	{ "WeatherEnabled",							INI::parseBool,nullptr,			offsetof( WeatherSetting, m_weatherEnabled ) },
+	{ "ParticleKind",								INI::parseIndexList,	WeatherParticleKindNames,	offsetof( WeatherSetting, m_particleKind ) },
+	{ "WindX",										INI::parseReal,nullptr,			offsetof( WeatherSetting, m_windX ) },
+	{ "WindY",										INI::parseReal,nullptr,			offsetof( WeatherSetting, m_windY ) },
+	{ "StreakLength",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_streakLength ) },
+	{ "StreakThickness",							INI::parseReal,nullptr,			offsetof( WeatherSetting, m_streakThickness ) },
+	{ "ParticleOpacity",							INI::parseReal,nullptr,			offsetof( WeatherSetting, m_opacity ) },
+	{ "FalloffStart",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_falloffStart ) },
+	{ "FalloffEnd",									INI::parseReal,nullptr,			offsetof( WeatherSetting, m_falloffEnd ) },
+	{ "SwayScale",									INI::parseReal,nullptr,			offsetof( WeatherSetting, m_swayScale ) },
+	{ "MinSceneShade",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_minShade ) },
+	{ "ParticleTint",								INI::parseRGBColor,nullptr,		offsetof( WeatherSetting, m_particleTint ) },
+	{ "AmbientScale",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_ambientScale ) },
+	{ "KeyScale",										INI::parseReal,nullptr,			offsetof( WeatherSetting, m_keyScale ) },
+	{ "FogScale",										INI::parseReal,nullptr,			offsetof( WeatherSetting, m_fogScale ) },
+	{ "Wetness",										INI::parseReal,nullptr,			offsetof( WeatherSetting, m_wetness ) },
+	{ "ScreenTint",									INI::parseRGBColor,nullptr,		offsetof( WeatherSetting, m_screenTint ) },
+	{ "ScreenDarken",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_screenDarken ) },
+	{ "ScreenWispDensity",						INI::parseReal,nullptr,			offsetof( WeatherSetting, m_screenWispDensity ) },
+	{ "ScreenVignette",								INI::parseReal,nullptr,			offsetof( WeatherSetting, m_screenVignette ) },
+	{ "LightningStrikesPerMinute",			INI::parseReal,nullptr,			offsetof( WeatherSetting, m_lightningChance ) },
+	{ "LightningIntensity",						INI::parseReal,nullptr,			offsetof( WeatherSetting, m_lightningIntensity ) },
 	{ nullptr, nullptr, nullptr, 0 },
 };
+
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: names for the ParticleKind enum, in the
+// order the enum declares (INI::parseIndexList resolves by position).
+const char *const WeatherParticleKindNames[] =
+{
+	"SNOW",
+	"RAIN",
+
+	nullptr
+};
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: shared block plumbing for the two INI
+// entries. The retail "Weather" block and a "WeatherType NAME = SNOWY" block both live as one
+// Overridable chain per weather type: system defaults create the base, a map's override file appends
+// an override (preserving the retail copy-then-parse semantics exactly), and switching types is just
+// repointing TheWeatherSetting - no re-parse, no reallocation.
+//-------------------------------------------------------------------------------------------------
+static WeatherSetting *openWeatherProfileForParse(INI *ini, Weather type)
+{
+	const Int index = (Int)type;
+	WeatherSetting *base = s_weatherProfiles[index];
+
+	if (base == nullptr)
+	{
+		base = s_weatherProfiles[index] = newInstance(WeatherSetting);
+		base->applyTypeDefaults(type);
+	}
+	else if (ini->getLoadType() == INI_LOAD_CREATE_OVERRIDES)
+	{
+		WeatherSetting *wsOverride = newInstance(WeatherSetting);
+		*wsOverride = *base;
+		wsOverride->markAsOverride();
+		base->friend_getFinalOverride()->setNextOverride(wsOverride);
+		base = wsOverride;
+	}
+	else
+	{
+		// A second plain "Weather"/"WeatherType" block in the system pass is a data error, same as retail.
+		throw INI_INVALID_DATA;
+	}
+
+	return base;
+}
 
 //-------------------------------------------------------------------------------------------------
 void INI::parseWeatherDefinition( INI *ini )
 {
-	if (TheWeatherSetting == nullptr) {
-		TheWeatherSetting = newInstance(WeatherSetting);
-	} else if (ini->getLoadType() == INI_LOAD_CREATE_OVERRIDES) {
-		WeatherSetting* ws = (WeatherSetting*) (TheWeatherSetting.getNonOverloadedPointer());
-		WeatherSetting* wsOverride = newInstance(WeatherSetting);
-		*wsOverride = *ws;
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: this is the retail block, so it always
+	// targets the snowy profile; per-type authoring lives in "WeatherType NAME".
+	WeatherSetting *target = openWeatherProfileForParse(ini, WEATHER_SNOWY);
 
-		// Mark that it is an override.
-		wsOverride->markAsOverride();
+	// parse the data
+	ini->initFromINI( target, target->getFieldParse() );
 
-		ws->friend_getFinalOverride()->setNextOverride(wsOverride);
-	} else {
+	if (TheSnowManager != nullptr)
+	{
+		if (s_activeWeatherType == WEATHER_SNOWY)
+		{
+			// Re-resolve the active view: a map override only shows up at the end of the chain.
+			TheSnowManager->setWeatherType(WEATHER_SNOWY);
+		}
+		else
+		{
+			TheSnowManager->updateIniSettings();
+		}
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1:
+//   WeatherType NAME = RAINY     ; any WeatherNames value
+//     ...same keys as the Weather block...
+//   End
+// Lets a mod author tune rain/blizzard without touching the shipped snow recipe.
+//-------------------------------------------------------------------------------------------------
+void INI::parseWeatherTypeDefinition( INI *ini )
+{
+	// "WeatherType = RAINY" - resolved through the same name table the GameData "Weather" key uses,
+	// so an authored block and a map's GameData line can never disagree about what a name means.
+	Weather type = (Weather)INI::scanIndexList(ini->getNextToken(), WeatherNames);
+	if (type < WEATHER_NORMAL || type >= WEATHER_COUNT)
+	{
 		throw INI_INVALID_DATA;
 	}
 
-	WeatherSetting* weatherSet = (WeatherSetting*) (TheWeatherSetting.getNonOverloadedPointer());
-	weatherSet = (WeatherSetting*) (weatherSet->friend_getFinalOverride());
-	// parse the data
-	ini->initFromINI( weatherSet, TheWeatherSetting->getFieldParse() );
+	WeatherSetting *target = openWeatherProfileForParse(ini, type);
+	target->m_weatherType = type;
+	if (ini->getLoadType() != INI_LOAD_CREATE_OVERRIDES)
+	{
+		// A freshly authored type is live by default unless the block says otherwise.
+		target->m_weatherEnabled = TRUE;
+		target->m_snowEnabled = TRUE;
+	}
 
-	if (TheSnowManager)
+	ini->initFromINI( target, target->getFieldParse() );
+
+	if (s_activeWeatherType == type && TheSnowManager != nullptr)
+	{
+		TheSnowManager->setWeatherType(type);
+	}
+	else if (TheSnowManager)
+	{
 		TheSnowManager->updateIniSettings();
-
-	if (ini->getLoadType() == INI_LOAD_CREATE_OVERRIDES) {
-		// Check to see if we overrode any textures.
-		// If we did, then we need to replace them in the model.
 	}
 }

@@ -87,6 +87,8 @@
 
 #include "GameClient/ClientInstance.h"
 #include "GameClient/FXList.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
+#include "GameClient/LampList.h"
 #include "GameClient/GameClient.h"
 
 #ifdef SAGE_USE_NGMP
@@ -829,6 +831,11 @@ void GameEngine::init()
 
 
 		initSubsystem(TheFXListStore,"TheFXListStore", MSGNEW("GameEngineSubsystem") FXListStore(), &xferCRC, "Data\\INI\\Default\\FXList", "Data\\INI\\FXList");
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights (render-side only)
+		// TheSuperHackers @lesson path1 must stay nullptr: INI::loadFileDirectory throws INI_CANT_OPEN_FILE
+		// even in Release when a registered path yields zero files, so a Default\LampList dir that does not
+		// exist would crash startup. WeaponStore (nullptr, "Data\\INI\\Weapon") is the precedent.
+		initSubsystem(TheLampStore,"TheLampStore", MSGNEW("GameEngineSubsystem") LampStore(), &xferCRC, nullptr, "Data\\INI\\LampList");
 		initSubsystem(TheWeaponStore,"TheWeaponStore", MSGNEW("GameEngineSubsystem") WeaponStore(), &xferCRC, nullptr, "Data\\INI\\Weapon");
 		initSubsystem(TheObjectCreationListStore,"TheObjectCreationListStore", MSGNEW("GameEngineSubsystem") ObjectCreationListStore(), &xferCRC, "Data\\INI\\Default\\ObjectCreationList", "Data\\INI\\ObjectCreationList");
 		initSubsystem(TheLocomotorStore,"TheLocomotorStore", MSGNEW("GameEngineSubsystem") LocomotorStore(), &xferCRC, nullptr, "Data\\INI\\Locomotor");

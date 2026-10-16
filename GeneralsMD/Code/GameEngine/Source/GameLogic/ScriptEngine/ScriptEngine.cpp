@@ -5236,6 +5236,19 @@ void ScriptEngine::init()
 	curTemplate->m_numUiStrings = 1;
 	curTemplate->m_uiStrings[0] = "Show Weather = ";
 
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: pick the live weather type.
+	// Parameter is an index into WeatherNames: 0 NORMAL, 1 SNOWY, 2 RAINY, 3 STORM, 4 THUNDER,
+	// 5 BLIZZARD. An INT rather than a new Parameter:: type on purpose - every editor widget keys off
+	// ParameterType, and inventing one here would need GUIEdit/WorldBuilder work for no gain.
+	curTemplate = &m_actionTemplates[ScriptAction::SHOW_WEATHER_TYPE];
+	curTemplate->m_internalName = "SHOW_WEATHER_TYPE";
+	curTemplate->m_uiName = "Map/Environment/Set Weather Type.";
+	curTemplate->m_numParameters = 1;
+	curTemplate->m_parameters[0] = Parameter::INT;
+	curTemplate->m_numUiStrings = 2;
+	curTemplate->m_uiStrings[0] = "Set weather to ";
+	curTemplate->m_uiStrings[1] = " (0=normal 1=snow 2=rain 3=storm 4=thunder 5=blizzard).";
+
 	Int i;
 	for (i=0; i<Condition::NUM_ITEMS; i++) {
 		AsciiString str;
