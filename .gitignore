@@ -194,6 +194,9 @@ references/GameServer/
 /光照预览工作室/
 /多线程优化/
 /画质提升调研/
+/任务地图剧本/
+/地形贴图改造/
+/游戏特性/
 
 # User-requested global ignores: working docs, archives and scripts stay local
 *.md
