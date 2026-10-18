@@ -95,39 +95,14 @@ logs_*.zip
 references/GameClient/
 references/GameServer/
 
-# ===== General-Refresh: private workspace exclusions (2026-10-11) =====
-# Task/validation folders. These contain tens of thousands of AI validation
-# images and working files that must never enter the repository.
-/T0 编译工具/
-/T0 语言编辑器/
-/T1 big 解析器/
-/T2 模型清单解析器/
-/T3/
-/T3-0 法线贴图引擎对接/
-/T5 AO烘焙工具/
-/T6 贴图AI高清化/
-/T7 着色器系统启用/
-/T8 模型几何现代化/
-/AI升级/
-/光影升级/
-/地图升级/
-/模型升级/
-/渲染器现代化调研/
-/现代化指挥系统/
-/界面升级/
+# ===== General-Refresh: private workspace folders (2026-10-18) =====
+# Local working/task folders must never enter the repository.
+/工具/
+/光照预览工作室/
+/画质升级/
+/渲染器现代化调研(vulkan)/
 /引擎改造/
-/T0 编译工具 64位/
-/PS升级/
-/PS3.0升级调研/
-# ===== General-Refresh: PS3.0 survey folders and private tools (2026-10-13) =====
-# AI-written survey reports and their validation assets; the engine changes
-# they document land as code commits, the folders themselves stay local.
-/PS3.0 光影升级/
-/PS3.0 升级调研/
-/PS3.0 法线贴图升级/
-/PS3.0 贴图升级/
-/PS3.0 阴影升级/
-/T3 法线贴图生成工具/
+/游戏特性/
 /运行验证/
 /GeneralRefresh.exe
 /GeneralRefresh.pdb
@@ -187,16 +162,6 @@ references/GameServer/
 *smoke_stderr.txt
 *smoke_stdout.txt
 *buildimports.txt
-
-# Private asset tooling and local experiment folders (kept out of git)
-/T4 贴图分解工具/
-/_tmp_probe_units.py
-/光照预览工作室/
-/多线程优化/
-/画质提升调研/
-/任务地图剧本/
-/地形贴图改造/
-/游戏特性/
 
 # User-requested global ignores: working docs, archives and scripts stay local
 *.md
