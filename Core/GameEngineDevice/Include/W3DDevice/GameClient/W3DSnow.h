@@ -42,9 +42,12 @@ class W3DSnowManager : public SnowManager
 	void	render(RenderInfoClass &rinfo);
 	void	renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int cubeOriginY, Int cubeDimX, Int cubeDimY);
 	void	renderSubBox(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY );
-	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W3: rain falls as world-space line segments
-	// instead of sprites, so it gets its own leaf pass beside the two retail ones.
-	void	renderRainLines(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY );
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W3: rain falls as view-aligned streak
+	// quads instead of square sprites, so it gets its own leaf pass beside the two retail ones.
+	// Quads rather than D3DPT_LINELIST because hardware line width is a legacy feature (1 pixel on
+	// every modern driver, including DXVK), and a streak needs an authorable thickness, a per-drop
+	// alpha for distance falloff, and a slant that follows the wind.
+	void	renderRainStreaks(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY );
 	void	ReleaseResources();
 	Bool	ReAcquireResources();
 

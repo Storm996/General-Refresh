@@ -71,6 +71,7 @@
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "Common/BitFlagsIO.h"
+#include "Common/OptionPreferences.h"	// GeneralsX @feature PS3.0 4E 17/10/2026 lamp channel toggle
 // GeneralsX @feature 05/10/2026 For render side interpolation (WWMath::Normalize_Angle,
 // MSEC_PER_LOGICFRAME_REAL) and real time recoil stepping (SystemTime).
 #include "WWMath/wwmath.h"
@@ -2165,9 +2166,19 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
 //-------------------------------------------------------------------------------------------------
 void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 {
-	static const Bool s_lampOn = (getenv("GENERALSX_LAMPLIGHT") == nullptr) || (atoi(getenv("GENERALSX_LAMPLIGHT")) != 0);
-	if (!s_lampOn || TheLampStore == nullptr)
+	if (TheLampStore == nullptr)
 		return;
+	// GeneralsX @feature PS3.0 4E 17/10/2026: env wins, else the Graphics Options page key
+	// Options.ini LampLightEffect (default ON).
+	// GeneralsX @feature Qoder 18/10/2026: the gate is now live - LampStore owns it (the options page
+	// cannot reach this device class, but both sides reach the store), so the row takes effect on the
+	// next frame instead of the next start. OFF takes the existing fade-out route, the same one shroud
+	// and hide use, so a lamp that was already lit goes out over 5 frames instead of sticking.
+	if (!TheLampStore->getGlobalLampsEnabled())
+	{
+		releaseLamps();
+		return;
+	}
 
 	Drawable* draw = getDrawable();
 	if (draw == nullptr || draw->getTemplate() == nullptr)
@@ -2208,6 +2219,13 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 	++s_lampFrameClock;
 
 	const Int lampCount = m_lampSet->getNumLamps();
+	// GeneralsX @bugfix Qoder 18/10/2026: releaseLamps() empties m_lampLights (shroud, hide, and now
+	// the options-page gate), while the resize in the resolve block above only ever runs once because
+	// m_lampSetResolved stays set - so re-enabling a lamp that had been released indexed past the end
+	// of an empty vector. Re-arm the slots here; the acquisition loop below then re-borrows pooled
+	// lights as before.
+	if ((Int)m_lampLights.size() < lampCount)
+		m_lampLights.resize(lampCount, nullptr);
 	for (Int i = 0; i < lampCount; ++i)
 	{
 		const LampDef* def = m_lampSet->getLamp(i);
@@ -2224,6 +2242,13 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 			m_lampLights[i] = light;
 			light->setEnabled(TRUE);
 			light->setFrameFade(0, 0);	// 0 decay time = lasts forever; we own this lamp's lifecycle
+			// GeneralsX @bugfix PS3.0 4F 17/10/2026 (user report "the lit area is all-or-nothing"):
+			// the far-attenuation ramp below is only honoured by LightEnvironmentClass when the
+			// FAR_ATTENUATION flag is raised on the light. 4A pulses raise it (W3DDisplay::applyLightPulse);
+			// the lamps did not, so every mesh the light was collected by sat at atten=1 (full brightness)
+			// and then dropped to zero the instant the sphere-intersect cull excluded it - a hard cut, not
+			// a falloff. Raising the flag makes Set_Far_Attenuation_Range() smooth out the reach.
+			light->Set_Flag(LightClass::FAR_ATTENUATION, true);
 		}
 
 		// lamp position is model-local; transform to world with the adjusted drawable matrix
@@ -2231,7 +2256,7 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		Vector3 worldPos = worldMtx.Rotate_Vector(localPos);
 		worldPos += worldMtx.Get_Translation();
 
-		Real intensity = def->m_intensity;
+		Real intensity = def->m_intensity * TheLampStore->getGlobalIntensityGain();
 		if (def->m_flickerPeriodFrames > 0 && def->m_flickerAmp > 0.0f)
 		{
 			// smooth periodic breathing; per-instance random phase + per-lamp offset desynchronizes lamps

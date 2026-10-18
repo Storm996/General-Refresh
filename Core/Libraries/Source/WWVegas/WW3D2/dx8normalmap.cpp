@@ -34,11 +34,17 @@
 // surfaces and leaves downward faces on the plain ambient, so shadowed ground no longer reads as
 // the same value as an upward-lit wall. Uploaded as the GN-family PS c16 / ML PS c8 hemi rgb.
 // READ ONCE per process; GENERALSX_HEMI=0 restores the flat-ambient look bit-for-bit.
+// GeneralsX @tweak Qoder 17/10/2026 P0 of the per-pixel master switch (光影T0阶段/调研/
+// 2026-10-17_逐像素光照总闸_施工调研.md): 0.35 was the showcase value and, together with the
+// 0.35 GN spec, whitened every light-coloured building/vehicle top under the RTS camera (the
+// 14/10 verdict that pinned GENERALSX_GEOMNORMAL=0 in the user's HKCU). 0.15 keeps the
+// up-vs-down-face separation without lifting shadowed tops into haze; user-confirmed value for
+// the master-switch batch. GENERALSX_HEMI still wins for A/B forensics.
 static float Hemi_Ambient_K()
 {
 	static float cached = -1.0f;
 	if (cached < 0.0f) {
-		cached = 0.35f;
+		cached = 0.15f;
 		const char* ev = getenv("GENERALSX_HEMI");
 		if (ev != nullptr && *ev != 0) cached = (float)atof(ev);
 		if (cached < 0.0f) cached = 0.0f;
@@ -161,14 +167,26 @@ namespace DX8NormalMap
 		fflush(stderr);
 	}
 
+	// GeneralsX @feature PS3.0 4E 17/10/2026: user-facing mount toggle. The device layer injects
+	// Set_PBRML_Enabled once at shader install (OptionPreferences::getPBRMLEnabled) and the options
+	// menu re-arms it live through gameOptionApply_PBRML, so switching takes effect on the next
+	// Apply pass without a restart. The GENERALSX_PBRML env still wins outright (4C QA legs).
+	static int g_PBRML_UserEnabled = 1;
+
+	void Set_PBRML_Enabled(int on)
+	{
+		g_PBRML_UserEnabled = on ? 1 : 0;
+	}
+
 	static bool PBRML_Enabled()
 	{
 		static int cached = -1;
 		if (cached < 0) {
 			const char* ev = getenv("GENERALSX_PBRML");
-			cached = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
+			cached = (ev != nullptr && *ev != 0) ? ((strcmp(ev, "0") == 0) ? 0 : 1) : 2;
 		}
-		return cached == 1 && g_PS_PBRML != 0 && g_VS_ML != 0;
+		const bool on = (cached == 2) ? (g_PBRML_UserEnabled != 0) : (cached == 1);
+		return on && g_PS_PBRML != 0 && g_VS_ML != 0;
 	}
 
 	// GeneralsX @feature T3-0 P1: global sun fallback (direction TOWARD the light source - same
@@ -240,6 +258,17 @@ namespace DX8NormalMap
 	{
 		g_FogColorStrength = colorStrength;
 		g_FogRamp = startInvLen;
+	}
+
+	// GeneralsX @feature PS3.0 Weather W5: injected wetness for the PBR roughness term (see the two
+	// c8/c11 uploads below). Default 0 keeps every pixel identical to the dry shader path.
+	static float g_Wetness = 0.0f;
+
+	void Set_Wetness(float wet)
+	{
+		if (wet < 0.0f) wet = 0.0f;
+		if (wet > 1.0f) wet = 1.0f;
+		g_Wetness = wet;
 	}
 
 	// GeneralsX @tweak T3-0 showcase mode: GENERALSX_NORMALMAP_SHOWCASE=1 exaggerates the bump
@@ -510,6 +539,19 @@ namespace DX8NormalMap
 		return rp;
 	}
 
+	// GeneralsX @feature Qoder 17/10/2026 P2 forensics: public presence probes over the cached
+	// lookups, used by the renderer's one-line-per-mesh-class companion reconciliation. The caches
+	// own the returned pointers, so these only compare against nullptr (no refcount handling).
+	bool Has_Companion_Normal(TextureClass* diffuse)
+	{
+		return Find_Companion_Normal(diffuse) != nullptr;
+	}
+
+	bool Has_Companion_RP(TextureClass* diffuse)
+	{
+		return Find_Companion_RP(diffuse) != nullptr;
+	}
+
 	// GeneralsX @feature PS3.0-#76 Qoder 16/10/2026: targeted branch forensics for the four-plant
 	// sun-consistency bench. The [PBR] mount counter caps at 8 and the case-mixed duplicate texture
 	// names (ABPwrPlant.tga vs abpwrplant.tga) make the existing logs inconclusive about which
@@ -538,40 +580,33 @@ namespace DX8NormalMap
 
 	bool Apply(const Matrix3D& world, LightEnvironmentClass* lenv, TextureClass* diffuse)
 	{
-		// GeneralsX @bugfix Qoder 11/10/2026 T3-0: lenv may be NULL on battlefield objects
-		// (they rely on the global sun) - that is a LEGAL case handled by the fallback light
-		// and ambient below. The old guard rejected it, so such meshes intermittently skipped
-		// Apply frame-to-frame (NULL/non-NULL lenv alternation) and flickered between the
-		// dot3 pass and the fixed pipeline - the "snow/plain texture swap" flicker the user saw.
-		// GeneralsX @feature PS3.0 #70 15/10/2026: the bump path needs the normal-map switch; the
-		// roughness path only needs the PBR pair + an rp companion. Either arm alone (or both)
-		// mounts this pass; with nm==nullptr the PBR pair runs on a FLAT tangent normal.
+		// GeneralsX @bugfix Qoder 11/10/2026 T3-0: lenv may be NULL on battlefield objects (they
+		// rely on the global sun) - the single-light paths used the fallback light then, and the old
+		// null guard that rejected it caused the NULL/non-NULL "texture swap" flicker. Under P3 the
+		// only remaining consumer (ML) genuinely NEEDS the lenv, so null declines below - the merged
+		// base handles the global-sun meshes.
 		if (diffuse == nullptr) {
 			return false;
 		}
-		const bool bumpOn = Ready_To_Render();
-		if (!bumpOn && !RP_Ready()) {
-			Log_Bench_Path("reject:paths-off", diffuse, nullptr, nullptr);   // GeneralsX @feature PS3.0-#76
+		// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): Apply now serves ONLY the multi-light
+		// (ML) family - the 兼容层 the 光影T0阶段 research doc keeps untouched this round ("多光源（现有），
+		// 本期不动"). The legacy single-light DOT3 Blinn and PBR roughness mounts that used to sit at the
+		// tail of this function are superseded by the merged base pair in DX8GeomNormal::Apply (同一套底座
+		// 方程 + _nm/_rp 作为分支), so every mesh without point lights now falls through to gate 2. The ML
+		// path itself is bit-for-bit intact: same handles, same uploads, same PBRML sub-branch.
+		if (!Ready_To_Render() || !ML_Enabled()) {
+			Log_Bench_Path("reject:ml-off", diffuse, nullptr, nullptr);   // GeneralsX @feature PS3.0-#76
 			return false;
 		}
-		TextureClass* nm = bumpOn ? Find_Companion_Normal(diffuse) : nullptr;
+		// ML exists to shade POINT lights per pixel; a mesh with no light environment (global sun only)
+		// has none by definition, and an nm-less mesh cannot use the world-TBN pair at all.
+		if (lenv == nullptr) return false;
+		TextureClass* nm = Find_Companion_Normal(diffuse);
+		if (nm == nullptr) {
+			Log_Bench_Path("reject:no-normalmap", diffuse, nm, nullptr);   // GeneralsX @feature PS3.0-#76
+			return false;
+		}
 		TextureClass* rp = RP_Ready() ? Find_Companion_RP(diffuse) : nullptr;
-		if (nm == nullptr && rp == nullptr) {
-			Log_Bench_Path("reject:no-companions", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-			return false;
-		}
-		// Roughness-only mode never had the point-light ML pair to offer: if this mesh's light
-		// environment collects point lights, leave it to the fixed pipeline (which still lights
-		// them) instead of mounting the single-light PBR pair and losing those lights.
-		if (nm == nullptr && lenv != nullptr) {
-			const int total = lenv->Get_Light_Count();
-			for (int i = 0; i < total; ++i) {
-				if (lenv->isPointLight(i)) {
-					Log_Bench_Path("reject:pointlight-roughness-only", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-					return false;
-				}
-			}
-		}
 
 		// --- WVP for the custom vertex shader ---
 		// Mirror the proven water-shader convention (W3DWater.cpp): read view/proj in raw DX8
@@ -740,9 +775,10 @@ namespace DX8NormalMap
 		// --- bind textures / switch shaders ---
 		// GeneralsX @feature PS3.0 T5 13/10/2026 multi-light branch: when this mesh's light
 		// environment actually carries point lights (crates fire, superweapon blasts, lamp posts)
-		// and the device layer installed the ML pair, bind that instead - the PS loops over up to
-		// four lights per pixel with radius falloff.  No point lights (the overwhelming common
-		// case) or GENERALSX_MULTILIGHT=0 keeps the T1 single-light path bit-for-bit.
+		// and the device layer installed the ML pair, bind that - the PS loops over up to eight
+		// lights per pixel with radius falloff.  GeneralsX @feature Qoder 17/10/2026 P3: this is now
+		// the ONLY mount path here (the nm/lenv/ML guards above pre-checked it); a mesh with no point
+		// lights collects mlCount 0 and falls through to the merged base in gate 2.
 		if (nm != nullptr && lenv != nullptr && ML_Enabled())
 		{
 			// GeneralsX @feature PS3.0-P3-18 14/10/2026: the collection cap follows the engine's
@@ -810,7 +846,7 @@ namespace DX8NormalMap
 				// armed, an _rp companion present and the PBRML PS installed, shade this lit mesh with
 				// the GGX lobe for the sun AND every collected point light instead of the Blinn ML path
 				// (which used to swallow the PBR look whenever any lamp/explosion touched the mesh).
-				// c11 = (mode, LI, ENV, -) mirrors the single-light PBR c8 contract in a free register.
+				// c11 = (mode, LI, ENV, wetness) mirrors the single-light PBR c8 contract in a free register.
 				const bool pbrml = (PBR_Mode() == 2 && PBRML_Enabled() && rp != nullptr);
 				if (pbrml)
 				{
@@ -822,7 +858,7 @@ namespace DX8NormalMap
 							mlCount, (const char*)diffuse->Get_Texture_Name());
 						fflush(stderr);
 					}
-					const Vector4 c11pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), 0.0f);
+					const Vector4 c11pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), g_Wetness);
 					DX8Wrapper::Set_Pixel_Shader_Constant(11, &c11pbr, 1);
 					DX8Wrapper::Set_Texture(2, rp);
 				}
@@ -835,44 +871,13 @@ namespace DX8NormalMap
 			}
 		}
 
-		// GeneralsX @feature PS3.0-P4-1 15/10/2026: PBR variant mount (see Install_PBR block above).
-		// Only the single-light path reaches here (the ML branch returned first, by design).  The
-		// variant VS reads the c0..c5/c9 constants uploaded above unchanged; the PS additionally
-		// samples stage2 (the _rp companion) and reads c8=(mode, LI, ENV, -).
-		// GeneralsX @feature PS3.0 #70 15/10/2026: rp was probed up-front, so this branch now runs
-		// with or without the normal-map switch.  Roughness-only (nm == nullptr) leaves stage1
-		// unbound and re-uploads c3=(0,0,0,1): the PS discards whatever the (unbound) s1 sample
-		// returns and shades with the FLAT tangent normal, i.e. the interpolated geometric normal.
-		if (rp != nullptr)
-		{
-			static int s_pbrMounted = 0;
-			if (s_pbrMounted < 8)
-			{
-				++s_pbrMounted;
-				fprintf(stderr, "[PBR] mode=%d mounted on diffuse='%s' with rp='%s' bump=%d\n",
-					PBR_Mode(), (const char*)diffuse->Get_Texture_Name(), (const char*)rp->Get_Texture_Name(),
-					nm != nullptr ? 1 : 0);
-				fflush(stderr);
-			}
-			const Vector4 c8pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), 0.0f);
-			DX8Wrapper::Set_Pixel_Shader_Constant(8, &c8pbr, 1);   // c8 = (mode, LI, ENV, -)
-			if (nm == nullptr) {
-				const Vector4 flat(0.0f, 0.0f, 0.0f, 1.0f);
-				DX8Wrapper::Set_Pixel_Shader_Constant(3, &flat, 1); // c3: tangent normal forced to (0,0,1)
-			}
-			Log_Bench_Path("mount:PBR", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-			DX8Wrapper::Set_Texture(1, nm);
-			DX8Wrapper::Set_Texture(2, rp);
-			DX8Wrapper::Set_Vertex_Shader(g_VS_PBR);
-			DX8Wrapper::Set_Pixel_Shader(g_PS_PBR);
-			return true;
-		}
-
-		Log_Bench_Path("mount:DOT3", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-		DX8Wrapper::Set_Texture(1, nm);
-		DX8Wrapper::Set_Vertex_Shader(g_VS);
-		DX8Wrapper::Set_Pixel_Shader(g_PS);
-		return true;
+		// GeneralsX @feature Qoder 17/10/2026 P3: the legacy PBR (roughness single-light) and DOT3
+		// (Blinn single-light) mounts that used to live here are GONE - the merged pair in
+		// DX8GeomNormal::Apply is the single base now (调研 §2: 一个底座 PS + 两个可选采样层). This point
+		// is reached only when the ML branch above declined (no point lights collected), and returning
+		// false leaves state untouched so gate 2 can mount the merged pair on the same batch.
+		Log_Bench_Path("fall-through:gn-merged", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
+		return false;
 	}
 
 	void Restore(UINT_PTR fvf)
@@ -915,6 +920,23 @@ namespace DX8GeomNormal
 	static UINT_PTR g_PS      = 0;
 	static bool     g_Enabled = false;   // off until Install; default ON after (kill switch: =0)
 
+	// GeneralsX @feature Qoder 17/10/2026 P2: skinned-batch variant (see header). The dynamic layout
+	// the CPU skinning pass submits carries a REAL COLOR0 channel (team flash, baked detail, alpha),
+	// which the rigid VS pair drops - so skins get their own VS (relay) + PS (GN lighting x vertex
+	// diffuse, the same FF-parity chain the dot3 pair ships). 0 handles = skins stay fixed pipeline.
+	static UINT_PTR g_VS_SKIN = 0;
+	static UINT_PTR g_PS_SKIN = 0;
+
+	// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): the MERGED pair for the TG3 tangent-space
+	// layout - rigid bump meshes and tangent skin batches both submit DX8_FVF_XYZNDUV1TG3, and both are
+	// served by ONE program that IS the plain GN lighting equation plus two optional sampling branches
+	// (s1 _nm bump, s3 _rp roughness) and the GNS sun-shadow branch (s2). This is what retires the
+	// parallel DOT3/PBR single-light families (DX8NormalMap::Apply keeps only ML, per 本期不动).
+	// 0 handles = every TG3 batch declines and stays on the fixed pipeline.
+	static UINT_PTR g_VS_MERGED = 0;
+	static UINT_PTR g_PS_MERGED = 0;
+	static bool     g_mergedBoundThisBatch = false;   // Restore unbinds the s1/s3 companion stages
+
 	// World-space key sun (direction TOWARD the light, same convention as DX8NormalMap's
 	// fallback) and its diffuse color; the L1 sky fill mirrors DX8NormalMap's pair.
 	static Vector3  g_KeyDir(0.0f, 0.0f, 1.0f);
@@ -946,6 +968,10 @@ namespace DX8GeomNormal
 		g_VS_DUV2 = vs_duv2;
 		g_PS      = ps_handle;
 		const char* ev = getenv("GENERALSX_GEOMNORMAL");
+		// GeneralsX @tweak Qoder 17/10/2026: seed only. The device layer overrides this a few lines
+		// later through Set_Enabled(OptionPreferences().getPerPixelLighting()), which is the same env
+		// test plus the Options.ini "PerPixelLighting" row - keeping the identical semantics here means
+		// a non-Windows build (no option seed) still behaves exactly as before.
 		g_Enabled = (ev == nullptr || strcmp(ev, "0") != 0);   // GeneralsX @tweak PS3.0 L2 14/10/2026 default ON
 		fprintf(stderr, "[GN] geometric-normal shaders installed vs_duv1=%p vs_duv2=%p ps=%p enabled=%d\n",
 			(void*)vs_duv1, (void*)vs_duv2, (void*)ps_handle, (int)g_Enabled);
@@ -955,6 +981,26 @@ namespace DX8GeomNormal
 	bool Ready_To_Render()
 	{
 		return g_Enabled && g_PS != 0 && (g_VS_DUV1 != 0 || g_VS_DUV2 != 0);
+	}
+
+	// GeneralsX @feature Qoder 17/10/2026: per-pixel lighting master switch (see header). The pass used
+	// to be reachable only through GENERALSX_GEOMNORMAL read once in Install(); the Graphics Options
+	// page row "逐像素光照" now owns it and can toggle it live, because dx8renderer.cpp asks
+	// Ready_To_Render() per batch. Set from the device layer at startup (OptionPreferences getter, env
+	// override included) and from the menu on every apply. Toggling costs one branch per batch and
+	// leaves shader handles installed either way, so ON->OFF->ON is exact.
+	void Set_Enabled(bool enabled)
+	{
+		if (g_Enabled == enabled)
+			return;
+		g_Enabled = enabled;
+		fprintf(stderr, "[GN] per-pixel lighting master switch -> %s\n", g_Enabled ? "ON" : "OFF");
+		fflush(stderr);
+	}
+
+	bool Is_Enabled()
+	{
+		return g_Enabled;
 	}
 
 	// GeneralsX @feature PS3.0 P3-21b 14/10/2026 - sun shadow reception in the GN pass (see header).
@@ -976,6 +1022,30 @@ namespace DX8GeomNormal
 	{
 		g_SunPS5 = ps_handle;
 		fprintf(stderr, "[GN] sun-shadow PCF5 variant installed ps=%p\n", (void*)ps_handle);
+		fflush(stderr);
+	}
+
+	// GeneralsX @feature Qoder 17/10/2026 P2: skinned-batch GN variant pair (see header). Install
+	// failure (0 handles) is silent-safe: Apply's DUV2 branch then returns false and every skin
+	// batch keeps the fixed pipeline, exactly the pre-P2 behavior.
+	void Install_Skin(UINT_PTR vs_handle, UINT_PTR ps_handle)
+	{
+		g_VS_SKIN = vs_handle;
+		g_PS_SKIN = ps_handle;
+		fprintf(stderr, "[GN] skinned variant pair installed vs=%p ps=%p\n",
+			(void*)vs_handle, (void*)ps_handle);
+		fflush(stderr);
+	}
+
+	// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): merged TG3 pair (see the statics block
+	// above). A 0-handle install is silent-safe: Apply's TG3 branch then returns false and bump/
+	// roughness meshes keep the fixed pipeline exactly like a master-switch-OFF frame does today.
+	void Install_Merged(UINT_PTR vs_handle, UINT_PTR ps_handle)
+	{
+		g_VS_MERGED = vs_handle;
+		g_PS_MERGED = ps_handle;
+		fprintf(stderr, "[GNM] merged TG3 pair registered vs=%p ps=%p\n",
+			(void*)vs_handle, (void*)ps_handle);
 		fflush(stderr);
 	}
 
@@ -1045,20 +1115,60 @@ namespace DX8GeomNormal
 		return out;
 	}
 
-	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv)
+	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv, TextureClass* diffuse)
 	{
 		if (!Ready_To_Render()) return false;
 		UINT_PTR vs = 0;
-		if (fvf == (int)DX8_FVF_XYZNUV1) vs = g_VS_DUV1;
+		bool skinBatch = false;
+		bool merged = false;
+		TextureClass* nm = nullptr;
+		TextureClass* rp = nullptr;
+		if (fvf == (int)DX8_FVF_XYZNDUV1TG3) {
+			// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): the merged base mount for the
+			// tangent-space layout - rigid bump meshes AND tangent skin batches share this enum
+			// (dynamic_fvf_type_nm), and skins render identity-world so the same uploads serve both.
+			// The two detail layers are probed with DX8NormalMap's OWN cached finders (the #68
+			// team-colour and #87 sub-128px rejections live inside them and therefore carry over
+			// verbatim): bump reads the _nm companion only while the 凹凸 menu row is ON, roughness
+			// reads _rp whenever the PBR mode is armed - the same decoupling #70 shipped. No companion
+			// at all = return false, so these batches keep the exact fixed-pipeline pixels they had
+			// before P3 (the legacy single-light mount never took them either).
+			if (g_VS_MERGED == 0 || g_PS_MERGED == 0) return false;
+			if (diffuse == nullptr) return false;
+			nm = DX8NormalMap::Is_Enabled() ? DX8NormalMap::Find_Companion_Normal(diffuse) : nullptr;
+			rp = DX8NormalMap::Get_PBR_Mode() > 0 ? DX8NormalMap::Find_Companion_RP(diffuse) : nullptr;
+			if (nm == nullptr && rp == nullptr) return false;
+			vs = g_VS_MERGED;
+			merged = true;
+		}
+		else if (fvf == (int)DX8_FVF_XYZNUV1) vs = g_VS_DUV1;
 		else if (fvf == (int)DX8_FVF_XYZNUV2) vs = g_VS_DUV2;
+		else if (fvf == (int)DX8_FVF_XYZNDUV2) {
+			// GeneralsX @feature Qoder 17/10/2026 P2: skinned batch (the dynamic CPU-skinning layout).
+			// NO fallback to the rigid pair when the skin pair is missing: a rigid VS declares no
+			// COLOR0, so the D3D9 vertex declaration would drop the vertex tint/flash and the batch
+			// would render visibly wrong. Both handles required, else the batch stays fixed pipeline.
+			if (g_VS_SKIN == 0 || g_PS_SKIN == 0) return false;
+			vs = g_VS_SKIN;
+			skinBatch = true;
+		}
 		else return false;
 		if (vs == 0) return false;
 
 		// GeneralsX @feature PS3.0 P3-21b 14/10/2026: prefer the shadow-aware variants when a sun map
 		// is active and a variant exists for this FVF; otherwise the plain GN pair runs unchanged.
+		// GeneralsX @feature Qoder 17/10/2026 P3: the MERGED pair carries its own shadow branch
+		// (c27.z), so it takes the sun map on EVERY TG3 batch - rigid bump meshes gain shadow
+		// reception they never had (addition, not regression) and the P2 "skins never get shadows"
+		// limit dissolves (the merged program relays COLOR0 AND builds sv from the light-clip rows).
+		// The 5x5 PCF tier still ships only on the plain rigid variants (3x3 kernel in the merged PS;
+		// the game layer's spread doubling for PCF5 widens the merged blur correspondingly - visible
+		// only with PCF=5 + a bump mesh inside the shadow, both opt-in).
 		bool useShadow = false;
-		UINT_PTR psSel = g_PS;
-		if (sunShadowActive()) {
+		UINT_PTR psSel = merged ? g_PS_MERGED : (skinBatch ? g_PS_SKIN : g_PS);
+		if (merged) {
+			useShadow = sunShadowActive();
+		} else if (!skinBatch && sunShadowActive()) {
 			const UINT_PTR svs = (fvf == (int)DX8_FVF_XYZNUV1) ? g_SunVS_DUV1 : g_SunVS_DUV2;
 			if (svs != 0) {
 				vs = svs;
@@ -1228,8 +1338,13 @@ namespace DX8GeomNormal
 		// precedent: the camera's +Z axis in world space sits at flat[2], flat[6], flat[10] of the raw
 		// DX8 view matrix. GN normals and light dirs are already WORLD space (VS rotates them), so
 		// unlike dot3 (model space) no inverse transform is needed here. Knobs mirror the dot3 ones:
-		// GENERALSX_GEOMNORMAL_SPECPOWER (default 24) / GENERALSX_GEOMNORMAL_SPEC (default 0.35;
-		// 0.35 is the showcase value measured 14/10, 0.12 was the retail-parity dot3 default).
+		// GENERALSX_GEOMNORMAL_SPECPOWER (default 24) / GENERALSX_GEOMNORMAL_SPEC (default 0.12).
+		// GeneralsX @tweak Qoder 17/10/2026 P0 of the per-pixel master switch: the factory value was
+		// walked up to 0.35 on 14/10 for the showcase and that, plus HEMI 0.35, is what made GN read
+		// whitened and got the path pinned off on the user's machine (PS3.0 升级过程/PS3.0升级实施记录.md
+		// §26.3 had already registered 0.12 as the retail-parity fix, awaiting the user's go-ahead -
+		// given now on 17/10 as part of promoting GN to the menu's "逐像素光照" master switch). 0.12
+		// equals the proven dot3 single-light spec (c6.y), so curved tops keep their retail brightness.
 		{
 			const float* vd = reinterpret_cast<const float*>(&view);
 			Vector3 Ew(vd[2], vd[6], vd[10]);
@@ -1241,7 +1356,7 @@ namespace DX8GeomNormal
 			static float specInt = -1.0f;
 			if (specPow < 0.0f) {
 				specPow = 24.0f;
-				specInt = 0.35f;   // GeneralsX @tweak PS3.0 L2 14/10/2026: showcase level (was 0.12)
+				specInt = 0.12f;   // GeneralsX @tweak Qoder 17/10/2026: retail parity (showcase was 0.35)
 				const char* evPow = getenv("GENERALSX_GEOMNORMAL_SPECPOWER");
 				if (evPow != nullptr && *evPow != 0) specPow = (float)atof(evPow);
 				const char* evInt = getenv("GENERALSX_GEOMNORMAL_SPEC");
@@ -1253,6 +1368,49 @@ namespace DX8GeomNormal
 			DX8Wrapper::Set_Pixel_Shader_Constant(13, &c13eye, 1);    // PS c13 = world eye dir, w = spec power
 			Vector4 c14spec(specInt, specInt, specInt, 0.0f);
 			DX8Wrapper::Set_Pixel_Shader_Constant(14, &c14spec, 1);   // PS c14 = spec intensity (0 = off)
+		}
+
+		// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): merged-pair layer contract uploads.
+		// c27 = (bumpK, bumpOn, shadowOn, rpOn) selects the detail branches; c28 = (mode, LI, ENV,
+		// wetness) re-expresses the proven PBR c8 / PBRML c11 contract on this program. bumpK keeps the
+		// #69 slider mapping (default 0.8 -> xy deviation 2.5) so the 凹凸强度 slider drives the merged
+		// bump exactly like it drove the dot3 one. When no sun map is active the light-clip rows go
+		// identity: sv is still computed but c27.z=0 branches the taps out, so the pixel never reads the
+		// unbound stage 2. Companion stages are ALWAYS (re)bound - nullptr included - so the wrapper
+		// cache can never hand a stale _nm/_rp to the next batch, same discipline as the P4-1/P3-21b
+		// unbinds in the two Restore paths.
+		if (merged) {
+			if (!useShadow) {
+				static const float kIdentity4[16] = {
+					1.0f, 0.0f, 0.0f, 0.0f,
+					0.0f, 1.0f, 0.0f, 0.0f,
+					0.0f, 0.0f, 1.0f, 0.0f,
+					0.0f, 0.0f, 0.0f, 1.0f };
+				DX8Wrapper::Set_Vertex_Shader_Constant(7, kIdentity4, 4);   // VS c7..c10 = identity (sv unused)
+				// GeneralsX @bugfix Qoder 17/10/2026 P3 (self-caught while wiring): sticky categories can
+				// hand the merged pair straight after a PBRML batch (point-lit mesh then unlit one) and
+				// PBRML leaves the _rp texture on stage 2. GN's Restore only unbinds s2 when the shadow
+				// flag was set, so without this the stale rp would outlive the category and leak into
+				// the next multi-stage fixed-pipeline material - the exact P4-1 hazard, closed the same way.
+				DX8Wrapper::Set_Texture(2, nullptr);
+			}
+			float bumpK = DX8NormalMap::Get_Strength() * 3.125f;
+			if (bumpK < 0.0f) bumpK = 0.0f;
+			const Vector4 c27(bumpK, nm != nullptr ? 1.0f : 0.0f, useShadow ? 1.0f : 0.0f, rp != nullptr ? 1.0f : 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(27, &c27, 1);
+			const Vector4 c28((float)DX8NormalMap::Get_PBR_Mode(), DX8NormalMap::PBR_LI(), DX8NormalMap::PBR_ENV(), DX8NormalMap::g_Wetness);
+			DX8Wrapper::Set_Pixel_Shader_Constant(28, &c28, 1);
+			DX8Wrapper::Set_Texture(1, nm);
+			DX8Wrapper::Set_Texture(3, rp);
+			g_mergedBoundThisBatch = true;
+			static int s_gnmMounted = 0;
+			if (s_gnmMounted < 8) {
+				++s_gnmMounted;
+				fprintf(stderr, "[GNM] merged mounted on diffuse='%s' nm=%d rp=%d mode=%d shadow=%d\n",
+					(const char*)diffuse->Get_Texture_Name(), nm != nullptr ? 1 : 0, rp != nullptr ? 1 : 0,
+					DX8NormalMap::Get_PBR_Mode(), useShadow ? 1 : 0);
+				fflush(stderr);
+			}
 		}
 
 		DX8Wrapper::Set_Vertex_Shader(vs);
@@ -1267,6 +1425,13 @@ namespace DX8GeomNormal
 		if (g_sunBoundThisBatch) {
 			DX8Wrapper::Set_Texture(2, nullptr);
 			g_sunBoundThisBatch = false;
+		}
+		// GeneralsX @feature Qoder 17/10/2026 P3: the merged pair's companion stages (s1 _nm, s3 _rp)
+		// ride the same unbind discipline - and only then, so plain GN batches never touch stage 1/3.
+		if (g_mergedBoundThisBatch) {
+			DX8Wrapper::Set_Texture(1, nullptr);
+			DX8Wrapper::Set_Texture(3, nullptr);
+			g_mergedBoundThisBatch = false;
 		}
 		DX8Wrapper::Set_Pixel_Shader(0);
 		DX8Wrapper::Set_Vertex_Shader(0);

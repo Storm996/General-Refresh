@@ -1900,6 +1900,12 @@ void DX8TextureCategoryClass::Render()
 	** the old per-prt Restore did. Draw order and every gate condition are unchanged.
 	*/
 	int mountedKind = 0;	// 0 = fixed pipeline, 1 = DX8NormalMap (dot3/PBR), 2 = DX8GeomNormal
+	// GeneralsX @feature Qoder 17/10/2026 P2: the FVF a mounted GN pass has to restore to. For rigid
+	// containers this is the nominal container FVF (what it always was); for skin batches it is the
+	// EFFECTIVE dynamic layout the CPU skinning pass submits (DX8_FVF_XYZNDUV2), because the container
+	// label (NUV1) never matches the bound buffer and the wrapper re-asserts the buffer FVF on every
+	// VERTEX_BUFFER_CHANGED (dx8wrapper.cpp:2892). Category layout is constant, so one value suffices.
+	unsigned gnMountFVF = 0;
 	static unsigned s_stickyPrts = 0, s_stickyInstalls = 0, s_stickyUnmounts = 0;
 
 	while (prt) {
@@ -2039,8 +2045,11 @@ void DX8TextureCategoryClass::Render()
 		** 开关命中且句柄就绪时挂载自定义 VS/PS; 默认关闭时下面整段短路, 严格走原固定管线 (零回归)。
 		*/
 		bool nmApplied = false;
-		// GeneralsX @feature PS3.0 #70 15/10/2026: the roughness path (RP_Ready) may arm this mount
-		// even with the normal-map switch OFF; Apply decides bump vs flat-normal PBR per texture.
+		// GeneralsX @feature PS3.0 #70 15/10/2026: (this mount could also arm with the normal-map
+		// switch OFF when the roughness pair was ready.) GeneralsX @feature Qoder 17/10/2026 P3: gate 1
+		// is the multi-light 兼容层 only now - Ready_To_Render (bump switch + both pairs installed) is
+		// its real precondition, and DX8NormalMap::Apply declines anything without an _nm companion or a
+		// collected point light, leaving every other bump/roughness batch to gate 2's merged base.
 		// GeneralsX @bugfix Qoder 16/10/2026 T3-0 white-flicker CLASS fix (was: per-texture file moves):
 		// the dot3/PBR pair may only take over a batch when the custom pipeline can reproduce the
 		// ENTIRE render semantics of that batch. Forensics on the CB civilian buildings (w3d_matdump.py
@@ -2064,7 +2073,7 @@ void DX8TextureCategoryClass::Render()
 		// texture-alpha - now such prts never mount, and the swap always runs on the fixed pipeline.
 		bool nmMapperPlain = (vmaterial == nullptr)
 			|| (vmaterial->Peek_Mapper(0) == nullptr && vmaterial->Peek_Mapper(1) == nullptr);
-		if ((DX8NormalMap::Ready_To_Render() || DX8NormalMap::RP_Ready())
+		if (DX8NormalMap::Ready_To_Render()
 			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNDUV1TG3 || Get_Container()->Is_Normal_Map_Batch())
 			&& mesh->Peek_Model()->Uses_Normal_Map()
 			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
@@ -2120,25 +2129,91 @@ void DX8TextureCategoryClass::Render()
 				if (lenv->isPointLight(li)) { gnLenvSafe = false; break; }
 			}
 		}
+		// GeneralsX @feature Qoder 17/10/2026 P2 (光影T0阶段): the EFFECTIVE vertex layout for the GN
+		// mount. The skin container's nominal FVF (DX8_FVF_XYZNUV1) is only a label - the CPU skinning
+		// pass writes the dynamic layout (dynamic_fvf_type == DX8_FVF_XYZNDUV2 with a real COLOR0
+		// channel) and the wrapper re-asserts the bound buffer's own FVF on every bind, so both the
+		// mount and the restore speak the effective layout and Apply routes the batch to the skinned
+		// VS/PS pair (kVertexShaderGN_SKIN/kPixelShaderGNSkin, FF-parity vertex-diffuse multiply).
+		// GeneralsX @feature Qoder 17/10/2026 P3 update: tangent-space skin batches (dynamic_fvf_type_nm
+		// == DX8_FVF_XYZNDUV1TG3, the layout the dot3 family used to own) are NOT excluded any more -
+		// the merged base pair takes them together with rigid bump meshes, sun shadow included (the P2
+		// "skins never get shadows" limit dissolved with the merge). Sorting containers stay out.
+		// Team colour needs no extra guard here (unlike the dot3 #68 rule): GN reads the batch's own
+		// VertexMaterialClass and scales ambient + every light colour by matAmbient/matDiffuse inside
+		// Apply, so house-colour material tint survives the mount - the same reason rigid house-colour
+		// parts already ride GN.
+		unsigned gnVBLayout = 0;
+		if (Get_Container()->Is_Skin_Batch()) {
+			// GeneralsX @feature Qoder 17/10/2026 P3: tangent skin batches (Is_Normal_Map_Batch - the
+			// CPU skinning pass writes dynamic_fvf_type_nm == DX8_FVF_XYZNDUV1TG3) are now taken by
+			// the MERGED base pair inside DX8GeomNormal::Apply; non-tangent skins keep the plain P2
+			// DUV2 skin pair. Sorting containers unchanged (their draws never go through the FVF path).
+			if (!Get_Container()->Is_Sorting())
+				gnVBLayout = Get_Container()->Is_Normal_Map_Batch()
+					? (unsigned)DX8_FVF_XYZNDUV1TG3 : (unsigned)DX8_FVF_XYZNDUV2;
+		} else {
+			gnVBLayout = Get_Container()->Get_FVF();
+		}
 		if (!nmApplied && gnLenvSafe && DX8GeomNormal::Ready_To_Render()
-			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNUV1 || Get_Container()->Get_FVF() == DX8_FVF_XYZNUV2)
+			&& (gnVBLayout == (unsigned)DX8_FVF_XYZNUV1 || gnVBLayout == (unsigned)DX8_FVF_XYZNUV2
+				|| gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2
+				// GeneralsX @feature Qoder 17/10/2026 P3: the tangent layout rides the merged base now
+				// (Apply probes the _nm/_rp companions and declines batches with neither, so a TG3 mesh
+				// without assets stays on the fixed pipeline exactly as before). Gate 1's stricter
+				// per-material contract applies to this layout only: multi-pass composites and
+				// mapper-generated UVs are invisible to a VS that reads raw vertex UVs (T3-0 fix).
+				|| (gnVBLayout == (unsigned)DX8_FVF_XYZNDUV1TG3
+					&& nmMapperPlain && mesh->Peek_Model()->Uses_Normal_Map()))
 			&& mesh->Peek_Model()->Get_Pass_Count() == 1
 			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
-			&& !mesh->Peek_Model()->Get_Flag(MeshModelClass::SKIN)
 			&& mesh->Get_Alpha_Override() == 1.0f
 			&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
 			// Same opaque-blend contract as the dot3 gate: alpha-blended glass with animated
 			// backgrounds flickered there (T3-0 fix), keep GN out of it too.
 			&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
 			&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO) {
-			gnApplied = DX8GeomNormal::Apply(*world_transform, vmaterial, Get_Container()->Get_FVF(), lenv);
+			gnApplied = DX8GeomNormal::Apply(*world_transform, vmaterial, (int)gnVBLayout, lenv, Peek_Texture(0));
+			if (gnApplied) gnMountFVF = gnVBLayout;
 			// GeneralsX @debug PS3.0 L2: sampled mount counter - distinguishes "gate never hits"
 			// (wrong FVF/pass/blend in practice) from "mounts but the change is invisible".
 			static unsigned s_gnMounted = 0;
 			if (gnApplied && (s_gnMounted++ % 4096u) == 0u) {
-				fprintf(stderr, "[GN] mounted batch #%u fvf=%s tex=%s\n", s_gnMounted,
-					Get_Container()->Get_FVF() == (int)DX8_FVF_XYZNUV1 ? "NUV1" : "NUV2",
+				static unsigned s_gnSkinMounted = 0;
+				if (gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2) ++s_gnSkinMounted;
+				fprintf(stderr, "[GN] mounted batch #%u skin=#%u fvf=%s tex=%s\n", s_gnMounted, s_gnSkinMounted,
+					gnVBLayout == (unsigned)DX8_FVF_XYZNUV1 ? "NUV1" : (gnVBLayout == (unsigned)DX8_FVF_XYZNUV2 ? "NUV2"
+						: (gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2 ? "SKIN-DUV2" : "TG3-merged")),
 					Peek_Texture(0) ? Peek_Texture(0)->Get_Texture_Name().str() : "(none)");
+				fflush(stderr);
+			}
+		}
+
+		// GeneralsX @feature Qoder 17/10/2026 P2: one-shot per-mesh-class companion reconciliation
+		// for skinned batches (the terrain line's [TNM] discipline): one stderr line per distinct skin
+		// mesh name telling whether its stage-0 diffuse has a "_nm"/"_rp" companion, so a DeepBump
+		// rollout can be audited against the live mesh list from a normal gameplay run - independent
+		// of whether THIS frame the batch mounted GN, dot3 or the fixed pipeline. The finders are the
+		// exact cached lookups the dot3/PBR mounts use (team-colour #68 and sub-128px #87 rejections
+		// show through); found companions load on first probe, bounded by the deployed companion set.
+		if (Get_Container()->Is_Skin_Batch()) {
+			static char s_gnSkinSeen[96][72];
+			static unsigned s_gnSkinSeenCount = 0;
+			const char* mname = mesh->Get_Name();
+			bool alreadyLogged = false;
+			for (unsigned si = 0; si < s_gnSkinSeenCount && mname != nullptr; ++si) {
+				if (strncmp(s_gnSkinSeen[si], mname, 71) == 0) { alreadyLogged = true; break; }
+			}
+			if (!alreadyLogged && s_gnSkinSeenCount < 96u) {
+				strncpy(s_gnSkinSeen[s_gnSkinSeenCount], mname != nullptr ? mname : "(null)", 71);
+				s_gnSkinSeen[s_gnSkinSeenCount][71] = 0;
+				++s_gnSkinSeenCount;
+				TextureClass* skinTex0 = Peek_Texture(0);
+				fprintf(stderr, "[GNSKIN] mesh=%s tex=%s nm=%d rp=%d\n",
+					mname != nullptr ? mname : "(null)",
+					skinTex0 ? skinTex0->Get_Texture_Name().str() : "(none)",
+					DX8NormalMap::Has_Companion_Normal(skinTex0) ? 1 : 0,
+					DX8NormalMap::Has_Companion_RP(skinTex0) ? 1 : 0);
 				fflush(stderr);
 			}
 		}
@@ -2154,7 +2229,9 @@ void DX8TextureCategoryClass::Render()
 			mountedKind = nmApplied ? 1 : 2;
 		} else if (mountedKind != 0) {
 			if (mountedKind == 1) DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
-			else DX8GeomNormal::Restore(Get_Container()->Get_FVF());
+			// GeneralsX @feature Qoder 17/10/2026 P2: restore with the layout the mount actually used
+			// (skin batches: the dynamic DUV2, never the nominal NUV1 container label).
+			else DX8GeomNormal::Restore(gnMountFVF != 0 ? gnMountFVF : Get_Container()->Get_FVF());
 			++s_stickyUnmounts;
 			mountedKind = 0;
 		}
@@ -2270,7 +2347,8 @@ void DX8TextureCategoryClass::Render()
 	if (mountedKind == 1) {
 		DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
 	} else if (mountedKind == 2) {
-		DX8GeomNormal::Restore(Get_Container()->Get_FVF());
+		// GeneralsX @feature Qoder 17/10/2026 P2: effective layout, see the per-prt unmount above.
+		DX8GeomNormal::Restore(gnMountFVF != 0 ? gnMountFVF : Get_Container()->Get_FVF());
 	}
 
 	if (!renderTasksRemaining)

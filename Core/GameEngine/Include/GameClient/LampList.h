@@ -113,6 +113,22 @@ public:
 	*/
 	const LampSet *findLampSet( const char* name ) const;
 
+	// GeneralsX @feature PS3.0 4F 17/10/2026: global lamp brightness gain for the Graphics Options
+	// slider (Options.ini LampLightIntensity, ticks 0-200, 100 = 1.0x; GENERALSX_LAMP_INT float wins
+	// inside the lazy seed). The render-side consumer (W3DModelDraw::updateLamps) multiplies every
+	// per-lamp INI intensity by this, so the user can dial the 4B look in-game and keep it.
+	void setGlobalIntensityGain( Real gain ) { m_intensityGain = gain; }
+	Real getGlobalIntensityGain() const;		///< lazy: seeds from OptionPreferences on first use
+
+	// GeneralsX @feature Qoder 18/10/2026 PS3.0 4E: the on/off half of the 4B lamp channel is now live
+	// too. It used to be a `static const Bool` latch inside W3DModelDraw::updateLamps, so the page's
+	// 建筑灯光 row only spoke at start-up. The store owns the value because it is the one piece both
+	// sides can reach (the options page is engine-layer, the lamps device-layer); GENERALSX_LAMPLIGHT
+	// still wins outright, so a scripted A/B leg is never moved by the menu. Turning it off makes
+	// updateLamps release every held lamp, i.e. the lights go out on the next frame.
+	void setGlobalLampsEnabled( Bool enabled );
+	Bool getGlobalLampsEnabled() const;		///< lazy: seeds from OptionPreferences on first use
+
 	static void parseLampListDefinition(INI* ini);
 
 private:
@@ -121,6 +137,8 @@ private:
 	typedef std::hash_map< NameKeyType, LampSet, rts::hash<NameKeyType>, rts::equal_to<NameKeyType>/**/> LampSetMap;
 
 	LampSetMap m_lampmap;
+	mutable Real m_intensityGain;				///< -1 = not yet seeded from the options store
+	mutable Int m_lampsEnabled;					///< GeneralsX @feature Qoder 18/10/2026 -1 = not yet seeded
 
 };
 

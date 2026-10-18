@@ -68,6 +68,18 @@ CampaignManager *TheCampaignManager = nullptr;
 
 
 
+//-----------------------------------------------------------------------------
+// GeneralsX @feature Qoder 17/10/2026 INI-driven campaign visibility. Lets a loose Campaign ini
+// declare `MainCampaign = Yes` (or No) and records that the key was actually present, so a campaign
+// can be added without editing the hard-coded list in MissionSelect.cpp.
+//-----------------------------------------------------------------------------
+static void parseMainCampaign( INI *ini, void *instance, void *store, const void *userData )
+{
+	Campaign *camp = (Campaign *)instance;
+	INI::parseBool( ini, instance, store, userData );
+	camp->m_isMainCampaignSet = TRUE;
+}
+
 const FieldParse CampaignManager::m_campaignFieldParseTable[] =
 {
 
@@ -76,6 +88,7 @@ const FieldParse CampaignManager::m_campaignFieldParseTable[] =
 	{ "CampaignNameLabel",	INI::parseAsciiString,							nullptr, offsetof( Campaign, m_campaignNameLabel ) },
 	{ "FinalVictoryMovie",	INI::parseAsciiString,							nullptr, offsetof( Campaign, m_finalMovieName ) },
 	{ "IsChallengeCampaign",			INI::parseBool,				nullptr, offsetof( Campaign, m_isChallengeCampaign ) },
+	{ "MainCampaign",			parseMainCampaign,				nullptr, offsetof( Campaign, m_isMainCampaign ) },
 	{ "PlayerFaction",		INI::parseAsciiString,					nullptr, offsetof( Campaign, m_playerFactionName ) },
 
 	{ nullptr,										nullptr,													nullptr, 0 }
@@ -114,12 +127,32 @@ void INI::parseCampaignDefinition( INI *ini )
 
 //-----------------------------------------------------------------------------
 Campaign::Campaign():
-	m_isChallengeCampaign(FALSE)
+	m_isChallengeCampaign(FALSE),
+	m_isMainCampaign(FALSE),
+	m_isMainCampaignSet(FALSE)
 {
 	m_missions.clear();
 	m_firstMission.clear();
 	m_name.clear();
 	m_finalMovieName.clear();
+}
+
+//-----------------------------------------------------------------------------
+// GeneralsX @feature Qoder 17/10/2026 INI-driven visibility with a zero-regression fallback: the
+// ini key wins when present, otherwise the historical hard-coded main-campaign list is used.
+//-----------------------------------------------------------------------------
+Bool Campaign::isMainCampaign() const
+{
+	if( m_isMainCampaignSet )
+		return m_isMainCampaign;
+
+	return m_name.compareNoCase( "USA" ) == 0
+		|| m_name.compareNoCase( "China" ) == 0
+		|| m_name.compareNoCase( "GLA" ) == 0
+		|| m_name.compareNoCase( "GEN_USA" ) == 0
+		|| m_name.compareNoCase( "GEN_GLA" ) == 0
+		|| m_name.compareNoCase( "GEN_China" ) == 0
+		|| m_name.compareNoCase( "GEN_TRAINING" ) == 0;
 }
 
 //-----------------------------------------------------------------------------

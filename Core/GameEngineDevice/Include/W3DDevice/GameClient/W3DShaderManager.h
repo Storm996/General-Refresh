@@ -112,6 +112,12 @@ public:
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed,
 	// meaning the shared per-pixel haze ramp is valid. The TREE30 path gates its own HLSL haze on this.
 	static Bool arePerPixelFogShadersActive();
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: TRUE when the TERRAIN30 HLSL trio was installed AND
+	// GENERALSX_TERRAIN_NM (default ON) is on. Gates both halves of the terrain normal pass: the packed
+	// normal atlas in WorldHeightMap, and the s4/c2 normal modulation inside the terrain pixel shaders.
+	// While FALSE the atlas is never built and the shaders are the plain fog trio, so a map with no
+	// *_nm.tga sheets - or any device below ps_3_0 - renders exactly as before the feature existed.
+	static Bool isTerrainNormalEnabled();
 	static void resetShader(ShaderTypes shader);	///<make sure W3D2 gets restored to normal
 	///Specify all textures (up to SHADER_TEXTURE_STAGES) which can be accessed by the shaders.
 	static void setTexture(Int stage,TextureClass* texture) {m_Textures[stage]=texture;}
@@ -151,6 +157,7 @@ public:
 	static Bool filterSetup(FilterTypes filter, FilterModes mode);
 
 	// Support routines for filter methods.
+	// Support routines for filter methods.
 	static Bool canRenderToTexture() { return (m_oldRenderSurface && m_newRenderSurface);}
 	static void startRenderToTexture(); ///< Sets render target to texture.
 	static IDirect3DTexture9 * endRenderToTexture(); ///< Ends render to texture, & returns texture.
@@ -160,7 +167,56 @@ public:
 	// GeneralsX @feature 05/10/2026 Bloom post-processing filter global toggle.
 	static Bool IsBloomFilterEnabled();	///<returns true if the bloom glow filter is enabled.
 	static void SetBloomFilterEnabled(Bool enabled);	///<enables/disables the bloom glow filter.
+	// GeneralsX @feature PS3.0 Weather W2/W4 16/10/2026: the screen half of the weather system.
+	// Two procedural passes over the tactical view rect - a multiply for cloud cover and a vignette,
+	// then an additive drizzle/blizzard veil plus the lightning flash. Not a W3DFilterInterface: that
+	// system has one filter slot (bloom owns it) and its render-to-texture chain cannot nest, while
+	// blending over the finished frame needs neither. Call once per tactical view draw, after the
+	// filter block: the rectangles below come from TheTacticalView, so a second caller would paint the
+	// effect over the wrong part of the screen. No-ops when the published weather scalars are neutral.
+	static void drawWeatherScreen();
 
+	// GeneralsX @feature PS3.0 Weather W5 16/10/2026: the shader half of the weather coupling. Pushes
+	// the two scalars that live in the WW3D2 dot3/PBR layer - the weather-scaled haze ramp (the GN/ML
+	// units that the one-time shader install would otherwise freeze at scale 1.0) and the rain wetness
+	// that the PBR roughness reads through c8.w / c11.w. Called from W3DDisplay::setTimeOfDay(), the
+	// single lighting install point, so a weather change lands on the same frame everywhere.
+	static void applyWeatherToShaders();
+
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the distance haze is a render
+	// effect the player can now own. The ramp recipe used to read GENERALSX_GNFOG once into a static,
+	// so the knob was a startup-only QA leg and nobody could turn the haze down from inside a match.
+	// These two setters hold the live value (enabled + 0..1 strength) that Build_Weather_Fog_Ramp
+	// consumes, and re-push the ramp so the shader families see it on the next draw - the graphics
+	// options page is an overlay over the live battlefield, so dragging the slider previews immediately.
+	// strength 0 (or enabled = false) makes every hazed pixel identical to the no-haze shader.
+	static void setDistanceHaze(Bool enabled, Real strength01);
+	static Bool isDistanceHazeEnabled();
+	static Real getDistanceHazeStrength();
+
+	// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: the bloom composite gain and the
+	// sun shadow map darkening strength used to be latched into a function-local static the first time
+	// each ran, so the two menu rows could only be read at start-up. They now follow the haze pattern -
+	// one lazily-seeded file static per value (the seed still lets OptionPreferences own the env
+	// precedence) plus a setter the options page pushes through Display. Consumers read the getter per
+	// frame, which is a static load, not an ini parse.
+	static void setBloomIntensity(Real intensity01);
+	static Real getBloomIntensity();					///< lazy seed from Options.ini / GENERALSX_BLOOM_INTENSITY
+	static void setShadowMapStrength(Real strength01);
+	static Real getShadowMapStrength();					///< lazy seed from Options.ini / GENERALSX_SHADOWMAP_INT
+
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: the ramp above only reaches the
+	// batches the custom ps_3_0 families take over (single-pass opaque rigid, no mapper UVs, pure
+	// directional light - dx8renderer.cpp:2065/2123). Everything they hand back - skinned meshes,
+	// multi-pass composites, vertex-coloured batches, point/spot-lit props, and terrain whenever the
+	// HLSL terrain leg is off - draws on the fixed pipeline, which read no haze at all. That is why
+	// only SOME distant buildings greyed out. These two calls wrap the fixed-function scene in
+	// D3D's own linear fog fed from the same recipe, so the whole world shares one horizon.
+	// Programmatic pixel shaders ignore D3DRS_FOGENABLE, so the already-hazed families cannot
+	// double up; the pair is called around the 3D scene only, so the 2D scene and every UI pass stay
+	// out of it. No-ops while the user switch is off or the strength is 0.
+	static void beginFixedFunctionHaze();
+	static void endFixedFunctionHaze();
 
 protected:
 	static TextureClass *m_Textures[SHADER_TEXTURE_STAGES];	///textures assigned to each of the possible stages

@@ -823,6 +823,7 @@ set(GAMEENGINE_SRC
     Source/GameClient/Input/Keyboard.cpp
     Source/GameClient/Input/Mouse.cpp
     Source/GameClient/Intro.cpp
+    Source/GameClient/LampList.cpp
     Source/GameClient/LanguageFilter.cpp
     Source/GameClient/Line2D.cpp
     Source/GameClient/MapUtil.cpp
@@ -839,6 +840,7 @@ set(GAMEENGINE_SRC
     Source/GameClient/RadiusDecal.cpp
     Source/GameClient/SelectionInfo.cpp
     Source/GameClient/Snow.cpp
+    Source/GameClient/WeatherFX.cpp
     Source/GameClient/Statistics.cpp
     Source/GameClient/System/Anim2D.cpp
 #    Source/GameClient/System/CampaignManager.cpp

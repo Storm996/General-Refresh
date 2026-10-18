@@ -80,6 +80,7 @@
 #include "GameLogic/ScriptEngine.h"
 #include "WWDownload/Registry.h"
 #include "GameClient/MessageBox.h"
+#include "GameClient/LampList.h"	// GeneralsX @feature PS3.0 4F 17/10/2026 live lamp brightness gain slider
 
 #include "WW3D2/ww3d.h"
 #include "WW3D2/texturefilter.h"
@@ -295,8 +296,9 @@ static const wchar_t *const s_antiAliasingTexts[] = { L"Off", L"2X", L"4X", L"8X
 // OptionPreferences getters own the units conversion and keep the GENERALSX_* QA env overrides
 // authoritative, so these fallbacks show exactly what the renderer will consume when the ini key
 // is absent. Sliders store raw ticks: 0-200 = percent x100 for the 0.0-2.0 strength range, 0-100
-// elsewhere. Only the normal-map strength has a live apply hook (DX8NormalMap re-arms every frame);
-// bloom, multi-light and the sun shadow map are compiled/created once per process and need a restart.
+// elsewhere. Rows with an apply hook are live (normal-map strength, roughness, GGX multi-light, the
+// pulse/lamp gates, bloom and the sun shadow density - see the hooks below); a row with apply = nullptr
+// feeds a resource that is compiled or created once per process and takes effect on restart.
 
 static Int gameOptionFallback_NormalStrength()
 {
@@ -321,11 +323,6 @@ static Int gameOptionFallback_ShadowSoftening()
 static Int gameOptionFallback_SunShadowRes()
 {
 	return OptionPreferences().getSunShadowMapResolution();
-}
-
-static Int gameOptionFallback_MultiLight()
-{
-	return OptionPreferences().getMultiLightEnabled() != FALSE;
 }
 
 static Int gameOptionFallback_ShadowMap()
@@ -363,6 +360,191 @@ static const wchar_t *const s_shadowSofteningTexts[] = { L"\u5173", L"\u4f4e", L
 static const Int s_sunShadowResValues[] = { 256, 512, 1024, 2048 };
 static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024", L"2048" };
 
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 4E 17/10/2026: lighting stage-four (4A/4B/4C) switches on the page.
+// The GGX multi-light mount is re-armed live (dx8normalmap evaluates it per Apply) and - since
+// Qoder 18/10/2026 - so are the 4A pulse and 4B lamp gates (see gameOptionApply_LightPulse /
+// gameOptionApply_LampLight below). Only the time-of-day preview still caches its slot on the first
+// setTimeOfDay, so that one row persists the ini key alone and takes effect on restart. Fallbacks read
+// the same OptionPreferences getters the renderer consumes, env GENERALSX_* overrides included.
+//-------------------------------------------------------------------------------------------------
+static Int gameOptionFallback_LightPulse()
+{
+	return OptionPreferences().getLightPulseEnabled() != FALSE;
+}
+
+static Int gameOptionFallback_LampLight()
+{
+	return OptionPreferences().getLampLightEnabled() != FALSE;
+}
+
+// GeneralsX @feature PS3.0 4F 17/10/2026: building-lamp brightness slider (ticks 0-200, 100 = 1.0x).
+// apply pushes the gain straight into LampStore so dragging the slider previews live - the options
+// page is an overlay over the running battlefield - and the generic save loop writes the tick to
+// Options.ini (LampLightIntensity), so the chosen value survives restarts.
+static Int gameOptionFallback_LampIntensity()
+{
+	return OptionPreferences().getLampLightIntensity();
+}
+
+static void gameOptionApply_LampIntensity(Int tick)
+{
+	if (TheLampStore != nullptr)
+		TheLampStore->setGlobalIntensityGain((Real)tick * 0.01f);
+}
+
+static Int gameOptionFallback_PBRML()
+{
+	return OptionPreferences().getPBRMLEnabled() != FALSE;
+}
+
+static void gameOptionApply_PBRML(Int on)
+{
+	DX8NormalMap::Set_PBRML_Enabled(on != 0);
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: four rows that used to be restart-only
+// now push straight into the layer that consumes them, following the setDistanceHaze route (the page is
+// an overlay over the running battlefield, so the player sees the change on the next frame).
+//  * 爆炸与枪口火光 -> Display::setLightPulseEnabled -> W3DDisplay's pulse gate.
+//  * 建筑灯光       -> LampStore::setGlobalLampsEnabled; the render side then releases every held lamp.
+//  * 泛光强度       -> Display::setBloomIntensity -> the composite constant (and the fixed-function
+//                     fallback glow byte, which used to ignore the slider completely).
+//  * 阴影浓度       -> Display::setShadowMapStrength -> both W3DSunShadowMap consumers.
+// Each receiving layer still resolves GENERALSX_LIGHTPULSE / GENERALSX_LAMPLIGHT /
+// GENERALSX_BLOOM_INTENSITY / GENERALSX_SHADOWMAP_INT first and ignores a menu push while its env leg
+// is present, so a scripted parity run cannot be moved from the page.
+//-------------------------------------------------------------------------------------------------
+static void gameOptionApply_LightPulse(Int on)
+{
+	if (TheDisplay != nullptr)
+		TheDisplay->setLightPulseEnabled(on != 0);
+}
+
+static void gameOptionApply_LampLight(Int on)
+{
+	if (TheLampStore != nullptr)
+		TheLampStore->setGlobalLampsEnabled(on != 0);
+}
+
+static void gameOptionApply_Bloom(Int tick)
+{
+	if (TheDisplay != nullptr)
+		TheDisplay->setBloomIntensity((Real)tick * 0.01f);
+}
+
+static void gameOptionApply_ShadowDensity(Int tick)
+{
+	if (TheDisplay != nullptr)
+		TheDisplay->setShadowMapStrength((Real)tick * 0.01f);
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 18/10/2026: the two shadow knobs that had no row at all, only an ini key.
+// Both are cached when W3DShadowManager is constructed once per process (density feeds
+// TexProjectClass::Set_Intensity, the volumetric one feeds the fullscreen SRCBLEND colour), and that
+// manager lives in the project's device layer, which this engine-side file cannot reach - so these
+// rows stay restart-only, the documented convention for once-per-process resources. Ticks are the
+// getters' own 0-100 percent domain; the factory defaults are the shipped 25 / 22.
+//-------------------------------------------------------------------------------------------------
+static Int gameOptionFallback_ShadowProjected()
+{
+	return (Int)(OptionPreferences().getShadowProjectedIntensity() + 0.5f);
+}
+
+static Int gameOptionFallback_ShadowVolumetric()
+{
+	return (Int)(OptionPreferences().getShadowVolumetricIntensity() + 0.5f);
+}
+
+// GeneralsX @feature Qoder 18/10/2026: the terrain per-pixel macro-normal child switch finally gets a
+// row. Options.ini TerrainPerPixel, factory default OFF (as is its parent Terrain30Shading - the batch22
+// retail-parity red line, untouched here). Restart-only: the HLSL terrain trio is compiled at terrain
+// shader init, and this child only arms once the parent is on.
+//-------------------------------------------------------------------------------------------------
+static Int gameOptionFallback_TerrainPerPixel()
+{
+	return OptionPreferences().getTerrainPerPixel() != FALSE;
+}
+
+// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the P3-14 distance haze was only ever
+// reachable through the GENERALSX_GNFOG environment variable, parsed once into a static at shader
+// install. Two rows now own it from the Graphics Options page: a tick (DistanceHaze) and a percent
+// slider (DistanceHazeIntensity, 0-100 = 0.0-1.0 blend, factory 60 - the shipped look).
+// The pair is mirrored in these two statics because the generic save loop writes each key and applies
+// it row by row: if the player moves both rows in one visit, an apply that re-read Options.ini would
+// see the other row's previous value. The fallbacks run on every page open, so they seed the pair from
+// the authoritative getters (GENERALSX_GNFOG override included) before any apply can use it.
+static Bool s_hazeEnabled = TRUE;
+static Int  s_hazeTick = 60;
+
+static Int gameOptionFallback_DistanceHaze()
+{
+	s_hazeEnabled = (OptionPreferences().getDistanceHazeEnabled() != FALSE);
+	return s_hazeEnabled ? 1 : 0;
+}
+
+static Int gameOptionFallback_DistanceHazeStrength()
+{
+	s_hazeTick = OptionPreferences().getDistanceHazeIntensity();
+	return s_hazeTick;
+}
+
+static void gameOptionApply_DistanceHaze(Int on)
+{
+	s_hazeEnabled = (on != 0);
+	if (TheDisplay != nullptr)
+		TheDisplay->setDistanceHaze(s_hazeEnabled, (Real)s_hazeTick * 0.01f);
+}
+
+static void gameOptionApply_DistanceHazeStrength(Int tick)
+{
+	s_hazeTick = tick;
+	if (TheDisplay != nullptr)
+		TheDisplay->setDistanceHaze(s_hazeEnabled, (Real)tick * 0.01f);
+}
+
+static Int gameOptionFallback_TodPreview()
+{
+	return OptionPreferences().getTodPreview();
+}
+
+static const Int s_todPreviewValues[] = { 0, 1, 2, 3, 4 };
+static const wchar_t *const s_todPreviewTexts[] =
+{
+	L"\u8ddf\u968f", L"\u4e0a\u5348", L"\u4e0b\u5348", L"\u508d\u665a", L"\u591c\u665a", // follow / morning / afternoon / evening / night
+};
+
+// GeneralsX @feature PS3.0 L2.2 17/10/2026: TERRAIN30 (the ps_3_0 HLSL terrain trio that carries the
+// L2.1 normal-map leg) as a page checkbox. The trio is compiled once per process at terrain shader
+// init, so this row is restart-only (apply = nullptr); fallback reads the same OptionPreferences
+// getter the renderer consumes, GENERALSX_TERRAIN30 env override included, and the factory default
+// is OFF (batch22 retail-parity verdict).
+static Int gameOptionFallback_Terrain30()
+{
+	return OptionPreferences().getTerrain30Shading() != FALSE;
+}
+
+// GeneralsX @feature Qoder 17/10/2026: "逐像素光照" - the per-pixel lighting master switch. It names
+// what DX8GeomNormal has always been (fixed pipeline -> per-pixel lighting against the interpolated
+// geometric normal, now also carrying sun-shadow reception, the 8-light lambert loop and eye-depth
+// haze) instead of leaving it an invisible env var. Deliberately NOT called "normal map": the bumpy
+// detail layer stays on UseNormalMapping / NormalMapStrength and the material layer on
+// RoughnessMapping - those mount per asset only when a *_nm / *_rp companion exists, this row only
+// decides whether lighting is evaluated per pixel at all. Live: dx8renderer asks Ready_To_Render()
+// per batch, so unchecked = the fixed pipeline again on the next frame (GENERALSX_GEOMNORMAL still
+// overrides for scripted A/B legs). Factory default ON = the shipping state since 14/10.
+static Int gameOptionFallback_PerPixelLighting()
+{
+	return OptionPreferences().getPerPixelLighting() != FALSE;
+}
+
+static void gameOptionApply_PerPixelLighting(Int on)
+{
+	DX8GeomNormal::Set_Enabled(on != 0);
+}
+
 // GeneralsX @feature Qoder 13/10/2026 Control names are the bare gadget names (no layout prefix):
 // the init loop formats "<layoutPrefix>:<name>", so the SAME rows drive both the retail
 // OptionsMenu.wnd gadgets and the clones on the new standalone GraphicsOptions.wnd page.
@@ -373,6 +555,15 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		"StaticTextMaxFpsLimit", L"\u6700\u5927\u5e27\u7387",
 		s_fpsLimitValues, s_fpsLimitTexts, (Int)ARRAY_SIZE(s_fpsLimitValues), 0, 0,
 		gameOptionFallback_FpsLimit, gameOptionApply_FpsLimit,
+	},
+	// GeneralsX @feature Qoder 17/10/2026: per-pixel lighting master row (see the helpers above).
+	// Lives above the two companion layers it no longer depends on: normal mapping and roughness are
+	// separate assets-driven mounts, and the bump strength has its own slider row.
+	{
+		GAME_OPTION_BOOL, "PerPixelLighting", "CheckPerPixelLighting",
+		nullptr, L"\u9010\u50cf\u7d20\u5149\u7167",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_PerPixelLighting, gameOptionApply_PerPixelLighting,
 	},
 	{
 		GAME_OPTION_BOOL, "UseNormalMapping", "CheckNormalMapping",
@@ -408,13 +599,13 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		GAME_OPTION_SLIDER, "BloomIntensity", "SliderBloom",
 		"StaticTextBloom", L"\u6cdb\u5149\u5f3a\u5ea6",
 		nullptr, nullptr, 0, 0, 100,
-		gameOptionFallback_Bloom, nullptr,
+		gameOptionFallback_Bloom, gameOptionApply_Bloom,
 	},
 	{
 		GAME_OPTION_SLIDER, "ShadowMapIntensity", "SliderShadowDensity",
 		"StaticTextShadowDensity", L"\u9634\u5f71\u6d53\u5ea6",
 		nullptr, nullptr, 0, 0, 100,
-		gameOptionFallback_ShadowDensity, nullptr,
+		gameOptionFallback_ShadowDensity, gameOptionApply_ShadowDensity,
 	},
 	{
 		GAME_OPTION_COMBO, "ShadowSoftening", "ComboBoxShadowSoftening",
@@ -428,17 +619,99 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		s_sunShadowResValues, s_sunShadowResTexts, (Int)ARRAY_SIZE(s_sunShadowResValues), 0, 0,
 		gameOptionFallback_SunShadowRes, nullptr,
 	},
-	{
-		GAME_OPTION_BOOL, "MultiLightEffect", "CheckMultiLight",
-		nullptr, L"\u591a\u5149\u6e90\u6548\u679c",
-		nullptr, nullptr, 0, 0, 0,
-		gameOptionFallback_MultiLight, nullptr,
-	},
+	// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): the "multi-light effect"
+	// row is gone. Since P3 the multi-light family is a permanently-on layer of the merged per-pixel
+	// base, the row was restart-only (apply = nullptr) so it never affected a running client, and GGX
+	// multi-light specular stays user-facing further down as its own row (PBRMultiLight).
+	// OptionPreferences now reports the feature ON, and CheckMultiLight was removed from
+	// GraphicsOptions.wnd in the same step - leaving the gadget behind would have shown an inert
+	// checkbox, exactly the "switch does nothing" trap the per-pixel row first fell into. Scripted A/B
+	// still turns it off with GENERALSX_MULTILIGHT=0.
 	{
 		GAME_OPTION_BOOL, "ShadowMap", "CheckShadowMap",
 		nullptr, L"\u771f\u5b9e\u9634\u5f71\uff08\u5b9e\u9a8c\uff09",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_ShadowMap, nullptr,
+	},
+	// GeneralsX @feature PS3.0 4E 17/10/2026 stage-four rows (see the helpers above): 4A pulses,
+	// 4B lamps, 4C GGX multi-light + time-of-day preview. The pulse and lamp gates became live rows on
+	// 18/10/2026; the time-of-day preview still carries apply = nullptr.
+	{
+		GAME_OPTION_BOOL, "LightPulseEffect", "CheckLightPulse",
+		nullptr, L"\u7206\u70b8\u4e0e\u67aa\u53e3\u706b\u5149",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_LightPulse, gameOptionApply_LightPulse,
+	},
+	{
+		GAME_OPTION_BOOL, "LampLightEffect", "CheckLampLight",
+		nullptr, L"\u5efa\u7b51\u706f\u5149",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_LampLight, gameOptionApply_LampLight,
+	},
+	// GeneralsX @feature PS3.0 4F 17/10/2026: live-previewed lamp brightness gain (see helpers above).
+	{
+		GAME_OPTION_SLIDER, "LampLightIntensity", "SliderLampIntensity",
+		"StaticTextLampIntensity", L"\u5efa\u7b51\u706f\u5f3a\u5ea6",
+		nullptr, nullptr, 0, 0, 200,
+		gameOptionFallback_LampIntensity, gameOptionApply_LampIntensity,
+	},
+	{
+		GAME_OPTION_BOOL, "PBRMultiLight", "CheckPBRML",
+		nullptr, L"GGX \u591a\u706f\u9ad8\u5149",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_PBRML, gameOptionApply_PBRML,
+	},
+	{
+		GAME_OPTION_COMBO, "TimeOfDayPreview", "ComboBoxTodPreview",
+		"StaticTextTodPreview", L"\u65f6\u523b\u9884\u89c8",
+		s_todPreviewValues, s_todPreviewTexts, (Int)ARRAY_SIZE(s_todPreviewValues), 0, 0,
+		gameOptionFallback_TodPreview, nullptr,
+	},
+	// GeneralsX @feature PS3.0 L2.2 17/10/2026: terrain HLSL leg opt-in (restart needed, see helper).
+	{
+		GAME_OPTION_BOOL, "Terrain30Shading", "CheckTerrain30Shading",
+		nullptr, L"\u73b0\u4ee3\u5730\u5f62\u5149\u5f71\uff08\u5b9e\u9a8c\uff09",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_Terrain30, nullptr,
+	},
+	// GeneralsX @feature Qoder 18/10/2026: the P4 terrain per-pixel child switch gets its own row (see
+	// the helper above). It only arms while the row above is on, and both stay OFF on a fresh install.
+	{
+		GAME_OPTION_BOOL, "TerrainPerPixel", "CheckTerrainPerPixel",
+		nullptr, L"\u5730\u5f62\u9010\u50cf\u7d20\u5149\u7167\uff08\u5b9e\u9a8c\uff09",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_TerrainPerPixel, nullptr,
+	},
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the distance haze tick plus its
+	// strength slider, both live (see the helpers above). Ticks 0-100 because the domain is a blend
+	// factor, not a gain.
+	{
+		GAME_OPTION_BOOL, "DistanceHaze", "CheckDistanceHaze",
+		nullptr, L"\u8ddd\u79bb\u96fe",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_DistanceHaze, gameOptionApply_DistanceHaze,
+	},
+	{
+		GAME_OPTION_SLIDER, "DistanceHazeIntensity", "SliderDistanceHaze",
+		"StaticTextDistanceHaze", L"\u8ddd\u79bb\u96fe\u6d53\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_DistanceHazeStrength, gameOptionApply_DistanceHazeStrength,
+	},
+	// GeneralsX @feature Qoder 18/10/2026: the two unit-shadow density knobs (see the helpers above).
+	// Restart-only rows - W3DShadowManager caches them at construction - but they were previously
+	// reachable only by hand-editing Options.ini, and they decide how dark the shadows under every
+	// tank and soldier are, which is the single most visible shadow number on the page.
+	{
+		GAME_OPTION_SLIDER, "ShadowProjectedIntensity", "SliderShadowProjected",
+		"StaticTextShadowProjected", L"\u6295\u5f71\u9634\u5f71\u6d53\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_ShadowProjected, nullptr,
+	},
+	{
+		GAME_OPTION_SLIDER, "ShadowVolumetricIntensity", "SliderShadowVolumetric",
+		"StaticTextShadowVolumetric", L"\u4f53\u79ef\u9634\u5f71\u6d53\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_ShadowVolumetric, nullptr,
 	},
 };
 

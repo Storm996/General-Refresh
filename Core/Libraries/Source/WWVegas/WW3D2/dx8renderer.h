@@ -211,6 +211,15 @@ public:
 	// mount guard accepts those batches through this hook instead of the container FVF.
 	virtual bool Is_Normal_Map_Batch() const { return false; }
 
+	// GeneralsX @feature Qoder 17/10/2026 P2: the skin container's nominal FVF (DX8_FVF_XYZNUV1) is
+	// NOT the layout of the vertex buffer it actually submits - the CPU skinning pass writes
+	// dynamic_fvf_type (XYZ|NORMAL|TEX2|DIFFUSE), and DX8Wrapper::Apply_Render_State_Changes re-asserts
+	// the buffer's own FVF on every bind (dx8wrapper.cpp:2892). A custom vertex shader mounted on those
+	// batches therefore has to declare COLOR0 and two UV sets, and a custom FVF restored from the
+	// nominal container value would shift the next fixed-pipeline draw. This hook tells the render
+	// gates "ask the dynamic layout, not the container label".
+	virtual bool Is_Skin_Batch() const { return false; }
+
 	void Add_Visible_Texture_Category(DX8TextureCategoryClass * tex_category,int pass)
 	{
 		WWASSERT(pass<MAX_PASSES);
@@ -286,6 +295,11 @@ public:
 	// GeneralsX @feature T3-0 P1: true while the current batch's dynamic VB uses the
 	// tangent-space layout (see Render()); lets the dot3 mount guard accept skinned meshes.
 	virtual bool Is_Normal_Map_Batch() const override { return NormalMapBatch; }
+
+	// GeneralsX @feature Qoder 17/10/2026 P2: identifies the skin container to the GN gate so it
+	// can mount the DUV2+COLOR0 vertex layout the CPU skinning pass actually submits (see the base
+	// class comment). Rigid containers keep the default false and use their nominal FVF.
+	virtual bool Is_Skin_Batch() const override { return true; }
 
 	void Add_Visible_Skin(MeshClass * mesh);
 

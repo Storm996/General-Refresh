@@ -807,13 +807,11 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 
 	float bias = 1.5f / zSpan;			// ~1.5 world units of acne guard, in [0,1] depth
 	float spread = 1.25f / (float)g_mapSize;
-	// GeneralsX @feature 13/10/2026 Options.ini ShadowMapIntensity via the options menu (env
-	// GENERALSX_SHADOWMAP_INT still overrides inside the getter).  Was a per-frame getenv, now
-	// cached once per process - the menu value takes effect at next start.
-	static float s_intensityCached = -1.0f;
-	if (s_intensityCached < 0.0f)
-		s_intensityCached = (float)OptionPreferences().getShadowMapIntensity() * 0.01f;
-	const float strength = s_intensityCached;
+	// GeneralsX @feature 13/10/2026 Options.ini ShadowMapIntensity via the options menu.  GeneralsX
+	// @feature Qoder 18/10/2026: the value is no longer latched per process - W3DShaderManager holds it
+	// live (env GENERALSX_SHADOWMAP_INT still wins inside the seed), so the row darkens or lightens the
+	// shadows on the next frame instead of the next start.
+	const float strength = (float)W3DShaderManager::getShadowMapStrength();
 
 	float c0[4] = { spread, spread, bias, strength };
 	dev->SetPixelShaderConstantF(0, c0, 1);
@@ -969,18 +967,18 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 	// because Apply then keeps the plain GN shaders).
 	if (sunShadowGNReception() && g_mapTexWrapper != nullptr && DX8GeomNormal::Sun_Shadow_Ready())
 	{
-		static float s_gnIntensity = -1.0f;
-		if (s_gnIntensity < 0.0f)
-			s_gnIntensity = (float)OptionPreferences().getShadowMapIntensity() * 0.01f;
+		// GeneralsX @feature Qoder 18/10/2026: same live value as the overlay pass above (no per-process
+		// latch), so one slider moves both shadow-map consumers together.
+		const float gnIntensity = (float)W3DShaderManager::getShadowMapStrength();
 		const float zSpan = g_sunZFarDist - g_sunZNearDist;
 		// GeneralsX @feature PS3.0-P3-22 14/10/2026: proportionate softening - the kernel half-width
 		// is 1.25 texels for 3x3 and 2.5 for 5x5, and dividing by the map edge keeps the world-space
 		// penumbra constant when the resolution tier moves (512 -> 2048).
 		const float spreadFactor = (sunShadowPCFTaps() == 5) ? 2.5f : 1.25f;
 		DX8GeomNormal::Set_Sun_Shadow(g_mapTexWrapper, g_sunM,
-			spreadFactor / (float)g_mapSize, (zSpan > 1.0f) ? 1.5f / zSpan : 0.0f, s_gnIntensity);
+			spreadFactor / (float)g_mapSize, (zSpan > 1.0f) ? 1.5f / zSpan : 0.0f, gnIntensity);
 		g_gnArmed = true;         // GeneralsX @feature PS3.0-P3-23: composition queries see reception live
-		g_gnStrength = s_gnIntensity;
+		g_gnStrength = gnIntensity;
 		static bool s_gnPushedLogged = false;
 		if (!s_gnPushedLogged)
 		{
@@ -988,7 +986,7 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 			fprintf(stderr, "[SMAP] GN reception armed (map=%s %d, pcf=%dx%d, spread=%.5f, bias=%.5f, strength=%.2f)\n",
 				mapFmtName(g_mapFmt), g_mapSize, sunShadowPCFTaps(), sunShadowPCFTaps(),
 				(double)(spreadFactor / (float)g_mapSize),
-				(double)((zSpan > 1.0f) ? 1.5f / zSpan : 0.0f), (double)s_gnIntensity);
+				(double)((zSpan > 1.0f) ? 1.5f / zSpan : 0.0f), (double)gnIntensity);
 			fflush(stderr);
 		}
 	}

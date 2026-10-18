@@ -63,6 +63,7 @@
 #include "GameClient/TerrainVisual.h"
 #include "GameClient/View.h"
 #include "GameClient/Water.h"
+#include "GameClient/WeatherFX.h"	// GeneralsX @feature PS3.0 Weather W1 16/10/2026 weather->terrain lighting coupler
 
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/TerrainLogic.h"
@@ -521,9 +522,25 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, const Vector3*li
 #else
 	Real shadeR, shadeG, shadeB;
 	Real shade;
+	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: weather coupler for the GROUND. The terrain
+	// vertex colors are rebuilt from the raw GlobalData arrays on every staticLightingChanged(), so
+	// multiplying the read values here is always scale-of-raw (never compounding between weather
+	// switches), and WEATHER_NORMAL's 1.0/1.0 leaves the retail colors bit-identical. The split
+	// mirrors the object side in W3DDisplay::setTimeOfDay: ambient term follows the weather ambient
+	// scale (overcast goes flat), the sun lobes follow the key scale. Dynamic lights from the
+	// iterator (map lamps, explosions) are deliberately NOT scaled - a street lamp should still
+	// shine in a storm.
+	const WeatherRenderState &wx = weatherRenderState();
+	const Bool wxGroundActive = (fabsf(wx.m_ambientScale - 1.0f) > 0.001f || fabsf(wx.m_keyScale - 1.0f) > 0.001f);
 	shadeR = TheGlobalData->m_terrainAmbient[0].red;	//only the first terrain light contributes to ambient
 	shadeG = TheGlobalData->m_terrainAmbient[0].green;
 	shadeB = TheGlobalData->m_terrainAmbient[0].blue;
+	if (wxGroundActive)
+	{
+		shadeR *= wx.m_ambientScale;
+		shadeG *= wx.m_ambientScale;
+		shadeB *= wx.m_ambientScale;
+	}
 
 	if (pLightsIterator) {
 		for (pLightsIterator->First(); !pLightsIterator->Is_Done(); pLightsIterator->Next())
@@ -591,9 +608,22 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, const Vector3*li
 		if (shade > 1.0) shade = 1.0;
 		if(shade < 0.0f) shade = 0.0f;
 		terrainDiffuse=&TheGlobalData->m_terrainDiffuse[lightIndex];
-		shadeR += shade*terrainDiffuse->red;
-		shadeG += shade*terrainDiffuse->green;
-		shadeB += shade*terrainDiffuse->blue;
+		if (wxGroundActive)
+		{
+			// GeneralsX @feature PS3.0 Weather W1 16/10/2026: sun lobes dim with the weather key scale.
+			Real wxSunR = terrainDiffuse->red * wx.m_keyScale;
+			Real wxSunG = terrainDiffuse->green * wx.m_keyScale;
+			Real wxSunB = terrainDiffuse->blue * wx.m_keyScale;
+			shadeR += shade*wxSunR;
+			shadeG += shade*wxSunG;
+			shadeB += shade*wxSunB;
+		}
+		else
+		{
+			shadeR += shade*terrainDiffuse->red;
+			shadeG += shade*terrainDiffuse->green;
+			shadeB += shade*terrainDiffuse->blue;
+		}
 	}
 
 	if (shadeR > 1.0) shadeR = 1.0;

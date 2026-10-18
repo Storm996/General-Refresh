@@ -20,6 +20,12 @@
 
 #pragma once
 
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: this header now names Weather at file scope
+// (the QA-gate externs below and SnowManager::m_weatherType), so it has to pull the engine's own base
+// types rather than rely on the includer's order - the device layer's W3DSnow.h includes Snow.h first,
+// and GameType.h is useless unless Lib/BaseType.h (Int/Bool/Real, CPP_11) has already been seen.
+#include "Lib/BaseType.h"
+#include "Common/GameType.h"
 #include "Common/SubsystemInterface.h"
 #include "Common/Overridable.h"
 #include "Common/Override.h"
@@ -102,7 +108,7 @@ class WeatherSetting : public Overridable
 		Real m_wetness;								///<0..1 roughness offset applied to PBR materials (rain-slick).
 		RGBColor m_screenTint;				///<screen-layer color multiply (cloud cover, blue night rain).
 		Real m_screenDarken;					///<screen-layer brightness multiply, 0..1 (thicker = darker sky).
-		Real m_screenWispDensity;		 ///<0..1 strength of the scrolling screen-space drizzle/snow veil.
+		Real m_screenWispDensity;		 ///<Peak opacity of the scrolling screen-space mist veil, 0..1 (0 = none).
 		Real m_screenVignette;				///<0..1 edge darkening (blizzard whiteout framing).
 		Real m_lightningChance;			 ///<expected strikes per minute; 0 disables (device-side RNG only).
 		Real m_lightningIntensity;		 ///<scale on the flash + dynamic light pulse a strike produces.
@@ -202,6 +208,12 @@ class SnowManager : public SubsystemInterface
 	virtual void init() override;
 	virtual void reset() override;
 	virtual void updateIniSettings ();
+
+	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the per-frame weather tick. It mirrors the
+	// logic-side GlobalData weather value into the render recipe and advances the lightning/veil
+	// envelope, and it implements the pure-virtual SubsystemInterface::update() that GameClient drives
+	// through TheSnowManager->UPDATE().
+	virtual void update() override;
 	void setVisible(Bool showWeather);	///<enable/disable rendering of weather - assuming it's available on map.
 
 	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: switch the active recipe at runtime

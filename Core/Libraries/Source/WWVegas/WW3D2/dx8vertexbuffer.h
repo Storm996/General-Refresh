@@ -67,9 +67,12 @@ class VertexBufferLockClass
 protected:
 	VertexBufferClass* VertexBuffer;
 	void* Vertices;
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: true when this lock wrote into the
+	// Vulkan host-visible geometry ring instead of the D3D9 buffer; dtor must then skip Unlock.
+	bool vk_mirrored;
 
 	// This class can't be used directly, so constructor as to be protected
-	VertexBufferLockClass(VertexBufferClass* vertex_buffer_) : VertexBuffer(vertex_buffer_) {}
+	VertexBufferLockClass(VertexBufferClass* vertex_buffer_) : VertexBuffer(vertex_buffer_), vk_mirrored(false) {}
 public:
 	void* Get_Vertex_Array() { return Vertices; }
 };
@@ -172,6 +175,9 @@ public:
 	{
 		DynamicVBAccessClass* DynamicVBAccess;
 		VertexFormatXYZNDUV2 * Vertices;
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: true when the batch was written into
+		// the dynamic geometry backing instead of the D3D9 pool; the destructor must then skip Unlock.
+		bool vk_mirrored;
 	public:
 		WriteLockClass(DynamicVBAccessClass* vb_access);
 		~WriteLockClass();

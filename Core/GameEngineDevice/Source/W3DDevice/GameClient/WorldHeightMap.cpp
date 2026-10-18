@@ -52,6 +52,7 @@
 #include "W3DDevice/GameClient/TileData.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/TerrainTex.h"
+#include "W3DDevice/GameClient/W3DShaderManager.h"	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 isTerrainNormalEnabled gate
 #include "W3DDevice/GameClient/W3DShadow.h"
 
 #include "Common/file.h"
@@ -407,11 +408,13 @@ WorldHeightMap::~WorldHeightMap()
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		REF_PTR_RELEASE(m_sourceTiles[i]);
 		REF_PTR_RELEASE(m_edgeTiles[i]);
+		REF_PTR_RELEASE(m_nmTiles[i]);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 normal tiles
 	}
 	for (i=0; i<NUM_ALPHA_TILES; i++) {
 		REF_PTR_RELEASE(m_alphaTiles[i]);
 	}
 	REF_PTR_RELEASE(m_terrainTex);
+	REF_PTR_RELEASE(m_terrainNMTex);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 normal atlas
 	REF_PTR_RELEASE(m_alphaTerrainTex);
 	REF_PTR_RELEASE(m_alphaEdgeTex);
 }
@@ -443,12 +446,15 @@ WorldHeightMap::WorldHeightMap():
 	m_tileMode(TILE_4x4),
 #endif
 	m_numCliffInfo(1),
-	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1)
+	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1),
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: normal atlas members.
+	m_terrainNMTex(nullptr), m_terrainNMHeight(1)
 {
 	Int i;
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		m_sourceTiles[i] = nullptr;
 		m_edgeTiles[i] = nullptr;
+		m_nmTiles[i] = nullptr;
 	}
 
 	TheSidesList->validateSides();
@@ -482,13 +488,16 @@ WorldHeightMap::WorldHeightMap(ChunkInputStream *pStrm, Bool logicalDataOnly):
 	m_tileMode(TILE_4x4),
 #endif
 	m_numCliffInfo(1),
-	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1)
+	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1),
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: normal atlas members.
+	m_terrainNMTex(nullptr), m_terrainNMHeight(1)
 {
 
 	int i;
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		m_sourceTiles[i]=nullptr;
 		m_edgeTiles[i]=nullptr;
+		m_nmTiles[i]=nullptr;
 	}
 
 	DataChunkInput file( pStrm );
@@ -1028,6 +1037,63 @@ void WorldHeightMap::readTexClass(TXTextureClass *texClass, TileData **tileData)
 	}
 }
 
+//=============================================================================
+// WorldHeightMap::readTexNM
+//=============================================================================
+// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: load the loose normal override for one terrain
+// texture class. The diffuse sheet named terrain->getTexture() ("grass.tga") is paired with a
+// "<stem>_nm.tga" of identical grid layout sitting in the same Art/Terrain/ folder. Tiles decoded
+// from that sheet land in m_nmTiles at the same firstTile offsets the diffuse uses, so the normal
+// atlas can pack them with the very positions updateTileTexturePositions() assigns to m_sourceTiles.
+//
+// Deliberately silent-safe: no sheet, wrong tile count, or a non-terrain class all leave m_nmTiles
+// null for those tiles. The atlas then packs a flat normal (128,128,255) there, so the ground pixel
+// is unchanged from before this feature and the retail parity is preserved without a gate.
+void WorldHeightMap::readTexNM(TXTextureClass *texClass)
+{
+	TerrainType *terrain = TheTerrainTypes->findTerrain( texClass->name );
+	if (terrain == nullptr) return;
+
+	// Build "<dir><stem>_nm.tga" from "<dir><stem>.<ext>".
+	char nmPath[_MAX_PATH];
+	AsciiString texName = terrain->getTexture();
+	const char *dot = strrchr(texName.str(), '.');
+	Int stemLen = dot ? (Int)(dot - texName.str()) : (Int)strlen(texName.str());
+	if (stemLen <= 0 || stemLen >= _MAX_PATH) return;
+	snprintf(nmPath, sizeof(nmPath), "%s%.*s_nm.tga", TERRAIN_TGA_DIR_PATH, stemLen, texName.str());
+
+	File *theFile = TheFileSystem->openFile(nmPath, File::READ | File::BINARY);
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: per-class evidence line. This doubles as the
+	// authoritative "which diffuse sheets does THIS map use" probe for forensics legs - the terrain
+	// class names come straight out of the loaded map's texture table, not a guess. numTiles/width
+	// are also printed because the offline nm generator must mirror ChooseTileGrid's per-class
+	// interpretation exactly, and that needs the class's expected tile count.
+	fprintf(stderr, "[TNM] class %s tex=%s numTiles=%d width=%d firstTile=%d nm=%s\n",
+		texClass->name.str(), texName.str(), texClass->numTiles, texClass->width,
+		texClass->firstTile, theFile ? "FOUND" : "missing");
+	fflush(stderr);
+	if (theFile == nullptr) return;
+
+	GDIFileStream theStream(theFile);
+	InputStream *pStr = &theStream;
+	Bool isLegacyGrid = false;
+	Int numTiles = WorldHeightMap::countTiles(pStr, nullptr, texClass->numTiles, &isLegacyGrid);
+	theFile->seek(0, File::START);
+	if (numTiles >= texClass->numTiles)
+	{
+		numTiles = texClass->numTiles;
+		Int width;
+		for (width = 10; width >= 1; width--) {
+			if (numTiles >= width*width) {
+				numTiles = width*width;
+				break;
+			}
+		}
+		WorldHeightMap::readTiles(pStr, m_nmTiles + texClass->firstTile, width, isLegacyGrid);
+	}
+	theFile->close();
+}
+
 /**
 * WorldHeightMap::ParseBlendTileData - read a blend tile info chunk.
 * Format is the newer CHUNKY format.
@@ -1111,6 +1177,7 @@ Bool WorldHeightMap::ParseBlendTileData(DataChunkInput &file, DataChunkInfo *inf
 
 		m_textureClasses[i].name = file.readAsciiString();
 		readTexClass(&m_textureClasses[i], m_sourceTiles);
+		readTexNM(&m_textureClasses[i]);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026
 	}
 	m_numEdgeTextureClasses = 0;
 	m_numEdgeTiles = 0;
@@ -2380,6 +2447,22 @@ TextureClass *WorldHeightMap::getTerrainTexture()
 		char buf[64];
 		sprintf(buf, "Base tex height %d", pow2Height);
 		DEBUG_LOG((buf));
+
+		// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: parallel normal atlas. Same pow2Height, same
+		// tile positions (they live on m_sourceTiles), flat pixels wherever readTexNM found no sheet.
+		// Only built when the ps_3_0 TERRAIN30 leg is installed AND GENERALSX_TERRAIN_NM is on, so the
+		// retail/FF path never pays the extra atlas. If the atlas can't be built (budget, format) we
+		// leave m_terrainNMTex null and the shader keeps its no-normal behaviour.
+		REF_PTR_RELEASE(m_terrainNMTex);
+		if (W3DShaderManager::isTerrainNormalEnabled())
+		{
+			m_terrainNMTex = MSGNEW("WorldHeightMap_getTerrainTexture") TerrainTextureClass(pow2Height);
+			m_terrainNMHeight = m_terrainNMTex->updateNM(this);
+			if (m_terrainNMHeight <= 0) {
+				// Builder refused (atlas format without 8-bit channels, etc.) - drop the atlas.
+				REF_PTR_RELEASE(m_terrainNMTex);
+			}
+		}
 		REF_PTR_RELEASE(m_alphaTerrainTex);
 		m_alphaTerrainTex = MSGNEW("WorldHeightMap_getTerrainTexture") AlphaTerrainTextureClass(m_terrainTex);
 
@@ -2418,6 +2501,16 @@ TextureClass *WorldHeightMap::getAlphaTerrainTexture()
 		getTerrainTexture();
 	}
 	return m_alphaTerrainTex;
+}
+
+// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: see the build block in getTerrainTexture. Null when
+// the NM leg is off/unavailable - callers must treat that as "no normal stage", never as an error.
+TextureClass *WorldHeightMap::getTerrainNormalTexture()
+{
+	if (m_terrainNMTex == nullptr && W3DShaderManager::isTerrainNormalEnabled()) {
+		getTerrainTexture();	// lazy build alongside the diffuse atlas
+	}
+	return m_terrainNMTex;
 }
 
 TextureClass *WorldHeightMap::getEdgeTerrainTexture()

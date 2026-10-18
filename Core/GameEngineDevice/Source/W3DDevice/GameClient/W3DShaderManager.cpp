@@ -54,6 +54,10 @@
 //-----------------------------------------------------------------------------
 
 #include "WW3D2/dx8wrapper.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the raw CPU-written flat-normal fallback
+// into the Vulkan texture store (unconditional: the symbol is a no-op unless the win64vk core is up).
+#include "WW3D2/Backend/VulkanTexMirror.h"
+#include "WWMath/wwmath.h"	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: Float_As_Int for FOGSTART/FOGEND
 #include "WW3D2/assetmgr.h"
 #include "Lib/BaseType.h"
 #include "Common/file.h"
@@ -67,6 +71,7 @@
 #include "GameClient/CommandXlat.h"
 #include "GameClient/Display.h"
 #include "GameClient/Water.h"
+#include "GameClient/WeatherFX.h"	// GeneralsX @feature PS3.0 Weather W2 16/10/2026 screen-layer scalars
 #include "GameLogic/GameLogic.h"
 #include "Common/GlobalData.h"
 #include "Common/GameLOD.h"
@@ -684,14 +689,11 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 		// GeneralsX @feature PS3.0 T4 13/10/2026 programmable chain: soft-knee brightpass ->
 		// 256->128 tent -> 128->64 tent -> additive composite of the 64px halo.  Same screen-space
 		// quads as the fixed-function path; only the stage state lines are replaced by PS constants.
-		static Real s_bloomIntensity = -1.0f;
-		if (s_bloomIntensity < 0.0f)
-		{
-			// GeneralsX @feature 13/10/2026 Options.ini BloomIntensity via the options menu
-			// (restart to take effect); env GENERALSX_BLOOM_INTENSITY remains the QA override
-			// inside the getter, default stays 0.35 (retail byte-quantised scale was 0x33/255 ~ 0.2).
-			s_bloomIntensity = OptionPreferences().getBloomIntensity();
-		}
+		// GeneralsX @feature 13/10/2026 Options.ini BloomIntensity via the options menu; env
+		// GENERALSX_BLOOM_INTENSITY remains the QA override inside the getter, default stays 0.35
+		// (retail byte-quantised scale was 0x33/255 ~ 0.2).  GeneralsX @feature Qoder 18/10/2026: read
+		// live instead of latched, so the page's row takes effect on the next drawn frame.
+		const Real bloomIntensity = W3DShaderManager::getBloomIntensity();
 
 		// Bright pass: scene texture -> quarter-res buffer through the knee.
 		float thr[4] = { 0.45f, 0.25f, 0.0f, 0.0f };
@@ -728,7 +730,7 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 		// Composite: 64px halo upscaled over the tactical view, scaled by the float intensity.
 		pDev->SetRenderTarget(0, backSurface);
 		pDev->SetPixelShader(m_compositePS);
-		float inten[4] = { s_bloomIntensity, 0.0f, 0.0f, 0.0f };
+		float inten[4] = { bloomIntensity, 0.0f, 0.0f, 0.0f };
 		pDev->SetPixelShaderConstantF(0, inten, 1);
 		pDev->SetTexture(0, m_smallTexture);
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
@@ -770,8 +772,16 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, D3DBLEND_ONE );
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
 	pDev->SetTexture(0, m_bloomTexture);
-	// Vertex diffuse color scales the glow intensity (0x33 = ~20%).
-	BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, 0x00333333);
+	// GeneralsX @feature PS3.0 Qoder 17/10/2026: the fixed-function fallback used to hard-code the
+	// 0x33 (~20%) retail glow byte, so the BloomIntensity row was silently ignored on any host that
+	// did not get the programmable chain. The same live getter now feeds both legs; on the shipping
+	// (HLSL) path the value is unchanged, and on this one the player's slider actually moves the glow.
+	// Quantised to one byte because a fixed-function vertex diffuse has no float channel.
+	const Int glowByte = (Int)(W3DShaderManager::getBloomIntensity() * 255.0f + 0.5f);
+	const UnsignedInt glowColor = (glowByte < 1) ? 0x00000000u
+		: (glowByte > 255 ? 0x00ffffffu : (0x00010101u * (UnsignedInt)glowByte));
+	// Vertex diffuse color scales the glow intensity (0x33 was the hard-coded ~20%).
+	BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, glowColor);
 	DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
 	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
@@ -2679,34 +2689,236 @@ Int TerrainShaderPixelShader::shutdown()
 	return TRUE;
 }
 
+// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the live haze setting, file-scope.
+// The recipe below used to parse GENERALSX_GNFOG into a function-static on first call and never look
+// again, which made the knob a startup-only QA leg: a player who found the distance wash too strong
+// had no way to turn it down except by launching the game with an environment variable. These two
+// hold the value the options page owns. The seed keeps every existing contract - the env still wins
+// over Options.ini, and with neither set the shipped state is ON at 0.6 (what P3-14 delivered).
+// -1 is the "not seeded yet" sentinel; the setters always write a clamped value, so once any of the
+// three paths has run the sentinel is gone for good.
+static Real s_hazeStrength = -1.0f;
+static Bool s_hazeEnabled = TRUE;
+
+static void seedDistanceHaze()
+{
+	if (s_hazeStrength >= 0.0f)
+		return;
+	// OptionPreferences owns the precedence: GENERALSX_GNFOG wins, then the DistanceHaze* keys.
+	s_hazeEnabled = OptionPreferences().getDistanceHazeEnabled();
+	s_hazeStrength = (Real)OptionPreferences().getDistanceHazeIntensity() * 0.01f;
+	fprintf(stderr, "[HAZE] seeded enabled=%d strength=%.2f (Options.ini / GENERALSX_GNFOG)\n",
+		(int)s_hazeEnabled, (double)s_hazeStrength);
+	fflush(stderr);
+}
+
+void W3DShaderManager::setDistanceHaze(Bool enabled, Real strength01)
+{
+	if (strength01 < 0.0f) strength01 = 0.0f;
+	else if (strength01 > 1.0f) strength01 = 1.0f;
+	s_hazeEnabled = enabled;
+	s_hazeStrength = strength01;
+
+	// Re-push the ramp now: the GN/dot3 families only see Set_Fog when something pushes it, and the
+	// install path runs a handful of times per session. Terrain, road and tree batches recompute the
+	// ramp themselves per batch, so they need nothing.
+	W3DShaderManager::applyWeatherToShaders();
+	fprintf(stderr, "[HAZE] user set enabled=%d strength=%.2f\n", (int)enabled, (double)strength01);
+	fflush(stderr);
+}
+
+Bool W3DShaderManager::isDistanceHazeEnabled()
+{
+	seedDistanceHaze();
+	return s_hazeEnabled;
+}
+
+Real W3DShaderManager::getDistanceHazeStrength()
+{
+	seedDistanceHaze();
+	return s_hazeStrength;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: the bloom composite gain and the sun
+// shadow map darkening strength. Both used to be latched into a function-local static the first time
+// their pass ran, so the two Graphics Options rows were start-up only. The seeds keep every existing
+// contract (OptionPreferences resolves GENERALSX_BLOOM_INTENSITY / GENERALSX_SHADOWMAP_INT before
+// Options.ini, and both factory defaults are untouched); a menu push is ignored while its env leg is
+// present, so a scripted parity run can never be moved by the page. -1 is the "not seeded yet"
+// sentinel, which is why a legal 0 parks the effect instead of re-reading the ini.
+//-------------------------------------------------------------------------------------------------
+static Real s_bloomIntensityLive = -1.0f;
+static Real s_shadowStrengthLive = -1.0f;
+
+static Bool lightingEnvPresent(const char* name)
+{
+	const char* ev = getenv(name);
+	return ev != nullptr && *ev != 0;
+}
+
+static Real clamp01(Real value)
+{
+	if (value < 0.0f)
+		return 0.0f;
+	if (value > 1.0f)
+		return 1.0f;
+	return value;
+}
+
+void W3DShaderManager::setBloomIntensity(Real intensity01)
+{
+	if (lightingEnvPresent("GENERALSX_BLOOM_INTENSITY"))
+		return;
+	s_bloomIntensityLive = clamp01(intensity01);
+	fprintf(stderr, "[BLOOM3] user set intensity=%.2f\n", (double)s_bloomIntensityLive);
+	fflush(stderr);
+}
+
+Real W3DShaderManager::getBloomIntensity()
+{
+	if (s_bloomIntensityLive < 0.0f)
+		s_bloomIntensityLive = OptionPreferences().getBloomIntensity();
+	return s_bloomIntensityLive;
+}
+
+void W3DShaderManager::setShadowMapStrength(Real strength01)
+{
+	if (lightingEnvPresent("GENERALSX_SHADOWMAP_INT"))
+		return;
+	s_shadowStrengthLive = clamp01(strength01);
+	fprintf(stderr, "[SMAP] user set strength=%.2f\n", (double)s_shadowStrengthLive);
+	fflush(stderr);
+}
+
+Real W3DShaderManager::getShadowMapStrength()
+{
+	if (s_shadowStrengthLive < 0.0f)
+		s_shadowStrengthLive = (Real)OptionPreferences().getShadowMapIntensity() * 0.01f;
+	return s_shadowStrengthLive;
+}
+
+// GeneralsX @feature PS3.0 Weather W5 16/10/2026: the haze ramp recipe in one place.
+// start = 45%, length = 50% of the normal-zoom far clip, cold grey-blue haze, haze strength knob
+// (PS3.0-P3-14, now user-owned - see seedDistanceHaze above). fogScale is the weather's coupling: a
+// blizzard's 2.4 pulls the ramp in to 19%/21% of the far clip so the horizon closes down, and lifts
+// the strength a little. scale 1.0 reproduces the install numbers exactly, which is what keeps a
+// clear map byte-identical.
+// Shared by the GN-family install below, the terrain/road/TREE30 c0/c1 upload and the weather refresh,
+// because three copies of one knob-reading recipe is how a haze ramp drifts.
+static void Build_Weather_Fog_Ramp(Real fogScale, Vector4 &colorStrength, Vector4 &ramp)
+{
+	// Read live: this runs per terrain batch, and two struct reads with the value already resolved
+	// is cheap enough that the effect can be re-tuned mid-match (options page) instead of at launch.
+	seedDistanceHaze();
+	const float s_fogStrength = (s_hazeEnabled != FALSE) ? (float)s_hazeStrength : 0.0f;
+
+	// Range covers everything the recipes publish (1.0 clear .. 2.4 blizzard) with room for an INI
+	// author to write more; the clamp only keeps the ramp from collapsing to zero length.
+	if (fogScale < 0.25f) fogScale = 0.25f;
+	else if (fogScale > 8.0f) fogScale = 8.0f;
+
+	// Far plane follows the W3DView::doCameraUpdate normal-zoom formula (NORMAL_DRAW_WIDTH *
+	// MAP_XY_FACTOR); the live per-frame farZ varies with scroll edge and real-zoom pitch, and the
+	// steady-state value is the right ramp anchor.
+	const Real farClip = WorldHeightMap::NORMAL_DRAW_WIDTH * MAP_XY_FACTOR;
+	Real fogStart = farClip * 0.45f / fogScale;
+	const Real fogLen = farClip * 0.5f / fogScale;
+	if (fogStart < 1.0f) fogStart = 1.0f;
+	// Thicker weather also lifts the blend a touch: 0.85 + 0.15*scale is exactly 1.0 at scale 1.
+	float strength = (float)(s_fogStrength * (0.85 + 0.15 * fogScale));
+	if (strength > 1.0f) strength = 1.0f;
+
+	colorStrength.Set(0.72f, 0.78f, 0.84f, strength);
+	ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f);
+}
+
+// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: the fixed-function half of the horizon.
+// The custom ps_3_0 families blend toward the haze colour themselves, but they only take batches that
+// clear the mount gates (dx8renderer.cpp:2065 / :2123 - single pass, opaque, plain UVs, pure
+// directional light, no skin, no material override). Everything they decline - skinned meshes,
+// two-pass composites, vertex-coloured props, lamp/spot-lit buildings, and terrain while the ps_3_0
+// terrain leg is off - draws on the fixed pipeline, which knows nothing about c25/c26 and therefore
+// stayed crisp. That is the "only SOME distant buildings grey out" report: a coverage hole, not a
+// look. D3D's own linear fog is the fixed pipeline's only distance blend, so these two calls feed it
+// from the same recipe around the 3D scene and the horizon becomes one continuous band.
+// The state is per-device, and programmable pixel shaders ignore D3DRS_FOGENABLE entirely (fog is
+// their own arithmetic), so a batch can never be hazed twice: mounted families answer to the shader
+// constants, everything else to these render states.
+static Bool s_ffHazeOn = FALSE;
+
+void W3DShaderManager::beginFixedFunctionHaze()
+{
+	Vector4 haze, ramp;
+	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
+	const float strength = haze.W;
+	if (strength <= 0.0f)
+	{
+		// Switch off (or strength 0): leave the shipped fixed-function state untouched, which is fog
+		// disabled - every pixel stays exactly where the no-haze build puts it.
+		if (s_ffHazeOn != FALSE)
+			endFixedFunctionHaze();
+		return;
+	}
+
+	const float start = ramp.X;
+	const float len = 1.0f / ramp.Y;
+	// D3D's linear fog has no blend scalar, only a ramp that ends at full fog. Folding the strength
+	// into the ramp length reproduces the shader recipe inside the band it actually works in:
+	// t_ff(z) = (z-start)/(len/strength) = (z-start)/len*strength = t_shader(z) for z <= start+len.
+	// Past the band the shader holds at `strength` while the ramp keeps creeping; at the far clip
+	// (start = 45%, len = 50% of it) that overshoot is at most 0.1*strength, and at strength 1.0 both
+	// saturate on the same pixel. Close enough to read as one horizon, and never a second look.
+	const float end = start + len / strength;
+
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGCOLOR,
+		DX8Wrapper::Convert_Color(Vector3(haze.X, haze.Y, haze.Z), 0.0f));
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGSTART, (unsigned)WWMath::Float_As_Int(start));
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGEND, (unsigned)WWMath::Float_As_Int(end));
+	// Table (per-pixel, eye depth) rather than vertex: the shader blend is per-pixel too, and vertex
+	// fog would band across the big terrain quads. W3D's init leaves FOGVERTEXMODE at LINEAR, so the
+	// explicit NONE keeps the two terms from adding.
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, TRUE);
+	s_ffHazeOn = TRUE;
+
+	// Forensics marker, once per session: the ramp the fixed pipeline actually got, so a screenshot can
+	// be attributed to these numbers instead of to a guess. Per-frame would flood stderr.
+	static Bool s_ffHazeLogged = FALSE;
+	if (s_ffHazeLogged == FALSE)
+	{
+		s_ffHazeLogged = TRUE;
+		fprintf(stderr, "[FFHAZE] armed strength=%.2f start=%.0f end=%.0f (table linear, FF batches only)\n",
+			(double)strength, (double)start, (double)end);
+		fflush(stderr);
+	}
+}
+
+void W3DShaderManager::endFixedFunctionHaze()
+{
+	if (s_ffHazeOn == FALSE)
+		return;
+	// Back to the state every other draw in the frame assumes (WW3D resets FOGENABLE to FALSE at
+	// Apply_Default_State, and the 2D scene, UI, weather screen veil and bloom passes all rely on it).
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
+	s_ffHazeOn = FALSE;
+}
+
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: shared c0/c1 upload for the ps_3_0 terrain and
 // road pixel shaders. Same ramp recipe as the GN [GNFOG] block (start 45% / length 50% of the
 // normal-zoom far clip, cold grey-blue haze, GENERALSX_GNFOG strength knob), kept separate from
 // the GN constants (c25/c26) so the two families cannot stomp on each other's registers.
 static void Upload_Terrain30_Fog_Constants(void)
 {
-	static Vector4 s_haze(0.72f, 0.78f, 0.84f, 0.6f);
-	static Vector4 s_ramp(0.0f, 1.0f, 0.0f, 0.0f);
-	static Bool s_once = FALSE;
-	if (!s_once)
-	{
-		s_once = TRUE;
-		float fogStrength = 0.6f;   // same GENERALSX_GNFOG knob as the GN family, batch 9 finalises.
-		const char* fenv = getenv("GENERALSX_GNFOG");
-		if (fenv != nullptr && *fenv != 0) fogStrength = (float)atof(fenv);
-		if (fogStrength < 0.0f) fogStrength = 0.0f;
-		if (fogStrength > 1.0f) fogStrength = 1.0f;
-		const Real farClip = WorldHeightMap::NORMAL_DRAW_WIDTH * MAP_XY_FACTOR;
-		const Real fogStart = farClip * 0.45f;
-		const Real fogLen = farClip * 0.5f;
-		s_haze.Set(0.72f, 0.78f, 0.84f, fogStrength);
-		s_ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f);
-		fprintf(stderr, "[TERRAIN30] fog strength=%.2f start=%.0f len=%.0f\n",
-			fogStrength, (double)fogStart, (double)fogLen);
-		fflush(stderr);
-	}
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0, (const float*)&s_haze, 1);
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(1, (const float*)&s_ramp, 1);
+	// GeneralsX @feature PS3.0 Weather W5: rebuilt from the published weather scale every call instead
+	// of being frozen at first use, so a script-driven weather switch moves the horizon haze on the
+	// same frame the lighting and the screen layer do. One builder call per terrain batch is arithmetic
+	// on a struct read; no allocation and no new plumbing.
+	Vector4 haze, ramp;
+	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
+	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0, (const float*)&haze, 1);
+	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(1, (const float*)&ramp, 1);
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio below has
@@ -2714,6 +2926,28 @@ static void Upload_Terrain30_Fog_Constants(void)
 // depth relay and uploads the fog ramp constants; the flag is never reset (the handles live for
 // the process lifetime, same as the .pso pair they replace).
 static Bool s_terrainHlslFog = FALSE;
+
+// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: the terrain normal pass switches.
+// GENERALSX_TERRAIN_NM defaults ON but only ever matters while s_terrainHlslFog is TRUE (the ps_3_0
+// terrain trio), so the retail fixed-function path and every TERRAIN30=0 run are untouched by it.
+// GENERALSX_TERRAIN_NM_GAIN scales the tangent-space xy deviation (0 = exact no-op, 2 = embossed).
+// s_nmFlatFallback is a 1x1 flat-normal texture created on first use so the NM-variant shaders can
+// never sample a stage-4 that the atlas loader left unbound: white would fold the modulation, flat
+// keeps it at exactly 1.0. Read once at shader init; changing it at runtime is not supported.
+static Bool s_terrainNMEnv = TRUE;
+static Real s_terrainNMGain = 1.0f;
+static IDirect3DTexture9 *s_nmFlatFallback = nullptr;
+
+// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: TRUE only while the derivative macro-normal (PPL)
+// trio is the installed trio (TerrainShaderPixelShader::init decides once, child of terrain30On).
+// set() consults it per pass to upload the reconstruction matrix Kmat = T3^T*inv3 (PS c3..c5) built
+// from the REAL stage-2 texture transform the device is about to use for the TEXCOORD2 relay.
+static Bool s_terrainPPL = FALSE;
+
+Bool W3DShaderManager::isTerrainNormalEnabled()
+{
+	return (s_terrainHlslFog && s_terrainNMEnv) ? TRUE : FALSE;
+}
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: same contract for the road dual-noise HLSL swap.
 static Bool s_roadHlslFog = FALSE;
@@ -2723,6 +2957,47 @@ static Bool s_roadHlslFog = FALSE;
 void W3DShaderManager::uploadPerPixelFogConstants()
 {
 	Upload_Terrain30_Fog_Constants();
+}
+
+// GeneralsX @feature PS3.0 Weather W5 16/10/2026: the shader half of the weather coupling.
+// Two values travel into the WW3D2 dot3/PBR layer, which cannot read game-side weather state itself
+// (platform-isolation rule, same as the Set_Fog injection at the install below):
+//   - the weather-scaled haze ramp for the GN/ML per-pixel families (c25/c26). The shader install only
+//     ever runs once, so without this refresh a script-driven storm would move the terrain, road and
+//     tree haze but leave every normal-mapped unit at clear-sky fog;
+//   - the rain wetness, which the PBR pixel shaders read out of the previously-unused c8.w / c11.w slot
+//     and turn into slicker roughness. 0 keeps every pixel numerically identical.
+// Both are derived device-side from the recipe, so neither can reach the replay CRC (Golden Rule 7).
+void W3DShaderManager::applyWeatherToShaders()
+{
+	const WeatherRenderState &wx = weatherRenderState();
+	Vector4 haze, ramp;
+	Build_Weather_Fog_Ramp(wx.m_fogScale, haze, ramp);
+	DX8NormalMap::Set_Fog(haze, ramp);
+	DX8NormalMap::Set_Wetness(wx.m_wetness);
+
+	// GeneralsX @bugfix PS3.0 Weather W5 16/10/2026: change-detector rather than the previous 1-in-256
+	// tick - see the matching note in W3DDisplay::setTimeOfDay(). The lighting install runs a handful of
+	// times per session, so a counter throttle only ever printed the state at load (fogScale=1.00 wet=0.00
+	// in every weather leg) and could not show that the fog ramp and the wetness slot moved with the
+	// recipe. Now: one line per distinct (type, fog, wet), plus one when it returns to neutral.
+	static Int s_lastShaderType = -999;
+	static Real s_lastShaderFog = -1.0f, s_lastShaderWet = -1.0f;
+	// Plain signed comparisons instead of fabsf: this file has no math.h of its own and the fixed-function
+	// legs build in more restricted translation units.
+	const Real dFog = wx.m_fogScale - s_lastShaderFog;
+	const Real dWet = wx.m_wetness - s_lastShaderWet;
+	if ((Int)wx.m_type != s_lastShaderType
+		|| dFog > 0.001f || dFog < -0.001f
+		|| dWet > 0.001f || dWet < -0.001f)
+	{
+		fprintf(stderr, "[WXSHADER] type=%d fogScale=%.2f start=%.0f invLen=%.4f strength=%.2f wet=%.2f\n",
+			(Int)wx.m_type, wx.m_fogScale, (double)ramp.X, (double)ramp.Y, (double)haze.W, wx.m_wetness);
+		fflush(stderr);
+		s_lastShaderType = (Int)wx.m_type;
+		s_lastShaderFog = wx.m_fogScale;
+		s_lastShaderWet = wx.m_wetness;
+	}
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed, which
@@ -2896,23 +3171,285 @@ Int TerrainShaderPixelShader::init()
 					"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
 					"}\n";
 
+					// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: normal-mapped variants of the trio.
+					// Identical to the plain versions above plus one sampler (s4 = the packed normal
+					// atlas, sampled with the very uv0 the atlas layer already uses, so tile gutters and
+					// mip chain line up by construction) and one constant (c2 = normalized sun direction
+					// in .xyz, xy-deviation gain in .w). The modulation is a ratio of lambert terms:
+					//   c.rgb *= saturate(dot(normalize(n), L)) / max(L.z, 0.05)
+					// with n sampled around the flat tangent normal (0,0,1). A flat texel reproduces
+					// the vertex-baked brightness exactly (ratio 1.0), and every deviation embosses the
+					// already-shaded pixel instead of double-lighting it. The world-up approximation is
+					// deliberate: the terrain vertex stream (VertexFormatXYZDUV2) carries no normal or
+					// tangent, and slopes keep their macro shading in vc.rgb - s4 only adds the tile's
+					// micro relief. Modulation lands before the cloud/lightmap multiplications, same
+					// order as real lighting.
+					static const char* kTerrainPS30BaseNM =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s4 : register(s4);\n"                 // normal atlas (stage4, uv0)
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"                  // xyz = sun dir (normalized), w = deviation gain
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 n = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    n.xy *= c2.w;\n"
+						"    n = normalize(n);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+					static const char* kTerrainPS30NoiseNM =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s2 : register(s2);\n"
+						"sampler s4 : register(s4);\n"
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 n = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    n.xy *= c2.w;\n"
+						"    n = normalize(n);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    c = c * tex2D(s2, i.dep.xy);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+					static const char* kTerrainPS30Noise12NM =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s2 : register(s2);\n"
+						"sampler s3 : register(s3);\n"
+						"sampler s4 : register(s4);\n"
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float2 uv3 : TEXCOORD3;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 n = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    n.xy *= c2.w;\n"
+						"    n = normalize(n);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    c = c * tex2D(s2, i.dep.xy);\n"
+						"    c = c * tex2D(s3, i.uv3);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+
+					// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: derivative macro-normal variants of
+					// the NM trio (逐像素光照总闸 施工调研 §4-P4, "采样/几何重建路线" inside the B5 slot).
+					// Terrain vertices carry no normal channel (VertexFormatXYZDUV2), so instead of inventing
+					// one the face normal is RECONSTRUCTED per pixel from screen-space derivatives of the
+					// existing TEXCOORD2 relay: that relay is the fixed-function CAMERASPACEPOSITION texture
+					// transform through the stage-2 matrix T (COUNT3, third column pinned to (0,0,1,0) by
+					// batch8 G1), i.e. dep = p_cam * T is AFFINE in the camera-space position p_cam. The three
+					// interpolated scalars of dep therefore map the triangle's screen tangents through T's
+					// top-left 3x3, and the row-vector identity (uM)x(vM) = det(M)(uxv)M^-T gives
+					//     w = cross(ddx(dep), ddy(dep))  =>  n_world(row) ∝ w * Kmat,  Kmat = T3^T * V3^T
+					// where T3 is the 3x3 actually loaded into D3DTS_TEXTURE2 this pass (read back from the
+					// device below, so noise projection / lightmap projection / the batch8 identity all use
+					// their own true matrix) and V3 the D3DTS_VIEW rotation. VIEW is rigid (orthonormal), so
+					// V3^T = V3^-1 = the inv the block already computes - the CPU builds Kmat = T3^T * inv3,
+					// uploads its three rows as c3/c4/c5 and the PS forms w * Kmat as w.x*c3 + w.y*c4 +
+					// w.z*c5. The cross product fixes the plane but not the hemisphere (det sign), so the
+					// sign is resolved by folding toward world up (gm.z) - terrain faces never point below
+					// the horizon under the RTS camera. The atlas micro-normal then reads as
+					// a tilt AROUND the reconstructed macro normal instead of around (0,0,1):
+					//     n = normalize(float3(atlas.xy * gain, 0) + atlas.z * gm)
+					// On flat ground gm = (0,0,1) and the expression collapses to EXACTLY the L2.1 NM pixel
+					// (bit-for-bit parity there); with no atlas (1x1 flat texel, a = (0,0,1)) the pixel gets
+					// the pure face normal - that is the new per-pixel macro shading on slopes. Ratio
+					// modulation and its sun division unchanged, cloud/lightmap/fog order unchanged, no
+					// specular (the terrain line's T-C ruling stands).
+					static const char* kTerrainPS30BaseNMPPL =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s4 : register(s4);\n"                 // normal atlas (stage4, uv0)
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"                  // xyz = sun dir (normalized), w = deviation gain
+						"float4 c3 : register(c3);\n"                  // P4: macro-normal matrix Kmat, row 0
+						"float4 c4 : register(c4);\n"                  // P4: Kmat row 1
+						"float4 c5 : register(c5);\n"                  // P4: Kmat row 2
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 a = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    a.xy *= c2.w;\n"
+						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
+						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
+						"    gm = normalize(gm);\n"
+						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
+						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+					static const char* kTerrainPS30NoiseNMPPL =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s2 : register(s2);\n"
+						"sampler s4 : register(s4);\n"
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"
+						"float4 c3 : register(c3);\n"
+						"float4 c4 : register(c4);\n"
+						"float4 c5 : register(c5);\n"
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 a = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    a.xy *= c2.w;\n"
+						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
+						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
+						"    gm = normalize(gm);\n"
+						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
+						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    c = c * tex2D(s2, i.dep.xy);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+					static const char* kTerrainPS30Noise12NMPPL =
+						"// d3d-target: ps_3_0\n"
+						"sampler s0 : register(s0);\n"
+						"sampler s1 : register(s1);\n"
+						"sampler s2 : register(s2);\n"
+						"sampler s3 : register(s3);\n"
+						"sampler s4 : register(s4);\n"
+						"float4 c0 : register(c0);\n"
+						"float4 c1 : register(c1);\n"
+						"float4 c2 : register(c2);\n"
+						"float4 c3 : register(c3);\n"
+						"float4 c4 : register(c4);\n"
+						"float4 c5 : register(c5);\n"
+						"struct PS_IN\n"
+						"{\n"
+						"    float2 uv0 : TEXCOORD0;\n"
+						"    float2 uv1 : TEXCOORD1;\n"
+						"    float3 dep : TEXCOORD2;\n"
+						"    float2 uv3 : TEXCOORD3;\n"
+						"    float4 vc  : COLOR0;\n"
+						"};\n"
+						"float4 main(PS_IN i) : COLOR\n"
+						"{\n"
+						"    float4 base = tex2D(s0, i.uv0);\n"
+						"    float4 det  = tex2D(s1, i.uv1);\n"
+						"    float4 c = lerp(base, det, i.vc.a) * i.vc;\n"
+						"    float3 a = tex2D(s4, i.uv0).xyz * 2.0 - 1.0;\n"
+						"    a.xy *= c2.w;\n"
+						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
+						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
+						"    gm = normalize(gm);\n"
+						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
+						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
+						"    c = c * tex2D(s2, i.dep.xy);\n"
+						"    c = c * tex2D(s3, i.uv3);\n"
+						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
+						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
+						"}\n";
+
 				// GeneralsX @bugfix PS3.0 batch22 14/10/2026: user on-machine verdict - the default-on
 				// TERRAIN30 mirror produced blocky ground tint rings around structures and grid-sawtooth
 				// terrain (the .pso disasm mirror does not reproduce the retail FF stage wiring exactly).
 				// Shipping default is back to the retail fixed-function/.pso path; GENERALSX_TERRAIN30=1
 				// keeps the HLSL leg alive as a QA opt-in.
-				bool terrain30On = false;
-				const char* tenv = getenv("GENERALSX_TERRAIN30");
-				if (tenv != nullptr && *tenv != 0 && strcmp(tenv, "0") != 0) terrain30On = true;
+				// GeneralsX @feature PS3.0 L2.2 17/10/2026: the switch is now also a Graphics Options
+				// page checkbox (Options.ini "Terrain30Shading"). The getter keeps the QA env winner and
+				// the OFF factory default, so retail parity is unchanged unless the user opts in.
+				const bool terrain30On = (OptionPreferences().getTerrain30Shading() != FALSE);
+
+				// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: read the normal-pass switches once,
+				// here where the terrain leg decides its shader variants. NM defaults ON but is only
+				// reachable through terrain30On, so GENERALSX_TERRAIN30=0 keeps the exact batch23 pair.
+				{
+					const char* nenv = getenv("GENERALSX_TERRAIN_NM");
+					s_terrainNMEnv = (nenv == nullptr || *nenv == 0) ? TRUE : (atoi(nenv) != 0);
+					const char* genv = getenv("GENERALSX_TERRAIN_NM_GAIN");
+					if (genv != nullptr && *genv != 0) s_terrainNMGain = (Real)atof(genv);
+				}
+				// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: read the per-pixel child switch once,
+				// next to the NM pair it rides on. Requested while terrain30On arms the derivative
+				// macro-normal trio below; it also forces the NM layer ON (the PPL variants share the
+				// s4/c2 contract, and the 1x1 flat fallback keeps them asset-parity). Never reachable
+				// unless the parent gate has already passed, so the batch22 factory-OFF default stands.
+				const bool pplReq = terrain30On && (OptionPreferences().getTerrainPerPixel() != FALSE);
+				if (pplReq) s_terrainNMEnv = TRUE;
+				// Pick the normal variants only while NM is on; if their compile fails the block below
+				// falls back to the retail .pso trio exactly like before (no half-installed NM state).
+				const bool useNM = (s_terrainNMEnv != FALSE);
+				const char* srcBase    = pplReq ? kTerrainPS30BaseNMPPL    : (useNM ? kTerrainPS30BaseNM    : kTerrainPS30Base);
+				const char* srcNoise   = pplReq ? kTerrainPS30NoiseNMPPL   : (useNM ? kTerrainPS30NoiseNM   : kTerrainPS30Noise);
+				const char* srcNoise12 = pplReq ? kTerrainPS30Noise12NMPPL : (useNM ? kTerrainPS30Noise12NM : kTerrainPS30Noise12);
+
 				if (terrain30On && W3DShaderManager::getShaderModelTier() >= DC_GENERIC_PIXEL_SHADER_3_0)
 				{
 					IDirect3DPixelShader9* hlslBase = nullptr;
 					IDirect3DPixelShader9* hlslNoise = nullptr;
 					IDirect3DPixelShader9* hlslNoise12 = nullptr;
 					const char* bp = nullptr; const char* np = nullptr; const char* n12p = nullptr;
-					const HRESULT bh = W3DShaderManager::compileShaderAtBestProfile(kTerrainPS30Base, false, "[TERRAIN30]", &bp, (void**)&hlslBase);
-					const HRESULT nh = W3DShaderManager::compileShaderAtBestProfile(kTerrainPS30Noise, false, "[TERRAIN30]", &np, (void**)&hlslNoise);
-					const HRESULT n2h = W3DShaderManager::compileShaderAtBestProfile(kTerrainPS30Noise12, false, "[TERRAIN30]", &n12p, (void**)&hlslNoise12);
+					const HRESULT bh = W3DShaderManager::compileShaderAtBestProfile(srcBase, false, "[TERRAIN30]", &bp, (void**)&hlslBase);
+					const HRESULT nh = W3DShaderManager::compileShaderAtBestProfile(srcNoise, false, "[TERRAIN30]", &np, (void**)&hlslNoise);
+					const HRESULT n2h = W3DShaderManager::compileShaderAtBestProfile(srcNoise12, false, "[TERRAIN30]", &n12p, (void**)&hlslNoise12);
 					if (SUCCEEDED(bh) && SUCCEEDED(nh) && SUCCEEDED(n2h)
 						&& hlslBase != nullptr && hlslNoise != nullptr && hlslNoise12 != nullptr)
 					{
@@ -2924,8 +3461,11 @@ Int TerrainShaderPixelShader::init()
 						m_dwBaseNoise1PixelShader = hlslNoise;
 						m_dwBaseNoise2PixelShader = hlslNoise12;
 						s_terrainHlslFog = TRUE;
-						fprintf(stderr, "[TERRAIN30] HLSL terrain trio installed base=%s noise=%s noise12=%s\n",
-							bp ? bp : "?", np ? np : "?", n12p ? n12p : "?");
+						// GeneralsX @feature Qoder 17/10/2026 P4: the PPL trio is now the live trio;
+						// arm the per-pass K upload in set() (and only then).
+						s_terrainPPL = pplReq ? TRUE : FALSE;
+						fprintf(stderr, "[TERRAIN30] HLSL terrain trio installed base=%s noise=%s noise12=%s nm=%d ppl=%d\n",
+							bp ? bp : "?", np ? np : "?", n12p ? n12p : "?", useNM ? 1 : 0, pplReq ? 1 : 0);
 						fflush(stderr);
 					}
 					else
@@ -2959,6 +3499,81 @@ Int TerrainShaderPixelShader::set(Int pass)
 		// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: fog ramp constants for the HLSL trio, shared
 		// with the road variant (re-uploaded per set() so device resets can never leave a stale pair).
 		Upload_Terrain30_Fog_Constants();
+
+		// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: wire the packed normal atlas into the NM
+		// variants. The atlas (stage slot 4) is only present when *_nm.tga sheets were found for this
+		// map; the shaders are compiled for NM the whole session, so an unbound stage 4 would sample
+		// white and fold the ground - the flat 1x1 fallback keeps the ratio exactly 1.0 instead.
+		if (s_terrainNMEnv)
+		{
+			TextureClass *nmAtlas = W3DShaderManager::getShaderTexture(4);
+			IDirect3DTexture9 *nmTex = (nmAtlas != nullptr) ? nmAtlas->Peek_D3D_Texture() : nullptr;
+			if (nmTex == nullptr)
+			{
+				if (s_nmFlatFallback == nullptr)
+				{
+					LPDIRECT3DDEVICE9 pDev = DX8Wrapper::_Get_D3D_Device8();
+					if (FAILED(pDev->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &s_nmFlatFallback, nullptr)))
+						s_nmFlatFallback = nullptr;
+					else
+					{
+						IDirect3DSurface9 *lvl = nullptr;
+						if (SUCCEEDED(s_nmFlatFallback->GetSurfaceLevel(0, &lvl)))
+						{
+							D3DLOCKED_RECT lr;
+							if (SUCCEEDED(lvl->LockRect(&lr, nullptr, 0)))
+							{
+								*((Int*)lr.pBits) = (Int)0xFF8080FFu;	// A255 R128 G128 B255 = tangent +Z
+								lvl->UnlockRect();
+							}
+							lvl->Release();
+							// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: this raw 1x1 flat-normal
+							// fallback is written straight on the CPU (pDev->CreateTexture, no TextureClass),
+							// so mirror it explicitly into the keyed Vulkan image once, after the fill.
+							VKTex_Mirror_D3D_Texture(s_nmFlatFallback);
+						}
+					}
+				}
+				nmTex = s_nmFlatFallback;
+			}
+			if (nmTex != nullptr)
+			{
+				DX8Wrapper::_Get_D3D_Device8()->SetTexture(4, nmTex);
+				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+				DX8Wrapper::Set_DX8_Texture_Stage_State(4, D3DTSS_TEXCOORDINDEX, 0);
+
+				// Sun vector: same -m_terrainLightPos[0] the CPU doTheLight loop shades the vertex
+				// diffuse with (HeightMap.cpp builds lightRay from it), normalized here because the
+				// shader divides by L.z so a flat texel lands on exactly 1.0. Degenerate/missing sun
+				// falls back to straight up, which is neutral for the overhead RTS view.
+				float sun[4];
+				{
+					const Coord3D &lp = TheGlobalData->m_terrainLightPos[0];
+					Vector3 L(-lp.x, -lp.y, -lp.z);
+					Real mag = L.Length();
+					if (mag < 1e-3f) { sun[0] = 0.0f; sun[1] = 0.0f; sun[2] = 1.0f; }
+					else { sun[0] = L.X / mag; sun[1] = L.Y / mag; sun[2] = L.Z / mag; }
+					sun[3] = s_terrainNMGain;
+				}
+				DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(2, sun, 1);
+
+				// GeneralsX @feature PS3.0 L2.1 TNM: one evidence line per session (change detector
+				// not needed - sun is static unless a script moves it, and the binding state only
+				// changes at map load). Atlas vs flat + the actual constants: the only in-game proof
+				// that the modulation math is fed real numbers.
+				static Bool s_tnmLogged = FALSE;
+				if (!s_tnmLogged)
+				{
+					s_tnmLogged = TRUE;
+					fprintf(stderr, "[TNM] stage4=%s sun=(%.3f,%.3f,%.3f) gain=%.2f\n",
+						(nmAtlas != nullptr) ? "atlas" : "flat", sun[0], sun[1], sun[2], sun[3]);
+					fflush(stderr);
+				}
+			}
+		}
 	}
 
 	//setup base pass
@@ -3082,6 +3697,37 @@ Int TerrainShaderPixelShader::set(Int pass)
 		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBasePixelShader);
 	}
 
+	// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: per-pass macro-normal reconstruction matrix for
+	// the PPL trio (PS c3..c5 = the three rows of Kmat = T3^T * inv3, see the trio's source comment).
+	// Both transforms are read back from the DEVICE so the matrix fed to the shader is exactly the one
+	// that will generate this pass's TEXCOORD2 relay - noise projection, lightmap projection, or the
+	// batch8 identity, all covered by one tail block. Indexed through contiguous float views because
+	// D3DXMATRIX's flat m[] form hit C3863 in batch8 G1. A degenerate VIEW would leave c3..c5 stale -
+	// impossible for a live camera, and worst case the shader just keeps the previous frame's fold.
+	if (s_terrainPPL && s_terrainHlslFog)
+	{
+		Matrix4x4 pplView;
+		Matrix4x4 pplTex;
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, pplView);
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_TEXTURE2, pplTex);
+		D3DXMATRIX pplInv;
+		float pplDet;
+		if (SUCCEEDED(D3DXMatrixInverse(&pplInv, &pplDet, (D3DXMATRIX*)&pplView)))
+		{
+			const float* tv = reinterpret_cast<const float*>(&pplTex);	// row-major: tv[r*4+c] = T[r][c]
+			const float* iv = reinterpret_cast<const float*>(&pplInv);
+			float kmat[12];
+			for (int row = 0; row < 3; ++row) {
+				for (int col = 0; col < 3; ++col) {
+					// Kmat[row][col] = sum_m T3[m][row] * inv3[m][col]   (inv3 = V3^T, VIEW is rigid)
+					kmat[row * 4 + col] = tv[row] * iv[col] + tv[4 + row] * iv[4 + col] + tv[8 + row] * iv[8 + col];
+				}
+				kmat[row * 4 + 3] = 0.0f;
+			}
+			DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(3, kmat, 3);
+		}
+	}
+
 	return TRUE;
 }
 
@@ -3089,6 +3735,7 @@ void TerrainShaderPixelShader::reset()
 {
 	DX8Wrapper::_Get_D3D_Device8()->SetTexture(2,nullptr);	//release reference to any texture
 	DX8Wrapper::_Get_D3D_Device8()->SetTexture(3,nullptr);	//release reference to any texture
+	DX8Wrapper::_Get_D3D_Device8()->SetTexture(4,nullptr);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 normal atlas
 
 	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);	//turn off pixel shader
 
@@ -4066,7 +4713,7 @@ static void InitNormalMapShaders()
 		"    return o;\n"
 		"}\n";
 
-	// PS: c8 = (mode, LI, ENV, -), mode from the env switch (DX8NormalMap::PBR_Mode):
+	// PS: c8 = (mode, LI, ENV, wetness), mode from the env switch (DX8NormalMap::PBR_Mode):
 	//   < 0.5 : the plain T1/L1 Blinn path, instruction-for-instruction (dead in practice - Apply
 	//           never mounts this pair at mode 0 - kept as an exact-parity escape hatch for QA).
 	//   1 (M1): roughness-driven Blinn only, per 工作清单 §2 M1: shininess = lerp(8,128,1-R),
@@ -4087,7 +4734,7 @@ static void InitNormalMapShaders()
 		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): bump xy/z scaling
 		"float4 c6 : register(c6);\n"                  // (specPow, specIntensity, -, -)
 		"float4 c7 : register(c7);\n"                  // sky-fill color rgb
-		"float4 c8 : register(c8);\n"                  // (mode, LI, ENV, -)
+		"float4 c8 : register(c8);\n"                  // (mode, LI, ENV, wetness)
 		"struct PS_IN\n"
 		"{\n"
 		"    float4 diffuse : COLOR0;\n"
@@ -4116,6 +4763,7 @@ static void InitNormalMapShaders()
 		"        return float4(base.rgb * lit + spec0, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
 		"    }\n"
 		"    float2 rm = tex2D(s2, i.uv).xy;\n"        // R=roughness, G=metalness (0..1, packer §1)
+		"    rm.x = rm.x * (1.0 - c8.w * 0.75);\n"    // GeneralsX @feature PS3.0 Weather W5: rain-slick. A wet film flattens the micro-surface, so roughness drops and every roughness-driven lobe below tightens. c8.w = 0 leaves this product numerically identical to before.
 		"    if (c8.x < 1.5)\n"
 		"    {\n"
 		"        float shin = lerp(8.0, 128.0, 1.0 - rm.x);\n"
@@ -4146,7 +4794,7 @@ static void InitNormalMapShaders()
 	// the ML world-TBN skeleton (c4/c5 world sun/eye, hemi c8, fog c9/c10, c16 count + c17..c32
 	// mlight pairs, static 8-step masked loop) upgraded with the M2 GGX lobe from kPixelShaderPBR:
 	// the sun AND every collected point light get D*F*G specular and (1-F)(1-M) kd, sampling the
-	// "<stem>_rp" companion on stage2.  c11 = (mode, LI, ENV, -) mirrors the single-light PBR c8
+	// "<stem>_rp" companion on stage2.  c11 = (mode, LI, ENV, wetness) mirrors the single-light PBR c8
 	// contract in a free register (c8 stays the ML hemi).  Mounted by dx8normalmap only when
 	// PBR mode == 2 with an rp companion and >=1 point light; GENERALSX_PBRML=0 forces it off.
 	// The V is the world eye constant (c5), not per-pixel - the same approximation the proven ML
@@ -4163,7 +4811,7 @@ static void InitNormalMapShaders()
 		"float4 c8 : register(c8);\n"                  // hemi ambient rgb, scaled by world-up n.z
 		"float4 c9 : register(c9);\n"                  // fog rgb haze color, w = blend strength
 		"float4 c10 : register(c10);\n"                // fog x = eye-depth start, y = 1/ramp length
-		"float4 c11 : register(c11);\n"                // (mode, LI, ENV, -)  GGX contract (cf. PBR c8)
+		"float4 c11 : register(c11);\n"                // (mode, LI, ENV, wetness)  GGX contract (cf. PBR c8)
 		"float4 c16 : register(c16);\n"                // x = number of active point lights (0..8)
 		"float4 mlights[16] : register(c17);\n"        // pairs: (center.xyz, innerRadius), (diffuse.rgb, outerRadius)
 		"struct PS_IN\n"
@@ -4205,6 +4853,7 @@ static void InitNormalMapShaders()
 		"    float3 L = normalize(c4.xyz);\n"
 		"    float ndl = saturate(dot(n, L));\n"
 		"    float2 rm = tex2D(s2, i.uv).xy;\n"        // R=roughness, G=metalness
+		"    rm.x = rm.x * (1.0 - c11.w * 0.75);\n"   // GeneralsX @feature PS3.0 Weather W5: rain-slick, same contract as the single-light PBR c8.w (see kPixelShaderPBR)
 		"    float3 F0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, rm.y);\n"
 		"    float a = rm.x * rm.x;\n"
 		"    float a2 = a * a;\n"
@@ -4256,12 +4905,14 @@ static void InitNormalMapShaders()
 		// GeneralsX @feature PS3.0 T5 13/10/2026 compile the multi-light pair on top of the main one.
 		// Failure here is purely additive: g_VS_ML/g_PS_ML stay 0 and dx8normalmap never mounts them.
 		{
-			// GeneralsX @feature 13/10/2026 user toggle in the options-menu registry
-			// (Options.ini MultiLightEffect); env GENERALSX_MULTILIGHT=0 still forces OFF inside
-			// the getter so scripted A/B keeps working.  When disabled here the ML pair is simply
-			// never installed and dx8normalmap falls back to the T1 single-light path.
+			// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): this is no longer a
+			// user toggle. OptionPreferences() reports the multi-light family ON unconditionally (the
+			// menu row and the Options.ini key are gone), so the ONLY way down left is the
+			// GENERALSX_MULTILIGHT=0 env, kept for scripted A/B. When it is set, the ML pair simply never
+			// installs and those batches fall back to the fixed pipeline - note the post-P3 merged base
+			// has no point-light terms, so a lamp-lit mesh is NOT covered by DX8GeomNormal.
 			if (!OptionPreferences().getMultiLightEnabled()) {
-				fprintf(stderr, "[ML] disabled (env GENERALSX_MULTILIGHT=0 or Options.ini MultiLightEffect=0)\n");
+				fprintf(stderr, "[ML] disabled (env GENERALSX_MULTILIGHT=0; point lights fall back to the fixed pipeline)\n");
 			} else {
 				IDirect3DVertexShader9* mlVS = nullptr;
 				IDirect3DPixelShader9* mlPS = nullptr;
@@ -4459,6 +5110,102 @@ static void InitNormalMapShaders()
 				"    float3 spec = c14.rgb * pow(saturate(dot(n, h)), c13.w) * ndl0;\n"
 				"    float4 lit = float4(base.rgb * saturate(col) + spec, base.a);\n"
 				"    float fogf = saturate((i.eye - c26.x) * c26.y) * c25.w;\n"   // P3-14: eye-depth haze, w=0 keeps the pixel exact (batch8 P0: VS-relayed TEXCOORD depth, POSITION inputs are X4502)
+				"    return lerp(lit, float4(c25.rgb, lit.a), fogf);\n"
+				"}\n";
+
+			// GeneralsX @feature Qoder 17/10/2026 P2 skinned-batch variants of the plain GN pair
+			// (光影T0阶段 P2). The CPU skinning pass submits the dynamic layout
+			// (dynamic_fvf_type = D3DFVF_XYZ|NORMAL|DIFFUSE|TEX2), whose COLOR0 channel carries the
+			// per-vertex tint / selection-damage flash / baked detail and the alpha the fixed pipeline
+			// multiplies into the output (VertexFormatXYZNDUV2 in dx8renderer.cpp's skin Render loop).
+			// The rigid VS pair declares no COLOR0, so D3D9 would silently drop it and skinned batches
+			// used to stay on the fixed pipeline. This VS relays the vertex diffuse untouched; the PS
+			// is the plain GN program with the same FF-parity chain the dot3 pair ships
+			// (base.rgb *= i.diffuse.rgb, alpha = base.a * i.diffuse.a). The sun-shadow variants are
+			// NOT duplicated for skins in P2 (DX8GeomNormal::Apply keeps skins on the plain pair;
+			// the merge lands in P3).
+			static const char* kVertexShaderGN_SKIN =
+				"float4 c0 : register(c0);\n"
+				"float4 c1 : register(c1);\n"
+				"float4 c2 : register(c2);\n"
+				"float4 c3 : register(c3);\n"
+				"float4 c4 : register(c4);\n"
+				"float4 c5 : register(c5);\n"
+				"float4 c6 : register(c6);\n"	// world rotation rows (object normal -> world; identity for skins)
+				"struct VS_OUT\n"
+				"{\n"
+				"    float4 pos : POSITION;\n"
+				"    float2 uv  : TEXCOORD0;\n"
+				"    float3 wn  : TEXCOORD1;\n"
+				"    float eye  : TEXCOORD2;\n"             // batch8 P0: clip w = eye depth; POSITION PS inputs are rejected by fxc (X4502)
+				"    float4 diffuse : COLOR0;\n"            // P2: vertex tint/flash relayed to the PS (FF diffuse channel)
+				"};\n"
+				"VS_OUT main(float3 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0, float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1)\n"
+				"{\n"
+				"    VS_OUT o;\n"
+				"    float4 p = float4(pos, 1.0);\n"
+				"    o.pos = float4(dot(p, c0), dot(p, c1), dot(p, c2), dot(p, c3));\n"
+				"    o.uv = uv0;\n"
+				"    o.wn = float3(dot(normal, c4.xyz), dot(normal, c5.xyz), dot(normal, c6.xyz));\n"
+				"    o.eye = o.pos.w;\n"
+				"    o.diffuse = diffuse;\n"
+				"    return o;\n"
+				"}\n";
+
+			static const char* kPixelShaderGNSkin =
+				"sampler s0 : register(s0);\n"                 // diffuse texture (bound by the category)
+				"float4 c4 : register(c4);\n"                  // ambient: matAmbient*envAmbient + emissive
+				"float4 c5 : register(c5);\n"                  // world light dir 0 (toward light)
+				"float4 c6 : register(c6);\n"                  // world light dir 1
+				"float4 c7 : register(c7);\n"                  // world light dir 2
+				"float4 c8 : register(c8);\n"                  // world light dir 3
+				"float4 c9 : register(c9);\n"                  // matDiffuse*lightColor 0
+				"float4 c10 : register(c10);\n"                // matDiffuse*lightColor 1
+				"float4 c11 : register(c11);\n"                // matDiffuse*lightColor 2
+				"float4 c12 : register(c12);\n"                // matDiffuse*lightColor 3
+				"float4 c13 : register(c13);\n"                // world eye dir (toward camera), w = spec power
+				"float4 c14 : register(c14);\n"                // spec intensity rgb (light 0 only, T1 knobs)
+				"float4 c16 : register(c16);\n"                // hemi ambient rgb (P3-12), scaled by world-up n.z (W3D is Z-up)
+				"float4 c17 : register(c17);\n"                // world light dir 4 (P3-18 widened the GN family to 8 lights)
+				"float4 c18 : register(c18);\n"
+				"float4 c19 : register(c19);\n"
+				"float4 c20 : register(c20);\n"
+				"float4 c21 : register(c21);\n"                // matDiffuse*lightColor 4
+				"float4 c22 : register(c22);\n"
+				"float4 c23 : register(c23);\n"
+				"float4 c24 : register(c24);\n"
+				"float4 c25 : register(c25);\n"                // P3-14 fog: rgb haze color, w = blend strength (0 = identity)
+				"float4 c26 : register(c26);\n"                // P3-14 fog: x = eye-depth start, y = 1/ramp length
+				"struct PS_IN\n"
+				"{\n"
+				"    float eye : TEXCOORD2;\n"                  // batch8 P0: eye depth relayed by the VS (POSITION input = X4502)
+				"    float2 uv : TEXCOORD0;\n"
+				"    float3 wn : TEXCOORD1;\n"
+				"    float4 diffuse : COLOR0;\n"                // P2: vertex diffuse stream (white + a255 on un-tinted assets)
+				"};\n"
+				"float4 main(PS_IN i) : COLOR\n"
+				"{\n"
+				"    float4 base = tex2D(s0, i.uv);\n"
+				"    base.rgb *= i.diffuse.rgb;\n"             // FF parity: vertex tint multiplies the albedo (dot3 pair precedent)
+				"    float l = length(i.wn);\n"
+				"    float3 n = (l > 1e-6) ? i.wn / l : float3(0.0, 1.0, 0.0);\n"
+				// Two-sided flip identical to kPixelShaderGN (#73): infantry/building skins ship the
+				// same mixed-facing hull parts, so the viewer-facing rule must carry over verbatim.
+				"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
+				"    float ndl0 = saturate(dot(n, c5.xyz));\n"
+				"    float3 col = c4.rgb + n.z * c16.rgb\n"
+				"        + c9.rgb  * ndl0\n"
+				"        + c10.rgb * saturate(dot(n, c6.xyz))\n"
+				"        + c11.rgb * saturate(dot(n, c7.xyz))\n"
+				"        + c12.rgb * saturate(dot(n, c8.xyz))\n"
+				"        + c21.rgb * saturate(dot(n, c17.xyz))\n"
+				"        + c22.rgb * saturate(dot(n, c18.xyz))\n"
+				"        + c23.rgb * saturate(dot(n, c19.xyz))\n"
+				"        + c24.rgb * saturate(dot(n, c20.xyz));\n"
+				"    float3 h = normalize(c5.xyz + normalize(c13.xyz));\n"
+				"    float3 spec = c14.rgb * pow(saturate(dot(n, h)), c13.w) * ndl0;\n"
+				"    float4 lit = float4(base.rgb * saturate(col) + spec, base.a * i.diffuse.a);\n"   // P2: FF-parity alpha (texel x vertex), see dot3 pair
+				"    float fogf = saturate((i.eye - c26.x) * c26.y) * c25.w;\n"   // P3-14: eye-depth haze, w=0 keeps the pixel exact
 				"    return lerp(lit, float4(c25.rgb, lit.a), fogf);\n"
 				"}\n";
 
@@ -4735,6 +5482,228 @@ static void InitNormalMapShaders()
 				"    return lerp(lit, float4(c25.rgb, lit.a), fogf);\n"
 				"}\n";
 
+				// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): the MERGED base pair for the
+				// TG3 tangent-space layout (rigid bump meshes + tangent skin batches - both submit
+				// DX8_FVF_XYZNDUV1TG3, and skins render identity-world so one VS serves both).
+				// 底座 = the exact plain-GN lighting equation (material-scaled ambient c4, up to 8
+				// world directional lights, hemi c16, T1 Blinn spec on light 0, eye-depth fog c25/c26,
+				// #73 two-sided flip) lifted from kPixelShaderGN; the two detail layers are uniform
+				// branches per 工作清单 §2 P3: c27.y picks the s1 bump sample (dot3 layer, c27.x carries
+				// the #69 slider deviation), c27.w the s3 roughness sample (M1 Blinn / M2 GGX ported from
+				// kPixelShaderPBR), c27.z the s2 sun-shadow taps lifted from kPixelShaderGNS (bump meshes
+				// gain shadow reception they never had - an addition, not a regression; 5x5 PCF tier
+				// stays on the rigid GN variants).  Samplers: s0 diffuse, s1 _nm, s2 sun map (GN
+				// convention - the rp companion MOVES from s2 to s3 to free it), s3 _rp.  Vertex
+				// diffuse rides through with the FF-parity chain (base*diffuse, alpha texel x vertex)
+				// the dot3/ML/skin pairs already ship.  "缺资产＝逐位不变": both branch flags 0 makes the
+				// pixel the plain GN pixel modulo the COLOR0 relay (flat fallback §7.2).
+				static const char* kVertexShaderGNMerged_TG3 =
+					"float4 c0 : register(c0);\n"
+					"float4 c1 : register(c1);\n"
+					"float4 c2 : register(c2);\n"
+					"float4 c3 : register(c3);\n"
+					"float4 c4 : register(c4);\n"
+					"float4 c5 : register(c5);\n"
+					"float4 c6 : register(c6);\n"	// world rotation rows (normal/tangent/binormal -> world)
+					"float4 c7 : register(c7);\n"	// object -> light clip rows (identity when no sun shadow)
+					"float4 c8 : register(c8);\n"
+					"float4 c9 : register(c9);\n"
+					"float4 c10 : register(c10);\n"
+					"struct VS_OUT\n"
+					"{\n"
+					"    float4 pos     : POSITION;\n"
+					"    float4 diffuse : COLOR0;\n"
+					"    float2 uv      : TEXCOORD0;\n"
+					"    float3 tT      : TEXCOORD1;\n"
+					"    float3 tB      : TEXCOORD2;\n"
+					"    float3 tN      : TEXCOORD3;\n"
+					"    float4 sv      : TEXCOORD4;\n"
+					"    float  eye     : TEXCOORD5;\n"   // batch8 P0: clip w = eye depth (POSITION PS input = X4502)
+					"};\n"
+					"VS_OUT main(float4 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0,\n"
+					"            float2 uv0 : TEXCOORD0, float3 tangent : TEXCOORD1, float3 binormal : TEXCOORD2)\n"
+					"{\n"
+					"    VS_OUT o;\n"
+					"    o.pos = float4(dot(pos, c0), dot(pos, c1), dot(pos, c2), dot(pos, c3));\n"
+					"    o.diffuse = diffuse;\n"
+					"    o.uv = uv0;\n"
+					"    o.tN = float3(dot(normal, c4.xyz), dot(normal, c5.xyz), dot(normal, c6.xyz));\n"
+					"    o.tT = float3(dot(tangent, c4.xyz), dot(tangent, c5.xyz), dot(tangent, c6.xyz));\n"
+					"    o.tB = float3(dot(binormal, c4.xyz), dot(binormal, c5.xyz), dot(binormal, c6.xyz));\n"
+					"    o.eye = o.pos.w;\n"
+					"    float4 s = float4(dot(pos, c7), dot(pos, c8), dot(pos, c9), dot(pos, c10));\n"
+					"    o.sv = float4(0.5 * (s.x + 1.0), 0.5 * (1.0 - s.y), 0.5 * s.z + 0.5, 1.0);\n"
+					"    return o;\n"
+					"}\n";
+
+				static const char* kPixelShaderGNMerged =
+					"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
+					"sampler s1 : register(s1);\n"                 // tangent-space normal map (_nm companion)
+					"sampler s2 : register(s2);\n"                 // sun shadow map (GN convention, bound only when c27.z=1)
+					"sampler s3 : register(s3);\n"                 // rp companion: R=roughness, G=metalness (P3: s2 belongs to the sun map)
+					"float4 c4 : register(c4);\n"                  // ambient: matAmbient*envAmbient + emissive
+					"float4 c5 : register(c5);\n"                  // world light dir 0 (toward light)
+					"float4 c6 : register(c6);\n"                  // world light dir 1
+					"float4 c7 : register(c7);\n"                  // world light dir 2
+					"float4 c8 : register(c8);\n"                  // world light dir 3
+					"float4 c9 : register(c9);\n"                  // matDiffuse*lightColor 0
+					"float4 c10 : register(c10);\n"                // matDiffuse*lightColor 1
+					"float4 c11 : register(c11);\n"                // matDiffuse*lightColor 2
+					"float4 c12 : register(c12);\n"                // matDiffuse*lightColor 3
+					"float4 c13 : register(c13);\n"                // world eye dir (toward camera), w = spec power
+					"float4 c14 : register(c14);\n"                // spec intensity rgb (light 0 only, T1 knobs)
+					"float4 c15 : register(c15);\n"                // shadow: (spread, spread, bias, strength)
+					"float4 c16 : register(c16);\n"                // hemi ambient rgb, scaled by world-up n.z (W3D Z-up)
+					"float4 c17 : register(c17);\n"                // world light dir 4..7
+					"float4 c18 : register(c18);\n"
+					"float4 c19 : register(c19);\n"
+					"float4 c20 : register(c20);\n"
+					"float4 c21 : register(c21);\n"                // matDiffuse*lightColor 4..7
+					"float4 c22 : register(c22);\n"
+					"float4 c23 : register(c23);\n"
+					"float4 c24 : register(c24);\n"
+					"float4 c25 : register(c25);\n"                // fog: rgb haze color, w = blend strength (0 = identity)
+					"float4 c26 : register(c26);\n"                // fog: x = eye-depth start, y = 1/ramp length
+					"float4 c27 : register(c27);\n"                // layers: (bumpK, bumpOn, shadowOn, rpOn)
+					"float4 c28 : register(c28);\n"                // rp contract: (mode, LI, ENV, wetness) - cf. PBR c8/PBRML c11
+					"struct PS_IN\n"
+					"{\n"
+					"    float4 diffuse : COLOR0;\n"
+					"    float2 uv      : TEXCOORD0;\n"
+					"    float3 tT      : TEXCOORD1;\n"
+					"    float3 tB      : TEXCOORD2;\n"
+					"    float3 tN      : TEXCOORD3;\n"
+					"    float4 sv      : TEXCOORD4;\n"
+					"    float  eye     : TEXCOORD5;\n"
+					"};\n"
+					// The M2 GGX lobe, verbatim from kPixelShaderPBRML (Schlick fresnel, Smith-Schlick G,
+					// grazing-V clamp, the 0.25-folded NDF). kd comes back through the out param.
+					"float3 ggxLobe(float3 n, float3 L, float3 E, float3 F0, float metal, float a2, float kk, float ndl, out float3 kd)\n"
+					"{\n"
+					"    float3 H = normalize(L + E);\n"
+					"    float ndh = saturate(dot(n, H));\n"
+					"    float vnd = max(dot(n, E), 0.05);\n"
+					"    float vnh = saturate(dot(E, H));\n"
+					"    float3 fres = F0 + (1.0 - F0) * pow(1.0 - vnh, 5.0);\n"
+					"    kd = (1.0 - fres) * (1.0 - metal);\n"
+					"    float dnom = ndh * ndh * (a2 - 1.0) + 1.0;\n"
+					"    float D = a2 / max(dnom * dnom, 1e-4);\n"
+					"    float G = (ndl / max(ndl * (1.0 - kk) + kk, 1e-3)) * (vnd / max(vnd * (1.0 - kk) + kk, 1e-3));\n"
+					"    return D * fres * G * 0.25;\n"
+					"}\n"
+					"float4 main(PS_IN i) : COLOR\n"
+					"{\n"
+					"    float4 base = tex2D(s0, i.uv);\n"
+					"    base.rgb *= i.diffuse.rgb;\n"           // FF parity: vertex tint multiplies the albedo (dot3/skin-pair chain)
+					// --- 细节层 1: the normal. Bumped reads the s1 tangent map through the world TBN
+					// (ML PS recipe); flat reads the interpolated geometric normal (plain GN recipe,
+					// with its degenerate-length guard).
+					"    float3 n;\n"
+					"    if (c27.y > 0.5)\n"
+					"    {\n"
+					"        float3 tn = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
+					"        tn.xy = tn.xy * c27.x;\n"           // #69 slider deviation (was dot3 c3.x)
+					"        tn = normalize(tn);\n"
+					"        float3 T = normalize(i.tT);\n"
+					"        float3 B = normalize(i.tB);\n"
+					"        float3 N = normalize(i.tN);\n"
+					"        n = tn.x * T + tn.y * B + tn.z * N;\n"
+					"    }\n"
+					"    else\n"
+					"    {\n"
+					"        float l = length(i.tN);\n"
+					"        n = (l > 1e-6) ? i.tN / l : float3(0.0, 1.0, 0.0);\n"
+					"    }\n"
+					"    n = normalize(n);\n"
+					// Two-sided flip (#73), same rule as kPixelShaderGN, applied to the reconstructed n.
+					"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
+					// --- sun shadow: the GNS 3x3 kernel behind a uniform branch (c27.z=0 keeps the
+					// exact unshadowed pixel and never touches the unbound s2).
+					"    float shade = 1.0;\n"
+					"    if (c27.z > 0.5)\n"
+					"    {\n"
+					"        float inside = (i.sv.x >= 0.0 && i.sv.x <= 1.0 && i.sv.y >= 0.0 && i.sv.y <= 1.0\n"
+					"            && i.sv.z >= 0.0 && i.sv.z <= 1.0) ? 1.0 : 0.0;\n"
+					"        float2 q = c15.xy;\n"
+					"        float count = 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2(-q.x, -q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2( 0.0,  -q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2( q.x,  -q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2(-q.x,  0.0)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2( q.x,  0.0)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2(-q.x,  q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2( 0.0,  q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        count += (tex2D(s2, i.sv.xy + float2( q.x,  q.y)).x + c15.z < i.sv.z) ? 1.0 : 0.0;\n"
+					"        shade = 1.0 - inside * c15.w * (count / 9.0);\n"
+					"    }\n"
+					// --- 底座 irradiance: the plain GN 8-light lambert sum, sun term shadowed.
+					"    float ndl0 = saturate(dot(n, c5.xyz));\n"
+					"    float3 col = c4.rgb + n.z * c16.rgb\n"
+					"        + c9.rgb  * ndl0 * shade\n"
+					"        + c10.rgb * saturate(dot(n, c6.xyz))\n"
+					"        + c11.rgb * saturate(dot(n, c7.xyz))\n"
+					"        + c12.rgb * saturate(dot(n, c8.xyz))\n"
+					"        + c21.rgb * saturate(dot(n, c17.xyz))\n"
+					"        + c22.rgb * saturate(dot(n, c18.xyz))\n"
+					"        + c23.rgb * saturate(dot(n, c19.xyz))\n"
+					"        + c24.rgb * saturate(dot(n, c20.xyz));\n"
+					"    col = saturate(col);\n"
+					"    float3 E = normalize(c13.xyz);\n"
+					"    float3 h = normalize(c5.xyz + E);\n"
+					"    float3 outc;\n"
+					// --- 细节层 2: the specular/roughness layer. No rp = the plain T1 Blinn (bit-exact
+					// GN term); mode 1 = roughness-driven Blinn (kPixelShaderPBR M1); mode 2 = M2 GGX
+					// (Schlick F + Smith-Schlick G + metal-killed diffuse), sun shadow folded into shade,
+					// env = constant hemisphere c28.z*F0 exactly as the shipped PBR/PBRML contract.
+					// 调研 §2: the V is the world eye CONSTANT (c13), same proven approximation as ML/PBRML.
+					"    if (c27.w < 0.5)\n"
+					"    {\n"
+					"        float3 spec = c14.rgb * pow(saturate(dot(n, h)), c13.w) * ndl0 * shade;\n"
+					"        outc = base.rgb * col + spec;\n"
+					"    }\n"
+					"    else\n"
+					"    {\n"
+					"        float2 rm = tex2D(s3, i.uv).xy;\n"  // R=roughness, G=metalness (packer §1)
+					"        rm.x = rm.x * (1.0 - c28.w * 0.75);\n"   // Weather W5 rain-slick (same as PBR c8.w)
+					"        if (c28.x < 1.5)\n"
+					"        {\n"
+					"            float shin = lerp(8.0, 128.0, 1.0 - rm.x);\n"
+					"            float3 spec = c14.rgb * pow(saturate(dot(n, h)), shin) * (1.0 - rm.x) * ndl0 * shade;\n"
+					"            outc = base.rgb * col + spec;\n"
+					"        }\n"
+					"        else\n"
+					"        {\n"
+					"            float3 F0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, rm.y);\n"
+					"            float a = rm.x * rm.x;\n"
+					"            float a2 = a * a;\n"
+					"            float kk = (rm.x + 1.0) * (rm.x + 1.0) * 0.125;\n"
+					"            float3 kd;\n"
+					"            float3 sp0 = ggxLobe(n, c5.xyz,  E, F0, rm.y, a2, kk, ndl0, kd) * c9.rgb  * ndl0 * shade;\n"
+					"            float ndl1 = saturate(dot(n, c6.xyz));\n"
+					"            float3 kdx;\n"
+					"            float3 sp1 = ggxLobe(n, c6.xyz,  E, F0, rm.y, a2, kk, ndl1, kdx) * c10.rgb * ndl1;\n"
+					"            float ndl2 = saturate(dot(n, c7.xyz));\n"
+					"            float3 sp2 = ggxLobe(n, c7.xyz,  E, F0, rm.y, a2, kk, ndl2, kdx) * c11.rgb * ndl2;\n"
+					"            float ndl3 = saturate(dot(n, c8.xyz));\n"
+					"            float3 sp3 = ggxLobe(n, c8.xyz,  E, F0, rm.y, a2, kk, ndl3, kdx) * c12.rgb * ndl3;\n"
+					"            float ndl4 = saturate(dot(n, c17.xyz));\n"
+					"            float3 sp4 = ggxLobe(n, c17.xyz, E, F0, rm.y, a2, kk, ndl4, kdx) * c21.rgb * ndl4;\n"
+					"            float ndl5 = saturate(dot(n, c18.xyz));\n"
+					"            float3 sp5 = ggxLobe(n, c18.xyz, E, F0, rm.y, a2, kk, ndl5, kdx) * c22.rgb * ndl5;\n"
+					"            float ndl6 = saturate(dot(n, c19.xyz));\n"
+					"            float3 sp6 = ggxLobe(n, c19.xyz, E, F0, rm.y, a2, kk, ndl6, kdx) * c23.rgb * ndl6;\n"
+					"            float ndl7 = saturate(dot(n, c20.xyz));\n"
+					"            float3 sp7 = ggxLobe(n, c20.xyz, E, F0, rm.y, a2, kk, ndl7, kdx) * c24.rgb * ndl7;\n"
+					"            float3 specSum = (sp0 + sp1 + sp2 + sp3 + sp4 + sp5 + sp6 + sp7) * c28.y;\n"
+					"            outc = base.rgb * kd * col * c28.y + c28.z * F0 + specSum;\n"
+					"        }\n"
+					"    }\n"
+					"    float4 lit = float4(outc, base.a * i.diffuse.a);\n"   // FF-parity alpha (see kPixelShader)
+					"    float fogf = saturate((i.eye - c26.x) * c26.y) * c25.w;\n"
+					"    return lerp(lit, float4(c25.rgb, lit.a), fogf);\n"
+					"}\n";
+
 			const char* gnPsSrc = kPixelShaderGN;
 			{
 				const char* rawEnv = getenv("GENERALSX_GEOMNORMAL_RAW");
@@ -4757,6 +5726,11 @@ static void InitNormalMapShaders()
 			if (gnVS1 != nullptr && gnVS2 != nullptr && gnPS != nullptr) {
 				DX8GeomNormal::Install((UINT_PTR)gnVS1, (UINT_PTR)gnVS2, (UINT_PTR)gnPS);
 				fprintf(stderr, "[GN] geometric-normal installed vs=%s/%s ps=%s\n", gnP1, gnP2, gnPP);
+				// GeneralsX @feature Qoder 17/10/2026: seed the per-pixel lighting master switch from
+				// the option layer, not from the raw getenv inside Install(), so the ini key, the
+				// Graphics Options row and the renderer all read one value (the getter keeps
+				// GENERALSX_GEOMNORMAL winning for scripted A/B legs).
+				DX8GeomNormal::Set_Enabled(OptionPreferences().getPerPixelLighting() != FALSE);
 			} else {
 				if (gnVS1 != nullptr) gnVS1->Release();
 				if (gnVS2 != nullptr) gnVS2->Release();
@@ -4764,6 +5738,55 @@ static void InitNormalMapShaders()
 				fprintf(stderr, "[GN] geometric-normal compile failed, fixed pipeline only\n");
 			}
 			fflush(stderr);
+
+			// GeneralsX @feature Qoder 17/10/2026 P2: compile the skinned GN variant pair as its own
+			// step - a failure here can never take the plain trio down, it just leaves
+			// DX8GeomNormal::Apply's DUV2 branch declining (skins stay on the fixed pipeline, exactly
+			// the pre-P2 behavior). Skipped in raw-probe mode: kPixelShaderGNRaw shares no contract
+			// with the skin relay, and that leg only ever runs scripted forensics.
+			if (gnVS1 != nullptr && gnVS2 != nullptr && gnPS != nullptr && gnPsSrc == kPixelShaderGN)
+			{
+				IDirect3DVertexShader9* gnSkinVS = nullptr;
+				IDirect3DPixelShader9* gnSkinPS = nullptr;
+				const char* gnSkinVProfile = nullptr; const char* gnSkinPProfile = nullptr;
+				HRESULT skHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderGN_SKIN, true, "[GNSKIN]", &gnSkinVProfile, (void**)&gnSkinVS);
+				if (SUCCEEDED(skHR) && gnSkinVS != nullptr)
+					skHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderGNSkin, false, "[GNSKIN]", &gnSkinPProfile, (void**)&gnSkinPS);
+				if (gnSkinVS != nullptr && gnSkinPS != nullptr) {
+					DX8GeomNormal::Install_Skin((UINT_PTR)gnSkinVS, (UINT_PTR)gnSkinPS);
+					fprintf(stderr, "[GNSKIN] skinned GN pair installed vs=%s ps=%s\n", gnSkinVProfile, gnSkinPProfile);
+				} else {
+					if (gnSkinVS != nullptr) gnSkinVS->Release();
+					if (gnSkinPS != nullptr) gnSkinPS->Release();
+					fprintf(stderr, "[GNSKIN] skinned variant compile failed, skins stay on the fixed pipeline\n");
+				}
+				fflush(stderr);
+			}
+
+			// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): compile the merged TG3 pair as its
+			// own additive step (same discipline as GNSKIN: a failure here can never take the plain trio
+			// or the skin pair down). Without the handles DX8GeomNormal::Apply declines every TG3 batch
+			// and those meshes stay on the fixed pipeline, while DX8NormalMap::Apply keeps serving the
+			// point-light ML family from its own handles. Skipped in raw-probe mode (scripted forensics
+			// leg - the probe replaces only the plain GN pixel program).
+			if (gnVS1 != nullptr && gnVS2 != nullptr && gnPS != nullptr && gnPsSrc == kPixelShaderGN)
+			{
+				IDirect3DVertexShader9* gnmVS = nullptr;
+				IDirect3DPixelShader9* gnmPS = nullptr;
+				const char* gnmVP = nullptr; const char* gnmPP = nullptr;
+				HRESULT gnmHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderGNMerged_TG3, true, "[GNM]", &gnmVP, (void**)&gnmVS);
+				if (SUCCEEDED(gnmHR) && gnmVS != nullptr)
+					gnmHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderGNMerged, false, "[GNM]", &gnmPP, (void**)&gnmPS);
+				if (gnmVS != nullptr && gnmPS != nullptr) {
+					DX8GeomNormal::Install_Merged((UINT_PTR)gnmVS, (UINT_PTR)gnmPS);
+					fprintf(stderr, "[GNM] merged TG3 pair installed vs=%s ps=%s\n", gnmVP, gnmPP);
+				} else {
+					if (gnmVS != nullptr) gnmVS->Release();
+					if (gnmPS != nullptr) gnmPS->Release();
+					fprintf(stderr, "[GNM] merged pair compile failed, bump/roughness meshes stay fixed pipeline (ML unaffected)\n");
+				}
+				fflush(stderr);
+			}
 			// (scope note PS3.0-P3-21b: the shadow-variant compile below stays inside this brace scope -
 			// that is where the kVertexShaderGNS_* / kPixelShaderGNS sources are declared.)
 
@@ -4837,6 +5860,11 @@ static void InitNormalMapShaders()
 			if (pm) { pm += strlen("-pbrmode="); int v = atoi(pm); if (v >= 0 && v <= 2) pbrMode = v; }
 		}
 		DX8NormalMap::Set_PBR_Mode(pbrMode);
+
+		// GeneralsX @feature PS3.0 4E 17/10/2026: seed the GGX multi-light mount toggle from
+		// Options.ini PBRMultiLight (GENERALSX_PBRML wins inside the getter, 4C QA legs unchanged);
+		// the Graphics Options page re-arms it live through gameOptionApply_PBRML.
+		DX8NormalMap::Set_PBRML_Enabled(OptionPreferences().getPBRMLEnabled() ? 1 : 0);
 		fprintf(stderr, "[DOT3] shaders installed (enabled=%d strength=%.2f; default follows options-menu NormalMapping toggle)\n",
 			(int)enable, strength);
 		fprintf(stderr, "[PBR] mode=%d (0=off 1=roughness-Blinn 2=GGX; bump=%d, roughness-only mounts with flat normals)\n",
@@ -4848,24 +5876,18 @@ static void InitNormalMapShaders()
 		// device layer computes the pair here once at shader install. Ramp derives from the camera's
 		// far clip (start = 45%, length = 50% of it) so the haze sits beyond normal play distances;
 		// the tint is a hand-picked cold grey-blue (true sky colour arrives with the P3-15 sky work).
-		// GENERALSX_GNFOG sets the strength (default 0.6, clamped 0..1; =0 keeps pixels bit-exact).
+		// Strength is user-owned now (Graphics Options page / Options.ini DistanceHaze*), seeded
+		// lazily by seedDistanceHaze(); GENERALSX_GNFOG still wins inside the OptionPreferences getters,
+		// and 0 keeps pixels bit-exact with the pre-P3-14 build. Default is the shipped 0.6.
 		{
-			float fogStrength = 0.6f;
-			const char* fenv = getenv("GENERALSX_GNFOG");
-			if (fenv != nullptr && *fenv != 0) fogStrength = (float)atof(fenv);
-			if (fogStrength < 0.0f) fogStrength = 0.0f;
-			if (fogStrength > 1.0f) fogStrength = 1.0f;
-			// Far plane follows the W3DView::doCameraUpdate normal-zoom formula
-			// (NORMAL_DRAW_WIDTH * MAP_XY_FACTOR); the live per-frame farZ varies with scroll edge and
-			// real-zoom pitch, the steady-state value is the right fog ramp anchor.
-			const Real farClip = WorldHeightMap::NORMAL_DRAW_WIDTH * MAP_XY_FACTOR;
-			const Real fogStart = farClip * 0.45f;
-			const Real fogLen = farClip * 0.5f;
-			Vector4 colorStrength(0.72f, 0.78f, 0.84f, fogStrength);
-			Vector4 ramp(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f);
+			// GeneralsX @feature PS3.0 Weather W5: the ramp now comes from the shared builder, at scale
+			// 1.0 (dry). The weather refresh re-pushes it through the same function whenever the type
+			// changes, so install and runtime cannot disagree.
+			Vector4 colorStrength, ramp;
+			Build_Weather_Fog_Ramp(1.0f, colorStrength, ramp);
 			DX8NormalMap::Set_Fog(colorStrength, ramp);
-			fprintf(stderr, "[GNFOG] strength=%.2f start=%.0f len=%.0f\n",
-				fogStrength, (double)fogStart, (double)fogLen);
+			fprintf(stderr, "[GNFOG] strength=%.2f start=%.0f invLen=%.4f\n",
+				(double)colorStrength.W, (double)ramp.X, (double)ramp.Y);
 			fflush(stderr);
 		}
 	}
@@ -5207,6 +6229,519 @@ void W3DShaderManager::drawViewport(Int color)
 	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
 	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+}
+
+// GeneralsX @feature PS3.0 Weather W2 + W4 16/10/2026 ==================================================
+// The screen half of the weather system: everything the recipe says the *air in front of the lens* does.
+//
+// Two passes over the tactical view rectangle, in this order:
+//   1. cloud cover  - multiplies the finished frame by tint x darken, with a radial fall-off (the
+//                     vignette) so a storm closes in from the edges instead of dimming uniformly.
+//   2. veil + flash - adds the scrolling mist/snow veil and, for a thunderstorm, the white bolt frame.
+//
+// Why this is not a W3DFilterInterface: the filter system owns a single slot which the bloom filter
+// already claims, and its render-to-texture chain cannot nest, so a second filter would silently steal
+// or break the first. Blending over the completed frame needs neither the slot nor a scene sample, so
+// weather and bloom simply compose. Both legs are therefore procedural: no textures are read, which
+// also means nothing can go wrong with a missing asset.
+//
+// Ladder: ps_2_0-and-up runs one quad per pass with the constants below; the fixed-function fallback
+// tessellates the same functions onto a 16x12 grid of vertex colours, so a device without programmable
+// pixel shaders still gets tint, darken, vignette and veil (only the blob edges are softer). A shader
+// failure can therefore never remove an effect, which is the same rule the bloom chain plays by.
+//
+// Source of the numbers is weatherRenderState(), which is computed in the device layer and never
+// crosses into the CRC stream or a network packet (AGENTS.md Golden Rule 7).
+// ======================================================================================================
+
+/// Radial darkening factor: 1.0 through the middle 30% of the view, (1-strength) in the corners.
+/// Shared by both legs so a fixed-function frame and a shader frame go grey by the same curve.
+static Real weatherVignetteFactor(Real u, Real v, Real aspect, Real strength)
+{
+	const Real du = (u - 0.5f) * aspect;		//stretch x so the iso-lines are circles in pixel space
+	const Real dv = v - 0.5f;
+	const Real e2 = du * du + dv * dv;
+	const Real m2 = 0.25f * aspect * aspect + 0.25f;	//squared half-diagonal: corners land on 1.0
+	if (m2 <= 0.0f)
+		return 1.0f;
+	Real t = (e2 - 0.09f * m2) / (0.91f * m2);
+	if (t < 0.0f) t = 0.0f;
+	if (t > 1.0f) t = 1.0f;
+	return 1.0f - strength * t;
+}
+
+/// Integer-mix hash in [0,1). The programmable leg uses the conventional frac(sin(dot())) fold instead
+/// because ps_2_0 has no integer ops; the two place their blobs differently but read identically, which
+/// is the whole point of procedural mist.
+static Real weatherHash(Int x, Int y)
+{
+	UnsignedInt h = (UnsignedInt)x * 374761393u + (UnsignedInt)y * 668265263u;
+	h = (h ^ (h >> 13)) * 1274126177u;
+	h = h ^ (h >> 16);
+	return (Real)(h & 0xffffffu) * (1.0f / 16777216.0f);
+}
+
+/// Bilinear value noise over unit cells, smooth-interpolated. Cell coordinates are never negative:
+/// the scroll phase starts at 0 and only grows, so a plain cast is a floor.
+static Real weatherValueNoise(Real x, Real y)
+{
+	const Int ix = (Int)x;
+	const Int iy = (Int)y;
+	Real fx = x - (Real)ix;
+	Real fy = y - (Real)iy;
+	fx = fx * fx * (3.0f - 2.0f * fx);
+	fy = fy * fy * (3.0f - 2.0f * fy);
+	const Real a = weatherHash(ix, iy);
+	const Real b = weatherHash(ix + 1, iy);
+	const Real c = weatherHash(ix, iy + 1);
+	const Real e = weatherHash(ix + 1, iy + 1);
+	const Real ab = a + (b - a) * fx;
+	const Real ce = c + (e - c) * fx;
+	return ab + (ce - ab) * fy;
+}
+
+/// Two octaves, scrolling diagonally. Same cell density as kWeatherVeilPS so the two legs disagree only
+/// in sharpness, never in scale. Seven cells across the height: at five the blobs were a fifth of the
+/// screen each and read as separate white cushions rather than as mist on a lens.
+static Real weatherVeilNoise(Real u, Real v, Real aspect, Real phase)
+{
+	const Real sx = 7.0f * aspect;
+	const Real sy = 7.0f;
+	const Real base = weatherValueNoise(u * sx + phase, v * sy + phase * 0.31f);
+	const Real detail = weatherValueNoise(u * sx * 2.7f - phase * 0.53f, v * sy * 2.7f + phase * 0.11f);
+	return base * 0.65f + detail * 0.35f;
+}
+
+/// 0..1 veil coverage at this point, i.e. how much mist is in front of the lens right here. The recipe's
+/// density (the peak alpha this coverage is scaled by) is applied by the caller.
+static Real weatherVeilAmount(Real u, Real v, Real aspect, Real phase)
+{
+	Real t = (weatherVeilNoise(u, v, aspect, phase) - 0.45f) * 2.2f;
+	if (t < 0.0f) t = 0.0f;
+	if (t > 1.0f) t = 1.0f;
+	return t;
+}
+
+static DWORD Weather_Pack_Color(Real r, Real g, Real b)
+{
+	if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+	if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+	if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+	return (DWORD)(0xff000000u |
+		((UnsignedInt)(r * 255.0f + 0.5f) << 16) |
+		((UnsignedInt)(g * 255.0f + 0.5f) << 8) |
+		((UnsignedInt)(b * 255.0f + 0.5f)));
+}
+
+// GeneralsX @bugfix PS3.0 Weather W2 16/10/2026: the veil leg now blends on SRCALPHA/INVSRCALPHA (see
+// drawWeatherScreen), so its vertices carry a real alpha as well as a colour.
+static DWORD Weather_Pack_Color_Alpha(Real r, Real g, Real b, Real a)
+{
+	if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+	return (Weather_Pack_Color(r, g, b) & 0x00ffffffu) | ((DWORD)(a * 255.0f + 0.5f) << 24);
+}
+
+// GeneralsX @feature PS3.0 Weather W2 16/10/2026: one lattice vertex of the veil leg. The blend
+// multiplies the source by its own alpha, so the vertex carries the coverage in alpha and the
+// un-premultiplied colour in rgb - the same split kWeatherVeilPS does on the programmable leg.
+// w = this point's mist coverage, total = w + flash (the alpha), flash = the uniform bolt term.
+static DWORD Weather_Pack_Veil(Real w, Real total, Real flash, Real veilR, Real veilG, Real veilB)
+{
+	const Real inv = total > 0.0001f ? 1.0f / total : 0.0f;
+	const Real fw = flash * inv;
+	return Weather_Pack_Color_Alpha(
+		veilR * w * inv + 0.98f * fw,
+		veilG * w * inv + 0.99f * fw,
+		veilB * w * inv + 1.00f * fw,
+		total);
+}
+
+// Transform-and-lit vertex for the fixed-function lattice: colour only, no texture coordinates, because
+// neither leg samples anything.
+struct WeatherScreenVertex
+{
+	D3DXVECTOR4 p;
+	DWORD color;
+};
+
+// Grid resolution for the fixed-function legs. 16x12 quads is ~3 samples per noise cell, enough that the
+// veil reads as blobs rather than as a gradient, and costs 408 vertices a frame.
+enum { WEATHER_GRID_COLS = 17, WEATHER_GRID_ROWS = 13 };
+
+#ifdef _WIN32
+// c0.xyz = tint x darken, c0.w = vignette strength, c1.x = view aspect.
+// Output is the multiplier itself; the blend state (SRCBLEND=DESTCOLOR) does the multiplying.
+static const char kWeatherCloudPS[] =
+"float4 c0 : register(c0);\n"
+"float4 c1 : register(c1);\n"
+"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+"{\n"
+"    float2 d = uv - 0.5;\n"
+"    d.x *= c1.x;\n"
+"    float e2 = dot(d, d);\n"
+"    float m2 = 0.25 * c1.x * c1.x + 0.25;\n"
+"    float t = saturate((e2 - 0.09 * m2) / (0.91 * m2));\n"
+"    return float4(c0.xyz * (1.0 - c0.w * t), 0.0);\n"
+"}\n";
+
+// c0.x = scroll phase, c0.y = density (peak veil alpha), c0.z = flash, c0.w = view aspect.
+// c1.xyz = mist colour. The leg blends on SRCALPHA/INVSRCALPHA, so the return is (colour, coverage):
+// the frame is pulled toward the mist rather than having light added on top of it, which is what mist
+// in front of a lens does - it flattens contrast instead of glowing. A bolt rides the same alpha, and
+// because its colour is white, saturating it to 1 clips the frame white exactly like the old additive
+// pass did but without washing the mist patches out first.
+static const char kWeatherVeilPS[] =
+"float4 c0 : register(c0);\n"
+"float4 c1 : register(c1);\n"
+"float wnoise(float2 p)\n"
+"{\n"
+"    float2 i = floor(p);\n"
+"    float2 f = frac(p);\n"
+"    f = f * f * (3.0 - 2.0 * f);\n"
+"    float a = frac(sin(dot(i, float2(12.9898, 78.233))) * 43758.5453);\n"
+"    float b = frac(sin(dot(i + float2(1.0, 0.0), float2(12.9898, 78.233))) * 43758.5453);\n"
+"    float c = frac(sin(dot(i + float2(0.0, 1.0), float2(12.9898, 78.233))) * 43758.5453);\n"
+"    float e = frac(sin(dot(i + float2(1.0, 1.0), float2(12.9898, 78.233))) * 43758.5453);\n"
+"    return lerp(lerp(a, b, f.x), lerp(c, e, f.x), f.y);\n"
+"}\n"
+"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
+"{\n"
+"    float2 p = float2(uv.x * c0.w, uv.y) * 7.0;\n"
+"    float n = wnoise(p + float2(c0.x, c0.x * 0.31));\n"
+"    n = n * 0.65 + 0.35 * wnoise(p * 2.7 - float2(c0.x * 0.53, c0.x * -0.11));\n"
+"    float w = saturate((n - 0.45) * 2.2) * c0.y;\n"
+"    float a = saturate(w + c0.z);\n"
+"    float3 col = (c1.xyz * w + float3(0.98, 0.99, 1.0) * c0.z) / max(a, 0.0001);\n"
+"    return float4(col, a);\n"
+"}\n";
+#endif	// _WIN32
+
+void W3DShaderManager::drawWeatherScreen()
+{
+	if (TheTacticalView == nullptr || TheDisplay == nullptr)
+		return;
+
+	const WeatherRenderState &wx = weatherRenderState();
+
+	// Cloud multiplier, per channel. 1.0 everywhere means the weather is not touching the frame.
+	Real mulR = wx.m_screenTint.red * wx.m_screenDarken;
+	Real mulG = wx.m_screenTint.green * wx.m_screenDarken;
+	Real mulB = wx.m_screenTint.blue * wx.m_screenDarken;
+	if (mulR < 0.0f) mulR = 0.0f; else if (mulR > 1.0f) mulR = 1.0f;
+	if (mulG < 0.0f) mulG = 0.0f; else if (mulG > 1.0f) mulG = 1.0f;
+	if (mulB < 0.0f) mulB = 0.0f; else if (mulB > 1.0f) mulB = 1.0f;
+	const Real vig = wx.m_screenVignette < 0.0f ? 0.0f : wx.m_screenVignette;
+
+	Real flash = wx.m_flash;
+	if (flash > 1.0f) flash = 1.0f;
+	if (flash < 0.0f) flash = 0.0f;
+	// GeneralsX @bugfix PS3.0 Weather W4 16/10/2026: this rode the veil leg at 0.92 of full alpha, and the
+	// veil blends on SRCALPHA/INVSRCALPHA - so 0.92 is a lerp that puts 92% of the mist colour over the
+	// frame and leaves 8% of the battlefield. That is a white screen with a screenshot on it, not a
+	// thunderstorm. A bolt is meant to lift the frame, briefly, with the scene still readable through it,
+	// which is what half coverage gives; the rest of the brightness is carried by the dynamic light.
+	flash *= 0.50f;
+
+	static int s_env = -1;
+	if (s_env < 0)
+	{
+		// QA leg: GENERALSX_WEATHER_SCREEN=0 keeps the world particles and lighting coupling but takes
+		// the screen layer out, which is how the A/B captures separate the two halves of the effect.
+		const char *ev = getenv("GENERALSX_WEATHER_SCREEN");
+		s_env = (ev != nullptr && atoi(ev) == 0) ? 0 : 1;
+	}
+
+	const Bool doCloud = (mulR < 0.999f || mulG < 0.999f || mulB < 0.999f || vig > 0.001f);
+	const Bool doVeil = (wx.m_screenWispDensity > 0.001f || flash > 0.001f);
+	if (!s_env || (!doCloud && !doVeil))
+		return;
+
+	static Real s_veilGain = -1.0f;
+	if (s_veilGain < 0.0f)
+	{
+		const char *ev = getenv("GENERALSX_WEATHER_VEIL");
+		s_veilGain = ev != nullptr ? (Real)atof(ev) : 1.0f;
+		if (s_veilGain < 0.0f) s_veilGain = 0.0f;
+		else if (s_veilGain > 4.0f) s_veilGain = 4.0f;
+	}
+	const Real density = wx.m_screenWispDensity * s_veilGain;
+
+	// Mist drift. Frame-stepped rather than clock-stepped on purpose: it is cosmetic, and reading a
+	// wall clock here would make the veil shape depend on machine timing for no benefit. Wrapping at
+	// 1024 keeps the float far from its resolution cliff; the noise is not periodic, so the wrap
+	// shuffles the blobs once after roughly 45 minutes of play - invisible, and never a gameplay event.
+	static Real s_phase = 0.0f;
+	if (doVeil)
+	{
+		s_phase += 0.006f;
+		if (s_phase > 1024.0f) s_phase -= 1024.0f;
+	}
+
+	Int xpos, ypos, width, height;
+	TheTacticalView->getOrigin(&xpos, &ypos);
+	width = TheTacticalView->getWidth();
+	height = TheTacticalView->getHeight();
+	if (width <= 1 || height <= 1)
+		return;
+	const Real aspect = (Real)width / (Real)height;
+	const Real x0 = (Real)xpos, y0 = (Real)ypos;
+	const Real x1 = (Real)(xpos + width), y1 = (Real)(ypos + height);
+
+	LPDIRECT3DDEVICE9 pDev = DX8Wrapper::_Get_D3D_Device8();
+	if (pDev == nullptr)
+		return;
+
+	BloomQuadVertex vbQuad[4];	//the programmable legs each fill one screen quad with view-local uv 0..1
+
+	// One-time shader build, on the first frame that actually has weather: a map that stays clear never
+	// pays for compiling (or holds onto) the two programs.
+	enum WeatherPSState { WXPS_UNTRIED = 0, WXPS_READY = 1, WXPS_FF = 2 };
+	static WeatherPSState s_ps = WXPS_UNTRIED;
+	static IDirect3DPixelShader9 *s_cloudPS = nullptr;
+	static IDirect3DPixelShader9 *s_veilPS = nullptr;
+	if (s_ps == WXPS_UNTRIED)
+	{
+#ifdef _WIN32
+		if (getenv("GENERALSX_WEATHER3") != nullptr && atoi(getenv("GENERALSX_WEATHER3")) == 0)
+		{
+			s_ps = WXPS_FF;
+		}
+		else
+		{
+			const char *profile = nullptr;
+			void *handle = nullptr;
+			if (FAILED(W3DShaderManager::compileShaderAtBestProfile(kWeatherCloudPS, false, "[WXSCREEN]", &profile, &handle)) || handle == nullptr)
+			{
+				s_ps = WXPS_FF;
+			}
+			else
+			{
+				s_cloudPS = (IDirect3DPixelShader9*)handle;
+				handle = nullptr;
+				if (FAILED(W3DShaderManager::compileShaderAtBestProfile(kWeatherVeilPS, false, "[WXSCREEN]", &profile, &handle)) || handle == nullptr)
+				{
+					s_cloudPS->Release();
+					s_cloudPS = nullptr;
+					s_ps = WXPS_FF;
+				}
+				else
+				{
+					s_veilPS = (IDirect3DPixelShader9*)handle;
+					s_ps = WXPS_READY;
+					fprintf(stderr, "[WXSCREEN] cloud+veil on %s\n", profile ? profile : "?");
+					fflush(stderr);
+				}
+			}
+		}
+#else
+		// Runtime HLSL is Windows-only (the D3D9 shim is the only compiler in the shipped build), so the
+		// Linux/macOS path runs the lattice below. Same four scalars, softer veil.
+		s_ps = WXPS_FF;
+#endif
+	}
+
+	// Presets go through DX8Wrapper so its state cache stays truthful, exactly like the bloom filter's
+	// set() does; only after that is the device state worth snapshotting for the restore below.
+	{
+		VertexMaterialClass *vmat = VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
+		DX8Wrapper::Set_Material(vmat);
+		REF_PTR_RELEASE(vmat);	//preset, no need to keep a reference
+		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
+		DX8Wrapper::Apply_Render_State_Changes();
+	}
+
+	DWORD oldBlendEnable, oldSrcBlend, oldDstBlend, oldZEnable, oldZWrite, oldZFunc;
+	DWORD oldAlphaTest, oldCull, oldFog, oldLighting;
+	pDev->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlendEnable);
+	pDev->GetRenderState(D3DRS_SRCBLEND, &oldSrcBlend);
+	pDev->GetRenderState(D3DRS_DESTBLEND, &oldDstBlend);
+	pDev->GetRenderState(D3DRS_ZENABLE, &oldZEnable);
+	pDev->GetRenderState(D3DRS_ZWRITEENABLE, &oldZWrite);
+	pDev->GetRenderState(D3DRS_ZFUNC, &oldZFunc);
+	pDev->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAlphaTest);
+	pDev->GetRenderState(D3DRS_CULLMODE, &oldCull);
+	pDev->GetRenderState(D3DRS_FOGENABLE, &oldFog);
+	pDev->GetRenderState(D3DRS_LIGHTING, &oldLighting);
+
+	// The fixed-function legs rewrite stage 0/1; the programmable legs ignore them, but saving and
+	// restoring is cheap and keeps the cache honest either way.
+	DWORD oldStage[8];
+	const D3DTEXTURESTAGESTATETYPE stageKeys[8] =
+	{
+		D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_ALPHAOP,
+		D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS
+	};
+	for (Int s = 0; s < 8; ++s)
+		pDev->GetTextureStageState(0, stageKeys[s], &oldStage[s]);
+	DWORD oldStage1[2];
+	pDev->GetTextureStageState(1, D3DTSS_COLOROP, &oldStage1[0]);
+	pDev->GetTextureStageState(1, D3DTSS_ALPHAOP, &oldStage1[1]);
+
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	// Direct3D 8 exposes no alpha-write mask (D3DRS_ALPHAWRITEENABLE is a D3D9 state), so the two blend
+	// factors below do touch the back-buffer alpha: the cloud pass multiplies it, the veil pass adds to it.
+	// Nothing in this engine reads destination alpha - the 2D UI blends on SRC_ALPHA/INV_SRC_ALPHA, the
+	// scene clear writes a constant 1.0, and no filter samples the alpha channel - so the effect is
+	// invisible by construction rather than suppressed by a state the API cannot set.
+
+	// Veil colour: mist is lighter than the scene it dims, tinted by the same recipe that dims the sky,
+	// so a blue-grey storm veil and a white blizzard veil both follow what the INI author wrote.
+	Real veilR = 0.62f + 0.38f * wx.m_screenTint.red;
+	Real veilG = 0.62f + 0.38f * wx.m_screenTint.green;
+	Real veilB = 0.62f + 0.38f * wx.m_screenTint.blue;
+
+	Bool usedShader = FALSE;
+
+	if (doCloud)
+	{
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+
+		if (s_ps == WXPS_READY && s_cloudPS != nullptr)
+		{
+			usedShader = TRUE;
+			// uv is the position across the view, 0..1, not a texture lookup: nothing is sampled.
+			BuildBloomQuad(vbQuad, x0, y0, x1, y1, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
+			float c0[4] = { mulR, mulG, mulB, vig };
+			float c1[4] = { aspect, 0.0f, 0.0f, 0.0f };
+			DX8Wrapper::Apply_Render_State_Changes();
+			pDev->SetVertexShader(nullptr);
+			pDev->SetPixelShader(s_cloudPS);
+			pDev->SetPixelShaderConstantF(0, c0, 1);
+			pDev->SetPixelShaderConstantF(1, c1, 1);
+			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+			pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
+			pDev->SetPixelShader(nullptr);
+		}
+		else
+		{
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			DX8Wrapper::Apply_Render_State_Changes();
+			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			WeatherScreenVertex row[2 * WEATHER_GRID_COLS];
+			for (Int r = 0; r + 1 < WEATHER_GRID_ROWS; ++r)
+			{
+				const Real vA = (Real)r / (Real)(WEATHER_GRID_ROWS - 1);
+				const Real vB = (Real)(r + 1) / (Real)(WEATHER_GRID_ROWS - 1);
+				const Real yA = y0 + (y1 - y0) * vA;
+				const Real yB = y0 + (y1 - y0) * vB;
+				for (Int c = 0; c < WEATHER_GRID_COLS; ++c)
+				{
+					const Real u = (Real)c / (Real)(WEATHER_GRID_COLS - 1);
+					const Real x = x0 + (x1 - x0) * u;
+					const Real fa = weatherVignetteFactor(u, vA, aspect, vig);
+					const Real fb = weatherVignetteFactor(u, vB, aspect, vig);
+					Int i = c * 2;
+					row[i].p = D3DXVECTOR4(x, yB, 0.0f, 1.0f);
+					row[i].color = Weather_Pack_Color(mulR * fb, mulG * fb, mulB * fb);
+					row[i + 1].p = D3DXVECTOR4(x, yA, 0.0f, 1.0f);
+					row[i + 1].color = Weather_Pack_Color(mulR * fa, mulG * fa, mulB * fa);
+				}
+				pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
+			}
+		}
+	}
+
+	if (doVeil)
+	{
+		// GeneralsX @bugfix PS3.0 Weather W2 16/10/2026: this used to be ONE/ONE (pure add). With the
+		// recipe densities of the first draft that put up to 0.57 of white on top of the frame wherever a
+		// noise blob sat, so the storm read as glowing cushions of light. Alpha-blended, the same numbers
+		// become a lerp toward the mist colour: bright ground gets dimmed, dark ground gets lifted, and
+		// the whole screen loses a little contrast - which is what haze does.
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+		if (s_ps == WXPS_READY && s_veilPS != nullptr)
+		{
+			usedShader = TRUE;
+			BuildBloomQuad(vbQuad, x0, y0, x1, y1, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
+			float c0[4] = { s_phase, density, flash, aspect };
+			float c1[4] = { veilR, veilG, veilB, 0.0f };
+			DX8Wrapper::Apply_Render_State_Changes();
+			pDev->SetVertexShader(nullptr);
+			pDev->SetPixelShader(s_veilPS);
+			pDev->SetPixelShaderConstantF(0, c0, 1);
+			pDev->SetPixelShaderConstantF(1, c1, 1);
+			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+			pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
+			pDev->SetPixelShader(nullptr);
+		}
+		else
+		{
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			DX8Wrapper::Apply_Render_State_Changes();
+			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			WeatherScreenVertex row[2 * WEATHER_GRID_COLS];
+			for (Int r = 0; r + 1 < WEATHER_GRID_ROWS; ++r)
+			{
+				const Real vA = (Real)r / (Real)(WEATHER_GRID_ROWS - 1);
+				const Real vB = (Real)(r + 1) / (Real)(WEATHER_GRID_ROWS - 1);
+				const Real yA = y0 + (y1 - y0) * vA;
+				const Real yB = y0 + (y1 - y0) * vB;
+				for (Int c = 0; c < WEATHER_GRID_COLS; ++c)
+				{
+					const Real u = (Real)c / (Real)(WEATHER_GRID_COLS - 1);
+					const Real x = x0 + (x1 - x0) * u;
+					// A bolt is uniform, so it rides on every lattice vertex; only the veil is shaped.
+					const Real wa = density * weatherVeilAmount(u, vA, aspect, s_phase);
+					const Real wb = density * weatherVeilAmount(u, vB, aspect, s_phase);
+					Int i = c * 2;
+					row[i].p = D3DXVECTOR4(x, yB, 0.0f, 1.0f);
+					row[i].color = Weather_Pack_Veil(wb, wb + flash, flash, veilR, veilG, veilB);
+					row[i + 1].p = D3DXVECTOR4(x, yA, 0.0f, 1.0f);
+					row[i + 1].color = Weather_Pack_Veil(wa, wa + flash, flash, veilR, veilG, veilB);
+				}
+				pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
+			}
+		}
+	}
+
+	// Put the frame back the way the scene renderer expects it: no blending, depth test on and writing,
+	// and every stage state restored through DX8Wrapper so its cache matches the device again.
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, oldBlendEnable);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, oldSrcBlend);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, oldDstBlend);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, oldZEnable);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, oldZWrite);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, oldZFunc);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, oldAlphaTest);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, oldCull);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, oldFog);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, oldLighting);
+	for (Int s = 0; s < 8; ++s)
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, stageKeys[s], oldStage[s]);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, oldStage1[0]);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_ALPHAOP, oldStage1[1]);
+	if (usedShader)
+		pDev->SetVertexShader(nullptr);	//D18 contract: nothing raw-bound may outlive this call
+	DX8Wrapper::Apply_Render_State_Changes();
+
+	// One line per leg on the first draw of a type, so a capture can tell "weather is off" apart from
+	// "the screen layer ran but the recipe asked for nothing" without reading the whole log.
+	static Int s_lastLoggedType = -1;
+	const Int nowType = (Int)wx.m_type;
+	if (nowType != s_lastLoggedType)
+	{
+		s_lastLoggedType = nowType;
+		fprintf(stderr, "[WXSCREEN] type=%d mul=(%.3f,%.3f,%.3f) vig=%.2f veil=%.2f flash=%.2f leg=%s rect=%dx%d\n",
+			nowType, mulR, mulG, mulB, vig, density, flash,
+			s_ps == WXPS_READY ? "hlsl" : "ff", width, height);
+		fflush(stderr);
+	}
 }
 
 // W3DShaderManager::startRenderToTexture =======================================================

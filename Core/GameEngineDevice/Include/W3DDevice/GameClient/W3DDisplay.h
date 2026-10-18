@@ -90,6 +90,15 @@ public:
 																 UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime//, Bool donut = FALSE
 																 ) override;
 	virtual void setTimeOfDay ( TimeOfDay tod ) override;
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: forward the options-page value to
+	// the shader manager, which owns the live haze state and re-pushes the ramp (see Display.h).
+	virtual void setDistanceHaze ( Bool enabled, Real strength01 ) override;
+	// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs (see Display.h): the three forwards
+	// the graphics options page uses to re-arm the pulse gate, the bloom gain and the sun-shadow
+	// strength without a restart.
+	virtual void setLightPulseEnabled ( Bool enabled ) override;
+	virtual void setBloomIntensity ( Real intensity01 ) override;
+	virtual void setShadowMapStrength ( Real strength01 ) override;
 
 	/// draw a line on the display in screen coordinates
 	virtual void drawLine( Int startX, Int startY, Int endX, Int endY,

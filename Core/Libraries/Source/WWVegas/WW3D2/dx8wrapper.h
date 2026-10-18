@@ -122,6 +122,11 @@ class ZTextureClass;
 class LightClass;
 class SurfaceClass;
 class DX8Caps;
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the fixed-function state block that
+// Backend/VulkanDraw.h defines (and that header is only pulled in by the win64 Vulkan build). Declared
+// here as an incomplete type so this header stays free of the Vulkan seam, exactly like the void*
+// handles the rest of the wedge API uses.
+struct VKDraw_FF_State;
 
 struct DX8FrameStatistics
 {
@@ -368,6 +373,14 @@ public:
 	static void Release_Render_State();
 
 	static void Set_DX8_Material(const D3DMATERIAL9* mat);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: read-side of the material shadow. D3D has no
+	// GetMaterial, and VertexMaterialClass::Apply() pushes the W3D material straight through
+	// Set_DX8_Material to the device, so the fixed-function vertex stage - which needs ambient, diffuse,
+	// specular, emissive and the power term for every lit batch - can only be fed from here. Falls back to
+	// the retail default (the values VertexMaterialClass::Apply_Null installs) until the first material
+	// has been applied, which is also what the D3D9 path draws with in that window.
+	static const D3DMATERIAL9& Peek_DX8_Material();
 
 	static void Set_Gamma(float gamma,float bright,float contrast,bool calibrate=true,bool uselimit=true);
 
@@ -640,6 +653,55 @@ public:
 	static unsigned Get_Pixel_Shader_Constant_Limit() { return Pixel_Shader_Constant_Limit; }
 	static void Report_Shader_Constant_Range(const char* setter,int reg,int count);
 
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0 (pure-Vulkan port): render-state census.
+	// The port has to turn this facade's lazy state replay (Apply_Render_State_Changes) into a bounded
+	// set of Vulkan pipeline state objects, and the only honest way to size that set is to count what
+	// the running game actually asks for. With GENERALSX_VKCENSUS=1 every draw digests the shadow
+	// state into two keys: one that ignores texture stage / sampler state (the PSO key, once stage
+	// state moves into an interpreted pixel shader) and one that includes it. Both are histogrammed,
+	// along with the FVF set, the light-enable masks, the fixed-function vs programmable split, the
+	// combinator op/arg sets and the render-state/stage-state/sampler token sets a translator must
+	// cover. Off, the cost is the touched-token stores below (one byte store per setter call).
+	// Periodic + shutdown dumps land in Vulkan/artifacts/census.csv with a stderr gate line.
+	static void VK_Census_Draw(unsigned prim_type, unsigned short polys, unsigned short verts);
+	static void VK_Census_Dump(const char* reason);
+	static bool VK_Census_On();
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the facade-side submit filler. With the
+	// draw path up (GENERALSX_VKDRAW=1) the indexed-draw sites hand it the batch and this turns the shadow
+	// state (FVF, render states, constants, buffers) into a VKDraw_Submit and records it. It returns true
+	// when the batch was consumed by Vulkan - the caller then skips DX8CALL(DrawIndexedPrimitive) - and
+	// false while the path is off or the batch cannot be backed, in which case the D3D9 call still runs.
+	// 'first_index' and 'base_vertex' are already D3D's StartIndex(+iba_offset) and BaseVertexIndex, so the
+	// vertex/index buffer offsets fold into those and the streams bind at the raw backing offset.
+	static bool VK_Emit_Indexed_Draw(void* vb, void* ib, unsigned primitive_type,
+		unsigned short first_index, unsigned short polygon_count,
+		unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the viewport shadow the submit filler
+	// binds per draw. Vulkan has no device viewport state - the recorder is handed a rectangle with the
+	// batch - so Set_Viewport has to publish it here as well as to D3D9 while both paths are alive.
+	static void VK_Shadow_Viewport(const D3DVIEWPORT9* viewport);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: read one shadowed render state as the value
+	// the device would have used. Invalidate_Cached_Render_States fills RenderStates with the 0x12345678
+	// sentinel, and a slot the game never wrote after that has no shadow at all - which is not zero. See
+	// the implementation for the measurement that makes this more than a tidy-up.
+	static unsigned VK_Read_RS(unsigned token);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the two reads the same sentinel logic needs
+	// for the states that are not plain ordinals - a float carried as its own bit pattern, and a texture
+	// stage register whose documented default is not zero.
+	static unsigned VK_Read_RS_Default_bits(unsigned token, float fallback);
+	static unsigned VK_Read_TSS(unsigned stage, unsigned token, unsigned fallback);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: pack the fixed-function vertex-stage block
+	// (VKDraw_FF_State, the third dynamic uniform of every submit) out of the facade's shadows for one
+	// batch: the three matrices with the ZBias emulation the D3D path applies, the material the engine
+	// last installed, the eight light slots, fog, the material colour sources and the per-stage texture
+	// coordinate generators. A member because the state it reads is protected here.
+	static void VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info);
+
 	static bool Registry_Save_Render_Device( const char * sub_key );
 	static bool Registry_Load_Render_Device( const char * sub_key, bool resize_window );
 
@@ -773,6 +835,10 @@ protected:
 	static UINT_PTR						Vertex_Shader;
 	static UINT_PTR						Pixel_Shader;
 	static IDirect3DVertexDeclaration9*	Vertex_Declaration;
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0/5: Set_Vertex_FVF used to forward straight to
+	// SetFVF, so the facade never knew the current vertex format. The Vulkan PSO key needs it (FVF is
+	// the vertex input layout there, not a device state), and so does the census, so mirror it here.
+	static DWORD							Vertex_Format;
 
 	static Vector4							Vertex_Shader_Constants[MAX_VERTEX_SHADER_CONSTANTS];
 	static Vector4							Pixel_Shader_Constants[MAX_PIXEL_SHADER_CONSTANTS];
@@ -786,6 +852,13 @@ protected:
 
 	static DWORD							Vertex_Processing_Behavior;
 
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: shadow of the last material handed to
+	// Set_DX8_Material. Written unconditionally (a 68-byte copy per material change, against a facade that
+	// already logs thousands of state calls per frame) so the non-Vulkan builds keep identical behaviour -
+	// nothing reads it there.
+	static D3DMATERIAL9					Material_Shadow;
+	static bool								Material_Shadow_Valid;
+
 	static ZTextureClass*				Shadow_Map[MAX_SHADOW_MAPS];
 
 	static Vector3							Ambient_Color;
@@ -796,6 +869,12 @@ protected:
 	// GeneralsX @build d3d9 port 11/10/2026 D3DTSS_CONSTANT=32 needs index 32; sampler states cached separately
 	static unsigned						TextureStageStates[MAX_TEXTURE_STAGES][33];
 	static unsigned						SamplerStates[MAX_TEXTURE_STAGES][16];
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: which token slots the game ever writes. The
+	// census digests only these instead of all 256*33*16 slots, and the translated set is exactly what
+	// wedge 5's state table and wedge 7's interpreted pixel shader have to cover.
+	static unsigned char				VK_RS_Touched[256];
+	static unsigned char				VK_TSS_Touched[33];
+	static unsigned char				VK_Samp_Touched[16];
 	static IDirect3DBaseTexture9 *	Textures[MAX_TEXTURE_STAGES];
 
 	// These fog settings are constant for all objects in a given scene,
@@ -881,6 +960,8 @@ WWINLINE void DX8Wrapper::Set_Vertex_Shader(UINT_PTR vertex_shader)
 // (dx8wrapper.cpp:2740), which is also why W3DTreeBuffer.cpp:1722 rebinds after applying state.
 WWINLINE void DX8Wrapper::Set_Vertex_FVF(DWORD fvf)
 {
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0/5: mirror the format so the facade knows it.
+	Vertex_Format=fvf;
 	DX8CALL(SetFVF(fvf));
 }
 
@@ -1018,8 +1099,18 @@ WWINLINE void DX8Wrapper::Set_DX8_Material(const D3DMATERIAL9* mat)
 {
 	DX8_RECORD_MATERIAL_CHANGE();
 	WWASSERT(mat);
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: mirror the material for the Vulkan
+	// fixed-function vertex stage before handing it to D3D, because this is the only place the W3D
+	// material's resolved D3DMATERIAL9 ever exists in one piece.
+	Material_Shadow = *mat;
+	Material_Shadow_Valid = true;
 	SNAPSHOT_SAY(("DX8 - SetMaterial"));
 	DX8CALL(SetMaterial(mat));
+}
+
+WWINLINE const D3DMATERIAL9& DX8Wrapper::Peek_DX8_Material()
+{
+	return Material_Shadow;
 }
 
 WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT9* light)
@@ -1041,6 +1132,10 @@ WWINLINE void DX8Wrapper::Set_DX8_Light(int index, D3DLIGHT9* light)
 
 WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigned value)
 {
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: mark the slot before the dedupe return so the
+	// census sees every token the game tries to write, not just the ones that changed.
+	VK_RS_Touched[state]=1;
+
 	// Can't monitor state changes because setShader call to GERD may change the states!
 	if (RenderStates[state]==value) return;
 
@@ -1066,6 +1161,11 @@ WWINLINE void DX8Wrapper::Set_DX8_Clip_Plane(DWORD Index, CONST float* pPlane)
 
 WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURESTAGESTATETYPE state, unsigned value)
 {
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: mark the slot before the early-out so a value
+	// that was already correct still shows up in the census token set. D3DTSS ordinals start at 1 and
+	// D3DTSS_CONSTANT is 32, matching the 33-wide cache.
+	if (state > 0 && state < 33) VK_TSS_Touched[state]=1;
+
   	if (stage >= MAX_TEXTURE_STAGES)
   	{	DX8CALL(SetTextureStageState( stage, state, value ));
   		return;
@@ -1094,6 +1194,10 @@ WWINLINE void DX8Wrapper::Set_DX8_Texture_Stage_State(unsigned stage, D3DTEXTURE
 // separate device API with their own numeric space aliasing D3DTSS_*; route them to SetSamplerState.
 WWINLINE void DX8Wrapper::Set_DX8_Sampler_State(unsigned stage, D3DSAMPLERSTATETYPE state, unsigned value)
 {
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: sampler slots feed the immutable-sampler LUT
+	// the Vulkan port needs, so record which D3DSAMP_* tokens the game writes at all.
+	if (state > 0 && state < 16) VK_Samp_Touched[state]=1;
+
   	if (stage >= MAX_TEXTURE_STAGES)
   	{	DX8CALL(SetSamplerState( stage, state, value ));
   		return;

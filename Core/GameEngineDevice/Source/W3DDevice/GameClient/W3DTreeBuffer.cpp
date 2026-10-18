@@ -87,6 +87,9 @@ enum
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/dx8renderer.h"
 #include "WW3D2/matinfo.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: converge the procedural tree atlas into the
+// Vulkan texture mirror (unconditional: the symbol is a no-op unless the win64vk Vulkan core is up).
+#include "WW3D2/Backend/VulkanTexMirror.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "d3dx9tex.h"
@@ -192,6 +195,8 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 	DX8_ErrorCode(surface_level->UnlockRect());
 	surface_level->Release();
 	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, (UINT)0, D3DX_FILTER_BOX));
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the procedurally-built tree atlas.
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	if (WW3D::Get_Texture_Reduction()) {
 		DX8_ErrorCode(Peek_D3D_Texture()->SetLOD((DWORD)WW3D::Get_Texture_Reduction()));
 	}

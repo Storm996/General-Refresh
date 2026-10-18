@@ -50,6 +50,9 @@
 #include "WWLib/simplevec.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/matinfo.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: converge procedural water bump maps into the
+// Vulkan texture mirror (unconditional: the symbol is a no-op unless the win64vk Vulkan core is up).
+#include "WW3D2/Backend/VulkanTexMirror.h"
 
 #include "Common/FramePacer.h"
 #include "Common/GameState.h"
@@ -564,6 +567,9 @@ HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE9 *pTex, TextureClass 
 		REF_PTR_RELEASE (surf);
 	}
 
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the procedurally-built bump atlas.
+	VKTex_Mirror_D3D_Texture(pTex[0]);
+
 #else
 	surf=pBumpSource->Get_Surface_Level();
 	surf->Get_Description(d3dsd);
@@ -644,6 +650,8 @@ HRESULT WaterRenderObjClass::initBumpMap(LPDIRECT3DTEXTURE9 *pTex, TextureClass 
 
     m_pBumpTexture[i]->UnlockRect(0);
     surf->Unlock();
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the procedurally-built bump texture.
+	VKTex_Mirror_D3D_Texture(m_pBumpTexture[i]);
 #endif
 
     return S_OK;

@@ -33,6 +33,12 @@
 #include "GameClient/LampList.h"
 
 #include "Common/INI.h"
+#include "Common/OptionPreferences.h"	// GeneralsX @feature PS3.0 4F 17/10/2026 lazy seed of the lamp gain slider
+
+// GeneralsX @feature Qoder 18/10/2026 getenv()/atoi() for the live lamp gate, fprintf()/fflush() for
+// its one-shot seed evidence line.
+#include <cstdio>
+#include <cstdlib>
 
 // DEFINES ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -90,12 +96,82 @@ static const FieldParse TheLampSetFieldParse[] =
 //-------------------------------------------------------------------------------------------------
 LampStore::LampStore()
 {
+	m_intensityGain = -1.0f;	// GeneralsX @feature PS3.0 4F 17/10/2026 sentinel: seed lazily from the options store
+	m_lampsEnabled = -1;		// GeneralsX @feature Qoder 18/10/2026 sentinel for the on/off half
 }
 
 //-------------------------------------------------------------------------------------------------
 LampStore::~LampStore()
 {
 	m_lampmap.clear();
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 4F 17/10/2026: current lamp brightness gain (1.0 = the original 4B look).
+// GENERALSX_LAMP_INT (float) always wins so QA can A/B without touching Options.ini; otherwise the
+// gain is seeded lazily from the options store (Options.ini LampLightIntensity ticks) on the first
+// lamp frame and live-updated by the Graphics Options slider apply hook afterwards.
+//-------------------------------------------------------------------------------------------------
+Real LampStore::getGlobalIntensityGain() const
+{
+	const char* env = getenv("GENERALSX_LAMP_INT");
+	if (env != nullptr && *env != 0)
+	{
+		Real gain = (Real)atof(env);
+		if (gain < 0.0f) gain = 0.0f;
+		if (gain > 2.0f) gain = 2.0f;
+		return gain;
+	}
+
+	if (m_intensityGain < 0.0f)
+		m_intensityGain = (Real)OptionPreferences().getLampLightIntensity() * 0.01f;
+
+	return m_intensityGain;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 18/10/2026 PS3.0 4E: the live on/off gate for the whole lamp channel
+// (see LampList.h). GENERALSX_LAMPLIGHT resolves once per process into a static - the env block cannot
+// change while the game runs, and a QA leg that sets it must not be overridable from the page.
+// Without an env the gate seeds from Options.ini LampLightEffect on the first lamp frame and the
+// Graphics Options row re-arms it from then on.
+//-------------------------------------------------------------------------------------------------
+static Int LampEnvState()
+{
+	static Int state = 0;		///< 0 = not looked up, 1 = no env, 2 = env OFF, 3 = env ON
+	if (state == 0)
+	{
+		const char* env = getenv("GENERALSX_LAMPLIGHT");
+		if (env == nullptr || *env == 0)
+			state = 1;
+		else
+			state = (atoi(env) != 0) ? 3 : 2;
+	}
+	return state;
+}
+
+void LampStore::setGlobalLampsEnabled( Bool enabled )
+{
+	if (LampEnvState() != 1)
+		return;							// the env leg owns the channel while it is set
+	m_lampsEnabled = (enabled != FALSE) ? 1 : 0;
+}
+
+Bool LampStore::getGlobalLampsEnabled() const
+{
+	const Int envState = LampEnvState();
+	if (envState == 2)
+		return FALSE;
+	if (envState == 3)
+		return TRUE;
+
+	if (m_lampsEnabled < 0)
+	{
+		m_lampsEnabled = (OptionPreferences().getLampLightEnabled() != FALSE) ? 1 : 0;
+		fprintf(stderr, "[LAMP] gate seeded enabled=%d (Options.ini LampLightEffect)\n", m_lampsEnabled);
+		fflush(stderr);
+	}
+	return m_lampsEnabled != 0;
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -156,6 +156,11 @@ protected:
 
 	TileData			*m_sourceTiles[NUM_SOURCE_TILES];	///< Tiles for m_textureClasses
 	TileData			*m_edgeTiles[NUM_SOURCE_TILES];	///< Tiles for m_textureClasses
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: parallel tangent-space normal tiles loaded from
+	// Art/Terrain/<stem>_nm.tga for each diffuse tile sheet. A null entry (or a missing sheet) means
+	// "flat normal" - the atlas packs (0.5,0.5,1) there, so a map without any *_nm asset renders
+	// bit-identical to before this block existed. Only consumed by the ps_3_0 TERRAIN30 leg.
+	TileData			*m_nmTiles[NUM_SOURCE_TILES];	///< Normal-map tiles parallel to m_sourceTiles.
 
 	TBlendTileInfo	m_blendedTiles[NUM_BLEND_TILES];
 	TBlendTileInfo	m_extraBlendedTiles[NUM_BLEND_TILES];
@@ -180,6 +185,11 @@ protected:
 	 texture. */
 	TerrainTextureClass *m_terrainTex;
 	Int	m_terrainTexHeight; /// Height of m_terrainTex allocated.
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: parallel normal atlas, same tile layout as
+	// m_terrainTex (positions come from m_sourceTiles, this one only supplies pixels). Built inside
+	// getTerrainTexture() only when the TERRAIN30 HLSL leg is live and GENERALSX_TERRAIN_NM is on.
+	TerrainTextureClass *m_terrainNMTex;
+	Int	m_terrainNMHeight; /// Height of m_terrainNMTex allocated.
 	/** The texture that contains the alpha edge tiles that get blended on
 			top of the base texture. getAlphaUVData does the mapping. */
 	AlphaTerrainTextureClass *m_alphaTerrainTex;
@@ -202,11 +212,17 @@ protected:
 protected:
 	TileData *getSourceTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_sourceTiles[ndx]); return(nullptr); };
 	TileData *getEdgeTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_edgeTiles[ndx]); return(nullptr); };
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: normal tile for a diffuse tile index, nullptr = flat.
+	TileData *getNMTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_nmTiles[ndx]); return(nullptr); };
 	/// UV mapping data for a cell to map into the terrain texture.
 	void getUVForNdx(Int ndx, float *minU, float *minV, float *maxU, float*maxV);
 	Bool getUVForTileIndex(Int ndx, Short tileNdx, float U[4], float V[4]);
 	Int getTextureClassFromNdx(Int tileNdx);
 	void readTexClass(TXTextureClass *texClass, TileData **tileData);
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: loads <sheet stem>_nm.tga for a texture class into
+	// m_nmTiles at the same tile offsets. Missing file or grid-count mismatch leaves the class null
+	// (= flat normals) and logs one [TNM] line; never a load failure.
+	void readTexNM(TXTextureClass *texClass);
 	Int updateTileTexturePositions(Int *edgeHeight); ///< Places each tile in the texture.
 	void initCliffFlagsFromHeights();
 	void setCellCliffFlagFromHeights(Int xIndex, Int yIndex);
@@ -283,6 +299,10 @@ public:  // height map info.
 public:  // tile and texture info.
 	void setTextureLOD(Int lod);	///< set maximum lod level sent to the hardware.
 	TextureClass *getTerrainTexture();  //< generates if needed and returns the terrain texture
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: the parallel normal atlas (built by
+	// getTerrainTexture when the NM leg is on). Returns nullptr when disabled/unbuilt, which keeps the
+	// TERRAIN30 shader on its no-normal branch and the frame identical to before this feature.
+	TextureClass *getTerrainNormalTexture();
 	TextureClass *getAlphaTerrainTexture(); //< generates if needed and returns alpha terrain texture
 	TextureClass *getEdgeTerrainTexture(); //< generates if needed and returns blend edge texture
 	/// UV mapping data for a cell to map into the terrain texture.  Returns true if the textures had to be stretched for cliffs.

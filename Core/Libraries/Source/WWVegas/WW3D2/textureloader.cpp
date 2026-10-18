@@ -59,9 +59,76 @@
 #include "ddsfile.h"
 #include "bitmaphandler.h"
 #include "WWDebug/wwprofile.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.2: texture mirror bridge (win64vk port tree only)
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanGeo.h"
+#include "Backend/VulkanTexMirror.h"
+#endif
 
 bool TextureLoader::TextureLoadSuspended;
 int TextureLoader::TextureInactiveOverrideTime = 0;
+
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: shared mirror entry for procedural textures.
+// Defined unconditionally so z_gameenginedevice (which is NOT built with SAGE_USE_VULKAN_CORE) can
+// link and call it; the real body only exists in the win64vk port tree, else it is a no-op.
+// Derives dimensions/format from the D3D texture itself, re-locks every mip READONLY and feeds the
+// keyed Vulkan upload. The disk loader path stays where it is (it already has Width/Height/Format in
+// hand and its texels are final the moment it unlocks); this is what the game-device writers call.
+bool VKTex_Mirror_D3D_Texture(void* d3d_texture)
+{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (!VKTex_Ready() || !d3d_texture) return false;
+
+	IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(d3d_texture);
+	const UINT levels = tex->GetLevelCount();
+	if (levels == 0 || levels > 16) return false;
+
+	D3DSURFACE_DESC desc0;
+	if (FAILED(tex->GetLevelDesc(0, &desc0))) return false;
+	const WW3DFormat fmt = D3DFormat_To_WW3DFormat(desc0.Format);
+
+	VKTex_Mip_Source src[16];
+	bool all_locked = true;
+	for (UINT i = 0; i < levels; ++i)
+	{
+		D3DLOCKED_RECT lr;
+		src[i].bits = nullptr; src[i].pitch = 0;
+		if (SUCCEEDED(tex->LockRect(i, &lr, nullptr, D3DLOCK_READONLY)))
+		{
+			src[i].bits = (const unsigned char*)lr.pBits;
+			src[i].pitch = (unsigned int)lr.Pitch;
+		}
+		else all_locked = false;
+	}
+
+	bool mirrored = false;
+	if (all_locked)
+		mirrored = VKTex_Upload_2D(d3d_texture, desc0.Width, desc0.Height, levels, (int)fmt, src);
+
+	for (UINT i = 0; i < levels; ++i)
+	{
+		if (src[i].bits) tex->UnlockRect(i);
+	}
+
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: release-visible console evidence that a
+	// procedural (non-loader) texture actually reached the Vulkan mirror - the only way to tell the
+	// dynamic convergence apart from the disk-loader uploads in a forensic run.
+	{
+		static unsigned long s_dynMirrorCalls = 0;
+		++s_dynMirrorCalls;
+		if (mirrored && (s_dynMirrorCalls <= 8 || (s_dynMirrorCalls % 64) == 0))
+		{
+			fprintf(stderr, "[VKWP1] dyn mirror #%u: %ux%u levels=%u ww3dfmt=%d key=%p\n",
+				s_dynMirrorCalls, (unsigned)desc0.Width, (unsigned)desc0.Height, (unsigned)levels, (int)fmt, d3d_texture);
+			fflush(stderr);
+		}
+	}
+	return mirrored;
+#else
+	(void)d3d_texture;
+	return false;
+#endif
+}
 
 #define USE_MANAGED_TEXTURES
 
@@ -1773,6 +1840,33 @@ void TextureLoadTaskClass::Unlock_Surfaces()
 		}
 		LockedSurfacePtr[i] = nullptr;
 	}
+
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.2: the MANAGED shadow now holds final texels;
+	// mirror them into a device-local VkImage (env GENERALSX_VKTEX) before the D3D9 object continues
+	// its (presentation-invisible) life. Re-lock READONLY per level, one packed feed, one fence-wait.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (VKTex_Ready() && MipLevelCount <= 16)
+	{
+		VKTex_Mip_Source src[16];
+		bool all_locked = true;
+		for (unsigned int i = 0; i < MipLevelCount; ++i)
+		{
+			D3DLOCKED_RECT lr;
+			src[i].bits = nullptr; src[i].pitch = 0;
+			if (SUCCEEDED(Peek_D3D_Texture()->LockRect(i, &lr, nullptr, D3DLOCK_READONLY)))
+			{
+				src[i].bits = (const unsigned char*)lr.pBits;
+				src[i].pitch = (unsigned int)lr.Pitch;
+			}
+			else all_locked = false;
+		}
+		if (all_locked) VKTex_Upload_2D((void*)Peek_D3D_Texture(), Width, Height, MipLevelCount, (int)Format, src);
+		for (unsigned int i = 0; i < MipLevelCount; ++i)
+		{
+			if (src[i].bits) Peek_D3D_Texture()->UnlockRect(i);
+		}
+	}
+#endif
 
 #ifndef USE_MANAGED_TEXTURES
 	IDirect3DTexture9* tex = DX8Wrapper::_Create_DX8_Texture(Width, Height, Format, Texture->MipLevelCount,D3DPOOL_DEFAULT);

@@ -43,6 +43,10 @@
 #include "dx8wrapper.h"
 #include "dx8fvf.h"
 #include "dx8caps.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: geometry ring bridge (win64vk port tree only)
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanGeo.h"
+#endif
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
 #include <d3dx9core.h>
@@ -97,6 +101,11 @@ VertexBufferClass::VertexBufferClass(unsigned type_, unsigned FVF, unsigned shor
 	_VertexBufferCount++;
 	_VertexBufferTotalVertices+=VertexCount;
 	_VertexBufferTotalSize+=VertexCount*fvf_info->Get_FVF_Size();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A forensics: pair with the backing create/drop
+	// trace so a buffer that never gets a backing is distinguishable from one whose backing was dropped.
+	if (type == BUFFER_TYPE_DX8) VKGeo_Trace_Buffer(this, FVF, VertexCount, 1);
+#endif
 #ifdef VERTEX_BUFFER_LOG
 	WWDEBUG_SAY(("New VB, %d vertices, size %d bytes",VertexCount,VertexCount*fvf_info->Get_FVF_Size()));
 	WWDEBUG_SAY(("Total VB count: %d, total %d vertices, total size %d bytes",
@@ -110,6 +119,13 @@ VertexBufferClass::VertexBufferClass(unsigned type_, unsigned FVF, unsigned shor
 
 VertexBufferClass::~VertexBufferClass()
 {
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: the wedge-5 backing is keyed by this
+	// object's address, so it must die with the object - otherwise a buffer that is later allocated at
+	// the same address inherits this one's VkBuffer and draws its stale geometry.
+	VKGeo_Back_Drop(this);
+	VKGeo_Trace_Buffer(this, fvf_info ? fvf_info->Get_FVF() : 0u, VertexCount, 0);
+#endif
 	_VertexBufferCount--;
 	_VertexBufferTotalVertices-=VertexCount;
 	_VertexBufferTotalSize-=VertexCount*fvf_info->Get_FVF_Size();
@@ -182,6 +198,31 @@ VertexBufferClass::WriteLockClass::WriteLockClass(VertexBufferClass* VertexBuffe
 		}
 #endif
 		DX8_Assert();
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: with the Vulkan geometry ring up
+		// (GENERALSX_VKGEO=1), vertex data is written straight into host-visible VkDeviceMemory
+		// and the D3D9 lock is skipped; D3D9 presentation is already intercepted at wedge 2.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		{
+			unsigned geo_size = VertexBuffer->Get_Vertex_Count() * VertexBuffer->FVF_Info().Get_FVF_Size();
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: once the draw path is up the
+			// batch needs the (VkBuffer, offset) THIS lock wrote, and it has to stay valid until the draw
+			// reads it - wedge 3.1's shared bump ring gave every lock a new offset and can't back that.
+			// The per-object backing is keyed by the WW3D buffer object itself.
+			Vertices = VKGeo_Back_Lock(VertexBuffer, geo_size, VertexBuffer->FVF_Info().Get_FVF_Size(), 0,
+				(flags & D3DLOCK_DISCARD) != 0);
+			if (Vertices) {
+				vk_mirrored = true;
+				break;
+			}
+			if (VKGeo_Ready(geo_size)) {
+				Vertices = VKGeo_Alloc(geo_size, (flags & D3DLOCK_DISCARD) != 0);
+				if (Vertices) {
+					vk_mirrored = true;
+					break;
+				}
+			}
+		}
+#endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
 			0,
 			0,
@@ -204,10 +245,13 @@ VertexBufferClass::WriteLockClass::~WriteLockClass()
 	DX8_THREAD_ASSERT();
 	switch (VertexBuffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 3.1: ring write, no D3D9 resource was locked
+#endif
+		DX8_Assert();
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
 #endif
-		DX8_Assert();
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
 		break;
 	case BUFFER_TYPE_SORTING:
@@ -248,6 +292,31 @@ VertexBufferClass::AppendLockClass::AppendLockClass(VertexBufferClass* VertexBuf
 		}
 #endif
 		DX8_Assert();
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: mirror partial append into a fresh
+		// full-buffer-sized ring region so the write lands at base + start_index*fvf.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		{
+			unsigned fvf_size = VertexBuffer->FVF_Info().Get_FVF_Size();
+			unsigned geo_size = VertexBuffer->Get_Vertex_Count() * fvf_size;
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: an append writes into the same
+			// per-object backing as the full lock, so several appends of one buffer converge in one VkBuffer
+			// instead of scattering across the bump ring.
+			char* back_base = (char*)VKGeo_Back_Lock(VertexBuffer, geo_size, fvf_size, 0, false);
+			if (back_base) {
+				vk_mirrored = true;
+				Vertices = back_base + start_index * fvf_size;
+				break;
+			}
+			if (VKGeo_Ready(geo_size)) {
+				char* ring_base = (char*)VKGeo_Alloc(geo_size, false);
+				if (ring_base) {
+					vk_mirrored = true;
+					Vertices = ring_base + start_index * fvf_size;
+					break;
+				}
+			}
+		}
+#endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
 			start_index*VertexBuffer->FVF_Info().Get_FVF_Size(),
 			index_range*VertexBuffer->FVF_Info().Get_FVF_Size(),
@@ -270,6 +339,9 @@ VertexBufferClass::AppendLockClass::~AppendLockClass()
 	DX8_THREAD_ASSERT();
 	switch (VertexBuffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 3.1: ring write, no D3D9 resource was locked
+#endif
 		DX8_Assert();
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
@@ -876,7 +948,7 @@ void DynamicVBAccessClass::Allocate_Sorting_Dynamic_Buffer()
 static int dx8_lock;
 DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynamic_vb_access_)
 	:
-	DynamicVBAccess(dynamic_vb_access_)
+	DynamicVBAccess(dynamic_vb_access_), vk_mirrored(false)
 {
 	DX8_THREAD_ASSERT();
 	switch (DynamicVBAccess->Get_Type()) {
@@ -898,6 +970,24 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 //		WWASSERT(!_DynamicDX8VertexBuffer->Engine_Refs());
 
 		DX8_Assert();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: the dynamic pool is one shared buffer
+		// that many batches append to within a frame, which is exactly what the rotating backing is for:
+		// the whole pool surface is mapped per frame slot, so a batch the game queued three frames ago is
+		// still readable while this frame's writes go to their own slot. The pool offset is not folded in
+		// here - DrawIndexedPrimitive carries it as BaseVertexIndex and the submit filler passes it on.
+		{
+			const unsigned fvf_size = DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size();
+			const unsigned geo_size = DynamicVBAccess->VertexBuffer->Get_Vertex_Count() * fvf_size;
+			char* slot = (char*)VKGeo_Back_Lock(DynamicVBAccess->VertexBuffer, geo_size, fvf_size, 1,
+				DynamicVBAccess->VertexBufferOffset == 0);
+			if (slot) {
+				vk_mirrored = true;
+				Vertices = (VertexFormatXYZNDUV2*)(slot + DynamicVBAccess->VertexBufferOffset * fvf_size);
+				break;
+			}
+		}
+#endif
 		// Lock with discard contents if the buffer offset is zero
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
 			DynamicVBAccess->VertexBufferOffset*_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
@@ -923,6 +1013,9 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 	DX8_THREAD_ASSERT();
 	switch (DynamicVBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 5.A: wrote the backing, the D3D9 pool was never locked
+#endif
 #ifdef VERTEX_BUFFER_LOG
 		dx8_lock--;
 		WWASSERT(!dx8_lock);

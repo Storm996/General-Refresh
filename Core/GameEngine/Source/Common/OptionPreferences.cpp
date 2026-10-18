@@ -1161,11 +1161,18 @@ Real OptionPreferences::getBloomIntensity() const
 
 Bool OptionPreferences::getMultiLightEnabled() const
 {
+	// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): the multi-light family is
+	// no longer a user preference. It is a permanently-on layer of the merged per-pixel base, and its
+	// menu row carried apply = nullptr, so flipping it never did anything to a running client anyway.
+	// The ini key is therefore NOT read any more (a stale MultiLightEffect=0 from an older Options.ini
+	// must not silently kill the lamp/GGX path), and the menu widget has left GraphicsOptions.wnd with
+	// it. GENERALSX_MULTILIGHT=0 stays as the scripted A/B back door - that is the one supported way
+	// down, and it keeps working for the forensics harness.
 	const char* env = getenv("GENERALSX_MULTILIGHT");
 	if (env != nullptr && strcmp(env, "0") == 0)
 		return FALSE;
 
-	return (getInt("MultiLightEffect", 1) != 0) ? TRUE : FALSE;
+	return TRUE;
 }
 
 Bool OptionPreferences::getShadowMapEnabled() const
@@ -1215,5 +1222,160 @@ Int OptionPreferences::getPresentInterval() const
 		return v;
 	}
 	return (getInt("VSync", 1) != 0) ? 1 : 0;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 4E 17/10/2026 lighting stage-four switches for the Graphics Options page.
+// Each getter keeps the historical GENERALSX_* env semantics (the QA legs built in 4A/4B/4C keep
+// working unchanged) and adds the user-facing Options.ini key as the fallback.
+//-------------------------------------------------------------------------------------------------
+Bool OptionPreferences::getLightPulseEnabled() const
+{
+	const char* env = getenv("GENERALSX_LIGHTPULSE");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0) ? TRUE : FALSE;
+
+	return (getInt("LightPulseEffect", 1) != 0) ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getLampLightEnabled() const
+{
+	const char* env = getenv("GENERALSX_LAMPLIGHT");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0) ? TRUE : FALSE;
+
+	return (getInt("LampLightEffect", 1) != 0) ? TRUE : FALSE;
+}
+
+// GeneralsX @feature PS3.0 4F 17/10/2026: building-lamp brightness gain. Stored as ticks 0-200
+// (100 = 1.0x, the raw 4B INI look); GENERALSX_LAMP_INT carries the float gain for scripted A/B.
+// Factory default is 60 = 0.6x: the unscaled lamps washed whole facades white (user report).
+Int OptionPreferences::getLampLightIntensity() const
+{
+	const char* env = getenv("GENERALSX_LAMP_INT");
+	if (env != nullptr && *env != 0)
+	{
+		Real gain = (Real)atof(env);
+		if (gain < 0.0f)
+			gain = 0.0f;
+		if (gain > 2.0f)
+			gain = 2.0f;
+		return (Int)(gain * 100.0f + 0.5f);
+	}
+
+	Int tick = getInt("LampLightIntensity", 60);
+	if (tick < 0)
+		tick = 0;
+	if (tick > 200)
+		tick = 200;
+	return tick;
+}
+
+Bool OptionPreferences::getPBRMLEnabled() const
+{
+	// Same env contract as the WW3D2 library gate: only the literal "0" forces OFF, any other
+	// value forces ON, unset falls through to the ini key (default ON, retail-stage-4 shipped state).
+	const char* env = getenv("GENERALSX_PBRML");
+	if (env != nullptr && *env != 0)
+		return (strcmp(env, "0") == 0) ? FALSE : TRUE;
+
+	return (getInt("PBRMultiLight", 1) != 0) ? TRUE : FALSE;
+}
+
+// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the P3-14 distance haze as two
+// Graphics Options rows. ini keys DistanceHaze (0/1, default ON = the shipped look) and
+// DistanceHazeIntensity (ticks 0-100, i.e. 0.0-1.0 blend strength, default 60). GENERALSX_GNFOG stays
+// authoritative for scripted A/B: the value is a float 0..1, "0" forces the feature off AND strength 0,
+// anything else forces ON at that strength - so a QA leg never has to touch the user's Options.ini.
+Bool OptionPreferences::getDistanceHazeEnabled() const
+{
+	const char* env = getenv("GENERALSX_GNFOG");
+	if (env != nullptr && *env != 0)
+		return (atof(env) > 0.0) ? TRUE : FALSE;
+
+	return (getInt("DistanceHaze", 1) != 0) ? TRUE : FALSE;
+}
+
+Int OptionPreferences::getDistanceHazeIntensity() const
+{
+	const char* env = getenv("GENERALSX_GNFOG");
+	if (env != nullptr && *env != 0)
+	{
+		Real gain = (Real)atof(env);
+		if (gain < 0.0f)
+			gain = 0.0f;
+		if (gain > 1.0f)
+			gain = 1.0f;
+		return (Int)(gain * 100.0f + 0.5f);
+	}
+
+	Int tick = getInt("DistanceHazeIntensity", 60);
+	if (tick < 0)
+		tick = 0;
+	if (tick > 100)
+		tick = 100;
+	return tick;
+}
+
+Int OptionPreferences::getTodPreview() const
+{
+	const char* env = getenv("GENERALSX_TOD_OVERRIDE");
+	Int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("TimeOfDayPreview", 0);
+	if (v < 0 || v > 4)
+		v = 0;	// 0 = follow the map's own time of day
+	return v;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature PS3.0 L2.2 17/10/2026: TERRAIN30 (ps_3_0 HLSL terrain trio) opt-in for the
+// Graphics Options page. Env GENERALSX_TERRAIN30 keeps its QA meaning and wins whenever present;
+// otherwise the ini key decides. Factory default OFF preserves the batch22 retail-parity verdict
+// (the FF/.pso leg stays the shipping path unless the user explicitly opts in). Consumers re-read
+// this at terrain shader init, so toggling takes effect on restart - same convention as the other
+// once-per-process rows on the page.
+//-------------------------------------------------------------------------------------------------
+Bool OptionPreferences::getTerrain30Shading() const
+{
+	const char* env = getenv("GENERALSX_TERRAIN30");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0 || strcmp(env, "0") != 0) ? TRUE : FALSE;
+
+	return (getInt("Terrain30Shading", 0) != 0) ? TRUE : FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal child switch. Env
+// GENERALSX_TERRAIN_PPL wins for QA legs; otherwise the ini key decides, factory default OFF. This is
+// strictly a CHILD of Terrain30Shading (the batch22 retail-parity red line): the consumer only reaches
+// it after the HLSL trio gate has already passed, so turning this on can never flip the terrain default.
+// Read at terrain shader init, so toggling takes effect on restart - same convention as the parent.
+//-------------------------------------------------------------------------------------------------
+Bool OptionPreferences::getTerrainPerPixel() const
+{
+	const char* env = getenv("GENERALSX_TERRAIN_PPL");
+	if (env != nullptr && *env != 0)
+		return atoi(env) != 0 ? TRUE : FALSE;
+
+	return (getInt("TerrainPerPixel", 0) != 0) ? TRUE : FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 17/10/2026: per-pixel lighting master switch (光影T0阶段 line). The pass
+// itself is DX8GeomNormal - it re-lights rigid meshes per pixel against the interpolated geometric
+// normal, and since 14/10 it also carries the sun shadow reception, the 8-light lambert loop and the
+// eye-depth haze. Before this row it was only reachable through GENERALSX_GEOMNORMAL read once at
+// shader install, which made the shipping default invisible to the player and impossible to A/B from
+// inside the game. The env keeps the exact legacy semantics (any value that is not "0" enables, so a
+// scripted run never touches Options.ini); otherwise ini PerPixelLighting decides, default ON = the
+// state every player has been getting. Live apply, unlike the terrain row above: the renderer consults
+// Ready_To_Render() per batch.
+//-------------------------------------------------------------------------------------------------
+Bool OptionPreferences::getPerPixelLighting() const
+{
+	const char* env = getenv("GENERALSX_GEOMNORMAL");
+	if (env != nullptr && *env != 0)
+		return (strcmp(env, "0") != 0) ? TRUE : FALSE;
+
+	return (getInt("PerPixelLighting", 1) != 0) ? TRUE : FALSE;
 }
 

@@ -2037,7 +2037,13 @@ void W3DView::draw()
 
 		if (m_isWireFrameEnabled)
 			W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_CLEAR_LINE);
+		// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: the batches the custom shader
+		// families decline only join the horizon through D3D's own fog states, so arm them for the 3D
+		// scene and nothing else - the 2D scene, UI, mouse and the filter passes below stay outside.
+		// No-ops while the graphics-page 距离雾 switch is off or at strength 0.
+		W3DShaderManager::beginFixedFunctionHaze();
 		W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		W3DShaderManager::endFixedFunctionHaze();
 		W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_DISABLE);
 		m_isWireFrameEnabled = m_nextWireFrameEnabled;
 
@@ -2088,10 +2094,20 @@ void W3DView::draw()
 		///@todo: Don't clear z-buffer unless shader uses z-bias or anything else that would cause <= z to fail on normal render.
 		DX8Wrapper::Clear(false, true, Vector3(0.0f,0.0f,0.0f), TheWaterTransparency->m_minWaterOpacity);	// Clear z but not color
 		W3DDisplay::m_3DScene->setCustomPassMode(SCENE_PASS_DEFAULT);
+		W3DShaderManager::beginFixedFunctionHaze();		// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage (see the main pass above)
 		W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		W3DShaderManager::endFixedFunctionHaze();
 		Coord2D deltaScroll;
 		W3DShaderManager::filterPostRender(m_viewFilter, m_viewFilterMode, deltaScroll, doExtraRender);
 	}
+
+	// GeneralsX @feature PS3.0 Weather W2 16/10/2026 the screen half of the weather system: cloud-cover
+	// multiply, then the additive mist veil and lightning flash. Placed here - after every filter pass has
+	// handed the scene back and before the overlays and the 2D scene - so weather dims the world but never
+	// the path debug lines, the status bars or the user interface, and composes with bloom instead of
+	// competing for the single filter slot. Tactical view only: the quads are sized from TheTacticalView.
+	if (this == TheTacticalView)
+		W3DShaderManager::drawWeatherScreen();
 
 	if( TheGlobalData->m_debugAI )
 	{

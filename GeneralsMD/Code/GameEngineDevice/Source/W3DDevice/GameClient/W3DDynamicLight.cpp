@@ -51,7 +51,10 @@ void W3DDynamicLight::On_Frame_Update()
 	if (m_curIncreaseFrameCount>0 && m_increaseFrameCount>0) {
 		// increasing
 		m_curIncreaseFrameCount--;
-		factor = (m_increaseFrameCount-m_curIncreaseFrameCount)/(Real)m_increaseFrameCount;
+		Real x = (m_increaseFrameCount-m_curIncreaseFrameCount)/(Real)m_increaseFrameCount;
+		// GeneralsX @tweak PS3.0 4G 17/10/2026 smoothstep rise: the linear ramp read as an instant
+		// full-brightness pop at typical 2-4 frame increase times; x*x*(3-2x) starts and ends soft.
+		factor = x*x*(3.0f-2.0f*x);
 
 	}	else if (m_decayFrameCount==0) {
 		factor = 1.0;  // never decays,
@@ -61,7 +64,11 @@ void W3DDynamicLight::On_Frame_Update()
 			m_enabled = false;
 			return;
 		}
-		factor = m_curDecayFrameCount/(Real)m_decayFrameCount;
+		// GeneralsX @tweak PS3.0 4G 17/10/2026 smoothstep fall: linear decay kept brightness high
+		// then dropped a whole 1/decayTime step every frame, ending in a visible snap-to-black;
+		// the same eased curve fades the tail out progressively.
+		Real x = m_curDecayFrameCount/(Real)m_decayFrameCount;
+		factor = x*x*(3.0f-2.0f*x);
 	}
 	if (m_decayRange) {
 		this->FarAttenEnd = factor*m_targetRange;

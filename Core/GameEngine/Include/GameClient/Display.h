@@ -133,6 +133,20 @@ public:
 	virtual void step() {}; ///< Do one fixed time step
 	virtual void draw() override;																		///< Redraw the entire display
 	virtual void setTimeOfDay( TimeOfDay tod ) = 0;								///< Set the time of day for this display
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the graphics options page owns the
+	// P3-14 distance haze (enabled + 0..1 blend strength). The 3D display re-pushes the ramp so the
+	// change lands on the next draw - the options page is an overlay over a live battlefield, so the
+	// player previews what they are dragging. No-op default: the 2D/window displays have no haze.
+	virtual void setDistanceHaze( Bool enabled, Real strength01 ) {};
+	// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: three more rows the graphics
+	// options page now owns without a restart, all following the setDistanceHaze route above (the page
+	// is an overlay over a live battlefield, so the player previews what they dragged). The 3D display
+	// forwards each one to the layer that actually reads the value; the env QA legs keep winning
+	// inside the seed, so a scripted parity run is never moved by the menu. No-op defaults: the
+	// 2D/window displays have no pulses, no bloom and no sun shadow map.
+	virtual void setLightPulseEnabled( Bool enabled ) {};		///< stage-4A explosion/muzzle light pulses
+	virtual void setBloomIntensity( Real intensity01 ) {};		///< programmable bloom composite gain
+	virtual void setShadowMapStrength( Real strength01 ) {};	///< sun shadow map darkening strength
 	virtual void createLightPulse( const Coord3D *pos, const RGBColor *color, Real innerRadius,Real attenuationWidth,
 																 UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime//, Bool donut = FALSE
 																 ) = 0;

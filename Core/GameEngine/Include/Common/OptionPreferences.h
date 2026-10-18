@@ -156,11 +156,42 @@ public:
 	// env still wins outright so scripted A/B runs never touch the user's file.
 	Int getPBRMode() const;
 	Real getBloomIntensity() const;				///< tick 0-100 stored, returned 0.0-1.0; env GENERALSX_BLOOM_INTENSITY wins outright (default 0.35)
-	Bool getMultiLightEnabled() const;			///< env GENERALSX_MULTILIGHT=0 forces OFF, else ini MultiLightEffect (default ON)
+	Bool getMultiLightEnabled() const;			///< PS3.0 P3 follow-up: always ON, the ini key and the menu row are gone; env GENERALSX_MULTILIGHT=0 is the only way down
 	Bool getShadowMapEnabled() const;			///< any GENERALSX_SHADOWMAP with atoi>0 forces ON / =0 forces OFF, else ini ShadowMap (default OFF)
 	Int getShadowMapIntensity() const;			///< 0-100 percent; env GENERALSX_SHADOWMAP_INT wins when set (default 55)
 	Int getSunShadowMapResolution() const;		///< one of 256/512/1024, snap-up (default 1024)
 	Int getPresentInterval() const;				///< GeneralsX @feature PS3.0-P3-25a vsync ticks 0..3; env GENERALSX_SWAPINTERVAL wins, else ini VSync (default 1 = on). Restart to take effect.
+	// GeneralsX @feature PS3.0 4E 17/10/2026 lighting stage-four switches for the Graphics Options page.
+	// Same S-family rules: Options.ini only, never folded into m_iniCRC (replay/LAN safe), and the
+	// GENERALSX_* QA env overrides keep winning inside these getters so A/B scripts never touch the file.
+	Bool getLightPulseEnabled() const;			///< 4A explosion/muzzle dynamic light pulses; env GENERALSX_LIGHTPULSE wins, else ini LightPulseEffect (default ON)
+	Bool getLampLightEnabled() const;			///< 4B building lamps; env GENERALSX_LAMPLIGHT wins, else ini LampLightEffect (default ON)
+	Int getLampLightIntensity() const;			///< 4F lamp brightness gain; tick 0-200 stored, 100 = 1.0x; env GENERALSX_LAMP_INT (float) wins (default 60 = 0.6x)
+	Bool getPBRMLEnabled() const;				///< 4C GGX multi-light specular; env GENERALSX_PBRML ("0" forces off) wins, else ini PBRMultiLight (default ON)
+	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the P3-14 distance haze gets its
+	// own page rows. ini DistanceHaze (0/1, default ON) + DistanceHazeIntensity (ticks 0-100 = the
+	// 0.0-1.0 blend strength, default 60); env GENERALSX_GNFOG (float 0..1) wins over both so QA legs
+	// never edit the user's file, and 0 there means "off AND strength 0" for a bit-exact parity run.
+	Bool getDistanceHazeEnabled() const;
+	Int getDistanceHazeIntensity() const;		///< 0-100 percent haze blend at the far end of the ramp.
+	Int getTodPreview() const;					///< 4C time-of-day preview 0 = follow the map, 1..4 force a slot; env GENERALSX_TOD_OVERRIDE wins, else ini TimeOfDayPreview
+	// GeneralsX @feature PS3.0 L2.2 17/10/2026: HLSL terrain trio (TERRAIN30) opt-in from the Graphics
+	// Options page; env GENERALSX_TERRAIN30 keeps winning for QA legs, else ini Terrain30Shading
+	// (default OFF = retail FF/.pso parity, the batch22 verdict). Restart to re-install the trio.
+	Bool getTerrain30Shading() const;
+	// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal child switch (B5 slot).
+	// env GENERALSX_TERRAIN_PPL wins for QA legs, else ini TerrainPerPixel (factory default OFF = the L2.1
+	// NM trio parity). CHILD of Terrain30Shading: it never arms anything on its own - the HLSL terrain trio
+	// must already be opted in (batch22 retail-parity red line, default untouched). Restart (terrain shader
+	// re-init) to take effect, same convention as the parent row.
+	Bool getTerrainPerPixel() const;
+	// GeneralsX @feature Qoder 17/10/2026: per-pixel lighting master switch (the DX8GeomNormal pass)
+	// from the Graphics Options page row "逐像素光照". env GENERALSX_GEOMNORMAL keeps winning for QA legs
+	// ("0" = off, anything else = on), else ini PerPixelLighting (default ON = the 14/10 shipping state).
+	// Live: the renderer asks DX8GeomNormal::Ready_To_Render() per batch, so no restart is needed.
+	// Orthogonal to UseNormalMapping / RoughnessMapping / NormalMapStrength - those stay companion
+	// layers mounted per asset, this one only decides fixed-function vs per-pixel lighting.
+	Bool getPerPixelLighting() const;
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int getSkirmishTickRate() const;
 };

@@ -72,6 +72,8 @@ public:
 	{
 		IndexBufferClass* index_buffer;
 		unsigned short* indices;
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: ring mirror flag (see VertexBufferLockClass)
+		bool vk_mirrored;
 	public:
 		WriteLockClass(IndexBufferClass* index_buffer, int flags=0);
 		~WriteLockClass();
@@ -83,6 +85,7 @@ public:
 	{
 		IndexBufferClass* index_buffer;
 		unsigned short* indices;
+		bool vk_mirrored;	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: ring mirror flag
 	public:
 		AppendLockClass(IndexBufferClass* index_buffer,unsigned start_index, unsigned index_range);
 		~AppendLockClass();
@@ -137,6 +140,9 @@ public:
 	{
 		DynamicIBAccessClass* DynamicIBAccess;
 		unsigned short* Indices;
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: dynamic index pool written through
+		// the rotating geometry backing; the destructor then skips the D3D9 Unlock. See the vertex side.
+		bool vk_mirrored;
 	public:
 		WriteLockClass(DynamicIBAccessClass* ib_access);
 		~WriteLockClass();

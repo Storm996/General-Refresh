@@ -28,6 +28,9 @@
 
 // GeneralsX @feature PS3.0-P3-26 14/10/2026 V2: snow receives scene light + per-flake sway phase.
 #include "Common/GlobalData.h"
+// GeneralsX @feature PS3.0 Weather W1/W3 16/10/2026: the render-side weather scalars (tint, flash
+// envelope) that tint the whole particle batch, plus the recipe profile accessors.
+#include "GameClient/WeatherFX.h"
 
 // GeneralsX @feature PS3.0-P3-26: deterministic per-flake sway phase in [0,2pi). The retail phase is
 // the emitter column index, so every flake in a column sways as one sheet (visible banding). A cheap
@@ -53,8 +56,52 @@ static bool Snow_Sway_On()
 
 // GeneralsX @feature PS3.0-P3-26: quad vertex tint from the same time-of-day pair the tracks use
 // (terrain ambient + half key). Retail leaves it 0xffffffff so snow ignores the scene light entirely.
-// Clamped to [0.45,1] per channel: snow stays recognisable at night without going pitch black.
 // GENERALSX_SNOW_LIT=0 restores 0xffffffff bit-for-bit.
+// GeneralsX @feature PS3.0 Weather W1/W3 16/10/2026: the same tint is now shared by every weather
+// primitive and gains two weather terms:
+//   - the recipe's own particle tint (cold blue for rain, bright white for a blizzard), and
+//   - the lightning envelope, so the falling sheet brightens for the two frames a bolt burns.
+// The per-channel floor is the recipe's MinSceneShade (0.45 = the old literal, so the retail snow
+// look is unchanged). Particles are drawn PRELIT_DIFFUSE (the vertex color IS the final color), so
+// this is a whole-batch tint decided once per frame rather than per-flake lighting - per-particle
+// lighting is not expressible in the fixed pipeline here.
+static void Weather_Shade_RGB(Real shade[3])
+{
+	shade[0] = shade[1] = shade[2] = 1.0f;
+
+	static bool litOn = [] {
+		const char* ev = getenv("GENERALSX_SNOW_LIT");
+		return ev == nullptr || strcmp(ev, "0") != 0;
+	}();
+	if (!litOn || !TheGlobalData || TheWeatherSetting == nullptr) return;
+
+	shade[0] = TheGlobalData->m_terrainAmbient[0].red + TheGlobalData->m_terrainDiffuse[0].red * 0.5f;
+	shade[1] = TheGlobalData->m_terrainAmbient[0].green + TheGlobalData->m_terrainDiffuse[0].green * 0.5f;
+	shade[2] = TheGlobalData->m_terrainAmbient[0].blue + TheGlobalData->m_terrainDiffuse[0].blue * 0.5f;
+
+	// GeneralsX @feature PS3.0 Weather W1: recipe tint, then the floor/clamp.
+	shade[0] *= TheWeatherSetting->m_particleTint.red;
+	shade[1] *= TheWeatherSetting->m_particleTint.green;
+	shade[2] *= TheWeatherSetting->m_particleTint.blue;
+
+	const Real flash = weatherRenderState().m_flash * 0.85f;
+	for (Int i = 0; i < 3; i++) {
+		shade[i] += flash;
+		if (shade[i] < TheWeatherSetting->m_minShade) shade[i] = TheWeatherSetting->m_minShade;
+		if (shade[i] > 1.0f) shade[i] = 1.0f;
+	}
+}
+
+static UnsignedInt Weather_Tint_RGB()
+{
+	Real shade[3];
+	Weather_Shade_RGB(shade);
+	const UnsignedInt r = (UnsignedInt)(shade[0] * 255.0f);
+	const UnsignedInt g = (UnsignedInt)(shade[1] * 255.0f);
+	const UnsignedInt b = (UnsignedInt)(shade[2] * 255.0f);
+	return (r << 16) | (g << 8) | b;
+}
+
 static UnsignedInt Snow_Lit_Color()
 {
 	static bool litOn = [] {
@@ -62,19 +109,36 @@ static UnsignedInt Snow_Lit_Color()
 		return ev == nullptr || strcmp(ev, "0") != 0;
 	}();
 	if (!litOn || !TheGlobalData) return 0xffffffff;
-	Real shade[3] = {
-		TheGlobalData->m_terrainAmbient[0].red + TheGlobalData->m_terrainDiffuse[0].red * 0.5f,
-		TheGlobalData->m_terrainAmbient[0].green + TheGlobalData->m_terrainDiffuse[0].green * 0.5f,
-		TheGlobalData->m_terrainAmbient[0].blue + TheGlobalData->m_terrainDiffuse[0].blue * 0.5f,
-	};
-	for (Int i = 0; i < 3; i++) {
-		if (shade[i] < 0.45f) shade[i] = 0.45f;
-		if (shade[i] > 1.0f) shade[i] = 1.0f;
-	}
-	const UnsignedInt r = (UnsignedInt)(shade[0] * 255.0f);
-	const UnsignedInt g = (UnsignedInt)(shade[1] * 255.0f);
-	const UnsignedInt b = (UnsignedInt)(shade[2] * 255.0f);
-	return 0xff000000u | (b) | (g << 8) | (r << 16);
+	return 0xff000000u | Weather_Tint_RGB();
+}
+
+// GeneralsX @feature PS3.0 Weather W3 16/10/2026: rain streak color = the shared batch tint plus this
+// drop's own alpha (opacity ceiling x distance falloff). Only the quad streak path can do that: the
+// point-sprite path has no per-particle alpha at all (FVF is XYZ only), which is why distant snow
+// relies on box culling and the screen layer instead.
+static UnsignedInt Rain_Streak_Color(Real alphaScale)
+{
+	Real a = alphaScale;
+	if (a < 0.0f) a = 0.0f;
+	if (a > 1.0f) a = 1.0f;
+	const UnsignedInt alpha = (UnsignedInt)(a * 255.0f);
+	return (alpha << 24) | Weather_Tint_RGB();
+}
+
+// GeneralsX @feature PS3.0 Weather W3 16/10/2026: half-width, in texture units, of the band the streak
+// ribbon samples out of the rain sprite. EXRainDrop's opaque bar sits in columns 14..17 of 32 (u
+// 0.4375..0.5625); 0.07 covers it with the sprite's own soft shoulders and nothing else.
+static const Real RAIN_STREAK_U_BAND = 0.07f;
+
+// GeneralsX @feature PS3.0 Weather W3 16/10/2026: which primitive the active recipe wants, resolved
+// the same way in render() and in ReAcquireResources() - the two must agree or the pass would draw
+// with a buffer that was never allocated for it.
+static bool Weather_Use_Point_Sprites()
+{
+	return TheWeatherSetting != nullptr
+		&& TheWeatherSetting->m_particleKind != WeatherSetting::PARTICLE_RAIN
+		&& TheWeatherSetting->m_usePointSprites
+		&& DX8Wrapper::Get_Current_Caps()->Support_PointSprites();
 }
 
 
@@ -124,10 +188,13 @@ Bool W3DSnowManager::ReAcquireResources()
 {
 	ReleaseResources();
 
-	if (!TheWeatherSetting->m_snowEnabled)
-		return TRUE;	//no need for resources if snow is disabled.
+	if (!TheWeatherSetting->wantsParticles())
+		return TRUE;	//no need for resources if no weather is drawing.
 
-	if (TheWeatherSetting->m_usePointSprites && DX8Wrapper::Get_Current_Caps()->Support_PointSprites())
+	// GeneralsX @feature PS3.0 Weather W3 16/10/2026: rain always uses the quad streak path, so it
+	// needs the index buffer even on cards with point sprites. Uses the same predicate as the render
+	// pass so the buffer that gets allocated is always the one that gets drawn with.
+	if (Weather_Use_Point_Sprites())
 	{
 		IDirect3DDevice9* m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
@@ -209,6 +276,11 @@ void W3DSnowManager::reset()
 
 void W3DSnowManager::update()
 {
+	// GeneralsX @bugfix Storm996 16/10/2026 PS3.0 Weather W1: the device class shadows the base
+	// update(), so the weather mirror (logic value -> active recipe) and the render-side scalars
+	// (WeatherFX) must be driven from HERE - GameClient only ever calls this override.
+	SnowManager::update();
+
 	// TheSuperHackers @tweak The snow render update is now decoupled from the logic step.
 	m_time += WW3D::Get_Logic_Frame_Time_Seconds();
 
@@ -310,6 +382,13 @@ void W3DSnowManager::renderSubBox(RenderInfoClass &rinfo, Int originX, Int origi
 	Int cubeOriginXRemainder = originX;	//loop counter - adjusted when not all particles fit into render buffer.
 	Vector3 snowCenter;
 
+	// GeneralsX @feature PS3.0 Weather W3 16/10/2026: wind carry for the sprite path. Both values are
+	// 0 in the retail recipe, so every position below stays bit-identical; a blizzard recipe (WindX=16)
+	// uses them to rake the sheet across the box as it falls. Read once per leaf box, applied per flake.
+	const Real windX = TheWeatherSetting != nullptr ? TheWeatherSetting->m_windX : 0.0f;
+	const Real windY = TheWeatherSetting != nullptr ? TheWeatherSetting->m_windY : 0.0f;
+	const Real boxDim = m_boxDimensions > 0.0001f ? m_boxDimensions : 1.0f;
+
 	m_totalRendered += totalPart;
 
 	while (totalPart)
@@ -351,6 +430,15 @@ void W3DSnowManager::renderSubBox(RenderInfoClass &rinfo, Int originX, Int origi
 				//find world-space position of snow flake
 				snowCenter.Set(x*m_emitterSpacing,y*m_emitterSpacing,h0);
 
+				// GeneralsX @feature PS3.0 Weather W3 16/10/2026: the wind carries the flake sideways in
+				// proportion to how far it has fallen. Skipped entirely at zero wind (the retail recipe).
+				if (windX != 0.0f || windY != 0.0f)
+				{
+					const Real fallFrac = (m_snowCeiling - h0) / boxDim;
+					snowCenter.X += windX * fallFrac;
+					snowCenter.Y += windY * fallFrac;
+				}
+
 				//Adjust position so snow flakes don't fall straight down.
 				// GeneralsX @feature PS3.0-P3-26: per-flake phase (GENERALSX_SNOW_SWAY=0 restores the
 				// retail per-column phase bit-for-bit).
@@ -383,10 +471,14 @@ flush_particles:
 
 void W3DSnowManager::render(RenderInfoClass &rinfo)
 {
-	if (!TheWeatherSetting->m_snowEnabled || !m_isVisible)
+	// GeneralsX @feature PS3.0 Weather W1/W3 16/10/2026: the active recipe now decides both whether
+	// anything draws and which primitive it wants. wantsParticles() already carries the
+	// GENERALSX_WEATHER=0 kill leg, so the retail A/B leg short-circuits here.
+	if (!TheWeatherSetting->wantsParticles() || !m_isVisible)
 		return;
 
-	Int usePointSprites = DX8Wrapper::Get_Current_Caps()->Support_PointSprites() && TheWeatherSetting->m_usePointSprites;
+	const Bool isRain = (TheWeatherSetting->m_particleKind == WeatherSetting::PARTICLE_RAIN);
+	const Bool usePointSprites = isRain ? FALSE : Weather_Use_Point_Sprites();
 
 	//make sure the noise table is powers of 2 in dimensions.
 	WWASSERT(ISPOW2(SNOW_NOISE_X) && ISPOW2(SNOW_NOISE_Y));
@@ -422,6 +514,14 @@ void W3DSnowManager::render(RenderInfoClass &rinfo)
 	//so adjust bounding box to include them.
 	bbox.Extent.X += m_amplitude+m_quadSize;
 	bbox.Extent.Y += m_amplitude+m_quadSize;
+
+	// GeneralsX @feature PS3.0 Weather W3 16/10/2026: rain drifts sideways by up to the recipe's wind
+	// over one fall cycle, so the clip box has to leave room for it or the slanted sheet gets cut.
+	if (isRain)
+	{
+		bbox.Extent.X += fabsf(TheWeatherSetting->m_windX);
+		bbox.Extent.Y += fabsf(TheWeatherSetting->m_windY);
+	}
 
 	//Clip our visible snow rendering box
 	if ((cubeOriginX * m_emitterSpacing ) < (bbox.Center.X - bbox.Extent.X))
@@ -469,6 +569,13 @@ void W3DSnowManager::render(RenderInfoClass &rinfo)
 		ReAcquireResources();
 
 	DX8Wrapper::Set_Texture(0,m_snowTexture);
+
+	// GeneralsX @feature PS3.0 Weather W3 16/10/2026: streak pass for the rain family.
+	if (isRain)
+	{
+		renderRainStreaks(rinfo, cubeOriginX, cubeOriginY, cubeDimX, cubeDimY);
+		return;
+	}
 
 	if (!usePointSprites)
 	{
@@ -551,6 +658,12 @@ void W3DSnowManager::renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int 
 	Int y=cubeOriginY;	//loop counter.
 	Int cubeOriginXRemainder = cubeOriginX;	//loop counter - adjusted when not all particles fit into render buffer.
 
+	// GeneralsX @feature PS3.0 Weather W3 16/10/2026: same wind carry as the sprite path (zero wind =
+	// bit-identical to retail), read once per batch.
+	const Real quadWindX = TheWeatherSetting != nullptr ? TheWeatherSetting->m_windX : 0.0f;
+	const Real quadWindY = TheWeatherSetting != nullptr ? TheWeatherSetting->m_windY : 0.0f;
+	const Real quadBoxDim = m_boxDimensions > 0.0001f ? m_boxDimensions : 1.0f;
+
 	//Find total number of particles that need rendering.
 	Int totalPart=(cubeDimY-cubeOriginY)*(cubeDimX-cubeOriginX);
 
@@ -590,6 +703,15 @@ void W3DSnowManager::renderAsQuads(RenderInfoClass &rinfo, Int cubeOriginX, Int 
 
 					//find world-space position of snow flake
 					snowCenter.Set(x*m_emitterSpacing,y*m_emitterSpacing,h0);
+
+					// GeneralsX @feature PS3.0 Weather W3 16/10/2026: wind carry before the view
+					// transform, so the drift is in world units like the sprite path.
+					if (quadWindX != 0.0f || quadWindY != 0.0f)
+					{
+						const Real quadFallFrac = (m_snowCeiling - h0) / quadBoxDim;
+						snowCenter.X += quadWindX * quadFallFrac;
+						snowCenter.Y += quadWindY * quadFallFrac;
+					}
 
 					//Get view-space position
 					Matrix3D::Transform_Vector(view,snowCenter,&snowCenterVS);
@@ -635,5 +757,223 @@ flush_particles:
 			DX8Wrapper::Draw_Triangles(	0,numberInBatch*2, 0, numberInBatch*4);
 			totalPart -= numberInBatch;
 		}
+	}
+}
+
+//=============================================================================
+// W3DSnowManager::renderRainStreaks
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W3: the rain family's world layer.
+//
+// Same camera-following emitter grid as snow (same noise table, same fall cycle, same box clip),
+// but every drop is a thin quad stretched along its own motion vector instead of a square sprite.
+// Why a quad and not a line primitive: hardware line width is a legacy D3D feature - every modern
+// driver, DXVK included, draws 1-pixel lines - and a streak needs an authorable thickness, a
+// per-drop alpha for the distance falloff, and a slant that tracks the wind. All three are vertex
+// attributes on a quad, and none of them are expressible with D3DPT_LINELIST.
+//
+// The quads reuse the retail index buffer (same four-vertex two-triangle layout as renderAsQuads),
+// and the vertices go in VIEW space with D3DTS_VIEW set to identity, exactly like the retail quad
+// fallback. Drop POSITIONS are built in world space first so the wind drift and the sway stay in
+// world units at any zoom; only the streak's long axis is then rotated into view space, where it
+// keeps its length (the view matrix is orthonormal) and the slant comes out of the projection.
+//=============================================================================
+void W3DSnowManager::renderRainStreaks(RenderInfoClass &rinfo, Int originX, Int originY, Int cubeDimX, Int cubeDimY)
+{
+	const WeatherSetting *recipe = TheWeatherSetting;
+	if (recipe == nullptr)
+		return;
+	if (m_indexBuffer == nullptr)
+		return;	//device not acquired yet - the quad streak pass has no buffers to draw with.
+
+	Matrix3D view;
+	CameraClass &camera = rinfo.Camera;
+	camera.Get_View_Matrix(&view);
+
+	const Real boxDim = m_boxDimensions > 0.0001f ? m_boxDimensions : 1.0f;
+	const Real halfLength = 0.5f * recipe->m_streakLength;
+	const Real halfWidth = 0.5f * recipe->m_streakThickness;
+	const Real opacity = recipe->m_opacity > 0.0f ? recipe->m_opacity : 1.0f;
+
+	// GeneralsX @bugfix PS3.0 Weather W3 16/10/2026: the fade is measured from the centre of the emitter
+	// box this frame actually draws, in the ground plane. It used to measure from the eye, which sits a
+	// couple of hundred units above and behind that centre, so at the normal RTS zoom every drop was
+	// already past FalloffStart and the whole sheet came out at one flat, dimmed alpha instead of a
+	// gradient. Ground-plane distance from the box centre is what the author numbers read as ("rain thins
+	// out past 460 units from where I am looking") and it does not change when the player zooms.
+	Real fadeCX = 0.5f * (Real)(originX + cubeDimX) * m_emitterSpacing;
+	Real fadeCY = 0.5f * (Real)(originY + cubeDimY) * m_emitterSpacing;
+
+	// Distance fade, measured in squared world units so the per-drop test costs no sqrt.
+	// FalloffEnd <= FalloffStart means "the map did not author a fade", and the batch stays solid.
+	const Real start2 = recipe->m_falloffStart * recipe->m_falloffStart;
+	const Real end2 = recipe->m_falloffEnd * recipe->m_falloffEnd;
+	const Real span2 = end2 > start2 + 1.0f ? end2 - start2 : 0.0f;
+
+	// World-space motion of one drop over a full fall cycle: straight down, sheared by the wind.
+	Vector3 motion(recipe->m_windX, recipe->m_windY, -boxDim);
+	if (motion.Length2() > 1e-8f)
+	{
+		motion.Normalize();
+	}
+	else
+	{
+		motion.Set(0.0f, 0.0f, -1.0f);
+	}
+
+	// Loop-invariant: the streak axes depend only on the view orientation, which is fixed for the frame.
+	Vector3 longVS;
+	Matrix3D::Rotate_Vector(view, motion, &longVS);
+	longVS *= halfLength;
+	Vector3 sideVS(-longVS.Y, longVS.X, 0.0f);	// the long axis rotated 90 degrees in the screen plane
+	const Real sideLen2 = sideVS.Length2();
+	if (sideLen2 > 1e-8f)
+	{
+		sideVS *= (halfWidth / sqrtf((float)sideLen2));
+	}
+	else
+	{
+		sideVS.Set(halfWidth, 0.0f, 0.0f);	//streak aimed straight at the eye: fall back to a horizontal ribbon.
+	}
+
+	const Vector3 corner_offsets[4] = {
+		-longVS + sideVS,
+		-longVS - sideVS,
+		 longVS - sideVS,
+		 longVS + sideVS
+	};
+
+	// GeneralsX @bugfix PS3.0 Weather W3 16/10/2026: the ZH rain sprite (EXRainDrop) is a 32x32 sheet
+	// whose visible bar is only columns 14..17 wide and runs the full height, so the texture's U axis is
+	// its THIN axis and V is its length. The first draft mapped them the other way round (u along the
+	// streak), which sampled the bar across the length and left a hard-edged slab the full authored
+	// thickness wide. Now u spans the width and is banded onto the bar so the sprite's soft shoulders
+	// land exactly on the ribbon's edges, and v runs the length with v=0 at the upper end - the sprite
+	// fades in at its top row, which is what makes the streak taper behind the drop.
+	const Real uLo = 0.5f - RAIN_STREAK_U_BAND;
+	const Real uHi = 0.5f + RAIN_STREAK_U_BAND;
+	const Vector2 streak_uvs[4] = {
+		Vector2(uHi, 0.0f),
+		Vector2(uLo, 0.0f),
+		Vector2(uLo, 1.0f),
+		Vector2(uHi, 1.0f)
+	};
+
+	Matrix4x4 identity(true);
+	DX8Wrapper::Set_Transform(D3DTS_VIEW, identity);
+
+	DX8Wrapper::Set_Index_Buffer(m_indexBuffer, 0);
+
+	Int y = originY;									//loop counter.
+	Int cubeOriginXRemainder = originX;	//loop counter - adjusted when not all drops fit into the batch.
+
+	Int totalPart = (cubeDimY - originY) * (cubeDimX - originX);
+	if (totalPart <= 0)
+		return;
+
+	m_totalRendered += totalPart;
+
+	while (totalPart)
+	{
+		Int batchSize = totalPart;
+		if (batchSize > SNOW_BATCH_SIZE)
+			batchSize = SNOW_BATCH_SIZE;
+
+		Int numberInBatch = 0;
+		Int cellsVisited = 0;	//grid cells consumed, faded-out ones included - see the loop tail.
+
+		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, batchSize * 4);
+		{
+			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
+			VertexFormatXYZNDUV2 *verts = lock.Get_Formatted_Vertex_Array();
+
+			for (; y < cubeDimY; y++)
+			{
+				for (Int x = cubeOriginXRemainder; x < cubeDimX; x++)
+				{
+					if (numberInBatch >= batchSize)
+					{
+						cubeOriginXRemainder = x;
+						goto flush_streaks;
+					}
+					cellsVisited++;
+					Int noiseOffset = MODPOW2(x + MAXIMUM_CAMERA_DISTANCE, SNOW_NOISE_X)
+						+ MODPOW2(y + MAXIMUM_CAMERA_DISTANCE, SNOW_NOISE_Y) * SNOW_NOISE_X;
+					if (noiseOffset > (SNOW_NOISE_X * SNOW_NOISE_Y))
+						noiseOffset = 0;
+
+					//height of this drop inside the falling column, then how far it has travelled.
+					const Real h0 = m_snowCeiling - fmod(m_heightTraveled + m_startingHeights[noiseOffset], boxDim);
+					const Real fallFrac = (m_snowCeiling - h0) / boxDim;	//0 at the top of the box, 1 at the bottom.
+
+					//Wind carries the drop sideways as it descends; the sway adds the small ripple the
+					//recipe already uses for snow (a rain recipe keeps its amplitude near zero).
+					const Real phaseX = Snow_Sway_Phase(x, y, 0);
+					const Real phaseY = Snow_Sway_Phase(x, y, 17);
+					Vector3 dropWS(
+						x * m_emitterSpacing + recipe->m_windX * fallFrac + m_amplitude * WWMath::Fast_Sin(h0 * m_frequencyScaleX + phaseX),
+						y * m_emitterSpacing + recipe->m_windY * fallFrac + m_amplitude * WWMath::Fast_Sin(h0 * m_frequencyScaleY + phaseY),
+						h0);
+
+					//Fade the distant drops (and drop them entirely) instead of letting the sheet turn
+					//into a wall of aliased pixels at the far edge of the box.
+					Real fade = 1.0f;
+					if (span2 > 0.0f)
+					{
+						const Real dx = dropWS.X - fadeCX;
+						const Real dy = dropWS.Y - fadeCY;
+						fade = (end2 - (dx * dx + dy * dy)) / span2;
+						if (fade < 0.0f)
+						{
+							continue;	//fully faded - no vertices to write.
+						}
+						if (fade > 1.0f)
+						{
+							fade = 1.0f;
+						}
+					}
+
+					const UnsignedInt streakColor = Rain_Streak_Color(opacity * fade);
+					Vector3 dropVS;
+					Matrix3D::Transform_Vector(view, dropWS, &dropVS);
+
+					for (Int i = 0; i < 4; i++)
+					{
+						*(Vector3 *)verts = dropVS + corner_offsets[i];
+						verts->nx = 0;	//keep AGP write-combining active
+						verts->ny = 0;
+						verts->nz = 0;
+						verts->diffuse = streakColor;	//scene-lit rgb + this drop's own alpha
+						verts->u1 = streak_uvs[i].X;
+						verts->v1 = streak_uvs[i].Y;
+						verts->u2 = 0;	//keep AGP write-combining active
+						verts->v2 = 0;
+						verts++;
+					}
+
+					numberInBatch++;
+				}
+				cubeOriginXRemainder = originX;	//reset to normal amount
+			}
+
+flush_streaks:
+			numberInBatch;	//need something at goto destination - same construct the retail quad pass uses.
+		}
+
+		if (numberInBatch)
+		{
+			DX8Wrapper::Set_Vertex_Buffer(vb_access);
+			DX8Wrapper::Draw_Triangles(0, numberInBatch * 2, 0, numberInBatch * 4);
+		}
+
+		// GeneralsX @bugfix PS3.0 Weather W3 16/10/2026: the retail loop this was copied from decrements
+		// its counter by the number of particles it WROTE, which is safe there because nothing in that
+		// pass is ever skipped. Here a fully-faded drop writes nothing, so a batch that culled more than
+		// it drew would leave the counter above zero with the grid already walked to the end - the next
+		// iteration visits nothing, draws nothing and spins forever (reachable at maximum zoom-out, where
+		// the clip box grows past FalloffEnd and the whole sheet culls). Count cells consumed instead,
+		// and break on a batch that consumed nothing so a hang is structurally impossible.
+		if (cellsVisited <= 0)
+			break;
+		totalPart -= cellsVisited;
 	}
 }

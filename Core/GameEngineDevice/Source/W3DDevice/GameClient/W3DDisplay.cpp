@@ -70,6 +70,7 @@ static void drawFramerateBar();
 #include "GameClient/Mouse.h"
 #include "GameClient/GlobalLanguage.h"
 #include "GameClient/Water.h"
+#include "GameClient/WeatherFX.h"		// GeneralsX @feature PS3.0 Weather W1 16/10/2026 weather->lighting coupler
 
 #include "GameNetwork/NetworkInterface.h"
 #include "Common/ModelState.h"
@@ -2577,6 +2578,40 @@ static void applyLightPulse(RTS3DScene* scene, const Coord3D *pos, const RGBColo
 	theDynamicLight->Set_Flag(LightClass::FAR_ATTENUATION,true);
 }
 
+// GeneralsX @feature Qoder 18/10/2026 PS3.0 4E: the pulse gate is now a live value.
+// GENERALSX_LIGHTPULSE still wins outright (cached on the first query, so a QA parity leg can never be
+// moved by the menu); without an env the gate seeds from Options.ini LightPulseEffect on the first
+// pulse and W3DDisplay::setLightPulseEnabled() re-arms it from the Graphics Options page, so flipping
+// the row changes the next explosion instead of the next game start.
+static Int s_pulseEnvState = 0;			///< 0 = not looked up yet, 1 = no env, 2 = env OFF, 3 = env ON
+static Int s_pulseUserEnabled = -1;		///< -1 = not seeded yet, else 0/1 (env or ini or the menu)
+
+static Bool LightPulse_Enabled()
+{
+	if (s_pulseEnvState == 0)
+	{
+		const char* ev = getenv("GENERALSX_LIGHTPULSE");
+		if (ev == nullptr || *ev == 0)
+			s_pulseEnvState = 1;
+		else
+			s_pulseEnvState = (atoi(ev) != 0) ? 3 : 2;
+	}
+	if (s_pulseEnvState == 3)
+		return TRUE;
+	if (s_pulseEnvState == 2)
+		return FALSE;
+	if (s_pulseUserEnabled < 0)
+		s_pulseUserEnabled = (OptionPreferences().getLightPulseEnabled() != FALSE) ? 1 : 0;
+	return s_pulseUserEnabled != 0;
+}
+
+void W3DDisplay::setLightPulseEnabled( Bool enabled )
+{
+	s_pulseUserEnabled = (enabled != FALSE) ? 1 : 0;
+	fprintf(stderr, "[LPULSE] user gate re-armed to %d\n", s_pulseUserEnabled);
+	fflush(stderr);
+}
+
 void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
 																	 Real innerRadius, Real attenuationWidth,
 																	 UnsignedInt increaseFrameTime,
@@ -2588,9 +2623,10 @@ void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
 	// is the transport for explosion/muzzle lighting in lighting stage four.
 	// GENERALSX_LIGHTPULSE=0 kills the whole channel (QA A/B leg); default ON = retail parity.
 	// GENERALSX_LIGHTPULSE_LOG=1 prints every accepted pulse for on-hardware evidence.
-	static const Bool s_pulseOn = (getenv("GENERALSX_LIGHTPULSE") == nullptr) || (atoi(getenv("GENERALSX_LIGHTPULSE")) != 0);
+	// GeneralsX @feature PS3.0 4E 17/10/2026: the env keeps winning; with no env the gate follows
+	// the Graphics Options page (Options.ini LightPulseEffect).
 	static const Bool s_pulseLog = (getenv("GENERALSX_LIGHTPULSE_LOG") != nullptr) && (atoi(getenv("GENERALSX_LIGHTPULSE_LOG")) != 0);
-	if (!s_pulseOn)
+	if (!LightPulse_Enabled())
 	{
 		return;
 	}
@@ -2669,8 +2705,10 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 	{
 		static int s_todOv = -1;
 		if (s_todOv < 0) {
+			// GeneralsX @feature PS3.0 4E 17/10/2026: env wins, else the Graphics Options page key
+			// Options.ini TimeOfDayPreview (0 = follow the map). Restart to take effect.
 			const char* ev = getenv("GENERALSX_TOD_OVERRIDE");
-			s_todOv = (ev != nullptr && *ev != 0) ? atoi(ev) : 0;
+			s_todOv = (ev != nullptr && *ev != 0) ? atoi(ev) : OptionPreferences().getTodPreview();
 			if (s_todOv < 0 || s_todOv >= TIME_OF_DAY_COUNT) s_todOv = 0;
 		}
 		if (s_todOv != 0) {
@@ -2692,11 +2730,72 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 		}
 	}
 
+	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: weather -> lighting coupler.
+	// The active weather recipe carries two multipliers (ambientScale / keyScale); they are folded
+	// into EVERY lighting consumer below, always derived from the raw INI slot values (or from a
+	// value that was already multiplied once this call), so re-entering setTimeOfDay can never
+	// compound them. WEATHER_NORMAL reports 1.0/1.0, which short-circuits the whole feature: the
+	// arithmetic below is then bit-for-bit the retail/PS3.0 path (Golden Rule: visible difference
+	// only when the weather is actually non-normal).
+	//   ambientScale crushes the shadow side (scene ambient, dot3/GN ambient feeds, every non-key
+	//   slot light) - overcast and blizzard read flat and grey.
+	//   keyScale dims the sun (slot0 diffuse + the GN per-pixel key lobe).
+	const WeatherRenderState &wx = weatherRenderState();
+	const Real wxAmb = wx.m_ambientScale;
+	const Real wxKey = wx.m_keyScale;
+	const Bool wxActive = (fabsf(wxAmb - 1.0f) > 0.001f || fabsf(wxKey - 1.0f) > 0.001f);
+	// GeneralsX @bugfix PS3.0 Weather W5 16/10/2026: this used a 1-in-256 counter, which is the wrong
+	// instrument for a call that runs a handful of times per session (retail time-of-day is static, so
+	// setTimeOfDay fires at load and on scripted/weather changes only). Every weather leg therefore
+	// printed exactly one line - and it was the weather the map declared at load, not the one the QA
+	// env or a script switched to, so the leg could not show its own coupling numbers. Log on CHANGE of
+	// the (type, ambient, key, fog, wet) tuple instead: one honest line per distinct lighting state,
+	// which is what makes "the storm crushed the sun to 0.72/0.60" readable in a capture log.
+	static Int s_lastType = -999;
+	static Real s_lastAmb = -1.0f, s_lastKey = -1.0f, s_lastFog = -1.0f, s_lastWet = -1.0f;
+	static unsigned s_wxLogCount = 0;
+	const Int curType = (Int)wx.m_type;
+	if (wxActive)
+	{
+		if (curType != s_lastType
+			|| fabsf(wxAmb - s_lastAmb) > 0.001f
+			|| fabsf(wxKey - s_lastKey) > 0.001f
+			|| fabsf(wx.m_fogScale - s_lastFog) > 0.001f
+			|| fabsf(wx.m_wetness - s_lastWet) > 0.001f)
+		{
+			++s_wxLogCount;
+			fprintf(stderr, "[WEATHER_LIGHT] type=%d ambMul=%.2f keyMul=%.2f fog=%.2f wet=%.2f n=%u\n",
+				curType, wxAmb, wxKey, wx.m_fogScale, wx.m_wetness, s_wxLogCount);
+			fflush(stderr);
+		}
+		s_lastType = curType;
+		s_lastAmb = wxAmb;
+		s_lastKey = wxKey;
+		s_lastFog = wx.m_fogScale;
+		s_lastWet = wx.m_wetness;
+	}
+	else
+	{
+		// Neutral (retail parity path): forget the last tuple so the next weather change logs again,
+		// and say so once - a leg that switches back to clear weather must be visible in the log too.
+		if (s_lastType != -999)
+		{
+			++s_wxLogCount;
+			fprintf(stderr, "[WEATHER_LIGHT] type=%d neutral ambMul=1.00 keyMul=1.00 n=%u\n", curType, s_wxLogCount);
+			fflush(stderr);
+		}
+		s_lastType = -999;
+	}
+
 	const GlobalData::TerrainLighting *ol=&TheGlobalData->m_terrainObjectsLighting[tod][0];
 
 	if( m_3DScene )
 	{
-		m_3DScene->Set_Ambient_Light( Vector3(ol->ambient.red, ol->ambient.green, ol->ambient.blue) );
+		Vector3 sceneAmbient( ol->ambient.red, ol->ambient.green, ol->ambient.blue );
+		if (wxActive) {
+			sceneAmbient *= wxAmb;
+		}
+		m_3DScene->Set_Ambient_Light( sceneAmbient );
 	}
 
 	for (Int i=0; i<LightEnvironmentClass::MAX_LIGHTS; i++)
@@ -2706,7 +2805,16 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			ol=&TheGlobalData->m_terrainObjectsLighting[tod][i];
 
 			m_myLight[i]->Set_Ambient( Vector3( 0.0f, 0.0f, 0.0f ) );
-			m_myLight[i]->Set_Diffuse( Vector3(ol->diffuse.red, ol->diffuse.green, ol->diffuse.blue ) );
+			Vector3 slotDiffuse( ol->diffuse.red, ol->diffuse.green, ol->diffuse.blue );
+			if (wxActive) {
+				// slot0 is the key sun, slots1..3 are fill/bounce/map lamps -> all non-key terms dim
+				// with the ambient scale (the same split the L1c crush knob uses).
+				slotDiffuse *= (i == 0) ? wxKey : wxAmb;
+				if (slotDiffuse.X > 1.0f) slotDiffuse.X = 1.0f;
+				if (slotDiffuse.Y > 1.0f) slotDiffuse.Y = 1.0f;
+				if (slotDiffuse.Z > 1.0f) slotDiffuse.Z = 1.0f;
+			}
+			m_myLight[i]->Set_Diffuse( slotDiffuse );
 			m_myLight[i]->Set_Specular( Vector3(0,0,0) );
 			Matrix3D mtx;
 			mtx.Set(Vector3(1,0,0), Vector3(0,1,0), Vector3(ol->lightPos.x, ol->lightPos.y, ol->lightPos.z), Vector3(0,0,0));
@@ -2724,19 +2832,29 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 	// lightPos into the light's Z column, hence the negation here.
 	{
 		const GlobalData::TerrainLighting* sl = &TheGlobalData->m_terrainObjectsLighting[tod][0];
+		// GeneralsX @feature PS3.0 Weather W1 16/10/2026: same coupler factors as the fixed pipeline
+		// above (raw slot0 values * weather), so the dot3 and GN paths dim in lockstep with the sun.
+		Vector3 wxFallbackAmbient( sl->ambient.red, sl->ambient.green, sl->ambient.blue );
+		Vector3 wxGnKeyColor( sl->diffuse.red, sl->diffuse.green, sl->diffuse.blue );
+		if (wxActive) {
+			wxFallbackAmbient *= wxAmb;
+			wxGnKeyColor *= wxKey;
+			if (wxGnKeyColor.X > 1.0f) wxGnKeyColor.X = 1.0f;
+			if (wxGnKeyColor.Y > 1.0f) wxGnKeyColor.Y = 1.0f;
+			if (wxGnKeyColor.Z > 1.0f) wxGnKeyColor.Z = 1.0f;
+		}
 		DX8NormalMap::Set_Global_Fallback_Light(
 			Vector3(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z),
-			Vector3(sl->ambient.red, sl->ambient.green, sl->ambient.blue));
+			wxFallbackAmbient);
 		// GeneralsX @feature PS3.0 L2 14/10/2026: the geometric-normal per-pixel diffuse module
 		// corrects the fixed-pipeline sun term, so it needs the same direction plus the key's
 		// DIFFUSE color (the fallback light above only carries direction + ambient).
 		DX8GeomNormal::Set_Global_Key_Light(
 			Vector3(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z),
-			Vector3(sl->diffuse.red, sl->diffuse.green, sl->diffuse.blue));
+			wxGnKeyColor);
 		// The GN VS rebuilds the Gouraud base, so it also needs the scene object ambient (the same
 		// slot0 ambient fed to Set_Ambient_Light above).
-		DX8GeomNormal::Set_Global_Ambient(
-			Vector3(sl->ambient.red, sl->ambient.green, sl->ambient.blue));
+		DX8GeomNormal::Set_Global_Ambient( wxFallbackAmbient );
 	}
 
 	// GeneralsX @feature PS3.0 L1 13/10/2026: three-point lighting rig (key = the retail sun above).
@@ -2808,6 +2926,9 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 				if (fdLen2 > 1e-6f) fd *= (Real)(1.0f / sqrtf((float)fdLen2));
 				Vector3 fc(kd.X * 0.45f, kd.Y * 0.68f, kd.Z * 1.05f);
 				fc *= s_fillScale;
+				// GeneralsX @feature PS3.0 Weather W1 16/10/2026: slot1 is force-overwritten here, so the
+				// synthetic fill carries the weather ambient factor itself (it is a non-key term).
+				if (wxActive) fc *= wxAmb;
 				if (fc.X > 1.0f) fc.X = 1.0f;
 				if (fc.Y > 1.0f) fc.Y = 1.0f;
 				if (fc.Z > 1.0f) fc.Z = 1.0f;
@@ -2854,6 +2975,7 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 					if (bdLen2 > 1e-6f) bd *= (Real)(1.0f / sqrtf((float)bdLen2));
 					Vector3 bc(kd.X, kd.Y * 0.62f, kd.Z * 0.38f);
 					bc *= s_bounceScale;
+					if (wxActive) bc *= wxAmb;		// GeneralsX @feature PS3.0 Weather W1 16/10/2026: non-key term
 					if (bc.X > 1.0f) bc.X = 1.0f;
 					if (bc.Y > 1.0f) bc.Y = 1.0f;
 					if (bc.Z > 1.0f) bc.Z = 1.0f;
@@ -2899,6 +3021,7 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			const GlobalData::TerrainLighting* k0 = &TheGlobalData->m_terrainObjectsLighting[tod][0];
 			Vector3 amb(k0->ambient.red, k0->ambient.green, k0->ambient.blue);
 			amb *= s_ambScale;
+			if (wxActive) amb *= wxAmb;	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: raw-derived
 			if (m_3DScene) {
 				m_3DScene->Set_Ambient_Light(amb);
 			}
@@ -2948,6 +3071,7 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			const GlobalData::TerrainLighting* k0 = &TheGlobalData->m_terrainObjectsLighting[tod][0];
 			Vector3 kd(k0->diffuse.red, k0->diffuse.green, k0->diffuse.blue);
 			kd *= s_keyGain;
+			if (wxActive) kd *= wxKey;	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: raw-derived key term
 			if (kd.X > 1.0f) kd.X = 1.0f;
 			if (kd.Y > 1.0f) kd.Y = 1.0f;
 			if (kd.Z > 1.0f) kd.Z = 1.0f;
@@ -2966,6 +3090,34 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			}
 		}
 	}
+
+	// GeneralsX @feature PS3.0 Weather W5 16/10/2026: last step of the lighting install. setTimeOfDay
+	// is the one place the device writes the lighting state, so pushing the weather's shader-half
+	// scalars (GN/ML haze ramp + PBR wetness) from here puts them on the same frame as the fixed
+	// pipeline, the terrain haze and the screen layer. WEATHER_NORMAL publishes fogScale 1.0 /
+	// wetness 0, which re-uploads exactly the install numbers, so a clear map stays unchanged.
+	W3DShaderManager::applyWeatherToShaders();
+}
+
+// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: hand the player's choice to the
+// shader manager. Everything downstream (the GN/dot3 injected ramp, the terrain/road/tree batch
+// upload, the weather coupling) reads one recipe, so this single call moves the whole scene.
+void W3DDisplay::setDistanceHaze( Bool enabled, Real strength01 )
+{
+	W3DShaderManager::setDistanceHaze(enabled, strength01);
+}
+
+// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: the two remaining shader-side
+// values the Graphics Options page now owns without a restart. Both live in W3DShaderManager, which
+// is where the bloom composite and the sun shadow map read them (see W3DShaderManager.h).
+void W3DDisplay::setBloomIntensity( Real intensity01 )
+{
+	W3DShaderManager::setBloomIntensity(intensity01);
+}
+
+void W3DDisplay::setShadowMapStrength( Real strength01 )
+{
+	W3DShaderManager::setShadowMapStrength(strength01);
 }
 
 // W3DDisplay::drawLine =======================================================

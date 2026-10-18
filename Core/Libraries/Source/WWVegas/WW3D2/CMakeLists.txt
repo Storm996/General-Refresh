@@ -1,3 +1,8 @@
+# GeneralsX @feature Qoder 17/10/2026 Pure-Vulkan port line: WP1 opt-in Vulkan device core.
+# OFF in every shipping tree (Linux/macOS/win64 stay bit-identical); the win64vk port tree flips it.
+option(SAGE_USE_VULKAN_CORE "WP1: compile Vulkan device core behind DX8Wrapper facade (Windows only)" OFF)
+set(SAGE_VULKAN_HEADERS_DIR "" CACHE PATH "Vulkan-Headers include dir for SAGE_USE_VULKAN_CORE")
+
 set(WW3D2_SRC
     aabtree.cpp
     aabtree.h
@@ -248,9 +253,37 @@ if(WIN32)
     )
 endif()
 
+# GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: gated sources + headers (Windows only).
+if(SAGE_USE_VULKAN_CORE)
+    if(NOT WIN32)
+        message(FATAL_ERROR "SAGE_USE_VULKAN_CORE is Windows-only for now")
+    endif()
+    list(APPEND WW3D2_SRC
+        Backend/VulkanCore.cpp
+        Backend/VulkanCore.h
+        Backend/VulkanFns.h
+        Backend/VulkanGeo.h
+        Backend/VulkanTexMirror.h
+        Backend/VulkanDesc.h
+        Backend/VulkanDraw.h
+        Backend/VulkanDraw.cpp
+        Backend/VulkanFF.h
+        Backend/VulkanFF.cpp
+        Backend/VkShadersTri.h
+        Backend/VkShadersDesc.h
+        Backend/VkShadersDraw.h
+        Backend/VkShadersFF.h
+    )
+endif()
+
 add_library(corei_ww3d2 INTERFACE)
 
 target_sources(corei_ww3d2 INTERFACE ${WW3D2_SRC})
+
+if(SAGE_USE_VULKAN_CORE)
+    target_include_directories(corei_ww3d2 INTERFACE "${SAGE_VULKAN_HEADERS_DIR}")
+    target_compile_definitions(corei_ww3d2 INTERFACE SAGE_USE_VULKAN_CORE)
+endif()
 
 # GeneralsX @build fbraz 11/02/2026 BenderAI - Enable FreeType text rendering on Linux/macOS
 target_compile_definitions(corei_ww3d2 INTERFACE

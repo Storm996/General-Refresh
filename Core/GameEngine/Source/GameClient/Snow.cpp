@@ -33,6 +33,9 @@
 // GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the render layer observes the logic-side
 // weather value here (one-way read; it is never written back, so replay/CRC state is untouched).
 #include "Common/GlobalData.h"
+// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: the type switch refills the display's
+// lighting slots (setTimeOfDay) so the weather->lighting coupler re-runs the moment the weather flips.
+#include "GameClient/Display.h"
 // GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1/W4: render-side weather state owner.
 #include "GameClient/WeatherFX.h"
 
@@ -62,7 +65,11 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_particleKind = PARTICLE_RAIN;
 			m_weatherEnabled = TRUE;
 			m_snowEnabled = TRUE;				//render-side gate is shared with the retail recipe.
-			m_snowTexture = "EXRainStreak.tga";
+			// GeneralsX @bugfix PS3.0 Weather W3 16/10/2026: this used to name EXRainStreak.tga, which
+			// no ZH archive contains - WW3D answers a missing texture with its magenta debug surface, so
+			// the whole sheet drew purple. EXRainDrop is the real ZH rain sprite (32x32, a soft-edged
+			// vertical streak that fades in at the top and is brightest at the bottom tip).
+			m_snowTexture = "EXRainDrop.tga";
 			m_snowBoxDimensions = 110.0f;
 			m_snowBoxDensity = 0.85f;
 			m_snowVelocity = 42.0f;
@@ -70,8 +77,11 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_snowFrequencyScaleX = 0.02f;
 			m_snowFrequencyScaleY = 0.02f;
 			m_streakLength = 3.2f;
-			m_streakThickness = 0.06f;
-			m_opacity = 0.55f;
+			// The sprite's bar is drawn across the quad by a narrow UV band, so this is now the on-screen
+			// ribbon's real width in world units: 0.022 is a couple of pixels at the usual RTS zoom.
+			m_streakThickness = 0.022f;
+			// The sprite peaks at alpha 141/255, so opacity is the multiplier on top of that shape.
+			m_opacity = 0.85f;
 			m_falloffStart = 180.0f;
 			m_falloffEnd = 420.0f;
 			m_windX = 2.0f;
@@ -85,7 +95,7 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_wetness = 0.45f;
 			m_screenTint.red = 0.86f; m_screenTint.green = 0.90f; m_screenTint.blue = 0.98f;
 			m_screenDarken = 0.88f;
-			m_screenWispDensity = 0.35f;
+			m_screenWispDensity = 0.13f;
 			m_screenVignette = 0.12f;
 			m_lightningChance = 0.0f;
 			break;
@@ -94,15 +104,15 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_particleKind = PARTICLE_RAIN;
 			m_weatherEnabled = TRUE;
 			m_snowEnabled = TRUE;
-			m_snowTexture = "EXRainStreak.tga";
+			m_snowTexture = "EXRainDrop.tga";
 			m_snowBoxDimensions = 110.0f;
 			m_snowBoxDensity = 1.25f;
 			m_snowVelocity = 60.0f;
 			m_snowAmplitude = 1.2f;
 			m_swayScale = 2.2f;
 			m_streakLength = 5.5f;
-			m_streakThickness = 0.08f;
-			m_opacity = 0.65f;
+			m_streakThickness = 0.03f;
+			m_opacity = 0.95f;
 			m_falloffStart = 200.0f;
 			m_falloffEnd = 460.0f;
 			m_windX = 7.0f;
@@ -116,7 +126,7 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_wetness = 0.65f;
 			m_screenTint.red = 0.76f; m_screenTint.green = 0.80f; m_screenTint.blue = 0.92f;
 			m_screenDarken = 0.74f;
-			m_screenWispDensity = 0.62f;
+			m_screenWispDensity = 0.20f;
 			m_screenVignette = 0.26f;
 			m_lightningChance = 0.0f;
 			break;
@@ -127,6 +137,7 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_ambientScale = 0.58f;
 			m_keyScale = 0.48f;
 			m_screenDarken = 0.66f;
+			m_screenWispDensity = 0.22f;
 			m_lightningChance = 6.0f;			///<expected strikes/minute - device-side RNG only.
 			m_lightningIntensity = 1.0f;
 			break;
@@ -157,18 +168,28 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_wetness = 0.0f;
 			m_screenTint.red = 0.93f; m_screenTint.green = 0.96f; m_screenTint.blue = 1.0f;
 			m_screenDarken = 0.92f;
-			m_screenWispDensity = 0.75f;
+			m_screenWispDensity = 0.24f;
 			m_screenVignette = 0.35f;
 			m_lightningChance = 0.0f;
 			break;
 
 		case WEATHER_SNOWY:
 		{
-			// GeneralsX @tweak PS3.0 Weather W1: the retail snow recipe gains only the new screen-layer
-			// identity values here - a map that never writes a WeatherType block renders exactly as before.
+			// GeneralsX @tweak PS3.0 Weather W1/W2: the retail snow recipe gains the new layer's identity
+			// values here. Kept deliberately mild: falling flakes already carry the effect, so the screen
+			// half only adds the overcast lift a snowy day has and no whiteout.
 			m_weatherType = WEATHER_SNOWY;
 			m_particleKind = PARTICLE_SNOW;
 			m_minShade = 0.45f;					///<matches the literal floor the PS3.0-P3-26 tint used.
+			m_ambientScale = 0.95f;
+			m_keyScale = 0.92f;
+			m_fogScale = 1.2f;
+			m_wetness = 0.0f;						///<snow is not rain-slick; nothing to gain from a roughness offset.
+			m_screenTint.red = 0.97f; m_screenTint.green = 0.99f; m_screenTint.blue = 1.0f;
+			m_screenDarken = 0.97f;
+			m_screenWispDensity = 0.18f;
+			m_screenVignette = 0.08f;
+			m_lightningChance = 0.0f;
 			break;
 		}
 
@@ -177,6 +198,20 @@ void WeatherSetting::applyTypeDefaults(Weather type)
 			m_weatherType = WEATHER_NORMAL;
 			m_weatherEnabled = FALSE;
 			m_snowEnabled = FALSE;
+			// GeneralsX @feature PS3.0 Weather W1/W2: state every coupling explicitly. This profile is
+			// built by copying the snowy base (see getWeatherProfile), so leaving a scalar out would
+			// inherit snow's numbers and a clear map would render weather-tinted - the one thing the
+			// retail-parity default has to guarantee.
+			m_ambientScale = 1.0f;
+			m_keyScale = 1.0f;
+			m_fogScale = 1.0f;
+			m_wetness = 0.0f;
+			m_screenTint.red = 1.0f; m_screenTint.green = 1.0f; m_screenTint.blue = 1.0f;
+			m_screenDarken = 1.0f;
+			m_screenWispDensity = 0.0f;
+			m_screenVignette = 0.0f;
+			m_lightningChance = 0.0f;
+			m_lightningIntensity = 1.0f;
 			break;
 	}
 }
@@ -221,10 +256,10 @@ void applyWeatherType(Weather type)
 	TheWeatherSetting = (WeatherSetting *)profile->friend_getFinalOverride();
 	s_activeWeatherType = (Weather)index;
 
-	if (TheSnowManager != nullptr)
-	{
-		TheSnowManager->setWeatherType((Weather)index);
-	}
+	// NOTE: deliberately does NOT call SnowManager::setWeatherType() - that function calls back into
+	// this one, so a two-way link here would recurse forever. The manager is the driver (its update()
+	// mirrors the logic value and its setWeatherType() publishes the recipe + refills the lighting);
+	// this half only resolves the data.
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -305,6 +340,28 @@ void SnowManager::setWeatherType(Weather type)
 		m_time = 0;	//start the new type's fall cycle from the top of its box.
 	}
 	updateIniSettings();
+	if (type != previous)
+	{
+		// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: publish the new scalars and re-run
+		// the lighting install, so a live script switch (or a map whose saved weather differs from the
+		// recipe loaded at init) repaints the world on the SAME frame instead of waiting for the next
+		// time-of-day change. W3DDisplay::setTimeOfDay rewrites every slot light from the raw INI
+		// values before applying the weather factors, so repeating it is idempotent, and it also marks
+		// the static terrain lighting dirty (BaseHeightMap::staticLightingChanged) which is what
+		// recolors the ground with the new coupler factors.
+		if (TheWeatherFX != nullptr)
+		{
+			TheWeatherFX->refreshStateNow();
+		}
+		if (TheDisplay != nullptr && TheGlobalData != nullptr)
+		{
+			TheDisplay->setTimeOfDay(TheGlobalData->m_timeOfDay);
+		}
+		if (TheTacticalView != nullptr)
+		{
+			TheTacticalView->forceRedraw();
+		}
+	}
 }
 
 void SnowManager::update()

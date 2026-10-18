@@ -100,6 +100,11 @@ public:
 	Mission *getMissionByIndex( Int idx ) const;
 	AsciiString getFinalVictoryMovie();
 	Bool isChallengeCampaign() { return m_isChallengeCampaign; }
+	// GeneralsX @feature Qoder 17/10/2026 INI-driven campaign visibility. A Campaign block may
+	// declare `MainCampaign = Yes/No`; when it does, that value decides whether the campaign is
+	// offered in the mission-select list. When the key is absent we fall back to the historical
+	// hard-coded name list, so retail ZH and the migrated GEN_* campaigns are unaffected.
+	Bool isMainCampaign() const;
 
 public:
 	typedef std::list< Mission* > MissionList;			///< list of Shell Menu schemes
@@ -111,6 +116,8 @@ public:
 	MissionList m_missions;
 	AsciiString m_finalMovieName;
 	Bool m_isChallengeCampaign;
+	Bool m_isMainCampaign;			///< GeneralsX @feature Qoder 17/10/2026 value of the optional `MainCampaign` ini key
+	Bool m_isMainCampaignSet;		///< GeneralsX @feature Qoder 17/10/2026 TRUE when the ini actually declared `MainCampaign`
 	AsciiString m_playerFactionName;
 };
 

@@ -43,6 +43,7 @@
 #include "Common/ModuleFactory.h"
 #include "Common/RandomValue.h"
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"	// GeneralsX @feature PS3.0 4E 17/10/2026 time-of-day preview key
 #include "Common/GameLOD.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/GameClient.h"
@@ -177,8 +178,10 @@ static TimeOfDay renderTimeOfDayOverride(TimeOfDay tod)
 {
 	static int ov = -1;
 	if (ov < 0) {
+		// GeneralsX @feature PS3.0 4E 17/10/2026: env wins, else the Graphics Options page key
+		// Options.ini TimeOfDayPreview (0 = follow the map). Restart to take effect.
 		const char* ev = getenv("GENERALSX_TOD_OVERRIDE");
-		ov = (ev != nullptr && *ev != 0) ? atoi(ev) : 0;
+		ov = (ev != nullptr && *ev != 0) ? atoi(ev) : OptionPreferences().getTodPreview();
 		if (ov < 0 || ov >= TIME_OF_DAY_COUNT) ov = 0;
 		if (ov != 0) {
 			fprintf(stderr, "[TOD] render override active: %d (logic TOD stays %d)\n", ov, (Int)tod);

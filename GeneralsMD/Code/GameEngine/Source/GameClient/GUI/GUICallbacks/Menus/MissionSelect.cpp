@@ -95,18 +95,15 @@ static Int packCampMission( Int campIdx, Int misIdx )
 // GeneralsX @feature Qoder 07/10/2026 Also surface the migrated original Generals campaigns
 // (loose Data\INI\Campaign\GeneralsCampaigns.ini), which are namespaced with a GEN_ prefix to
 // avoid colliding with ZH's own USA/GLA/China/TRAINING campaigns.
+// GeneralsX @feature Qoder 17/10/2026 The list is now INI-driven: a Campaign block may declare
+// `MainCampaign = Yes/No` (parsed by CampaignManager) and that value wins. Campaigns that do not
+// declare the key keep the historical name-list behaviour, so nothing existing changes.
 static Bool isMainCampaign( const Campaign *camp )
 {
 	if( !camp )
 		return FALSE;
 
-	return camp->m_name.compareNoCase( "USA" ) == 0
-		|| camp->m_name.compareNoCase( "China" ) == 0
-		|| camp->m_name.compareNoCase( "GLA" ) == 0
-		|| camp->m_name.compareNoCase( "GEN_USA" ) == 0
-		|| camp->m_name.compareNoCase( "GEN_GLA" ) == 0
-		|| camp->m_name.compareNoCase( "GEN_China" ) == 0
-		|| camp->m_name.compareNoCase( "GEN_TRAINING" ) == 0;
+	return camp->isMainCampaign();
 }
 
 //-------------------------------------------------------------------------------------------------

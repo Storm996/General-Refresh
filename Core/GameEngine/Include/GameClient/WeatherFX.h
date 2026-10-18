@@ -36,6 +36,7 @@
 //  - The screen filter reads the tint/darken/wisp/vignette scalars and the flash envelope.
 #pragma once
 
+#include "Lib/BaseType.h"		//GeneralsX @feature PS3.0 Weather W1: GameType.h needs these first (see Snow.h)
 #include "Common/GameType.h"
 #include "Lib/RGBColor.h"
 
@@ -89,6 +90,11 @@ public:
 	/// Reset the schedule/flash between games so a fresh map never inherits the last one's lightning.
 	void reset();
 
+	/// Fold the active recipe into the published scalars right now, without ticking the lightning
+	/// schedule. Used by the type switch so the lighting refill that follows already sees the new
+	/// ambient/key factors (the per-frame update() would otherwise only apply them next frame).
+	void refreshStateNow() { rebuildState(); }
+
 	const WeatherRenderState &getState() const { return m_state; }
 
 	/// Lightning gate for QA: GENERALSX_WEATHER_THUNDER=0 keeps the rain but silences the strikes.
@@ -99,10 +105,10 @@ private:
 	Real m_nextStrikeSeconds;			///<countdown to the next strike of the current type.
 	Real m_flashRemaining;				///<seconds left of the flash core (drawn at full strength).
 	Real m_flashTotal;					///<length of the current flash, for the decay curve.
-	Real m_gunshotAfterglow;			///<unused today; kept for the muzzle-light lift follow-up.
 
 	void rebuildState();
 	void scheduleLightning(Real secondsDelta);
+	void traceClientRate();				///<once-a-second [WXSTAT] client-rate trace while weather is active.
 };
 
 extern WeatherFX *TheWeatherFX;

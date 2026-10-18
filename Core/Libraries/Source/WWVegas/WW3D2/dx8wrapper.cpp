@@ -84,6 +84,12 @@
 #include "render2d.h"
 #include "sortingrenderer.h"
 #include "shattersystem.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: optional Vulkan device core (opt-in tree only).
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanCore.h"
+#include "Backend/VulkanGeo.h" // wedge 3.4: render-target/depth mirror alloc hooks
+#include "Backend/VulkanDraw.h" // wedge 5: frame boundaries, render targets and the draw path
+#endif
 #include "light.h"
 #include "assetmgr.h"
 #include "textureloader.h"
@@ -238,6 +244,11 @@ void DX8Wrapper::Pillarbox_Cleanup()
 	if (s_offscreenTex) { s_offscreenTex->Release(); s_offscreenTex = nullptr; }
 	s_pillarboxEnabled = false;
 	s_pillarboxActive = false;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.B: with no pillarbox the scene mirror is the
+	// window size and the end-of-frame blit covers the whole swapchain image.
+	VKDraw_Set_Present_Rect(0, 0, 0, 0);
+#endif
 }
 
 bool DX8Wrapper::Pillarbox_Setup(int gameW, int gameH)
@@ -303,6 +314,13 @@ bool DX8Wrapper::Pillarbox_Setup(int gameW, int gameH)
 		s_dstX = 0; s_dstY = (bbH - s_dstH) / 2;
 	}
 	s_pillarboxEnabled = true;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.B: the Vulkan present chain reproduces this
+	// letterbox by blitting the scene mirror into the same rectangle, so the fit rect is published to the
+	// pipeline layer as soon as it is known. The D3D9 quad in Pillarbox_End is the other half of the same
+	// job and is skipped once the draw path is consuming the frame (see there).
+	VKDraw_Set_Present_Rect((unsigned)s_dstX, (unsigned)s_dstY, (unsigned)s_dstW, (unsigned)s_dstH);
+#endif
 	fprintf(stderr, "INFO: Pillarbox: game=%dx%d, backbuffer=%dx%d, present=%ux%u, windowed=%d\n",
 		gameW,
 		gameH,
@@ -332,6 +350,13 @@ void DX8Wrapper::Pillarbox_Begin()
 		1.0f
 	};
 	D3DDevice->SetViewport(&sceneViewport);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: this viewport is set straight on the D3D9
+	// device, so it never passes through DX8Wrapper::Set_Viewport and the submit filler would keep drawing
+	// with the last viewport the game named. Publish it - with the pillarbox target it is the whole mirror,
+	// which is also what the layer falls back to, but a windowed frame with a stale shadow would not be.
+	VK_Shadow_Viewport(&sceneViewport);
+#endif
 	// Clear the offscreen RT and its depth buffer. The Begin_Render clear targeted
 	// the backbuffer before we switched, so without this the offscreen would carry
 	// stale depth from the previous frame.
@@ -353,6 +378,14 @@ void DX8Wrapper::Pillarbox_End()
 	IsRenderToTexture = false;
 
 	// Blit offscreen texture centered onto backbuffer (fit rect cached in Pillarbox_Setup)
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.B: this quad is the letterbox. The Vulkan
+	// present chain does the same job by blitting the scene mirror into the rect published at
+	// Pillarbox_Setup, and while the Vulkan present gate is up the D3D9 backbuffer is never shown - so
+	// drawing the quad would be a raw-device escape that cannot reach the screen. Wedge 9 deletes the
+	// block; until then it is what the gate below skips.
+	if (VulkanCore_Present_Enabled()) return;
+#endif
 	D3DVIEWPORT9 vp = {0, 0, (DWORD)s_bbW, (DWORD)s_bbH, 0.0f, 1.0f};
 	D3DDevice->SetViewport(&vp);
 	D3DDevice->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0);
@@ -481,11 +514,892 @@ Vector3							DX8Wrapper::Ambient_Color;
 
 bool								DX8Wrapper::world_identity;
 unsigned							DX8Wrapper::RenderStates[256];
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the material the fixed-function vertex stage
+// reads before the game has applied one is the one the engine itself installs for a null material
+// (VertexMaterialClass::Apply_Null): white diffuse/ambient, no specular/emissive, power 1.
+D3DMATERIAL9						DX8Wrapper::Material_Shadow =
+{ { 1.0f, 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f },
+  { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f }, 1.0f };
+bool								DX8Wrapper::Material_Shadow_Valid						= false;
 unsigned							DX8Wrapper::TextureStageStates[MAX_TEXTURE_STAGES][33];
 unsigned							DX8Wrapper::SamplerStates[MAX_TEXTURE_STAGES][16];
 IDirect3DBaseTexture9 *		DX8Wrapper::Textures[MAX_TEXTURE_STAGES];
 RenderStateStruct				DX8Wrapper::render_state;
 unsigned							DX8Wrapper::render_state_changed;
+
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0 (pure-Vulkan port): the render-state census.
+//
+// Why this exists: the facade replays state lazily (Apply_Render_State_Changes marks dirty bits, the
+// next draw applies them), which is free on D3D9 but has no equivalent on Vulkan, where state is baked
+// into pipeline state objects that must be enumerated up front. Guessing that set produced the classic
+// port failure of "works until a rare shader walks in", so the wedge order starts by measuring: with
+// GENERALSX_VKCENSUS=1 every draw digests the *live* shadow state into two keys -
+//   pso key  = shader bits + FVF + VS/PS tags + light mask + touched render states
+//              (deliberately WITHOUT stage state: wedge 7 replaces the combiner with one interpreted
+//               pixel shader that reads stage state as uniforms, so it must not multiply pipelines)
+//   full key = pso key + per-stage texture stage state + sampler state
+// - and histograms both. The gap between the two counts *is* the payoff of the interpreted-shader
+// design, and the token lists are the exact surface wedge 5's state table and wedge 7's switch have
+// to cover. Dumps repeat every 20000 draws so a run that gets killed mid-scenario still leaves data.
+// Off, the only cost is the one-byte touched marks in the setters.
+unsigned char						DX8Wrapper::VK_RS_Touched[256];
+unsigned char						DX8Wrapper::VK_TSS_Touched[33];
+unsigned char						DX8Wrapper::VK_Samp_Touched[16];
+DWORD								DX8Wrapper::Vertex_Format = 0;
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace
+{
+	const unsigned          VKCENSUS_ROW_SLOTS   = 8192;   // power of two, open addressing
+	const unsigned          VKCENSUS_ROW_MASK    = VKCENSUS_ROW_SLOTS - 1;
+	const unsigned          VKCENSUS_SET_SLOTS   = 4096;
+	const unsigned          VKCENSUS_SET_MASK    = VKCENSUS_SET_SLOTS - 1;
+	const unsigned          VKCENSUS_TAG_SLOTS   = 512;
+	const unsigned          VKCENSUS_TAG_MASK    = 1023;   // probe table is twice the slots
+	const unsigned          VKCENSUS_MAX_TOKENS  = 33;
+	const unsigned long long VKCENSUS_DUMP_EVERY = 20000;
+	const unsigned VKCENSUS_RS_KEY_SLOTS = 40;      // >= VKCENSUS_RS_KEY_COUNT, sized before the tables
+	const unsigned VKCENSUS_RS_VALUE_SLOTS = 8;     // distinct values remembered per keying state
+	const unsigned long long VKCENSUS_TOKEN_EVERY = 512;   // rebuild touched-token lists this often
+
+	// Render states that carry a per-frame VALUE instead of selecting a pipeline. They are curated (so
+	// they never show up as untracked) but deliberately excluded from the pso key: keying a pipeline on
+	// fog distance would explode the cache. Wedge 5 reads this list as "these go in the UBO".
+	const unsigned VKCENSUS_RS_UNIFORM[] = {
+		D3DRS_AMBIENT,
+		D3DRS_FOGSTART,
+		D3DRS_FOGEND,
+		D3DRS_FOGCOLOR,
+		D3DRS_FOGDENSITY,
+		D3DRS_TEXTUREFACTOR,
+	};
+	const unsigned VKCENSUS_RS_UNIFORM_N =
+		(unsigned)(sizeof(VKCENSUS_RS_UNIFORM) / sizeof(VKCENSUS_RS_UNIFORM[0]));
+	// Slots are a little wider than the table so the classification loops can never walk off the end.
+	const unsigned VKCENSUS_RS_UNIFORM_COUNT = VKCENSUS_RS_UNIFORM_N + 2u;
+
+	struct VKCensusRow
+	{
+		unsigned long long pso_key;
+		unsigned long long full_key;
+		unsigned long long draws;
+		unsigned long long polys;
+		unsigned           shader_bits;
+		unsigned           fvf;
+		unsigned           vs_tag;
+		unsigned           ps_tag;
+		unsigned           light_mask;
+		unsigned           prim;
+		unsigned short     used;
+		unsigned short     pad;
+	};
+
+	// key -> count, used for the pso-key set, the stage-combination histograms and the render-target
+	// set (those three must stay distinct from the row table because they collapse other fields).
+	struct VKCensusSet
+	{
+		unsigned long long key;
+		unsigned long long count;
+	};
+
+	struct VKCensusTag
+	{
+		UINT_PTR handle;
+		unsigned tag;
+	};
+
+	struct VKCensusSnap
+	{
+		unsigned                 shader_bits;
+		unsigned                 fvf;
+		UINT_PTR                 vs_handle;
+		UINT_PTR                 ps_handle;
+		unsigned                 light_mask;
+		unsigned long long       rt_key;
+		unsigned                 prim;
+		unsigned                 polys;
+		unsigned                 verts;
+		unsigned                 stages;          // stages a pass can actually reach
+		const unsigned*          rs;              // RenderStates[256]
+		const unsigned*          tss;             // TextureStageStates flattened [stages][33]
+		const unsigned*          samp;            // SamplerStates flattened [stages][16]
+		const unsigned char*     rs_touch;
+		const unsigned char*     tss_touch;
+		const unsigned char*     samp_touch;
+	};
+
+	struct VKCensusState
+	{
+		VKCensusRow* rows;
+		VKCensusSet* pso_set;
+		VKCensusSet* stage_set;
+		VKCensusSet* rt_set;
+		VKCensusTag  tags[VKCENSUS_TAG_MASK + 1];
+
+		unsigned rs_tok[256];
+		unsigned tss_tok[VKCENSUS_MAX_TOKENS];
+		unsigned samp_tok[VKCENSUS_MAX_TOKENS];
+		unsigned rs_tok_n;
+		unsigned tss_tok_n;
+		unsigned samp_tok_n;
+		// The render states a Vulkan pipeline keys on. Keeping this as an explicit table (rather than
+		// "hash every touched slot") makes the pso key stable across a run and, more importantly, makes
+		// the gap between what the census hashes and what the game writes visible: anything touched but
+		// not curated lands in rs_untracked, and that list has to be empty before wedge 5's state table
+		// can be called complete.
+		unsigned char rs_curated[256];
+		unsigned char rs_untracked[256];
+		unsigned rs_untracked_n;
+		unsigned long long rs_untracked_hits;
+		// Per keying state, the distinct values the game actually uses. This is what turns the census from
+		// a hash dump into wedge 5's translation table: "ZFUNC has 2 values, COLORWRITE 3" is the real
+		// multiplier on pipeline variants, and a state that saturates its 8 slots warns that the key is
+		// wider than the pipeline cache should be.
+		unsigned rs_key_val[VKCENSUS_RS_KEY_SLOTS][VKCENSUS_RS_VALUE_SLOTS];
+		unsigned char rs_key_val_n[VKCENSUS_RS_KEY_SLOTS];
+		unsigned long long rs_key_val_overflow;
+		// Render states that are uniform VALUES rather than pipeline choices: fog geometry, ambient,
+		// texture factor. A Vulkan pipeline must not key on them (they change per frame), but wedge 5's
+		// UBO has to carry them, so they get their own curated class and their own observed-value range.
+		unsigned char rs_uniform[256];
+		unsigned rs_uniform_tok[VKCENSUS_RS_UNIFORM_COUNT];
+		unsigned rs_uniform_n;
+		unsigned long long rs_uniform_hits;
+		unsigned long long rs_uniform_writes[VKCENSUS_RS_UNIFORM_COUNT];
+		unsigned rs_uniform_last[VKCENSUS_RS_UNIFORM_COUNT];
+		unsigned rs_uniform_changes[VKCENSUS_RS_UNIFORM_COUNT];
+		unsigned char rs_drop[256];
+		unsigned rs_drop_tok[VKCENSUS_MAX_TOKENS];
+		unsigned rs_drop_n;
+		unsigned fvf_list[64];
+		unsigned fvf_n;
+		unsigned light_list[256];
+		unsigned light_n;
+		unsigned op_list[64];
+		unsigned op_n;
+		unsigned arg_list[64];
+		unsigned arg_n;
+		unsigned tss_class[VKCENSUS_MAX_TOKENS];   // 0 other, 1 combiner op, 2 combiner operand
+
+		unsigned long long draws;
+		unsigned long long polys;
+		unsigned long long verts;
+		unsigned long long distinct_pso;
+		unsigned long long distinct_rows;
+		unsigned long long distinct_stage;
+		unsigned long long distinct_rt;
+		unsigned long long ff_draws;
+		unsigned long long prog_draws;
+		unsigned long long vs_draws;
+		unsigned long long ps_draws;
+		unsigned long long tag_overflow;
+		unsigned long long next_dump;
+		unsigned long long dumps;
+		unsigned long long token_ticks;
+		unsigned           tag_count;
+		unsigned long long row_overflow;
+		bool               checked;
+		bool               on;
+		bool               classified;
+		char               csv[512];
+	};
+
+	VKCensusState CX;   // namespace-scope: zero initialised
+
+	// The render states folded into the pso key. This is the honest candidate list for wedge 5's
+	// pipeline-state translation, and it is deliberately a table instead of "hash every touched slot":
+	// the key must be stable across a run, and any token the game writes that is NOT in this table has
+	// to show up as untracked so the list can be corrected rather than silently under-counted.
+	const unsigned VKCENSUS_RS_KEY[] = {
+		D3DRS_LIGHTING,
+		D3DRS_ZENABLE,
+		D3DRS_ZWRITEENABLE,
+		D3DRS_CULLMODE,
+		D3DRS_ALPHABLENDENABLE,
+		D3DRS_SRCBLEND,
+		D3DRS_DESTBLEND,
+		D3DRS_ALPHATESTENABLE,
+		D3DRS_ALPHAFUNC,
+		D3DRS_ALPHAREF,
+		D3DRS_FOGENABLE,
+		D3DRS_FOGTABLEMODE,
+		D3DRS_FOGVERTEXMODE,
+		D3DRS_COLORWRITEENABLE,
+		D3DRS_STENCILENABLE,
+		D3DRS_STENCILFUNC,
+		D3DRS_SRGBWRITEENABLE,
+		D3DRS_ZFUNC,
+		D3DRS_FILLMODE,
+		D3DRS_SHADEMODE,
+		D3DRS_DIFFUSEMATERIALSOURCE,
+		D3DRS_AMBIENTMATERIALSOURCE,
+		D3DRS_SPECULARMATERIALSOURCE,
+		D3DRS_EMISSIVEMATERIALSOURCE,
+		D3DRS_CLIPPLANEENABLE,
+		D3DRS_MULTISAMPLEANTIALIAS,
+		D3DRS_DEPTHBIAS,
+		D3DRS_SLOPESCALEDEPTHBIAS,
+		D3DRS_SPECULARENABLE,
+		D3DRS_COLORVERTEX,
+	};
+	const unsigned VKCENSUS_RS_KEY_COUNT = (unsigned)(sizeof(VKCENSUS_RS_KEY) / sizeof(VKCENSUS_RS_KEY[0]));
+
+	// Fixed-function switches the port consciously folds away rather than reproducing: range fog becomes
+	// plain vertex fog for every distance (wedge 6's decision), so it must not split a pipeline key, but it
+	// still has to be accounted for. Listing it here keeps the "everything the game writes is classified"
+	// property of the census instead of hiding it in an untracked bucket that would look like a bug.
+	const unsigned VKCENSUS_RS_DROP[] = {
+		D3DRS_RANGEFOGENABLE,
+	};
+	const unsigned VKCENSUS_RS_DROP_COUNT = (unsigned)(sizeof(VKCENSUS_RS_DROP) / sizeof(VKCENSUS_RS_DROP[0]));
+
+	unsigned long long vk_census_hash(unsigned long long h, unsigned v)
+	{
+		const unsigned char* b = (const unsigned char*)&v;
+		for (int i = 0; i < 4; ++i) {
+			h ^= (unsigned long long)b[i];
+			h *= 1099511628211ULL;
+		}
+		return h;
+	}
+
+	unsigned long long vk_census_hash64(unsigned long long h, unsigned long long v)
+	{
+		h = vk_census_hash(h, (unsigned)(v & 0xFFFFFFFFULL));
+		return vk_census_hash(h, (unsigned)(v >> 32));
+	}
+
+	unsigned vk_census_slot(unsigned long long key)
+	{
+		return (unsigned)((key ^ (key >> 29) ^ (key >> 58)) & VKCENSUS_SET_MASK);
+	}
+
+	// Bump a key in a set table; returns true when the key was new.
+	bool vk_census_bump(VKCensusSet* table, unsigned long long key, unsigned long long delta)
+	{
+		unsigned idx = vk_census_slot(key);
+		for (unsigned probe = 0; probe <= VKCENSUS_SET_MASK; ++probe) {
+			VKCensusSet& s = table[idx];
+			if (!s.key && !s.count) {
+				s.key = key;
+				s.count = delta;
+				return true;
+			}
+			if (s.key == key) { s.count += delta; return false; }
+			idx = (idx + 1) & VKCENSUS_SET_MASK;
+		}
+		return false;   // table saturated: stop counting, the gate line reports the pressure
+	}
+
+	unsigned vk_census_tag(UINT_PTR handle)
+	{
+		if (!handle) return 0;
+		unsigned long long h = (unsigned long long)handle;
+		unsigned idx = (unsigned)((h ^ (h >> 17)) & VKCENSUS_TAG_MASK);
+		for (unsigned probe = 0; probe <= VKCENSUS_TAG_MASK; ++probe) {
+			VKCensusTag& t = CX.tags[idx];
+			if (!t.handle) {
+				if (CX.tag_count >= VKCENSUS_TAG_SLOTS) { ++CX.tag_overflow; return VKCENSUS_TAG_SLOTS + 1; }
+				t.handle = handle;
+				t.tag = ++CX.tag_count;
+				return t.tag;
+			}
+			if (t.handle == handle) return t.tag;
+			idx = (idx + 1) & VKCENSUS_TAG_MASK;
+		}
+		++CX.tag_overflow;
+		return VKCENSUS_TAG_SLOTS + 1;
+	}
+
+	// Small value lists: the census wants "which distinct X did the game use", not a histogram.
+	bool vk_census_add_list(unsigned* list, unsigned& count, unsigned capacity, unsigned value)
+	{
+		for (unsigned i = 0; i < count; ++i) if (list[i] == value) return false;
+		if (count >= capacity) return false;
+		list[count++] = value;
+		return true;
+	}
+
+	// Fold the sentinel written by Invalidate_Cached_Render_States out of a digest: an invalidated slot
+	// has no value yet, so it must not split one key into two across a device reset.
+	unsigned vk_census_value(unsigned raw)
+	{
+		return (raw == 0x12345678u) ? 0u : raw;
+	}
+
+
+	void vk_census_rebuild_tokens(const VKCensusSnap& s)
+	{
+		CX.rs_tok_n = 0;
+		CX.tss_tok_n = 0;
+		CX.samp_tok_n = 0;
+		CX.rs_uniform_n = 0;
+		CX.rs_drop_n = 0;
+		for (unsigned i = 0; i < 256; ++i) {
+			if (!s.rs_touch[i]) continue;
+			CX.rs_tok[CX.rs_tok_n++] = i;
+			if (CX.rs_uniform[i]) {
+				if (CX.rs_uniform_n < VKCENSUS_RS_UNIFORM_COUNT) CX.rs_uniform_tok[CX.rs_uniform_n++] = i;
+			} else if (CX.rs_drop[i]) {
+				if (CX.rs_drop_n < VKCENSUS_MAX_TOKENS) CX.rs_drop_tok[CX.rs_drop_n++] = i;
+			} else if (!CX.rs_curated[i] && !CX.rs_untracked[i]) {
+				CX.rs_untracked[i] = 1;
+				++CX.rs_untracked_n;
+			}
+		}
+		for (unsigned i = 0; i < VKCENSUS_MAX_TOKENS; ++i) {
+			if (s.tss_touch[i]) {
+				if (CX.tss_tok_n < VKCENSUS_MAX_TOKENS) CX.tss_tok[CX.tss_tok_n++] = i;
+			}
+			if (s.samp_touch[i] && i < 16) {
+				if (CX.samp_tok_n < VKCENSUS_MAX_TOKENS) CX.samp_tok[CX.samp_tok_n++] = i;
+			}
+		}
+
+		// Classify the stage-state tokens once, off the facade's own name tables (see
+		// vk_census_ops_and_args for why this is name-driven rather than ordinal-driven).
+		if (!CX.classified) {
+			CX.classified = true;
+			for (unsigned i = 0; i < VKCENSUS_MAX_TOKENS; ++i) {
+				const char* name = DX8Wrapper::Get_DX8_Texture_Stage_State_Name((D3DTEXTURESTAGESTATETYPE)i);
+				if (!name) continue;
+				unsigned cls = 0;
+				for (const char* p = name; *p; ++p) {
+					if (p[0] == 'O' && p[1] == 'P' && (p[2] < '0' || p[2] > '9' || !p[2])) { cls = 1; break; }
+				}
+				if (!cls) {
+					for (const char* p = name; *p; ++p) {
+						if (p[0] == 'A' && p[1] == 'R' && p[2] == 'G') { cls = 2; break; }
+					}
+				}
+				CX.tss_class[i] = cls;
+			}
+		}
+	}
+
+	// Remember the distinct values a keying render state takes (first VKCENSUS_RS_VALUE_SLOTS of them).
+	void vk_census_note_key_value(unsigned slot, unsigned value)
+	{
+		unsigned char& n = CX.rs_key_val_n[slot];
+		for (unsigned i = 0; i < n; ++i) {
+			if (CX.rs_key_val[slot][i] == value) return;
+		}
+		if (n < VKCENSUS_RS_VALUE_SLOTS) {
+			CX.rs_key_val[slot][n++] = value;
+			return;
+		}
+		++CX.rs_key_val_overflow;
+	}
+
+	VKCensusRow* vk_census_find_row(unsigned long long full)
+	{
+		unsigned idx = (unsigned)((full ^ (full >> 29) ^ (full >> 58)) & VKCENSUS_ROW_MASK);
+		for (unsigned probe = 0; probe <= VKCENSUS_ROW_MASK; ++probe) {
+			VKCensusRow& r = CX.rows[idx];
+			if (!r.used) return &r;
+			if (r.full_key == full) return &r;
+			idx = (idx + 1) & VKCENSUS_ROW_MASK;
+		}
+		return nullptr;
+	}
+
+	// Op/arg collection: stage state tokens whose value space is an enum the interpreted pixel shader
+	// has to switch over. The token is classified by the name the facade's own tables give it ("...OP"
+	// is a combiner operation, "...ARG" one of its operands) rather than by hard-coded D3DTSS_* ordinals:
+	// the numeric space differs between the DX8 and D3D9 headers, the names do not, and those same name
+	// tables are what the CSV prints, so this classification cannot drift from the report.
+	void vk_census_ops_and_args(const VKCensusSnap& s)
+	{
+		for (unsigned stage = 0; stage < s.stages; ++stage) {
+			const unsigned* row = s.tss + (size_t)stage * VKCENSUS_MAX_TOKENS;
+			for (unsigned t = 0; t < CX.tss_tok_n; ++t) {
+				const unsigned tok = CX.tss_tok[t];
+				const unsigned cls = CX.tss_class[tok];
+				if (!cls) continue;
+				const unsigned v = vk_census_value(row[tok]);
+				if (!v) continue;
+				if (cls == 1) vk_census_add_list(CX.op_list, CX.op_n, 64, v);
+				else vk_census_add_list(CX.arg_list, CX.arg_n, 64, v);
+			}
+		}
+	}
+
+	void vk_census_record(const VKCensusSnap& s)
+	{
+		++CX.draws;
+		CX.polys += s.polys;
+		CX.verts += s.verts;
+
+		if (!(CX.token_ticks & (VKCENSUS_TOKEN_EVERY - 1))) vk_census_rebuild_tokens(s);
+		++CX.token_ticks;
+
+		// --- pso key: everything a pipeline needs except stage state ----------------------------
+		unsigned long long pso = 1469598103934665603ULL;
+		pso = vk_census_hash(pso, s.shader_bits);
+		pso = vk_census_hash(pso, s.fvf);
+		pso = vk_census_hash(pso, s.light_mask);
+		for (unsigned t = 0; t < VKCENSUS_RS_KEY_COUNT; ++t) {
+			const unsigned v = vk_census_value(s.rs[VKCENSUS_RS_KEY[t]]);
+			pso = vk_census_hash(pso, v);
+			if (t < VKCENSUS_RS_KEY_SLOTS) vk_census_note_key_value(t, v);
+		}
+
+		const unsigned vs_tag = vk_census_tag(s.vs_handle);
+		const unsigned ps_tag = vk_census_tag(s.ps_handle);
+		pso = vk_census_hash(pso, vs_tag);
+		pso = vk_census_hash(pso, ps_tag);
+		if (vk_census_bump(CX.pso_set, pso, 1)) ++CX.distinct_pso;
+
+		// --- full key: plus everything stage state can still change ------------------------------
+		unsigned long long full = pso;
+		for (unsigned stage = 0; stage < s.stages; ++stage) {
+			const unsigned* trow = s.tss + (size_t)stage * VKCENSUS_MAX_TOKENS;
+			const unsigned* srow = s.samp + (size_t)stage * 16;
+			unsigned long long stage_key = vk_census_hash(1469598103934665603ULL, stage);
+			for (unsigned t = 0; t < CX.tss_tok_n; ++t) {
+				const unsigned v = vk_census_value(trow[CX.tss_tok[t]]);
+				full = vk_census_hash(full, v);
+				stage_key = vk_census_hash(stage_key, v);
+			}
+			for (unsigned t = 0; t < CX.samp_tok_n; ++t) {
+				const unsigned v = vk_census_value(srow[CX.samp_tok[t]]);
+				full = vk_census_hash(full, v);
+				stage_key = vk_census_hash(stage_key, v);
+			}
+			// The per-stage tuple on its own is wedge 7's real workload: it is what the interpreted
+			// pixel shader's switch actually has to cover, stage by stage.
+			if (vk_census_bump(CX.stage_set, stage_key, 1)) ++CX.distinct_stage;
+		}
+
+		vk_census_ops_and_args(s);
+
+		// Render target sits outside both keys on purpose - a pipeline does not care which target it
+		// fills - but wedge 5's framebuffer/pass cache does, so it is counted on its own.
+		if (vk_census_bump(CX.rt_set, vk_census_hash64(1469598103934665603ULL, s.rt_key), 1)) ++CX.distinct_rt;
+
+		for (unsigned t = 0; t < CX.rs_tok_n; ++t) {
+			if (CX.rs_untracked[CX.rs_tok[t]]) ++CX.rs_untracked_hits;
+		}
+		// How often a uniform-class state actually changes value. A token that moves between draws is the
+		// evidence wedge 5 needs: it cannot be a pipeline key, it has to reach the constant buffer.
+		for (unsigned u = 0; u < CX.rs_uniform_n; ++u) {
+			const unsigned v = vk_census_value(s.rs[CX.rs_uniform_tok[u]]);
+			++CX.rs_uniform_writes[u];
+			if (v != CX.rs_uniform_last[u]) { ++CX.rs_uniform_changes[u]; CX.rs_uniform_last[u] = v; }
+			++CX.rs_uniform_hits;
+		}
+
+		if (vs_tag) ++CX.vs_draws;
+		if (ps_tag) ++CX.ps_draws;
+		if (vs_tag || ps_tag) ++CX.prog_draws;
+		else ++CX.ff_draws;
+
+		vk_census_add_list(CX.fvf_list, CX.fvf_n, 64, s.fvf);
+		vk_census_add_list(CX.light_list, CX.light_n, 256, s.light_mask);
+
+		VKCensusRow* row = vk_census_find_row(full);
+		if (!row) { ++CX.row_overflow; return; }
+		if (!row->used) {
+			row->used = 1;
+			row->full_key = full;
+			row->pso_key = pso;
+			row->shader_bits = s.shader_bits;
+			row->fvf = s.fvf;
+			row->vs_tag = vs_tag;
+			row->ps_tag = ps_tag;
+			row->light_mask = s.light_mask;
+			row->prim = s.prim;
+			++CX.distinct_rows;
+		}
+		++row->draws;
+		row->polys += s.polys;
+	}
+
+	int vk_census_cmp_row(const void* a, const void* b)
+	{
+		const VKCensusRow* ra = (const VKCensusRow*)a;
+		const VKCensusRow* rb = (const VKCensusRow*)b;
+		if (ra->draws < rb->draws) return 1;
+		if (ra->draws > rb->draws) return -1;
+		return 0;
+	}
+
+	int vk_census_cmp_set(const void* a, const void* b)
+	{
+		const VKCensusSet* sa = (const VKCensusSet*)a;
+		const VKCensusSet* sb = (const VKCensusSet*)b;
+		if (sa->count < sb->count) return 1;
+		if (sa->count > sb->count) return -1;
+		return 0;
+	}
+
+	void vk_census_copy(char* dst, size_t cap, const char* src)
+	{
+		size_t i = 0;
+		if (!cap) return;
+		for (; i + 1 < cap && src[i]; ++i) dst[i] = src[i];
+		dst[i] = 0;
+	}
+
+	// This TU is compiled on every platform (DXVK serves the same D3D9 API on Linux/macOS), so the env
+	// reads go through the platform's own accessor instead of assuming Win32.
+	bool vk_census_env_flag(const char* name)
+	{
+#ifdef _WIN32
+		char raw[8] = {};
+		DWORD n = GetEnvironmentVariableA(name, raw, (DWORD)sizeof(raw));
+		return (n != 0 && raw[0] != '0');
+#else
+		const char* raw = getenv(name);
+		return (raw != nullptr && raw[0] != 0 && raw[0] != '0');
+#endif
+	}
+
+	const char* vk_census_env_text(const char* name, char* buffer, size_t cap)
+	{
+#ifdef _WIN32
+		DWORD n = GetEnvironmentVariableA(name, buffer, (DWORD)cap);
+		return (n != 0 && n < (DWORD)cap) ? buffer : nullptr;
+#else
+		const char* raw = getenv(name);
+		if (!raw) return nullptr;
+		vk_census_copy(buffer, cap, raw);
+		return buffer;
+#endif
+	}
+
+	// The CSV goes to the Vulkan work hub by default so the artefact sits with the rest of the port's
+	// forensics; GENERALSX_VKCENSUS_CSV overrides it. The default is CWD-relative because the port's run
+	// script starts the game from its root.
+	void vk_census_default_csv(char* out, size_t cap)
+	{
+		char env[512] = {};
+		if (vk_census_env_text("GENERALSX_VKCENSUS_CSV", env, sizeof(env))) vk_census_copy(out, cap, env);
+		else vk_census_copy(out, cap, "Vulkan/artifacts/census.csv");
+	}
+
+	unsigned long long vk_census_uniform_changes()
+	{
+		unsigned long long total = 0;
+		for (unsigned u = 0; u < VKCENSUS_RS_UNIFORM_COUNT; ++u) total += CX.rs_uniform_changes[u];
+		return total;
+	}
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: read a shadowed render state as the value
+// the device would have applied.
+//
+// The census (Vulkan/artifacts/census_menu.csv, 2.42M draws) is what forces this. Six of the states that
+// key a pipeline are never written by the engine at all: D3DRS_ZENABLE, D3DRS_SHADEMODE,
+// D3DRS_STENCILFUNC, D3DRS_CLIPPLANEENABLE, D3DRS_MULTISAMPLEANTIALIAS and D3DRS_SRGBWRITEENABLE each
+// appear in the census exactly once, as the value 0x00000000, and that is not a real setting - it is
+// Invalidate_Cached_Render_States' sentinel 0x12345678 folded to zero by vk_census_value above (the
+// digest does that on purpose, so a device reset cannot split one key into two). Read the same way, a
+// pipeline key would therefore carry depth testing off and shading flat - and a batch that never named a
+// state would look like a content bug rather than a state-reading bug. A pipeline has to be built from
+// what the hardware would have done, so this is that table: ordinals from
+// Windows Kits/10/Include/10.0.26100.0/shared/d3d9types.h, defaults from the documented D3D9 state
+// initial values, which are also what the D3D9 device this port replaces applied to those same batches.
+unsigned DX8Wrapper::VK_Read_RS(unsigned token)
+{
+	const unsigned raw = RenderStates[token & 0xFFu];
+	if (raw != 0x12345678u) return raw;
+	switch (token) {
+	case D3DRS_ZENABLE:                return D3DZB_TRUE;
+	case D3DRS_ZWRITEENABLE:           return TRUE;
+	case D3DRS_ZFUNC:                  return D3DCMP_LESSEQUAL;
+	case D3DRS_FILLMODE:               return D3DFILL_SOLID;
+	case D3DRS_SHADEMODE:              return D3DSHADE_GOURAUD;
+	case D3DRS_CULLMODE:               return D3DCULL_CCW;
+	case D3DRS_ALPHABLENDENABLE:       return FALSE;
+	case D3DRS_ALPHATESTENABLE:        return FALSE;
+	case D3DRS_SRCBLEND:               return D3DBLEND_ONE;
+	case D3DRS_DESTBLEND:              return D3DBLEND_ZERO;
+	case D3DRS_ALPHAFUNC:              return D3DCMP_GREATER;
+	case D3DRS_ALPHAREF:               return 0;
+	case D3DRS_FOGENABLE:              return FALSE;
+	case D3DRS_FOGTABLEMODE:           return D3DFOG_NONE;
+	case D3DRS_FOGVERTEXMODE:          return D3DFOG_NONE;
+	case D3DRS_RANGEFOGENABLE:         return FALSE;
+	case D3DRS_SPECULARENABLE:         return FALSE;
+	case D3DRS_LIGHTING:               return TRUE;
+	case D3DRS_COLORVERTEX:            return TRUE;
+	case D3DRS_LOCALVIEWER:            return TRUE;
+	case D3DRS_NORMALIZENORMALS:       return FALSE;
+	case D3DRS_DIFFUSEMATERIALSOURCE:  return D3DMCS_COLOR1;
+	case D3DRS_AMBIENTMATERIALSOURCE:  return D3DMCS_MATERIAL;
+	case D3DRS_SPECULARMATERIALSOURCE: return D3DMCS_COLOR2;
+	case D3DRS_EMISSIVEMATERIALSOURCE: return D3DMCS_MATERIAL;
+	case D3DRS_AMBIENT:                return 0u;
+	case D3DRS_FOGCOLOR:               return 0u;
+	case D3DRS_TEXTUREFACTOR:          return 0u;
+	case D3DRS_COLORWRITEENABLE:       return 0x0000000Fu;
+	case D3DRS_STENCILENABLE:          return FALSE;
+	case D3DRS_STENCILFUNC:            return D3DCMP_ALWAYS;
+	case D3DRS_CLIPPLANEENABLE:        return 0u;
+	case D3DRS_MULTISAMPLEANTIALIAS:   return FALSE;
+	case D3DRS_SRGBWRITEENABLE:        return 0u;
+	case D3DRS_DEPTHBIAS:              return 0u;
+	case D3DRS_SLOPESCALEDEPTHBIAS:    return 0u;
+	default:                           return 0u;
+	}
+}
+
+// Same sentinel problem for the states that carry a float: D3D9 documents fog start 0.0, fog end 1.0
+// and density 1.0, and the shadow holds the bit pattern of the float, not the float.
+unsigned DX8Wrapper::VK_Read_RS_Default_bits(unsigned token, float fallback)
+{
+	const unsigned raw = RenderStates[token & 0xFFu];
+	if (raw != 0x12345678u) return raw;
+	float v = fallback;
+	unsigned bits;
+	memcpy(&bits, &v, sizeof(bits));
+	return bits;
+}
+
+// Texture-stage shadow read: D3DTSS_TEXCOORDINDEX defaults to the stage's own coordinate set (the
+// documentation says "Stage"), everything else in the stage registers defaults to zero.
+unsigned DX8Wrapper::VK_Read_TSS(unsigned stage, unsigned token, unsigned fallback)
+{
+	const unsigned raw = TextureStageStates[stage & (MAX_TEXTURE_STAGES - 1u)][token & 0x3Fu];
+	return (raw == 0x12345678u) ? fallback : raw;
+}
+
+// ----------------------------------------------------------------------------
+//
+// Census entry points (see the block above for what each number is for).
+//
+// ----------------------------------------------------------------------------
+
+bool DX8Wrapper::VK_Census_On()
+{
+	if (!CX.checked) {
+		CX.checked = true;
+		if (!vk_census_env_flag("GENERALSX_VKCENSUS")) return false;
+
+		CX.rows      = (VKCensusRow*)calloc(VKCENSUS_ROW_SLOTS, sizeof(VKCensusRow));
+		CX.pso_set   = (VKCensusSet*)calloc(VKCENSUS_SET_SLOTS, sizeof(VKCensusSet));
+		CX.stage_set = (VKCensusSet*)calloc(VKCENSUS_SET_SLOTS, sizeof(VKCensusSet));
+		CX.rt_set    = (VKCensusSet*)calloc(VKCENSUS_SET_SLOTS, sizeof(VKCensusSet));
+
+		if (!CX.rows || !CX.pso_set || !CX.stage_set || !CX.rt_set) {
+			free(CX.rows); free(CX.pso_set); free(CX.stage_set); free(CX.rt_set);
+			CX.rows = nullptr; CX.pso_set = nullptr; CX.stage_set = nullptr; CX.rt_set = nullptr;
+			fprintf(stderr, "[VKCENSUS] enabled but tables did not allocate; census disabled\n");
+			fflush(stderr);
+			return false;
+		}
+
+		for (unsigned t = 0; t < VKCENSUS_RS_KEY_COUNT; ++t) CX.rs_curated[VKCENSUS_RS_KEY[t]] = 1;
+		for (unsigned t = 0; t < VKCENSUS_RS_UNIFORM_N; ++t) CX.rs_uniform[VKCENSUS_RS_UNIFORM[t]] = 1;
+		for (unsigned t = 0; t < VKCENSUS_RS_DROP_COUNT; ++t) CX.rs_drop[VKCENSUS_RS_DROP[t]] = 1;
+		vk_census_default_csv(CX.csv, sizeof(CX.csv));
+		CX.next_dump = VKCENSUS_DUMP_EVERY;
+		CX.on = true;
+
+		fprintf(stderr, "[VKCENSUS] render-state census ON, csv=%s\n", CX.csv);
+		fflush(stderr);
+	}
+	return CX.on;
+}
+
+void DX8Wrapper::VK_Census_Draw(unsigned prim_type, unsigned short polygon_count, unsigned short vertex_count)
+{
+	if (!VK_Census_On()) return;
+
+	VKCensusSnap s;
+	s.shader_bits = (unsigned&)render_state.shader;
+	s.fvf         = (unsigned)Vertex_Format;
+	s.vs_handle   = Vertex_Shader;
+	s.ps_handle   = Pixel_Shader;
+
+	unsigned mask = 0;
+	for (unsigned i = 0; i < 8; ++i) {
+		if (render_state.LightEnable[i]) mask |= (1u << i);
+	}
+	s.light_mask = mask;
+
+	s.rt_key = (unsigned long long)(UINT_PTR)CurrentRenderTarget;
+	s.prim   = prim_type;
+	s.polys  = polygon_count;
+	s.verts  = vertex_count;
+
+	s.stages = CurrentCaps ? (unsigned)CurrentCaps->Get_Max_Textures_Per_Pass() : 2u;
+	if (s.stages > MAX_TEXTURE_STAGES) s.stages = MAX_TEXTURE_STAGES;
+
+	s.rs         = RenderStates;
+	s.tss        = &TextureStageStates[0][0];
+	s.samp       = &SamplerStates[0][0];
+	s.rs_touch   = VK_RS_Touched;
+	s.tss_touch  = VK_TSS_Touched;
+	s.samp_touch = VK_Samp_Touched;
+
+	vk_census_record(s);
+
+	if (CX.draws >= CX.next_dump) {
+		CX.next_dump += VKCENSUS_DUMP_EVERY;
+		VK_Census_Dump("periodic");
+	}
+}
+
+void DX8Wrapper::VK_Census_Dump(const char* reason)
+{
+	if (!CX.on) return;
+	++CX.dumps;
+
+	VKCensusRow* sorted_rows = (VKCensusRow*)malloc(sizeof(VKCensusRow) * VKCENSUS_ROW_SLOTS);
+	VKCensusSet* sorted_set  = (VKCensusSet*)malloc(sizeof(VKCensusSet) * VKCENSUS_SET_SLOTS);
+
+	FILE* f = fopen(CX.csv, "w");
+	if (!f) {
+		fprintf(stderr, "[VKCENSUS] csv open FAILED path=%s\n", CX.csv);
+		fflush(stderr);
+	} else {
+		const double collapse = CX.distinct_pso
+			? (double)CX.distinct_rows / (double)CX.distinct_pso : 0.0;
+
+		fprintf(f, "# GeneralsX pure-Vulkan wedge 0 render-state census\n");
+		fprintf(f, "# reason=%s dumps=%llu\n", reason, CX.dumps);
+		fprintf(f, "# summary,draws,%llu,polys,%llu,psoKeys,%llu,fullKeys,%llu,collapse,%g\n",
+			CX.draws, CX.polys, CX.distinct_pso, CX.distinct_rows, collapse);
+		fprintf(f, "# stageCombos,%llu,targets,%llu,fvfs,%u,lightMasks,%u,shaderTags,%u\n",
+			CX.distinct_stage, CX.distinct_rt, CX.fvf_n, CX.light_n, CX.tag_count);
+		fprintf(f, "# fixedFunction,%llu,programmable,%llu,vertexShader,%llu,pixelShader,%llu\n",
+			CX.ff_draws, CX.prog_draws, CX.vs_draws, CX.ps_draws);
+		fprintf(f, "# ops,%u,args,%u,rsTokens,%u,tssTokens,%u,sampTokens,%u\n",
+			CX.op_n, CX.arg_n, CX.rs_tok_n, CX.tss_tok_n, CX.samp_tok_n);
+		fprintf(f, "# untrackedRsTokens,%u,untrackedHits,%llu,rowOverflow,%llu,tagOverflow,%llu,keyValueOverflow,%llu\n",
+			CX.rs_untracked_n, CX.rs_untracked_hits, CX.row_overflow, CX.tag_overflow, CX.rs_key_val_overflow);
+		fprintf(f, "# uniformRsTokens,%u,uniformSamples,%llu,uniformValueChanges,%llu,droppedRsTokens,%u\n",
+			CX.rs_uniform_n, CX.rs_uniform_hits, vk_census_uniform_changes(), CX.rs_drop_n);
+
+		unsigned n = 0;
+		if (sorted_rows) {
+			for (unsigned i = 0; i < VKCENSUS_ROW_SLOTS; ++i) {
+				if (CX.rows[i].used) sorted_rows[n++] = CX.rows[i];
+			}
+			qsort(sorted_rows, n, sizeof(VKCensusRow), vk_census_cmp_row);
+			fprintf(f, "\nsection,pso_key,full_key,draws,polys,shader_bits,fvf,vs_tag,ps_tag,light_mask,prim\n");
+			const unsigned limit = (n < 500) ? n : 500;
+			for (unsigned i = 0; i < limit; ++i) {
+				const VKCensusRow& r = sorted_rows[i];
+				fprintf(f, "row,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u\n",
+					r.pso_key, r.full_key, r.draws, r.polys,
+					r.shader_bits, r.fvf, r.vs_tag, r.ps_tag, r.light_mask, r.prim);
+			}
+		}
+
+		// Two more sections reuse the same scratch set table (it is overwritten, never aliased).
+		for (int which = 0; which < 2; ++which) {
+			VKCensusSet* src = which ? CX.rt_set : CX.stage_set;
+			if (!sorted_set || !src) continue;
+			n = 0;
+			for (unsigned i = 0; i < VKCENSUS_SET_SLOTS; ++i) {
+				if (src[i].count) sorted_set[n++] = src[i];
+			}
+			qsort(sorted_set, n, sizeof(VKCensusSet), vk_census_cmp_set);
+			const unsigned limit = (n < 300) ? n : 300;
+			for (unsigned i = 0; i < limit; ++i) {
+				fprintf(f, "%s,%llu,%llu\n", which ? "target" : "stagecombo",
+					sorted_set[i].key, sorted_set[i].count);
+			}
+		}
+
+		for (unsigned i = 0; i < CX.fvf_n; ++i) fprintf(f, "fvf,%u\n", CX.fvf_list[i]);
+		for (unsigned i = 0; i < CX.light_n; ++i) fprintf(f, "lightmask,%u\n", CX.light_list[i]);
+
+		// Token tables: the current value plus its name is what the state translator reads to build
+		// its mapping, so the names come from the facade's own tables rather than a hand-written list.
+		for (unsigned i = 0; i < CX.rs_tok_n; ++i) {
+			const unsigned tok = CX.rs_tok[i];
+			const unsigned cls = CX.rs_curated[tok] ? 1u : (CX.rs_uniform[tok] ? 2u : (CX.rs_drop[tok] ? 3u : 0u));
+			fprintf(f, "rsstate,%u,%s,%u,%u\n", tok,
+				Get_DX8_Render_State_Name((D3DRENDERSTATETYPE)tok),
+				vk_census_value(RenderStates[tok]), cls);
+		}
+		// Uniform-class states with their activity: writes counted at census time, and how many times the
+		// value actually moved. Nonzero changes is the machine proof wedge 5 must route these to the UBO.
+		for (unsigned u = 0; u < CX.rs_uniform_n; ++u) {
+			const unsigned tok = CX.rs_uniform_tok[u];
+			// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 0: rs_uniform_changes is an unsigned int, so
+			// %llu read eight bytes off a four-byte slot and shifted every later column of this row - the
+			// "did the value actually move" proof wedge 5 was reading off the CSV was garbage.
+			fprintf(f, "rsuniform,%u,%s,%08X,%llu,%u\n", tok,
+				Get_DX8_Render_State_Name((D3DRENDERSTATETYPE)tok), CX.rs_uniform_last[u],
+				CX.rs_uniform_writes[u], CX.rs_uniform_changes[u]);
+		}
+		for (unsigned u = 0; u < CX.rs_drop_n; ++u) {
+			const unsigned tok = CX.rs_drop_tok[u];
+			fprintf(f, "rsdrop,%u,%s,%u\n", tok,
+				Get_DX8_Render_State_Name((D3DRENDERSTATETYPE)tok), vk_census_value(RenderStates[tok]));
+		}
+		// The distinct-value census for each pipeline-keyed state: wedge 5's variant multiplier.
+		for (unsigned t = 0; t < VKCENSUS_RS_KEY_COUNT && t < VKCENSUS_RS_KEY_SLOTS; ++t) {
+			const unsigned tok = VKCENSUS_RS_KEY[t];
+			const unsigned char n = CX.rs_key_val_n[t];
+			char values[VKCENSUS_RS_VALUE_SLOTS * 10 + 1] = {};
+			size_t used = 0;
+			for (unsigned i = 0; i < n && used + 12 < sizeof(values); ++i) {
+				int w = snprintf(values + used, sizeof(values) - used, i ? " %08X" : "%08X", CX.rs_key_val[t][i]);
+				if (w <= 0) break;
+				used += (size_t)w;
+			}
+			fprintf(f, "rskeyvalues,%u,%s,%u,%s\n", tok,
+				Get_DX8_Render_State_Name((D3DRENDERSTATETYPE)tok), n, values);
+		}
+
+		for (unsigned i = 0; i < CX.tss_tok_n; ++i) {
+			const unsigned tok = CX.tss_tok[i];
+			fprintf(f, "stagestate,%u,%s,%u,%u,%u\n", tok,
+				Get_DX8_Texture_Stage_State_Name((D3DTEXTURESTAGESTATETYPE)tok),
+				vk_census_value(TextureStageStates[0][tok]),
+				CX.tss_class[tok],
+				CX.tss_class[tok] == 1u ? 1u : 0u);
+		}
+		for (unsigned i = 0; i < CX.samp_tok_n; ++i) {
+			const unsigned tok = CX.samp_tok[i];
+			fprintf(f, "samplerstate,%u,%s,%u\n", tok,
+				Get_DX8_Sampler_State_Name((D3DSAMPLERSTATETYPE)tok),
+				vk_census_value(SamplerStates[0][tok]));
+		}
+		for (unsigned i = 0; i < CX.op_n; ++i) {
+			fprintf(f, "op,%u,%s\n", CX.op_list[i], Get_DX8_Texture_Op_Name(CX.op_list[i]));
+		}
+		for (unsigned i = 0; i < CX.arg_n; ++i) {
+			fprintf(f, "arg,%u,%s\n", CX.arg_list[i], Get_DX8_Texture_Arg_Name(CX.arg_list[i]));
+		}
+		for (unsigned i = 0; i < CX.tag_count; ++i) {
+			if (CX.tags[i].handle) fprintf(f, "shaderhandle,%llu,%u\n", (unsigned long long)CX.tags[i].handle, CX.tags[i].tag);
+		}
+
+		fclose(f);
+	}
+
+	// The gate line: everything wedge 5/6/7 commits to is bounded by these numbers.
+	{
+		const double collapse = CX.distinct_pso
+			? (double)CX.distinct_rows / (double)CX.distinct_pso : 0.0;
+		fprintf(stderr,
+			"VKCENSUS reason=%s draws=%llu polys=%llu psoKeys=%llu fullKeys=%llu collapse=%.2f "
+			"stageCombos=%llu targets=%llu fvfs=%u lightMasks=%u tags=%u ff=%llu prog=%llu vs=%llu ps=%llu "
+			"ops=%u args=%u rsTokens=%u tssTokens=%u sampTokens=%u untrackedRs=%u untrackedHits=%llu "
+			"uniformRs=%u uniformChanges=%llu droppedRs=%u rowOverflow=%llu tagOverflow=%llu "
+			"keyValueOverflow=%llu\n",
+			reason, CX.draws, CX.polys, CX.distinct_pso, CX.distinct_rows, collapse,
+			CX.distinct_stage, CX.distinct_rt, CX.fvf_n, CX.light_n, CX.tag_count,
+			CX.ff_draws, CX.prog_draws, CX.vs_draws, CX.ps_draws,
+			CX.op_n, CX.arg_n, CX.rs_tok_n, CX.tss_tok_n, CX.samp_tok_n,
+			CX.rs_untracked_n, CX.rs_untracked_hits,
+			CX.rs_uniform_n, vk_census_uniform_changes(), CX.rs_drop_n,
+			CX.row_overflow, CX.tag_overflow, CX.rs_key_val_overflow);
+		fflush(stderr);
+	}
+
+	free(sorted_rows);
+	free(sorted_set);
+}
 
 bool								DX8Wrapper::FogEnable									= false;
 D3DCOLOR							DX8Wrapper::FogColor										= 0;
@@ -743,11 +1657,27 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 		WWDEBUG_SAY(("DX8Wrapper Init completed"));
 	}
 
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: env-gated co-creation of the Vulkan device
+	// core on the engine HWND. D3D9 keeps presenting; this proves lifecycle coexistence only.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (!lite) {
+		VulkanCore_Try_Init(_Hwnd);
+	}
+#endif
+
 	return(true);
 }
 
 void DX8Wrapper::Shutdown()
 {
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: final census dump while the shadow state is
+	// still intact (the periodic dumps mean a killed run still leaves data).
+	VK_Census_Dump("shutdown");
+
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: tear the co-created Vulkan core down first.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	VulkanCore_Shutdown();
+#endif
 	if (D3DDevice) {
 
 		Set_Render_Target ((IDirect3DSurface9 *)nullptr);
@@ -1115,6 +2045,10 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		Invalidate_Cached_Render_States();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 2: keep the Vulkan swapchain in sync.
+		VulkanCore_Resize();
+#endif
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
 	}
@@ -2228,6 +3162,19 @@ void DX8Wrapper::Begin_Scene()
 
 	DX8CALL(BeginScene());
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 wedge 5: open the Vulkan frame that this scene's batches record
+	// into. It waits the frame slot's fence, resets that slot's descriptor pool and command buffer and
+	// stands the scene render target up, so it belongs here rather than in the present call.
+	if (VulkanCore_Present_Enabled()) {
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.B: the mirror the scene is drawn into is
+		// the render resolution, not the window - the two differ whenever the game runs at a resolution the
+		// display does not, and the present rect published by Pillarbox_Setup puts it back in the window.
+		VKDraw_Set_Scene_Extent((unsigned)ResolutionWidth, (unsigned)ResolutionHeight);
+		VKDraw_Begin_Frame();
+	}
+#endif
+
 	// GeneralsX @build BenderAI 10/02/2026 - Embedded browser Windows-only
 #ifdef _WIN32
 	DX8WebBrowser::Update();
@@ -2252,6 +3199,15 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 #endif
 
 	if (flip_frames) {
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 2: Vulkan swapchain presents instead of D3D9.
+		if (VulkanCore_Present_Enabled()) {
+			VulkanCore_Present_Frame();
+			FrameCount++;
+		}
+		else
+#endif
+		{
 		DX8_Assert();
 		HRESULT hr;
 		{
@@ -2289,6 +3245,7 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 		else {
 			DX8_ErrorCode(hr);
 		}
+		}
 	}
 
 	// Each frame, release all of the buffers and textures.
@@ -2301,6 +3258,12 @@ void DX8Wrapper::End_Scene(bool flip_frames)
 
 void DX8Wrapper::Flip_To_Primary()
 {
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 2: display owned by Vulkan in present mode.
+	if (VulkanCore_Present_Enabled()) {
+		return;
+	}
+#endif
 	// If we are fullscreen and the current frame is odd then we need
 	// to force a page flip to ensure that the first buffer in the flipping
 	// chain is the one visible.
@@ -2391,6 +3354,20 @@ void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &co
 	if (clear_z_stencil && has_stencil) flags |= D3DCLEAR_STENCIL;
 	if (flags)
 	{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.D: mirror the clear into the target the
+		// Vulkan frame is recording. The scene pass is created with LOAD, not CLEAR, because D3D lets a
+		// clear arrive after the target is set and before the first draw - vkCmdClearAttachment inside the
+		// pass is the form that keeps that ordering. The colour goes over as floats because a clear value is
+		// not format-packed: R,G,B,A in that order whatever the attachment's channel layout is.
+		if (VKDraw_Ready()) {
+			const unsigned argb = Convert_Color(color,dest_alpha);
+			const float rgba[4] = {
+				((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f,
+				(argb & 0xFF) / 255.0f, ((argb >> 24) & 0xFF) / 255.0f };
+			VKDraw_Clear(clear_color ? 1 : 0, clear_z_stencil ? 1 : 0, rgba, z, stencil, nullptr);
+		}
+#endif
 		DX8CALL(Clear(0, nullptr, flags, Convert_Color(color,dest_alpha), z, stencil));
 	}
 }
@@ -2398,6 +3375,11 @@ void DX8Wrapper::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &co
 void DX8Wrapper::Set_Viewport(CONST D3DVIEWPORT9* pViewport)
 {
 	DX8_THREAD_ASSERT();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: Vulkan has no device viewport, so the
+	// recorder has to be told what the game asked for; the shadow is read per submitted batch.
+	VK_Shadow_Viewport(pViewport);
+#endif
 	DX8CALL(SetViewport(pViewport));
 }
 
@@ -2498,6 +3480,515 @@ void DX8Wrapper::Set_Index_Buffer(const DynamicIBAccessClass& iba_,unsigned shor
 
 // ----------------------------------------------------------------------------
 //
+// Pure-Vulkan wedge 5.C: the facade-side submit filler (declared in dx8wrapper.h).
+//
+// ----------------------------------------------------------------------------
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+
+namespace {
+
+	// What the filler decided, kept separately from the pipeline layer's own counters because the two fail
+	// for different reasons: these are batches the facade could not describe at all, and VKDRAW's stats
+	// line reports the ones it described and the layer refused.
+	struct VKDrawFillCounters {
+		unsigned long long emitted;
+		unsigned long long notReady;
+		unsigned long long noVertexBacking;
+		unsigned long long noIndexBacking;
+		unsigned long long programmable;	// custom vertex/pixel shader: wedge 8 owns those
+		unsigned long long refused;		// the layer itself said no
+		unsigned long long materialized;	// backings copied out of the D3D9 resource on first draw
+		unsigned long long lastLog;
+	};
+	VKDrawFillCounters VKF;
+
+	// The engine's viewport, shadowed. D3D's SetViewport is device state with no readback worth a call per
+	// draw, and on Vulkan the viewport is a per-draw dynamic value the recorder has to be handed, so the
+	// facade keeps it here the moment the game sets it. DX8 has no scissor render state at all (d3d8types.h
+	// stops before D3DRS_SCISSORTESTENABLE), so the scissor follows the viewport, which is what D3D8's
+	// viewport clipping did for the same batches.
+	struct VKViewportShadow {
+		unsigned x, y, w, h;
+		bool     valid;
+	};
+	VKViewportShadow VK_VP = { 0, 0, 0, 0, false };
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A forensics: a batch whose vertex buffer has no
+	// backing falls back to D3D9, and the counters say how often - but not which buffer or why. Every WW3D
+	// lock path is mirrored, so a miss is either a buffer the game never wrote through those classes or an
+	// allocation that failed; the two need different fixes. Record the distinct buffer objects behind the
+	// misses (bounded, one line each) so the next log run names the class instead of the count.
+	struct VKMissLog {
+		void*	key[32];
+		unsigned used;
+	};
+	VKMissLog VKMiss;
+
+	void vk_report_missing_vb(VertexBufferClass* vb)
+	{
+		if (VKMiss.used >= 32) return;
+		for (unsigned i = 0; i < VKMiss.used; ++i) if (VKMiss.key[i] == vb) return;
+		VKMiss.key[VKMiss.used++] = vb;
+		fprintf(stderr, "[VKMISS] vb=%p type=%d verts=%u fvf=%08X stride=%u (miss #%u)\n",
+			(void*)vb, (int)vb->Type(), vb->Get_Vertex_Count(), vb->FVF_Info().Get_FVF(),
+			vb->FVF_Info().Get_FVF_Size(), VKMiss.used);
+		fflush(stderr);
+		// The first miss is the interesting one: everything after it is the same object drawn again.
+		// Dump the table it should have been in, so the log says whether the lock never ran or the
+		// backing was dropped.
+		if (VKMiss.used == 1u) VKGeo_Back_Dump(vb);
+	}
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: the last resort for a buffer with no
+	// backing. Every WW3D lock class is mirrored, yet the lifecycle trace (vkwp16) proved the game draws at
+	// least one vertex buffer that was never locked at all - born, filled and rendered with the contents
+	// living only in the D3D9 resource. Rather than lose those batches to D3D9 forever (which is fatal at
+	// wedge 9, when d3d9.dll is gone), materialise the backing here: create the per-object VkBuffer, read
+	// the D3D9 resource once with LOCK_READONLY and copy it in. After that the mirrored lock paths own the
+	// buffer, exactly as if the first lock had happened while the layer was up.
+	//
+	// This is a bridge, not a fix: it also covers the ~195 places that touch the raw device behind the
+	// facade's back (the plan's risk 1). Wedge 9 converts those call sites, and when nothing writes a D3D9
+	// resource directly any more this copy has nothing left to read and comes out with the d3d9 dependency.
+	// A buffer that fails here - a dynamic pool, which D3D9 refuses to lock readonly - is tried once and
+	// then left falling back, so a permanent failure cannot cost a memcpy per draw.
+	struct VKTriedLog {
+		void*	key[64];
+		unsigned used;
+	};
+	VKTriedLog VKTriedVB;
+	VKTriedLog VKTriedIB;
+
+	bool vk_backing_already_tried(VKTriedLog& tried, void* key)
+	{
+		for (unsigned i = 0; i < tried.used; ++i) if (tried.key[i] == key) return true;
+		if (tried.used < 64u) tried.key[tried.used++] = key;
+		return false;
+	}
+
+	bool vk_materialize_vertex_backing(VertexBufferClass* vb)
+	{
+		if (vk_backing_already_tried(VKTriedVB, vb)) return false;
+		const unsigned stride = vb->FVF_Info().Get_FVF_Size();
+		const unsigned bytes = vb->Get_Vertex_Count() * stride;
+		if (!stride || !bytes) return false;
+
+		IDirect3DVertexBuffer9* d3d = static_cast<DX8VertexBufferClass*>(vb)->Get_DX8_Vertex_Buffer();
+		if (!d3d) return false;
+		void* src = nullptr;
+		if (FAILED(d3d->Lock(0, 0, &src, D3DLOCK_READONLY)) || !src) {
+			if (src) d3d->Unlock();
+			return false;
+		}
+		void* dst = VKGeo_Back_Lock(vb, bytes, stride, 0, 0);
+		if (dst) memcpy(dst, src, bytes);
+		d3d->Unlock();
+		return dst != nullptr;
+	}
+
+	bool vk_materialize_index_backing(IndexBufferClass* ib)
+	{
+		if (vk_backing_already_tried(VKTriedIB, ib)) return false;
+		const unsigned bytes = ib->Get_Index_Count() * sizeof(unsigned short);
+		if (!bytes) return false;
+
+		IDirect3DIndexBuffer9* d3d = static_cast<DX8IndexBufferClass*>(ib)->Get_DX8_Index_Buffer();
+		if (!d3d) return false;
+		void* src = nullptr;
+		if (FAILED(d3d->Lock(0, 0, &src, D3DLOCK_READONLY)) || !src) {
+			if (src) d3d->Unlock();
+			return false;
+		}
+		void* dst = VKGeo_Back_Lock(ib, bytes, 0, 0, 0);
+		if (dst) memcpy(dst, src, bytes);
+		d3d->Unlock();
+		return dst != nullptr;
+	}
+
+}
+
+void DX8Wrapper::VK_Shadow_Viewport(const D3DVIEWPORT9* viewport)
+{
+	if (!viewport || !viewport->Width || !viewport->Height) return;
+	VK_VP.x = (unsigned)viewport->X;
+	VK_VP.y = (unsigned)viewport->Y;
+	VK_VP.w = (unsigned)viewport->Width;
+	VK_VP.h = (unsigned)viewport->Height;
+	VK_VP.valid = true;
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the fixed-function vertex stage's input block.
+//
+// Everything in here comes from a shadow the facade already keeps, and the point of that is the one
+// property D3D9 never gave this engine: the state a batch is drawn with is now *named* at submit time
+// instead of being whatever the device happens to hold. Each group is a whole number of vec4s so the C++
+// offsets equal the std140 offsets of the block in shaders/vkff.vert by construction.
+void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
+{
+	if (!out) return;
+	VKDraw_FF_State& ff = *out;
+	memset(&ff, 0, sizeof(ff));
+
+	const unsigned fvf = info.Get_FVF();
+	const unsigned texcount = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+
+	// ---- the three transforms ---------------------------------------------------------------
+	// Copied as the same 16 bytes DX8CALL(SetTransform) would have handed the device, in the same
+	// transposed storage the facade uses (render_state.world = engine matrix transposed), so the vertex
+	// stage and the D3D9 path cannot disagree about a transform even if the engine's own convention is
+	// ever re-examined. The identity flags are part of render_state_changed, not the matrices, so the
+	// matrix bytes behind an identity declaration are not guaranteed to be anything at all.
+	{
+		float identity[16] = { 1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1 };
+		if (render_state_changed & (unsigned)WORLD_IDENTITY) memcpy(&ff.world[0], identity, sizeof(identity));
+		else memcpy(&ff.world[0], &render_state.world[0][0], sizeof(ff.world));
+		if (render_state_changed & (unsigned)VIEW_IDENTITY) memcpy(&ff.view[0], identity, sizeof(identity));
+		else memcpy(&ff.view[0], &render_state.view[0][0], sizeof(ff.view));
+	}
+
+	// D3D9 dropped D3DRS_ZBIAS, so the port emulates it in the projection matrix; that emulation edits a
+	// temporary on the way to the device and never reaches a shadow, so the same two lines are repeated
+	// here on the same bytes. ZNear == ZFar is the degenerate 2D/UI pass the facade already skips.
+	{
+		Matrix4x4 proj = ProjectionMatrix;
+		if (ZNear != ZFar) {
+			float zb = (float)ZBias;
+			zb *= (1.0f / 16.0f);
+			zb *= 1.0f / (ZFar - ZNear);
+			proj[2][2] -= zb * proj[3][2];
+		}
+		memcpy(&ff.proj[0], &proj[0][0], sizeof(ff.proj));
+	}
+
+	// ---- the eye position -------------------------------------------------------------------
+	// D3DRS_LOCALVIEWER defaults to TRUE and the census measured it never written, so the eye is the
+	// camera's world position for every batch that lights anything. The view matrix is the camera-space
+	// transform, so eye = -R^T * t of that matrix, read straight out of the bytes above.
+	{
+		const float* v = &ff.view[0];
+		const float tx = v[12], ty = v[13], tz = v[14];
+		// R[j][i] = v[4*i+j] because the stored bytes are the engine matrix transposed and the engine
+		// keeps its basis vectors in columns.
+		ff.eye_position[0] = -(v[0] * tx + v[5] * ty + v[10] * tz);
+		ff.eye_position[1] = -(v[1] * tx + v[6] * ty + v[11] * tz);
+		ff.eye_position[2] = -(v[2] * tx + v[7] * ty + v[12] * tz);
+		ff.eye_position[3] = 1.0f;
+	}
+
+	// ---- material ---------------------------------------------------------------------------
+	{
+		const D3DMATERIAL9& m = Peek_DX8_Material();
+		memcpy(&ff.mat_diffuse[0],   &m.Diffuse,  sizeof(float) * 4);
+		memcpy(&ff.mat_ambient[0],   &m.Ambient,  sizeof(float) * 4);
+		memcpy(&ff.mat_specular[0],  &m.Specular, sizeof(float) * 4);
+		memcpy(&ff.mat_emissive[0],  &m.Emissive, sizeof(float) * 4);
+		ff.mat_power[0] = m.Power;
+	}
+
+	// ---- per-light colours, scene ambient and fog ---------------------------------------------
+	{
+		union { unsigned u; float f; } bs;
+		const unsigned amb = VK_Read_RS(D3DRS_AMBIENT);
+		ff.scene_ambient[0] = float((amb >> 16) & 0xFFu) / 255.0f;
+		ff.scene_ambient[1] = float((amb >> 8) & 0xFFu) / 255.0f;
+		ff.scene_ambient[2] = float(amb & 0xFFu) / 255.0f;
+		ff.scene_ambient[3] = 1.0f;
+
+		const unsigned fogc = VK_Read_RS(D3DRS_FOGCOLOR);
+		ff.fog_color[0] = float((fogc >> 16) & 0xFFu) / 255.0f;
+		ff.fog_color[1] = float((fogc >> 8) & 0xFFu) / 255.0f;
+		ff.fog_color[2] = float(fogc & 0xFFu) / 255.0f;
+		ff.fog_color[3] = 1.0f;
+
+		bs.u = VK_Read_RS_Default_bits(D3DRS_FOGSTART, 0.0f);    ff.fog_params[0] = bs.f;
+		bs.u = VK_Read_RS_Default_bits(D3DRS_FOGEND, 1.0f);      ff.fog_params[1] = bs.f;
+		bs.u = VK_Read_RS_Default_bits(D3DRS_FOGDENSITY, 1.0f);  ff.fog_params[2] = bs.f;
+
+		const unsigned tf = VK_Read_RS(D3DRS_TEXTUREFACTOR);
+		ff.tex_factor[0] = float((tf >> 16) & 0xFFu) / 255.0f;
+		ff.tex_factor[1] = float((tf >> 8) & 0xFFu) / 255.0f;
+		ff.tex_factor[2] = float(tf & 0xFFu) / 255.0f;
+		ff.tex_factor[3] = float((tf >> 24) & 0xFFu) / 255.0f;
+	}
+
+	// ---- the eight light slots ---------------------------------------------------------------
+	// The engine fills D3DLIGHT9 through Set_Light(index, LightClass) and that helper is the only writer,
+	// so the field meanings below are its own: Direction is the vector the light *travels* along (the
+	// engine negates Get_Light_Direction, which points at the light), Falloff carries Spot_Exponent and
+	// Theta and Phi both carry Spot_Angle. The D3D9 cone formula divides by cos(Theta)-cos(Phi), which is
+	// zero for that pair; the vertex stage treats the degenerate cone as the hard edge the same numbers
+	// describe (see vkff.vert), which is also what hardware did with a zero-width ramp.
+	unsigned lightMask = 0;
+	for (unsigned i = 0; i < 8; ++i) {
+		if (!render_state.LightEnable[i]) continue;
+		lightMask |= (1u << i);
+		const D3DLIGHT9& l = render_state.Lights[i];
+		VKDraw_FF_Light& dl = ff.lights[i];
+		dl.type_att[0] = (float)l.Type;
+		dl.type_att[1] = l.Attenuation0;
+		dl.type_att[2] = l.Attenuation1;
+		dl.type_att[3] = l.Attenuation2;
+		dl.pos_range[0] = l.Position.x;
+		dl.pos_range[1] = l.Position.y;
+		dl.pos_range[2] = l.Position.z;
+		dl.pos_range[3] = l.Range;
+		dl.dir_theta[0] = l.Direction.x;
+		dl.dir_theta[1] = l.Direction.y;
+		dl.dir_theta[2] = l.Direction.z;
+		dl.dir_theta[3] = l.Theta;
+		dl.phi_falloff[0] = l.Phi;
+		dl.phi_falloff[1] = l.Falloff;
+		memcpy(&dl.ambient[0],  &l.Ambient,  sizeof(float) * 4);
+		memcpy(&dl.diffuse[0],  &l.Diffuse,  sizeof(float) * 4);
+		memcpy(&dl.specular[0], &l.Specular, sizeof(float) * 4);
+	}
+
+	// ---- the flags ---------------------------------------------------------------------------
+	unsigned fx = 0;
+	if (VK_Read_RS(D3DRS_LIGHTING))         fx |= VKFF_FLAG_LIGHTING;
+	if (VK_Read_RS(D3DRS_COLORVERTEX))      fx |= VKFF_FLAG_COLORVERTEX;
+	if (VK_Read_RS(D3DRS_SPECULARENABLE))   fx |= VKFF_FLAG_SPECULAR_ENABLE;
+	if (VK_Read_RS(D3DRS_NORMALIZENORMALS)) fx |= VKFF_FLAG_NORMALIZE;
+	if (VK_Read_RS(D3DRS_FOGENABLE))        fx |= VKFF_FLAG_FOG_ENABLE;
+	if (fvf & D3DFVF_NORMAL)   fx |= VKFF_FLAG_HAS_NORMAL;
+	if (fvf & D3DFVF_DIFFUSE)  fx |= VKFF_FLAG_HAS_DIFFUSE;
+	if (fvf & D3DFVF_SPECULAR) fx |= VKFF_FLAG_HAS_SPECULAR;
+	if (fvf & D3DFVF_XYZRHW)   fx |= VKFF_FLAG_RHW;
+	if ((fvf & D3DFVF_XYZ) && !(fvf & (D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEXCOUNT_MASK)))
+		fx |= VKFF_FLAG_POSITION_ONLY;
+
+	unsigned fy = lightMask;
+	fy |= (texcount & 7u) << 8;
+	fy |= (VK_Read_RS(D3DRS_FOGVERTEXMODE) & 7u) << 11;
+	fy |= (VK_Read_RS(D3DRS_FOGTABLEMODE) & 7u) << 14;
+	fy |= (VK_Read_RS(D3DRS_AMBIENTMATERIALSOURCE) & 3u) << 17;
+	fy |= (VK_Read_RS(D3DRS_DIFFUSEMATERIALSOURCE) & 3u) << 19;
+	fy |= (VK_Read_RS(D3DRS_SPECULARMATERIALSOURCE) & 3u) << 21;
+	fy |= (VK_Read_RS(D3DRS_EMISSIVEMATERIALSOURCE) & 3u) << 23;
+	ff.flags[0] = fx;
+	ff.flags[1] = fy;
+
+	// ---- the per-stage coordinate source ------------------------------------------------------
+	// The whole fixed-function texture surface the census measured is these two registers plus the
+	// combiner state wedge 7 reads: nothing in the engine ever writes D3DTS_TEXTURE0..7, so there is no
+	// texture matrix stack to carry, and D3DTTFF_PROJECTED is the only transform flag the FVF_XYZRHW
+	// path can reach.
+	for (unsigned s = 0; s < VKFF_MAX_STAGES; ++s) {
+		const unsigned tci  = VK_Read_TSS(s, D3DTSS_TEXCOORDINDEX, s);
+		const unsigned ttff = VK_Read_TSS(s, D3DTSS_TEXTURETRANSFORMFLAGS, 0);
+		ff.stage[s].tci = tci;
+		ff.stage[s].ttff = ttff;
+		unsigned set = (tci >> 16) ? 0u : (tci & 0xFFFFu);
+		if (texcount == 0u) { ff.stage[s].set = 0u; ff.stage[s].components = 0u; continue; }
+		if (set >= texcount) set = texcount - 1u;
+		const unsigned bits = (fvf >> (16u + 2u * set)) & 3u;
+		ff.stage[s].set = set;
+		ff.stage[s].components = (bits == D3DFVF_TEXTUREFORMAT2) ? 2u
+			: (bits == D3DFVF_TEXTUREFORMAT1) ? 1u
+			: (bits == D3DFVF_TEXTUREFORMAT3) ? 3u : 4u;
+	}
+
+	// ---- the viewport ------------------------------------------------------------------------
+	// The RHW path arrives in this space already, and only this path can say which rectangle was current.
+	unsigned tw = 0, th = 0;
+	VKDraw_Get_Targets(nullptr, nullptr, &tw, &th);
+	if (VK_VP.valid) {
+		ff.viewport[0] = (float)VK_VP.x; ff.viewport[1] = (float)VK_VP.y;
+		ff.viewport[2] = (float)VK_VP.w; ff.viewport[3] = (float)VK_VP.h;
+	} else {
+		ff.viewport[2] = (float)tw;      ff.viewport[3] = (float)th;
+	}
+}
+
+bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_type,
+	unsigned short first_index, unsigned short polygon_count,
+	unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex)
+{
+	(void)min_vertex_index;	// a range hint for D3D9, not something Vulkan binds against
+	if (!VKDraw_Ready()) { ++VKF.notReady; return false; }
+
+	VertexBufferClass* vb = static_cast<VertexBufferClass*>(vb_);
+	IndexBufferClass*  ib = static_cast<IndexBufferClass*>(ib_);
+	if (!vb || !ib || !polygon_count) return false;
+
+	// A batch with a custom shader is a wedge-8 pipeline variant. The mechanism vertex/pixel stages this
+	// wedge stands up know nothing about those programs, so such a batch is reported as not consumable and
+	// the D3D9 call still runs - which is what keeps every intermediate state of this port playable.
+	if (Vertex_Shader || Pixel_Shader) { ++VKF.programmable; return false; }
+
+	void* vbBuf = nullptr; void* ibBuf = nullptr;
+	unsigned long long vbOff = 0, ibOff = 0;
+	unsigned vbBytes = 0, ibBytes = 0;
+	if (!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
+		if (!vk_materialize_vertex_backing(vb) ||
+			!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
+			++VKF.noVertexBacking;
+			vk_report_missing_vb(vb);
+			return false;
+		}
+		++VKF.materialized;
+	}
+	if (!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
+		if (!vk_materialize_index_backing(ib) ||
+			!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
+			++VKF.noIndexBacking;
+			return false;
+		}
+		++VKF.materialized;
+	}
+
+	// The vertex layout comes from the buffer, exactly like the D3D9 path takes it from the buffer:
+	// Apply_Render_State_Changes re-asserts SetFVF(vb->FVF_Info().Get_FVF()) on every buffer change, so
+	// this is the format the batch was drawn with, not merely the last one the game named.
+	const FVFInfoClass& info = vb->FVF_Info();
+	const unsigned fvf = info.Get_FVF();
+	const unsigned stride = info.Get_FVF_Size();
+	if (!fvf || !stride) { ++VKF.refused; return false; }
+
+	VKDraw_Attr attrs[VKDRAW_MAX_ATTRS];
+	unsigned attr_count = 0;
+	// Location 0 is the position, the only input the mechanism stages declare; the rest are declared so a
+	// wedge-6 fixed-function variant finds them at the offset the FVF says, and extra attributes that no
+	// stage reads cost nothing in Vulkan.
+	if (fvf & D3DFVF_XYZRHW) attrs[attr_count++] = { 0u, info.Get_Location_Offset(), 4u, 0u };
+	else                     attrs[attr_count++] = { 0u, info.Get_Location_Offset(), 3u, 0u };
+	// The position field of an FVF is one value from the mask 0x00E: 0x2 XYZ, 0x4 XYZRHW, then 0x6/0x8/0xA/
+	// 0xC/0xE for the blend-weight layouts. Testing ">= 0x6" is what separates them; the earlier "!= 0" form
+	// was true for plain XYZ as well, which silently dropped NORMAL from every lit mesh. It cost nothing
+	// while the wedge-5 stage only read position, and would cost the whole scene now that the fixed-function
+	// stage lights faces from location 1.
+	if ((fvf & 0x00E) >= 0x006) {
+		// Blend weights (D3DFVF_XYZB1..5) only mean something to a custom vertex shader, which was refused
+		// above, so there is nothing to describe here - and a skinning layout with five weights plus a
+		// matrix palette index set is wedge 6's and wedge 8's business, not this table's.
+	} else {
+		if (fvf & D3DFVF_NORMAL)   attrs[attr_count++] = { 1u, info.Get_Normal_Offset(),  3u, 0u };
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: D3DFVF_PSIZE is deliberately not
+		// described. Point rendering with a per-vertex size is D3DRS_POINTSCALE territory, which the
+		// approved plan drops, and the census measured no FVF with the bit set - every FVF it saw is
+		// accounted for in the case table of Vulkan/artifacts/census_menu.csv. It also has to be dropped
+		// for a hard reason: the wedge-6 fixed-function vertex stage numbers its texture coordinates from
+		// location 4, so a one-float point size at location 5 would collide with the second UV set and
+		// build a pipeline that reads the wrong bytes.
+	}
+	if (fvf & D3DFVF_DIFFUSE)  attrs[attr_count++] = { 2u, info.Get_Diffuse_Offset(),  4u, 1u };
+	if (fvf & D3DFVF_SPECULAR) attrs[attr_count++] = { 3u, info.Get_Specular_Offset(), 4u, 1u };
+	const unsigned texcount = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+	for (unsigned t = 0; t < texcount && attr_count < VKDRAW_MAX_ATTRS; ++t) {
+		// D3DFVF_TEXTUREFORMAT2 = 0 (two floats), 3 = one, 1 = three, 2 = four - two bits per set from bit 16.
+		const unsigned bits = (fvf >> (16u + 2u * t)) & 3u;
+		const unsigned comps = (bits == D3DFVF_TEXTUREFORMAT2) ? 2u
+			: (bits == D3DFVF_TEXTUREFORMAT1) ? 1u
+			: (bits == D3DFVF_TEXTUREFORMAT3) ? 3u : 4u;
+		attrs[attr_count++] = { 4u + t, info.Get_Tex_Offset(t), comps, 0u };
+	}
+	if (!attr_count) { ++VKF.refused; return false; }
+
+	VKDraw_Submit s = {};
+	s.key.shader_bits = (unsigned long long)(unsigned&)render_state.shader;
+	s.key.fvf         = fvf;
+	unsigned mask = 0;
+	for (unsigned i = 0; i < 8; ++i) if (render_state.LightEnable[i]) mask |= (1u << i);
+	s.key.light_mask  = mask;
+	s.key.vs_tag = 0u; s.key.ps_tag = 0u;	// wedge 8 replaces these with registry indices
+	s.key.topology = primitive_type;
+	// The attachment formats are filled in by the recorder from the images the pass is built on, so the
+	// facade does not have to know which mirror it is drawing into.
+	s.key.rt_format = 0u; s.key.depth_format = 0u;
+	s.key.sample_count = 1u;
+	s.key.cull_mode   = VK_Read_RS(D3DRS_CULLMODE);
+	// DX8 has no D3DRS_FRONTFACE, so the front-face declaration is a fixed part of this port's contract with
+	// the rasterizer rather than a shadowed state; see vk_cull() for what the pair means.
+	s.key.front_ccw   = 0u;
+	s.key.fill_mode   = VK_Read_RS(D3DRS_FILLMODE);
+	s.key.depth_test  = VK_Read_RS(D3DRS_ZENABLE)  != D3DZB_FALSE ? 1u : 0u;
+	s.key.depth_write = VK_Read_RS(D3DRS_ZWRITEENABLE) ? 1u : 0u;
+	s.key.depth_cmp   = VK_Read_RS(D3DRS_ZFUNC);
+	s.key.stencil_test = VK_Read_RS(D3DRS_STENCILENABLE) ? 1u : 0u;
+	s.key.blend_enable = VK_Read_RS(D3DRS_ALPHABLENDENABLE) ? 1u : 0u;
+	s.key.src_blend   = VK_Read_RS(D3DRS_SRCBLEND);
+	s.key.dst_blend   = VK_Read_RS(D3DRS_DESTBLEND);
+	// No separate-alpha blending in DX8: the two alpha fields stay 0 and the layer reuses the colour pair.
+	s.key.src_blend_alpha = 0u; s.key.dst_blend_alpha = 0u;
+	s.key.write_mask  = VK_Read_RS(D3DRS_COLORWRITEENABLE) & 0xFu;
+	s.key.alpha_test_enable = VK_Read_RS(D3DRS_ALPHATESTENABLE) ? 1u : 0u;
+	s.key.alpha_ref   = VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu;
+	s.key.alpha_cmp   = VK_Read_RS(D3DRS_ALPHAFUNC);
+	s.key.scissor_test = 0u;	// likewise absent from DX8; the recorder always sets one scissor
+
+	s.stream_count = 1;
+	s.streams[0].vk_buffer   = vbBuf;
+	s.streams[0].offset      = vbOff;
+	s.streams[0].stride      = stride;
+	s.streams[0].vertex_count = vb->Get_Vertex_Count();
+
+	for (unsigned i = 0; i < attr_count; ++i) s.attrs[i] = attrs[i];
+	s.attr_count = attr_count;
+
+	s.vk_index_buffer = ibBuf;
+	s.index_offset    = ibOff;
+	s.start_index     = first_index;
+	// How many indices the backing actually holds from here: D3D9 guarded the same read, and the layer
+	// refuses a batch that would run past it instead of reading another object's geometry.
+	s.index_count     = (ib->Get_Index_Count() > (unsigned)first_index)
+		? ib->Get_Index_Count() - (unsigned)first_index : 0u;
+	s.polygon_count   = polygon_count;
+	s.base_vertex     = (unsigned)base_vertex;
+
+	// Textures the D3D path had bound are handed over as views so the descriptor set is the real one; an
+	// unmirrored or empty slot falls to the layer's built-in white, which is the passthrough the D3D
+	// combiners used there. Samplers wait for wedge 7, which reads them out of the stage state.
+	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
+		VKTex_Info ti;
+		if (Textures[t] && VKTex_Query((void*)Textures[t], &ti) && ti.view) s.texture_views[t] = ti.view;
+	}
+
+	s.vertex_constants = (const float*)&Vertex_Shader_Constants[0];
+	s.pixel_constants  = (const float*)&Pixel_Shader_Constants[0];
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the fixed-function block travels with every
+	// batch, not only the ones the vertex stage is switched on for. Packing it unconditionally is what
+	// makes the gate a shader choice rather than a state choice - the same submit either way, so flipping
+	// GENERALSX_VKFFVERT cannot silently change what the pipeline was told to draw.
+	VKDraw_FF_State ffState;
+	VK_FF_Pack(&ffState, info);
+	s.ff = &ffState;
+	s.vertex_constant_vec4s = MAX_VERTEX_SHADER_CONSTANTS;
+	s.pixel_constant_vec4s  = MAX_PIXEL_SHADER_CONSTANTS;
+
+	unsigned tw = 0, th = 0;
+	void* ck = nullptr; void* dk = nullptr;
+	VKDraw_Get_Targets(&ck, &dk, &tw, &th);
+	if (VK_VP.valid && VK_VP.w <= tw && VK_VP.h <= th) {
+		s.viewport[0] = VK_VP.x; s.viewport[1] = VK_VP.y;
+		s.viewport[2] = VK_VP.w; s.viewport[3] = VK_VP.h;
+		s.scissor[0] = VK_VP.x; s.scissor[1] = VK_VP.y;
+		s.scissor[2] = VK_VP.x + VK_VP.w; s.scissor[3] = VK_VP.y + VK_VP.h;
+	} else {
+		s.viewport[2] = tw; s.viewport[3] = th;
+		s.scissor[2] = tw; s.scissor[3] = th;
+	}
+
+	if (!VK_Draw_Submit(&s)) { ++VKF.refused; return false; }
+	++VKF.emitted;
+	if ((VKF.emitted & 8191ull) == 0ull) {
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: the plan's hard gate for this wedge is
+		// "no D3D9 draw is left", and that is measurable, not deferred - a batch the emitter takes stops
+		// before DX8_RECORD_DRAW_CALLS(), so this frame's counter is the number the Vulkan path did NOT
+		// describe. dx8_calls is the same story one level up: the raw device calls the facade still makes.
+		// Both are per-frame (reset in Begin_Pass), so they read as the steady-state frame, not a total.
+		fprintf(stderr, "[VKDRAW] facade submits=%llu noVb=%llu noIb=%llu programmable=%llu refused=%llu materialized=%llu frameD3dDraws=%u frameDx8Calls=%u\n",
+			VKF.emitted, VKF.noVertexBacking, VKF.noIndexBacking, VKF.programmable, VKF.refused, VKF.materialized,
+			FrameStatistics.draw_calls, FrameStatistics.dx8_calls);
+		fflush(stderr);
+	}
+	return true;
+}
+
+#endif // _WIN32 && SAGE_USE_VULKAN_CORE
+
+// ----------------------------------------------------------------------------
+//
 // Private function for the special case of rendering polygons from sorting
 // index and vertex buffers.
 //
@@ -2572,6 +4063,23 @@ void DX8Wrapper::Draw_Sorting_IB_VB(
 		static_cast<DX8IndexBufferClass*>(dyn_ib_access.IndexBuffer)->Get_DX8_Index_Buffer()));
 	DX8_RECORD_INDEX_BUFFER_CHANGE();
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the sorting pass. The two dynamic
+	// buffers filled just above are the shared per-frame pools, so the batch is described at the pool
+	// backing plus the same offsets D3D9 was handed: IndexBufferOffset as the start index,
+	// VertexBufferOffset as BaseVertexIndex. A consumed batch must not also reach the device - wedge 9
+	// gates on the D3D9 draw counter going to zero.
+	if (VK_Emit_Indexed_Draw(dyn_vb_access.VertexBuffer,dyn_ib_access.IndexBuffer,
+		D3DPT_TRIANGLELIST,
+		(unsigned short)dyn_ib_access.IndexBufferOffset,
+		polygon_count,
+		0,
+		vertex_count,
+		(unsigned long long)dyn_vb_access.VertexBufferOffset)) {
+		DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
+		return;
+	}
+#endif
 	DX8_RECORD_DRAW_CALLS();
 	DX8CALL(DrawIndexedPrimitive(
 		D3DPT_TRIANGLELIST,
@@ -2605,6 +4113,10 @@ void DX8Wrapper::Draw(
 	SNAPSHOT_SAY(("DX8 - draw"));
 
 	Apply_Render_State_Changes();
+
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: measure the state tuple this draw is about to
+	// commit to, before any early-out, because the early-out still costs a state apply.
+	VK_Census_Draw(primitive_type, polygon_count, vertex_count);
 
 	// Debug feature to disable triangle drawing...
 	if (!_Is_Triangle_Draw_Enabled()) return;
@@ -2688,6 +4200,22 @@ void DX8Wrapper::Draw(
 					break;
 				}*/
 				DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+				// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the primary draw site. The
+				// filler describes the shadow state as a Vulkan batch and returns true when the pipeline
+				// layer took it, in which case no D3D9 draw is recorded and none is issued. Whatever it
+				// cannot describe - no backing, a custom shader, a refused submit - still runs the D3D9
+				// call below, which is what keeps the intermediate states of this port playable.
+				if (VK_Emit_Indexed_Draw(render_state.vertex_buffers[0],render_state.index_buffer,
+					primitive_type,
+					(unsigned short)(start_index+render_state.iba_offset),
+					polygon_count,
+					min_vertex_index,
+					vertex_count,
+					(unsigned long long)(render_state.index_base_offset+render_state.vba_offset))) {
+					break;
+				}
+#endif
 				DX8_RECORD_DRAW_CALLS();
 				DX8CALL(DrawIndexedPrimitive(
 					(D3DPRIMITIVETYPE)primitive_type,
@@ -3018,6 +4546,12 @@ IDirect3DTexture9 * DX8Wrapper::_Create_DX8_Texture
 		DX8_ErrorCode(ret);
 		// Just return the texture, no reduction
 		// allowed for render targets.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.4: stand up the Vulkan-side render-target
+		// mirror (device-local COLOR_ATTACHMENT image + layout state) for the engine's color RTs.
+		// Content still comes from D3D9 until wedge 5; this only proves the shape + machinery exist.
+		VKRT_Alloc_Color(texture, width, height, (int)format);
+#endif
 		return texture;
 	}
 
@@ -3239,6 +4773,11 @@ IDirect3DTexture9 * DX8Wrapper::_Create_DX8_ZTexture
 
 	// Just return the texture, no reduction
 	// allowed for render targets.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.4: depth-texture mirror (device-local
+	// DEPTH_STENCIL_ATTACHMENT image) for ZTextureClass instances. Shape/machinery only until wedge 5.
+	VKRT_Alloc_Depth(texture, width, height, (int)zformat);
+#endif
 
 	return texture;
 }

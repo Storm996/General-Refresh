@@ -50,6 +50,7 @@
 #ifndef USE_FLAT_HEIGHT_MAP // Flat height map uses flattened textures. jba. [3/20/2003]
 
 #include <stdlib.h>
+#include <stdio.h>   // GeneralsX @feature PS3.0 L2.1 T-B 16/10/2026 [TDL] forensic stderr
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
 #include <WWMath/tri.h>
@@ -1358,12 +1359,40 @@ void HeightMapRenderObjClass::On_Frame_Update()
 	BaseHeightMapRenderObjClass::On_Frame_Update();
 	Int i,j,k;
 	Int originX,originY;
-	if (Scene==nullptr) return;
+
+	// GeneralsX @feature PS3.0 L2.1 T-B 16/10/2026: terrain dynamic-light intake forensics.
+	// QA gate GENERALSX_TDL_LOG=1 (stderr+fflush so release builds see it, per the release
+	// logging convention). One line whenever the (inList, inRange, tiles) tuple changes:
+	// inList = lights the scene list holds that are (or were last frame) enabled,
+	// inRange = lights whose bounding box hit the drawn terrain region (numDynaLights),
+	// tiles = vertex-buffer tiles rewritten this frame. Answers "did the light reach the
+	// terrain intake" without any behaviour change when the gate is off.
+	static const Bool s_tdlLog = (getenv("GENERALSX_TDL_LOG") != nullptr && atoi(getenv("GENERALSX_TDL_LOG")) != 0);
+
+	if (Scene==nullptr) {
+		if (s_tdlLog) {
+			static Bool s_sceneNullWarned = false;
+			if (!s_sceneNullWarned) {
+				s_sceneNullWarned = true;
+				fprintf(stderr, "[TDL] Scene pointer null: terrain dynamic-light intake inactive\n");
+				fflush(stderr);
+			}
+		}
+		return;
+	}
 	RTS3DScene *pMyScene = (RTS3DScene *)Scene;
 
 
 	RefRenderObjListIterator pDynamicLightsIterator(pMyScene->getDynamicLights());
 	if (m_map == nullptr) {
+		if (s_tdlLog) {
+			static Bool s_mapNullWarned = false;
+			if (!s_mapNullWarned) {
+				s_mapNullWarned = true;
+				fprintf(stderr, "[TDL] m_map null: terrain dynamic-light intake inactive\n");
+				fflush(stderr);
+			}
+		}
 		return;
 	}
 
@@ -1379,6 +1408,8 @@ void HeightMapRenderObjClass::On_Frame_Update()
 #endif
 
 	Int numDynaLights=0;
+	Int enabledSeen=0;   // [TDL] lights currently enabled (or enabled last frame) in the scene list
+	Int tilesTouched=0;  // [TDL] vertex buffer tiles rewritten for dynamic light this frame
 	W3DDynamicLight *enabledLights[MAX_ENABLED_DYNAMIC_LIGHTS];
 
 	const Int xCoordMin = m_map->getDrawOrgX() - m_map->getBorderSizeInline();
@@ -1391,6 +1422,7 @@ void HeightMapRenderObjClass::On_Frame_Update()
 		W3DDynamicLight *pLight = (W3DDynamicLight*)pDynamicLightsIterator.Peek_Obj();
 		pLight->m_processMe = false;
 		if (pLight->m_enabled || pLight->m_priorEnable) {
+			enabledSeen++;	// [TDL]
 			Real range = pLight->Get_Attenuation_Range();
 			if (pLight->m_priorEnable) {
 				pLight->m_prevMinX = pLight->m_minX;
@@ -1527,8 +1559,26 @@ void HeightMapRenderObjClass::On_Frame_Update()
 				}
 				DX8VertexBufferClass *pVB = getVertexBufferTile(i, j);
 				VERTEX_FORMAT *pData = getVertexBufferBackup(i, j);
+				tilesTouched++;	// [TDL]
 				updateVBForLight(pVB, pData, xMin, yMin, xMax, yMax, originX,originY, enabledLights, numDynaLights);
 			}
+		}
+	}
+
+	// GeneralsX @feature PS3.0 L2.1 T-B 16/10/2026: [TDL] summary line, change-triggered only
+	// (see the gate comment at the top of this function). inList>0 && inRange==0 => the lights
+	// exist but miss the drawn region; inRange>0 && tiles==0 => bbox/tile intersect broken;
+	// tiles>0 yet no visual change => the rewritten color is overwritten downstream.
+	if (s_tdlLog) {
+		static Int s_lastInList = -1;
+		static Int s_lastInRange = -1;
+		static Int s_lastTiles = -1;
+		if (enabledSeen != s_lastInList || numDynaLights != s_lastInRange || tilesTouched != s_lastTiles) {
+			fprintf(stderr, "[TDL] inList=%d inRange=%d tiles=%d\n", enabledSeen, numDynaLights, tilesTouched);
+			fflush(stderr);
+			s_lastInList = enabledSeen;
+			s_lastInRange = numDynaLights;
+			s_lastTiles = tilesTouched;
 		}
 	}
 }
@@ -2018,6 +2068,11 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  		W3DShaderManager::setTexture(1,m_stageZeroTexture);
  		W3DShaderManager::setTexture(2,m_stageTwoTexture);	//cloud
  		W3DShaderManager::setTexture(3,m_stageThreeTexture);//noise
+ 		// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: parallel normal atlas for the TERRAIN30
+ 		// NM variants (sampler s4). Null is a supported state - TerrainShaderPixelShader::set()
+ 		// binds a 1x1 flat-normal fallback whenever no atlas exists, so maps without _nm sheets
+ 		// stay pixel-identical to the non-NM leg.
+ 		W3DShaderManager::setTexture(4,m_map ? m_map->getTerrainNormalTexture() : nullptr);
 		//Disable writes to destination alpha channel (if there is one)
 		if (DX8Wrapper::getBackBufferFormat() == WW3D_FORMAT_A8R8G8B8)
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);

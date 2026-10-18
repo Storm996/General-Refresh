@@ -55,6 +55,10 @@
 #include "Common/GlobalData.h"
 #include "WW3D2/dx8wrapper.h"
 #include "d3dx9tex.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: converge CPU-written terrain atlases into the
+// Vulkan texture mirror. Always included: VKTex_Mirror_D3D_Texture exists on every platform (no-op
+// unless the win64vk Vulkan core is up), and z_gameenginedevice is not built with SAGE_USE_VULKAN_CORE.
+#include "WW3D2/Backend/VulkanTexMirror.h"
 
 /******************************************************************************
 						TerrainTextureClass
@@ -370,9 +374,121 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	DX8_ErrorCode(filter_hr);
 	fprintf(stderr, "[TERRAIN] D3DXFilterTexture(TRIANGLE) hr=0x%08X\n", (unsigned)filter_hr);
 	fflush(stderr);
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	if (WW3D::Get_Texture_Reduction()) {
 		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
 	}
+	return(surface_desc.Height);
+}
+
+//=============================================================================
+// TerrainTextureClass::updateNM
+//=============================================================================
+// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: pack the parallel tangent-normal atlas.
+//
+// Layout is not recomputed here: the tile rectangles live on the diffuse tiles
+// (m_sourceTiles[i]->m_tileLocationInTexture, assigned by updateTileTexturePositions), and this
+// walks the very same loop reading m_nmTiles pixels instead. Any tile without a normal sheet stays
+// at the pre-filled flat value (128,128,255 = tangent-space +Z), so a map with no *_nm.tga assets
+// packs an all-flat atlas whose shader modulation is exactly 1.0 everywhere.
+//
+// Returns 0 (caller drops the atlas) when the chosen diffuse atlas format is the 16-bit fallback:
+// packing signed 8-bit offsets into 5/6-bit channels would quantize the normal sign axes to steps
+// of 8 and visibly band the ground.
+int TerrainTextureClass::updateNM(WorldHeightMap *htMap)
+{
+	IDirect3DSurface9 *surface_level;
+	D3DSURFACE_DESC surface_desc;
+	D3DLOCKED_RECT locked_rect;
+	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(0, &surface_level));
+	DX8_ErrorCode(surface_level->GetDesc(&surface_desc));
+	if (surface_desc.Width < TEXTURE_WIDTH || surface_desc.Format != D3DFMT_A8R8G8B8) {
+		surface_level->Release();
+		return 0;
+	}
+
+	DX8_ErrorCode(surface_level->LockRect(&locked_rect, nullptr, 0));
+
+	const Int tilePixelExtent = TILE_PIXEL_EXTENT;
+	Int nmWritten = 0, nmFlat = 0;
+
+	// Pre-fill the whole level flat (A=255 R=128 G=128 B=255), then overwrite real tiles.
+	{
+		Int *flatRow = (Int*)locked_rect.pBits;
+		for (Int r = 0; r < (Int)surface_desc.Height; r++) {
+			Int *pixel = flatRow + (r * surface_desc.Width);
+			for (Int c = 0; c < (Int)surface_desc.Width; c++) {
+				pixel[c] = (Int)0xFF8080FFu;
+			}
+		}
+	}
+
+	for (Int tileNdx = 0; tileNdx < htMap->m_numBitmapTiles; tileNdx++) {
+		TileData *pBase = htMap->getSourceTile(tileNdx);
+		if (!pBase) continue;
+		ICoord2D position = pBase->m_tileLocationInTexture;
+		if (position.x <= 0) continue;	// all real tile offsets start at 2, same rule as update().
+
+		TileData *pNM = htMap->getNMTile(tileNdx);
+		if (!pNM) { nmFlat++; continue; }	// stays at the pre-filled flat normal.
+		nmWritten++;
+
+		for (Int j = 0; j < tilePixelExtent; j++) {
+			UnsignedByte *pBGR = pNM->getRGBDataForWidth(tilePixelExtent);
+			pBGR += (tilePixelExtent-1-j)*TILE_BYTES_PER_PIXEL*tilePixelExtent; // invert to match the diffuse packing.
+			Int row = position.y+j;
+			UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + (row)*surface_desc.Width*4;
+			pBGRX += position.x*4;
+			for (Int i = 0; i < tilePixelExtent; i++) {
+				*((Int*)pBGRX) = (Int)(0xFF000000u + ((Int)pBGR[2]<<16) + ((Int)pBGR[1]<<8) + pBGR[0]);
+				pBGRX += 4;
+				pBGR += TILE_BYTES_PER_PIXEL;
+			}
+		}
+	}
+
+	// Same 4-pixel duplicated border per texture-class block as update(), so bilinear sampling at
+	// tile edges blends normals with the sheet's own wrap instead of atlas background.
+	Int texClass;
+	for (texClass=0; texClass<htMap->m_numTextureClasses; texClass++) {
+		Int width = htMap->m_textureClasses[texClass].width;
+		ICoord2D origin = htMap->m_textureClasses[texClass].positionInTexture;
+		if (origin.x<=0) continue;
+		width *= TILE_PIXEL_EXTENT;
+		Int j;
+		for (j=0; j<width; j++) {
+			Int row = origin.y+j;
+			UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + (row)*surface_desc.Width*4;
+			Int column = origin.x;
+			pBGRX += column*4;
+			memcpy(pBGRX-(4)*4, pBGRX+(width-4)*4, 4*4);
+			memcpy(pBGRX+(width*4), pBGRX, 4*4);
+		}
+		for (j=0; j<4; j++) {
+			Int row = origin.y-j-1;
+			UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + (row)*surface_desc.Width*4;
+			UnsignedByte *target = pBGRX+(origin.x-4)*4;
+			memcpy(target, target+width*surface_desc.Width*4, (width+8)*4);
+			row = origin.y+j;
+			pBGRX = ((UnsignedByte*)locked_rect.pBits) + (row)*surface_desc.Width*4;
+			target = pBGRX+(origin.x-4)*4;
+			memcpy(target+width*surface_desc.Width*4, target, (width+8)*4);
+		}
+	}
+
+	surface_level->UnlockRect();
+	surface_level->Release();
+
+	// Mips the same way the diffuse atlas does; an all-flat atlas mips to all-flat.
+	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_TRIANGLE));
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
+	if (WW3D::Get_Texture_Reduction()) {
+		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
+	}
+
+	fprintf(stderr, "[TNM] atlas packed: nm_tiles=%d flat_tiles=%d size=%dx%d\n",
+		nmWritten, nmFlat, surface_desc.Width, surface_desc.Height);
+	fflush(stderr);
 	return(surface_desc.Height);
 }
 
@@ -527,6 +643,7 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	surface_level->UnlockRect();
 	surface_level->Release();
 	DX8_ErrorCode(D3DXFilterTexture(D3DTexture, nullptr, 0, D3DX_FILTER_BOX));
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	return(surface_desc.Height);
 }
 #endif
@@ -635,6 +752,7 @@ Bool TerrainTextureClass::updateFlat(WorldHeightMap *htMap, Int xCell, Int yCell
 	DX8_ErrorCode(filter_hr);
 	fprintf(stderr, "[TERRAIN] D3DXFilterTexture(TRIANGLE) flat hr=0x%08X\n", (unsigned)filter_hr);
 	fflush(stderr);
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	return(surface_desc.Height);
 }
 
@@ -1047,6 +1165,7 @@ int AlphaEdgeTextureClass::update(WorldHeightMap *htMap)
 	// box-averaging the mips destroys high-frequency tile detail; triangle
 	// weights keep more contrast in the lower mip levels.
 	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_TRIANGLE));
+	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	return(surface_desc.Height);
 }
 

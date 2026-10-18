@@ -55,6 +55,11 @@ public:
 		// just use default destructor. ~TerrainTextureClass();
 public:
 	int update(WorldHeightMap *htMap); ///< Sets the pixels, and returns the actual height of the texture.
+	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: packs the parallel tangent-normal atlas from
+	// htMap's m_nmTiles. Same tile positions as update() (the layout is owned by the diffuse tiles),
+	// flat (128,128,255,255) wherever a normal tile is missing. Returns the texture height like
+	// update(), or 0 when the atlas format cannot carry 8-bit channels (caller then drops it).
+	int updateNM(WorldHeightMap *htMap);
 	Bool updateFlat(WorldHeightMap *htMap, Int xCell, Int yCell, Int cellWidth, Int pixelsPerCell); ///< Sets the pixels.
 	void setLOD(Int LOD);
 };

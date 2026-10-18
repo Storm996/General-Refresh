@@ -41,6 +41,10 @@
 #include "dx8indexbuffer.h"
 #include "dx8wrapper.h"
 #include "dx8caps.h"
+// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: geometry ring bridge (win64vk port tree only)
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanGeo.h"
+#endif
 #include "WWMath/sphere.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
@@ -79,6 +83,11 @@ IndexBufferClass::IndexBufferClass(unsigned type_, unsigned short index_count_)
 	_IndexBufferCount++;
 	_IndexBufferTotalIndices+=index_count;
 	_IndexBufferTotalSize+=index_count*sizeof(unsigned short);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A forensics: fvf 0 marks an index buffer in
+	// the trace; see the vertex-buffer twin for why birth/death lines are paired with the backing table.
+	if (type == BUFFER_TYPE_DX8) VKGeo_Trace_Buffer(this, 0u, index_count, 1);
+#endif
 #ifdef VERTEX_BUFFER_LOG
 	WWDEBUG_SAY(("New IB, %d indices, size %d bytes",index_count,index_count*sizeof(unsigned short)));
 	WWDEBUG_SAY(("Total IB count: %d, total %d indices, total size %d bytes",
@@ -90,6 +99,12 @@ IndexBufferClass::IndexBufferClass(unsigned type_, unsigned short index_count_)
 
 IndexBufferClass::~IndexBufferClass()
 {
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: drop the per-object backing keyed by
+	// 'this'. The address may be recycled by the next IB, so the backing must not outlive the object.
+	VKGeo_Back_Drop(this);
+	VKGeo_Trace_Buffer(this, 0u, index_count, 0);
+#endif
 	_IndexBufferCount--;
 	_IndexBufferTotalIndices-=index_count;
 	_IndexBufferTotalSize-=index_count*sizeof(unsigned short);
@@ -182,7 +197,7 @@ void IndexBufferClass::Copy(unsigned short* indices,unsigned first_index,unsigne
 // ----------------------------------------------------------------------------
 
 
-IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_, int flags) : index_buffer(index_buffer_)
+IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_, int flags) : index_buffer(index_buffer_), vk_mirrored(false)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(index_buffer);
@@ -191,6 +206,29 @@ IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
 		DX8_Assert();
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: index data mirrored into the
+		// host-visible geometry ring; D3D9 lock skipped while the ring is up (see dx8vertexbuffer.cpp).
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		{
+			unsigned geo_size = index_buffer->Get_Index_Count() * sizeof(unsigned short);
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: per-object backing first - a draw
+			// binds the (VkBuffer, offset) of this very index buffer, which wedge 3.1's shared ring cannot
+			// offer. The ring stays as the mirror-only fallback while GENERALSX_VKDRAW is off.
+			indices = (unsigned short*)VKGeo_Back_Lock(index_buffer, geo_size, 0, 0,
+				(flags & D3DLOCK_DISCARD) != 0);
+			if (indices) {
+				vk_mirrored = true;
+				break;
+			}
+			if (VKGeo_Ready(geo_size)) {
+				indices = (unsigned short*)VKGeo_Alloc(geo_size, (flags & D3DLOCK_DISCARD) != 0);
+				if (indices) {
+					vk_mirrored = true;
+					break;
+				}
+			}
+		}
+#endif
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->Get_DX8_Index_Buffer()->Lock(
 			0,
 			index_buffer->Get_Index_Count()*sizeof(WORD),
@@ -216,6 +254,9 @@ IndexBufferClass::WriteLockClass::~WriteLockClass()
 	DX8_THREAD_ASSERT();
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 3.1: ring write, no D3D9 resource was locked
+#endif
 		DX8_Assert();
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock());
 		break;
@@ -232,7 +273,7 @@ IndexBufferClass::WriteLockClass::~WriteLockClass()
 
 IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass* index_buffer_,unsigned start_index, unsigned index_range)
 	:
-	index_buffer(index_buffer_)
+	index_buffer(index_buffer_), vk_mirrored(false)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(start_index+index_range<=index_buffer->Get_Index_Count());
@@ -242,6 +283,28 @@ IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass* index_buffe
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
 		DX8_Assert();
+		// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.1: fresh full-buffer region, write at base+start
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		{
+			unsigned geo_size = index_buffer->Get_Index_Count() * sizeof(unsigned short);
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: append writes land in the same
+			// per-object backing as the full lock, offset by start_index.
+			unsigned short* back_base = (unsigned short*)VKGeo_Back_Lock(index_buffer, geo_size, 0, 0, false);
+			if (back_base) {
+				vk_mirrored = true;
+				indices = back_base + start_index;
+				break;
+			}
+			if (VKGeo_Ready(geo_size)) {
+				unsigned short* ring_base = (unsigned short*)VKGeo_Alloc(geo_size, false);
+				if (ring_base) {
+					vk_mirrored = true;
+					indices = ring_base + start_index;
+					break;
+				}
+			}
+		}
+#endif
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Lock(
 			start_index*sizeof(unsigned short),
 			index_range*sizeof(unsigned short),
@@ -264,6 +327,9 @@ IndexBufferClass::AppendLockClass::~AppendLockClass()
 	DX8_THREAD_ASSERT();
 	switch (index_buffer->Type()) {
 	case BUFFER_TYPE_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 3.1: ring write, no D3D9 resource was locked
+#endif
 		DX8_Assert();
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->index_buffer->Unlock());
 		break;
@@ -421,7 +487,7 @@ void DynamicIBAccessClass::_Deinit()
 
 DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_access_)
 	:
-	DynamicIBAccess(ib_access_)
+	DynamicIBAccess(ib_access_), vk_mirrored(false)
 {
 	DX8_THREAD_ASSERT();
 	DynamicIBAccess->IndexBuffer->Add_Ref();
@@ -430,6 +496,21 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 		WWASSERT(DynamicIBAccess);
 //		WWASSERT(!dynamic_dx8_index_buffer->Engine_Refs());
 		DX8_Assert();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: the index pool backing mirrors the
+		// whole pool for this frame's slot - Get_Index_Count() on the access object is the batch size,
+		// while the draw binds the pool and folds IndexBufferOffset into the start index.
+		{
+			const unsigned geo_size = DynamicIBAccess->IndexBuffer->Get_Index_Count() * sizeof(WORD);
+			char* slot = (char*)VKGeo_Back_Lock(DynamicIBAccess->IndexBuffer, geo_size, 0, 1,
+				DynamicIBAccess->IndexBufferOffset == 0);
+			if (slot) {
+				vk_mirrored = true;
+				Indices = (unsigned short*)(slot + DynamicIBAccess->IndexBufferOffset * sizeof(WORD));
+				break;
+			}
+		}
+#endif
 		DX8_ErrorCode(
 			static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Lock(
 			DynamicIBAccess->IndexBufferOffset*sizeof(WORD),
@@ -452,6 +533,9 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 	DX8_THREAD_ASSERT();
 	switch (DynamicIBAccess->Get_Type()) {
 	case BUFFER_TYPE_DYNAMIC_DX8:
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (vk_mirrored) break;	// wedge 5.A: wrote the backing, the D3D9 pool was never locked
+#endif
 		DX8_Assert();
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Unlock());
 		break;
