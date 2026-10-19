@@ -56,5 +56,39 @@ void VKFF_Vertex_Ref(const VKDraw_FF_State& ff, const VKFF_Vertex_In& in, VKFF_V
 // and runs once at co-create time behind GENERALSX_VKFFVERT=1.
 void VKFF_Run_Probe();
 
+// ---- wedge 7: the texture combiner -----------------------------------------------------------------
+//
+// What the second side is now. vkff.frag replaces the pixel program the D3D9 device generated per
+// texture-stage combination with one interpreter that replays D3DTSS_* out of the same packed block. The
+// reference below is that table again, transcribed from the D3D8/9 documentation rather than from the
+// GLSL, for the same reason the vertex equations are: a reference copied off the implementation only
+// proves the implementation equals itself. It covers the eight-stage loop, the D3DTA_* selectors with
+// their two modifier bits, the 26 D3DTOP rows for both channel groups, D3DTSS_RESULTARG routing, the
+// post-combiner specular add, the alpha test folded in from flags[2] and the table/vertex fog choice.
+//
+// Everything it consumes is already interpolated, because interpolation is the rasteriser's business and
+// the probe's rigs make every vertex of a band emit the same value (see VulkanCore.cpp's FF probe). The
+// four texels are the four mirrored texture slots as the sampler returned them; a stage above the fourth
+// gets white, which is the descriptor set's real limit until wedge 8 widens the layout.
+struct VKFF_Pixel_In {
+    float color[4];      // vColor: the colour the combiner's current register starts from
+    float specular[4];   // vSpecular: added after the last stage
+    float texel[4][4];   // slots 0..3, already sampled
+    float fog_depth;     // eye depth at this pixel, for the table fog modes
+    float fog_vertex;    // vFog.y, the interpolated vertex fog factor
+};
+
+// Returns 1 when the pixel survives the alpha test and out_rgba is what lands in the target, 0 when it was
+// discarded - which the probe needs, because a discarded pixel keeps the clear value rather than any colour
+// arithmetic can produce.
+int VKFF_Combine_Ref(const VKDraw_FF_State& ff, const VKFF_Pixel_In& in, float* out_rgba);
+
+// The wedge-7 acceptance probe: one band per combiner construct the interpreter can reach, drawn through
+// the real vkff.vert + vkff.frag pipeline into an RT mirror, with two 1x1 textures uploaded through the
+// real wedge-3.2 mirror path, read back and compared against VKFF_Combine_Ref. Logs
+//   VKFFPIX probe: fmt=.. bands=.. checked=.. skipped=.. mismatches=.. ...
+// and runs once at co-create time behind GENERALSX_VKFFPIX=1.
+void VKFF_Run_Pixel_Probe();
+
 #endif // _WIN32 && SAGE_USE_VULKAN_CORE
 #endif // GENERALSX_VULKANFF_H

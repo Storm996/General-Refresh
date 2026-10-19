@@ -182,5 +182,32 @@ bool VulkanCore_Present_Enabled();
 void VulkanCore_Present_Frame();      // clear-color frame through the Vulkan swapchain
 void VulkanCore_Resize();             // keep swapchain extent in sync with device resets
 
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7 forensics: read the scene target back to the
+// host and say, in the log, whether a real engine frame contains a picture. Every acceptance probe in
+// this port only proves that shader arithmetic matches a CPU reference on a synthetic rig, which cannot
+// distinguish "the pixel stage computes wrong colours" from "the draw path never took over" - so the
+// scene gets sampled instead of another human run. Record runs at the end of a frame while the scene
+// image is already in TRANSFER_SRC layout (the present blit read it from the same command buffer), Poll
+// runs at the start of the next one after that slot's fence passed. Both no-op unless
+// GENERALSX_VKLUMA=1; cadence is GENERALSX_VKLUMA_EVERY frames. The queue lock is re-entrant, so both
+// may be called from inside an already-locked frame section.
+void VKCore_Luma_Record(void* cmd, void* sceneImage, unsigned w, unsigned h, unsigned slot);
+void VKCore_Luma_Poll(unsigned slot);
+
+// GeneralsX @feature Qoder 19/10/2026 pure-Vulkan wedge 10 real-path forensics: the user verdict is that
+// in-game textures drop out per object (white silhouettes that come and go with the camera) and retail
+// evidence runs must be screenshots, not replays. Every frame the scene is blitted down to a fixed
+// 480x270 image, copied to host staging in that frame's slot, and Poll (after the slot fence) writes a
+// 24-bit BMP under Vulkan\logs\shots and logs one white/black census line per frame, so a human report
+// like "shot A white, shot B normal" becomes a machine-diffable time series. No-op unless
+// GENERALSX_VKSHOT=1. The queue lock is re-entrant, so both may sit inside a locked frame section.
+void VKCore_Shot_Record(void* cmd, void* sceneImage, unsigned w, unsigned h, unsigned slot, unsigned long long frame);
+void VKCore_Shot_Poll(unsigned slot);
+
+// GeneralsX @bugfix Qoder 19/10/2026 R-02: the present-chain frame counter, so censuses raised from the
+// facade (which never sees the swapchain) can name the frame a state change belongs to. Advances once
+// per presented frame in VulkanCore::Advance_Frame.
+unsigned long long VKCore_Frame_No();
+
 #endif // _WIN32
 #endif // GENERALSX_VULKANCORE_H

@@ -383,12 +383,77 @@ void W3DInGameUI::reset()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 3: fourth-level breakdown of the HUD draw (the
+// ingameui bucket from W3DDisplay::draw). Same env switch as the other phase probes
+// (GENERALSX_VKFPS_PHASES). Temporary forensic instrumentation, retire with the other probes.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct VKFph4
+	{
+		long long pre, hints, postDraw, repaint, postWin, endBatch, total, frames;
+		bool enabled, checked;
+		VKFph4() : pre(0), hints(0), postDraw(0), repaint(0), postWin(0), endBatch(0), total(0),
+			frames(0), enabled(false), checked(false) { }
+	};
+	VKFph4 g_fph4;
+
+	inline long long fph4NowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fph4On()
+	{
+		if (!g_fph4.checked)
+		{
+			g_fph4.checked = true;
+			g_fph4.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fph4.enabled;
+	}
+
+	struct VKFph4Scope
+	{
+		long long* out;
+		long long t0;
+		VKFph4Scope(long long* o) : out(o), t0(o ? fph4NowUs() : 0) { }
+		~VKFph4Scope() { if (out) *out += fph4NowUs() - t0; }
+	};
+
+	inline void fph4TickAndDump()
+	{
+		if (!g_fph4.enabled) return;
+		if ((++g_fph4.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase4.log", "a");
+		if (out)
+		{
+			fprintf(out, "[VKFPH4] frames=300 avg_us pre=%lld hints=%lld postDraw=%lld repaint=%lld "
+				"postWin=%lld endBatch=%lld total=%lld\n",
+				(long long)(g_fph4.pre / 300), (long long)(g_fph4.hints / 300), (long long)(g_fph4.postDraw / 300),
+				(long long)(g_fph4.repaint / 300), (long long)(g_fph4.postWin / 300), (long long)(g_fph4.endBatch / 300),
+				(long long)(g_fph4.total / 300));
+			fclose(out);
+		}
+		g_fph4.pre = g_fph4.hints = g_fph4.postDraw = g_fph4.repaint = 0;
+		g_fph4.postWin = g_fph4.endBatch = g_fph4.total = 0;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Draw member for the W3D implementation of the game user interface */
 //-------------------------------------------------------------------------------------------------
 void W3DInGameUI::draw()
 {
-	TheDisplay->beginBatch();
-	preDraw();
+	const bool vkP = fph4On();
+	fph4TickAndDump();
+	VKFph4Scope sTotal(vkP ? &g_fph4.total : nullptr);
+	{
+		VKFph4Scope s(vkP ? &g_fph4.pre : nullptr);
+		TheDisplay->beginBatch();
+		preDraw();
+	}
 
 	// draw selection region if drag selecting
 	if( m_isDragSelecting )
@@ -398,6 +463,7 @@ void W3DInGameUI::draw()
 	/// @todo should the UI be iterating through views like this?
 	if( TheDisplay )
 	{
+		VKFph4Scope s(vkP ? &g_fph4.hints : nullptr);
 		View *view;
 
 		for( view = TheDisplay->getFirstView();
@@ -430,17 +496,29 @@ void W3DInGameUI::draw()
 	if (!g_UT_startTiming)
 #endif
 
-	postDraw();
+	{
+		VKFph4Scope s(vkP ? &g_fph4.postDraw : nullptr);
+		postDraw();
+	}
 
-	TheWindowManager->winRepaint();
+	{
+		VKFph4Scope s(vkP ? &g_fph4.repaint : nullptr);
+		TheWindowManager->winRepaint();
+	}
 
-	postWindowDraw();
+	{
+		VKFph4Scope s(vkP ? &g_fph4.postWin : nullptr);
+		postWindowDraw();
+	}
 
 #ifdef EXTENDED_STATS
 	}
 #endif
 
-	TheDisplay->endBatch();
+	{
+		VKFph4Scope s(vkP ? &g_fph4.endBatch : nullptr);
+		TheDisplay->endBatch();
+	}
 
 }
 

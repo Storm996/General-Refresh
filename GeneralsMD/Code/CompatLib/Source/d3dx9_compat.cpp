@@ -294,6 +294,18 @@ D3DXLoadSurfaceFromSurface(
 	pSrcSurface->GetDesc(&descSrc);
 	pDestSurface->GetDesc(&descDest);
 
+	// GeneralsX @feature Qoder 18/10/2026 wedge 9.J5: the surviving /GS fault on the no-d3d9 replay has no
+	// symbolizable frame, so the last [VKD3DX] line before the dump names the call that was in flight.
+	{
+		static unsigned s_lsfCalls = 0;
+		if (++s_lsfCalls <= 256u) {
+			fprintf(stderr, "[VKD3DX] LSF #%u dst=%p %u x %u fmt=0x%X src=%p %u x %u fmt=0x%X f=0x%X\n",
+				s_lsfCalls, (void *) pDestSurface, (unsigned) descDest.Width, (unsigned) descDest.Height,
+				(unsigned) descDest.Format, (void *) pSrcSurface, (unsigned) descSrc.Width,
+				(unsigned) descSrc.Height, (unsigned) descSrc.Format, (unsigned) Filter);
+		}
+	}
+
 	if (descSrc.Format != descDest.Format)
 	{
 		if (IsDXTFormat(descSrc.Format) && !pSrcPalette && !pDestPalette) {
@@ -569,7 +581,10 @@ D3DXLoadSurfaceFromSurface(
 	gli::texture2d texSrc(imageFormat, gli::extent2d(descSrc.Width, descSrc.Height), 2);
 
 	// Copy the data to level 0
-	memcpy(texSrc.data(), srcRect.pBits, texSrc.size());
+	// GeneralsX @bugfix d3d9 port 18/10/2026 win64: texSrc holds TWO levels, so size() returned
+	// level0+level1 (5/4 of the source) and the memcpy read past the locked srcRect mirror into the
+	// heap guard page - the 0xc0000005 "read of <heap base+size>" faults in D3DXFilterTexture.
+	memcpy(texSrc.data(), srcRect.pBits, texSrc.size(0));
 	// Generate mip 1 from level 0
 	gli::texture2d mipMap = gli::generate_mipmaps(texSrc, gli::filter::FILTER_LINEAR);
 
@@ -781,6 +796,15 @@ D3DXFilterTexture(
 			int i;
 
 			tex->GetLevelDesc(SrcLevel, &desc);
+			{
+				// Wedge 9.J5 pair to the LSF trace: names the mip-churn loop this call is entering.
+				static unsigned s_filtCalls = 0;
+				if (++s_filtCalls <= 256u) {
+					fprintf(stderr, "[VKD3DX] FILT #%u tex=%p lvl=%u src=%u x %u nlevels=%u f=0x%X\n",
+						s_filtCalls, (void *) pBaseTexture, (unsigned) SrcLevel, (unsigned) desc.Width,
+						(unsigned) desc.Height, (unsigned) tex->GetLevelCount(), (unsigned) Filter);
+				}
+			}
 			if (Filter == D3DX_DEFAULT)
 			{
 				Filter = D3DX_FILTER_BOX;

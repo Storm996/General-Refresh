@@ -54,6 +54,7 @@
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/dx8caps.h"
+#include "WW3D2/Backend/VulkanTexMirror.h"
 #include "WWMath/vector2i.h"
 
 
@@ -100,6 +101,13 @@ static WW3DFormat findFormat(const WW3DFormat formats[], WW3DFormat fallback = W
 	DEBUG_CRASH(("WW3DRadar: No appropriate texture format") );
 	return fallback;
 }
+
+// GeneralsX @bugfix Qoder 18/10/2026 Radar forensic probe: count the cell statuses a shroud batch
+// actually writes, so "the minimap is black" can be split into "the shroud state says everything is
+// concealed" versus "the write path produced an opaque black layer anyway".
+static unsigned long s_radarShroudShrouded = 0;
+static unsigned long s_radarShroudFogged = 0;
+static unsigned long s_radarShroudClear = 0;
 
 //-------------------------------------------------------------------------------------------------
 /** Find the texture format we're going to use for the radar.  The texture format must
@@ -635,6 +643,9 @@ void W3DRadar::updateObjectTexture(TextureClass *texture)
 	// rebuild the object overlay
 	renderObjectList( m_objectList, texture );
 	renderObjectList( m_localObjectList, texture );
+
+	// GeneralsX @bugfix Qoder 18/10/2026 CPU-painted overlay (unit blips) needs its own Vulkan mirror.
+	VKTex_Mirror_D3D_Texture(texture->Peek_D3D_Texture());
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -935,6 +946,21 @@ void W3DRadar::init()
 	m_shroudTexture->Get_Filter().Set_Min_Filter( TextureFilterClass::FILTER_TYPE_DEFAULT );
 	m_shroudTexture->Get_Filter().Set_Mag_Filter( TextureFilterClass::FILTER_TYPE_DEFAULT );
 
+	// GeneralsX @bugfix Qoder 18/10/2026 Radar forensic probe: name the three textures so the draw
+	// emitter can identify their 2D quads by name instead of by a resolution shared with other art.
+	if (m_terrainTexture) m_terrainTexture->Set_Texture_Name("RADAR_TERRAIN");
+	if (m_overlayTexture) m_overlayTexture->Set_Texture_Name("RADAR_OVERLAY");
+	if (m_shroudTexture) m_shroudTexture->Set_Texture_Name("RADAR_SHROUD");
+
+	// GeneralsX @bugfix Qoder 18/10/2026 Radar forensic probe: label the three D3D texture keys once
+	// so the dyn-mirror log's raw pointers can be told apart during a minimap investigation.
+	fprintf(stderr, "[RADAR] textures terrain=%p overlay=%p shroud=%p fmt=%d/%d/%d\n",
+		m_terrainTexture ? m_terrainTexture->Peek_D3D_Texture() : nullptr,
+		m_overlayTexture ? m_overlayTexture->Peek_D3D_Texture() : nullptr,
+		m_shroudTexture ? m_shroudTexture->Peek_D3D_Texture() : nullptr,
+		(int)m_terrainTextureFormat, (int)m_overlayTextureFormat, (int)m_shroudTextureFormat);
+	fflush(stderr);
+
 	//
 	// create images used for rendering and set them up with the textures
 	//
@@ -1008,6 +1034,9 @@ void W3DRadar::reset()
 		surface->Clear();
 		REF_PTR_RELEASE(surface);
 	}
+	// GeneralsX @bugfix Qoder 18/10/2026 Clear() is a CPU memset, so the Vulkan mirror would keep
+	// showing the previous map until the next full rebuild. Mirror both cleared textures now.
+	VKTex_Mirror_D3D_Texture(m_terrainTexture->Peek_D3D_Texture());
 
 	surface = m_overlayTexture->Get_Surface_Level();
 	if( surface )
@@ -1015,6 +1044,7 @@ void W3DRadar::reset()
 		surface->Clear();
 		REF_PTR_RELEASE(surface);
 	}
+	VKTex_Mirror_D3D_Texture(m_overlayTexture->Peek_D3D_Texture());
 
 	// don't call Clear(); that wips to transparent. do this instead.
 	//gs Dude, it's called CLEARshroud.  It needs to clear the shroud.
@@ -1061,6 +1091,13 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	SurfaceClass *surface;
 	RGBColor waterColor;
 
+	// GeneralsX @bugfix Qoder 18/10/2026 Radar forensic probe: the minimap went black again while the
+	// reset mirrors still succeed, so log whether the paint pass runs at all and whether it reaches
+	// the Vulkan mirror (both were previously indistinguishable from a black upload).
+	fprintf(stderr, "[RADAR] buildTerrainTexture enter terrain=%p tex=%p\n",
+		(void*)terrain, m_terrainTexture ? m_terrainTexture->Peek_D3D_Texture() : nullptr);
+	fflush(stderr);
+
 	// we will want to reconstruct our new view box now
 	m_reconstructViewBox = TRUE;
 
@@ -1077,10 +1114,8 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	// Without this guard the code dereferences a null pointer and crashes at surfaceDesc offset 0x18.
 	if( !surface )
 	{
-#if !defined(_WIN32)
-		fprintf(stderr, "W3DRadar: buildTerrainTexture: null surface level — terrain texture unavailable, skipping terrain build\n");
+		fprintf(stderr, "[RADAR] buildTerrainTexture: null surface level, terrain texture unavailable\n");
 		fflush(stderr);
-#endif
 		return;
 	}
 
@@ -1298,6 +1333,13 @@ void W3DRadar::buildTerrainTexture( TerrainLogic *terrain )
 	surface->Unlock();
 	REF_PTR_RELEASE(surface);
 
+	// GeneralsX @bugfix Qoder 18/10/2026 The radar map is CPU-painted into a D3D texture, so the Vulkan
+	// draw layer has no keyed mirror for it and samples the built-in white: the radar frame stayed empty
+	// while the view trapezoid (plain drawLine) still showed. Mirror each completed CPU fill.
+	const bool mirrored = VKTex_Mirror_D3D_Texture(m_terrainTexture->Peek_D3D_Texture());
+	fprintf(stderr, "[RADAR] buildTerrainTexture done mirror=%d\n", mirrored ? 1 : 0);
+	fflush(stderr);
+
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1333,6 +1375,9 @@ void W3DRadar::clearShroud()
 
 	surface->Unlock();
 	REF_PTR_RELEASE(surface);
+
+	// GeneralsX @bugfix Qoder 18/10/2026 Shroud is CPU-painted too; mirror the cleared state.
+	VKTex_Mirror_D3D_Texture(m_shroudTexture->Peek_D3D_Texture());
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1385,6 +1430,13 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 	else
 		alpha = 0;
 
+	if( setting == CELLSHROUD_SHROUDED )
+		++s_radarShroudShrouded;
+	else if( setting == CELLSHROUD_FOGGED )
+		++s_radarShroudFogged;
+	else
+		++s_radarShroudClear;
+
 	if (m_shroudSurface == nullptr)
 	{
 		// This is expensive.
@@ -1408,6 +1460,9 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 
 		surface->Unlock();
 		REF_PTR_RELEASE(surface);
+
+		// GeneralsX @bugfix Qoder 18/10/2026 Single-shot shroud update outside begin/end: mirror it now.
+		VKTex_Mirror_D3D_Texture(m_shroudTexture->Peek_D3D_Texture());
 	}
 	else
 	{
@@ -1431,6 +1486,9 @@ void W3DRadar::setShroudLevel(Int shroudX, Int shroudY, CellShroudStatus setting
 void W3DRadar::beginSetShroudLevel()
 {
 	DEBUG_ASSERTCRASH( m_shroudSurface == nullptr, ("W3DRadar::beginSetShroudLevel: m_shroudSurface is expected null") );
+	s_radarShroudShrouded = 0;
+	s_radarShroudFogged = 0;
+	s_radarShroudClear = 0;
 	m_shroudSurface = m_shroudTexture->Get_Surface_Level();
 	DEBUG_ASSERTCRASH( m_shroudSurface != nullptr, ("W3DRadar::beginSetShroudLevel: Can't get surface for Shroud texture") );
 
@@ -1453,6 +1511,17 @@ void W3DRadar::endSetShroudLevel()
 		m_shroudSurfacePixelSize = 0;
 	}
 	REF_PTR_RELEASE(m_shroudSurface);
+
+	fprintf(stderr, "[RADAR] shroud batch: shrouded=%lu fogged=%lu clear=%lu shroudOn=%d\n",
+		s_radarShroudShrouded, s_radarShroudFogged, s_radarShroudClear,
+		TheGlobalData->m_shroudOn ? 1 : 0);
+	fflush(stderr);
+
+	// GeneralsX @bugfix Qoder 18/10/2026 One mirror per begin/end shroud batch rather than per cell.
+	if (m_shroudTexture)
+	{
+		VKTex_Mirror_D3D_Texture(m_shroudTexture->Peek_D3D_Texture());
+	}
 }
 
 //-------------------------------------------------------------------------------------------------

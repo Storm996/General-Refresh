@@ -61,4 +61,10 @@ class W3DSunShadowMap
 		// pixel never gets multiplied twice into "twice-dark" black (the S3 overlap the report warns of).
 		static bool isReceptionActive();
 		static float receptionStrength();
+
+		// GeneralsX @refactor Qoder 19/10/2026 R-05: true once the ShadowMap gate (Options.ini
+		// ShadowMap=1 default, GENERALSX_SHADOWMAP QA override) says the sun map owns this process's
+		// sun shadows. The legacy projected/volumetric managers check this so they stand down instead
+		// of burning 2.6 ms of CPU per frame drawing a second, redundant shadow layer.
+		static bool isWanted();
 };

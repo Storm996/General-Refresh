@@ -61,7 +61,7 @@ extern VkInstance g_impInst;
     VKFN(vkBeginCommandBuffer) VKFN(vkEndCommandBuffer) VKFN(vkResetCommandBuffer) \
     VKFN(vkCmdBeginRenderPass) VKFN(vkCmdEndRenderPass) \
     VKFN(vkCreateSemaphore) VKFN(vkDestroySemaphore) VKFN(vkCreateFence) VKFN(vkDestroyFence) \
-    VKFN(vkQueueSubmit) VKFN(vkWaitForFences) VKFN(vkResetFences) VKFN(vkDeviceWaitIdle) \
+    VKFN(vkQueueSubmit) VKFN(vkWaitForFences) VKFN(vkResetFences) VKFN(vkGetFenceStatus) VKFN(vkDeviceWaitIdle) \
     VKFN(vkGetPhysicalDeviceMemoryProperties) VKFN(vkCreateBuffer) VKFN(vkDestroyBuffer) \
     VKFN(vkGetBufferMemoryRequirements) VKFN(vkAllocateMemory) VKFN(vkFreeMemory) \
     VKFN(vkBindBufferMemory) VKFN(vkMapMemory) VKFN(vkUnmapMemory) \
@@ -82,7 +82,10 @@ extern VkInstance g_impInst;
     VKFN(vkAllocateDescriptorSets) VKFN(vkUpdateDescriptorSets) VKFN(vkFreeDescriptorSets) \
     VKFN(vkCmdBindDescriptorSets) \
     VKFN(vkGetPhysicalDeviceFormatProperties) VKFN(vkEnumerateDeviceExtensionProperties) \
-    VKFN(vkGetPhysicalDeviceFeatures)
+    VKFN(vkGetPhysicalDeviceFeatures) \
+    VKFN(vkCreateQueryPool) VKFN(vkDestroyQueryPool) VKFN(vkCmdResetQueryPool) \
+    VKFN(vkCmdBeginQuery) VKFN(vkCmdEndQuery) \
+    VKFN(vkCmdWriteTimestamp) VKFN(vkGetQueryPoolResults)
 
 struct Vkfns {
 #define VKFN(name) PFN_##name name = nullptr;

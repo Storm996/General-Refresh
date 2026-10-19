@@ -47,6 +47,9 @@
 // Use angle brackets (not quotes) to skip local d3d8.h stub and get DXVK headers
 // DXVK's d3d8.h includes d3d8types.h internally - no manual includes needed
 #include <d3d9.h>
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include <intrin.h>   // GeneralsX @debug Qoder 19/10/2026 BUG-03: _ReturnAddress for the render-state watch ring
+#endif
 #include "WWMath/matrix4.h"
 #include "statistics.h"
 #include "WWLib/wwstring.h"
@@ -57,6 +60,7 @@
 #include "dx8caps.h"
 
 #include "texture.h"
+#include "Backend/VulkanTexMirror.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
 #include "WW3D2/vertmaterial.h"
@@ -127,6 +131,7 @@ class DX8Caps;
 // here as an incomplete type so this header stays free of the Vulkan seam, exactly like the void*
 // handles the rest of the wedge API uses.
 struct VKDraw_FF_State;
+struct VKDraw_Submit;
 
 struct DX8FrameStatistics
 {
@@ -461,6 +466,80 @@ public:
 		unsigned short index_count,
 		unsigned short min_vertex_index,
 		unsigned short vertex_count);
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: DrawPrimitiveUP behind the facade, so the
+	// Vulkan recorder sees the same shadow state as an indexed batch. With the path up the call is consumed
+	// by Vulkan and no D3D9 draw is issued; otherwise it falls through to DX8CALL(DrawPrimitiveUP) and
+	// returns false. Wedge 9.G added the verdict for callers that need to prove which side drew.
+	static bool Draw_User_Primitive(
+		unsigned primitive_type,
+		unsigned primitive_count,
+		const void* vertex_data,
+		unsigned stride);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed user-memory draw for the families
+	// that own a raw D3D9 vertex/index buffer pair. The caller keeps its CPU mirror current as it fills the
+	// D3D9 buffers; this hands the same ranges to the recorder and returns false when the batch has to stay
+	// on D3D9 (offscreen target, untranslated program, unmirrored texture, unsupported layout). 'fvf' is the
+	// declaration the raw draw was issued with, and 'base_vertex' is D3D9's BaseVertexIndex.
+	static bool Draw_Indexed_User_Primitive(
+		unsigned primitive_type,
+		const void* vertex_data,
+		unsigned vertex_count,
+		unsigned stride,
+		unsigned fvf,
+		const void* index_data,
+		unsigned index_count,
+		unsigned base_vertex);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: DrawIndexedPrimitive issued against a raw
+	// engine buffer pair that was bound behind the facade's back (the volumetric shadow pools). The
+	// wrappers own mirrored backings, so the recorder can describe the batch without a CPU copy of the
+	// geometry. Returns false when the batch must stay on D3D9; the caller then issues its own raw call
+	// with the same arguments.
+	static bool Draw_Indexed_Primitive_From_Buffers(
+		void* vertex_buffer,
+		void* index_buffer,
+		unsigned primitive_type,
+		unsigned first_index,
+		unsigned polygon_count,
+		unsigned min_vertex_index,
+		unsigned vertex_count,
+		unsigned base_vertex);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: opt a render-target texture into Vulkan
+	// ownership. When every Set_Render_Target call to that texture publishes it to the recorder, the
+	// batches drawn there also have to be consumable by the recorder; a family that still has raw device
+	// draws must stay out of this list, which keeps its target switch invisible to Vulkan.
+	static void VK_Allow_Render_Target(void* texture_key);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: allocate recorder mirrors for a render
+	// target whose D3D9 resources were created raw (the sun shadow map) and opt them in. The colour key is
+	// the D3D9 texture and its format is a D3DFORMAT; the depth key may be a raw depth surface that has no
+	// texture container, so the map cannot be a Vulkan target without that key. Returns false when the
+	// format is outside the mirror's table, which leaves the family on D3D9.
+	static bool VK_Register_Render_Target(void* color_key, unsigned width, unsigned height,
+		int d3d_color_format, void* depth_key, int ww3d_zformat);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: publish a target pair to the recorder
+	// without touching DX8Wrapper's D3D9 RT cache. A pass that runs inside an already-open scene and
+	// switches targets with raw device calls (the sun shadow occluder) must not use Set_Render_Target:
+	// the wrapper owns exactly one custom-target slot and pillarbox already occupies it. Passing null
+	// colour publishes the scene mirrors and restores recorder ownership of the scene target.
+	// Returns false when the pair is not a registered, allowed mirror: the recorder then stays where it
+	// was and refuses facade draws until the scene target is published again.
+	static bool VK_Publish_Render_Target(void* color_surface, void* depth_surface);
+	static void VK_Publish_Scene_Target();
+
+	// GeneralsX @feature Qoder 19/10/2026 wedge 11 forensics: ask the recorder to copy the Vulkan mirror
+	// behind this texture key to host staging at the next frame boundary and log its R-channel census
+	// (the sun shadow map's "did the fill land" question). No-op unless GENERALSX_VKRTPROBE=1.
+	static void VK_RT_Probe(void* texture_key);
+
+	// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9: a post chain whose offscreen targets were
+	// not opted in still binds D3D9 textures. The recorder is left on the scene mirror during that chain,
+	// so without this gate its fixed-function copy quad is recorded into the scene with a source Vulkan
+	// never wrote. Suspend owns the facade for the whole chain; publishing the scene restores it.
+	static void VK_Suspend_Scene_Target();
 
 	/*
 	** Resources
@@ -678,6 +757,39 @@ public:
 		unsigned short first_index, unsigned short polygon_count,
 		unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex);
 
+	// GeneralsX @refactor Qoder 18/10/2026 pure-Vulkan wedge 9: the shadow-to-submit translation both draw
+	// paths share. It fills everything except the vertex/index source, which is what differs between an
+	// indexed batch and a user-memory one. 'ff_state' is the caller's storage for the packed fixed-function
+	// block the submit points at, so it has to outlive the submit call.
+	static void VK_Fill_Submit_State(VKDraw_Submit& submit, VKDraw_FF_State& ff_state,
+		const FVFInfoClass& info, unsigned vs_tag, unsigned ps_tag, unsigned primitive_type);
+
+	// GeneralsX @bugfix Qoder 19/10/2026 R-02 forensics: the untextured fixed-function submit census, run
+	// from the draw sites once the submit carries its real stream binding. Names the passes that paint a
+	// vertex-diffuse silhouette, resolves the material sources and alpha-test block, and samples the
+	// batch's own first DIFFUSE dwords - the field the white-silhouette attribution turns on.
+	static void VK_FF_NTX_Census(VKDraw_Submit& submit, const FVFInfoClass& info,
+		unsigned primitive_type, unsigned ps_tag, void* vertex_buffer, const void* vertex_data);
+
+	// GeneralsX @debug Qoder 19/10/2026 BUG-02: the screen-space batch stack census. One line per
+	// XYZRHW submit (bounding box, texture, recipe, vertex colours) for a few named frames, so a black
+	// rectangle on screen is attributed to the last batch whose box covers it. Env gate GENERALSX_VKBAR.
+	static void VK_BAR_Census(VKDraw_Submit& submit, const FVFInfoClass& info,
+		unsigned primitive_type, void* vertex_buffer, const void* vertex_data, unsigned vertex_count);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: the user-primitive emitter. It refuses the
+	// batches this layer cannot describe - a render target the facade is not publishing, stencil state, a
+	// bound texture without a Vulkan view, an untranslated program - by returning false, which makes the
+	// caller run the D3D9 call instead.
+	static bool VK_Emit_User_Primitive(unsigned primitive_type, const void* vertex_data,
+		unsigned stride, unsigned polygon_count);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed twin for raw-buffer families. Same
+	// refusal contract as VK_Emit_User_Primitive; geometry is copied from the caller's CPU mirror.
+	static bool VK_Emit_Indexed_User_Primitive(unsigned primitive_type,
+		const void* vertex_data, unsigned vertex_count, unsigned stride, unsigned fvf,
+		const void* index_data, unsigned index_count, unsigned base_vertex);
+
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the viewport shadow the submit filler
 	// binds per draw. Vulkan has no device viewport state - the recorder is handed a rectangle with the
 	// batch - so Set_Viewport has to publish it here as well as to D3D9 while both paths are alive.
@@ -694,6 +806,12 @@ public:
 	// stage register whose documented default is not zero.
 	static unsigned VK_Read_RS_Default_bits(unsigned token, float fallback);
 	static unsigned VK_Read_TSS(unsigned stage, unsigned token, unsigned fallback);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the sampler shadow read the pixel side needs.
+	// The filter and address tokens arrive here as the D3D8 ordinals the game wrote - the same numbers the
+	// census put in csv - so this only answers the sentinel question; decoding them is vkdesc_make_sampler's
+	// job and it decodes D3D8 ordinals, nothing else.
+	static unsigned VK_Read_Sampler(unsigned stage, unsigned token, unsigned fallback);
 
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: pack the fixed-function vertex-stage block
 	// (VKDraw_FF_State, the third dynamic uniform of every submit) out of the facade's shadows for one
@@ -875,6 +993,21 @@ protected:
 	static unsigned char				VK_RS_Touched[256];
 	static unsigned char				VK_TSS_Touched[33];
 	static unsigned char				VK_Samp_Touched[16];
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @debug Qoder 19/10/2026 BUG-03: watch-ring for ALPHABLENDENABLE/COLORWRITEENABLE/
+	// STENCILENABLE writes - see the push in Set_DX8_Render_State and the replay in the red census.
+	struct VK_RS_Watch_Entry {
+		unsigned long long frame;
+		unsigned state;
+		unsigned value;
+		void *ret;
+	};
+	static VK_RS_Watch_Entry			VK_RS_Watch[64];
+	static unsigned						VK_RS_Watch_N;
+	static void VK_RS_Watch_Push(unsigned state, unsigned value, void *ret);
+#endif
+
 	static IDirect3DBaseTexture9 *	Textures[MAX_TEXTURE_STAGES];
 
 	// These fog settings are constant for all objects in a given scene,
@@ -1146,6 +1279,15 @@ WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigne
 		SNAPSHOT_SAY(("DX8 - SetRenderState(state: %s, value: %s)",
 			Get_DX8_Render_State_Name(state),
 			value_name.str()));
+	}
+#endif
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @debug Qoder 19/10/2026 BUG-03: ring of every accepted write to the three states that
+	// decide whether an offscreen-looking pass paints to the screen (blend fake, colour mask, stencil).
+	// The red-batch census dump replays the tail of this ring with the submitter's return address.
+	if (state == D3DRS_ALPHABLENDENABLE || state == D3DRS_COLORWRITEENABLE || state == D3DRS_STENCILENABLE) {
+		VK_RS_Watch_Push((unsigned)state, value, _ReturnAddress());
 	}
 #endif
 
@@ -1422,6 +1564,11 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 						}
 						pSourceSurface->UnlockRect();
 					}
+					// GeneralsX @bugfix Qoder 18/10/2026 A CPU surface copied into a managed
+					// texture never reaches the loader, so mirror the finished bytes here.
+					if (SUCCEEDED(hr)) {
+						VKTex_Mirror_D3D_Texture(dstTexture);
+					}
 				} else {
 					DWORD dstLevels = dstTexture->GetLevelCount();
 					IDirect3DTexture9* stageTexture = nullptr;
@@ -1443,6 +1590,14 @@ WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
 								stageLevel->UnlockRect();
 								if (staged) {
 									hr = _Get_D3D_Device8()->UpdateTexture(stageTexture, dstTexture);
+									// GeneralsX @bugfix Qoder 18/10/2026 The destination is
+									// D3DPOOL_DEFAULT and cannot be locked, so the Vulkan mirror
+									// was never fed - the 3D shroud mask sampled white and the
+									// fog never darkened the terrain. Upload the staging bytes
+									// under the destination key.
+									if (SUCCEEDED(hr)) {
+										VKTex_Mirror_Texture_As(dstTexture, stageTexture, 1);
+									}
 								}
 							}
 							pSourceSurface->UnlockRect();
@@ -1923,7 +2078,12 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 		break;
 	case D3DTS_PROJECTION:
 		{
-			Matrix4x4 ProjectionMatrix=m.Transpose();
+			// GeneralsX @bugfix Qoder 18/10/2026 This used to declare a local named ProjectionMatrix,
+			// shadowing the static member. D3D9 still received the matrix, but the facade shadow that
+			// VK_FF_Pack feeds to the Vulkan FF shader kept the last camera projection - so every
+			// NDC-space 2D batch (Render2DClass UI, dazzle, sun-shadow receiver) was transformed by a
+			// stale perspective matrix and left the screen. Assign the member so both paths agree.
+			ProjectionMatrix=m.Transpose();
 			ZFar=0.0f;
 			ZNear=0.0f;
 			DX8CALL(SetTransform(D3DTS_PROJECTION,(D3DMATRIX*)&ProjectionMatrix));

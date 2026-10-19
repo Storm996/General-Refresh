@@ -239,6 +239,13 @@ target_precompile_headers(z_gameenginedevice PRIVATE
     [["PchCompat.h"]] # TheSuperHackers @build 08/02/2026 Platform-safe windows.h wrapper
 )
 
+# GeneralsX @build Qoder 18/10/2026 wedge 9.G: this target carries facade-side VK probes behind
+# #if defined(SAGE_USE_VULKAN_CORE) (shadow RTT opt-in and mirrors). The macro is an INTERFACE define
+# of corei_ww3d2, which reaches ww3d2 but not this STATIC library, so opt in explicitly.
+if(SAGE_USE_VULKAN_CORE)
+    target_compile_definitions(z_gameenginedevice PRIVATE SAGE_USE_VULKAN_CORE)
+endif()
+
 target_link_libraries(z_gameenginedevice PRIVATE
     corei_gameenginedevice_private
     zi_always

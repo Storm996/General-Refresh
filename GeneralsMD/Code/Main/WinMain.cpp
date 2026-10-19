@@ -946,6 +946,29 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 	TheDmaCriticalSection = nullptr;
 	TheMemoryPoolCriticalSection = nullptr;
 
+	// GeneralsX @bugfix Qoder 19/10/2026 #43 (wedge-9 NOD3D exit fault, exit code 0xC0000005): with the
+	// zero-d3d9 driver the CRT atexit chain still runs WW3D's static-object destructors after
+	// shutdownMemoryManager and the rest of the engine teardown have already released the memory those
+	// statics reference. The wedge-9 forensics proved the fault sits in a ww3d2 ??__F atexit destructor
+	// thunk (map + disassembly: a dangling container head whose link fields hold freed-arena values),
+	// i.e. the statics' real work is already done by the explicit shutdowns above and only their
+	// traversal crashes. End the process the same leak-on-purpose way the wedge-9 stub pools and the
+	// MultiListNode pool handle this: flush the CRT buffers, then let the OS reclaim the address space.
+	// QuickSilentProcessExit (Windows 10 19H1+) skips the static-destructor pass without touching the
+	// exit code; TerminateProcess is the fallback and a plain return the last resort.
+	if (getenv("GENERALSX_VK_NOD3D") != nullptr)
+	{
+		fflush(nullptr);
+		typedef BOOL (WINAPI *QuickSilentProcessExitFn)(HANDLE, UINT);
+		QuickSilentProcessExitFn quickExit =
+			(QuickSilentProcessExitFn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "QuickSilentProcessExit");
+		if (quickExit != nullptr)
+		{
+			quickExit(GetCurrentProcess(), (UINT)exitcode);
+		}
+		TerminateProcess(GetCurrentProcess(), (UINT)exitcode);
+	}
+
 	return exitcode;
 
 }

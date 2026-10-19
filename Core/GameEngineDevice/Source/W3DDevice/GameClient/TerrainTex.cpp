@@ -365,6 +365,42 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 		}
 
 	}
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: one-shot red-garbage scan of the packed
+	// atlas before it is mirrored to the Vulkan side. The terrain shader multiplies u_tex[0..3]
+	// atlas samples, so a never-written cell (position.x<=0 skip above) holding red backing-store
+	// garbage would burn red patches at terrain-tile granularity. First pass used a loose
+	// r>g+40&&r>b+40 rule and hit 850k pixels: that is just desert dirt (R>G>B is the map palette,
+	// e.g. 219,178,109). This pass separates truly saturated red garbage (r>=100 with g and b
+	// both under a third of r) from zeroed never-written cells (all four channels 0), each with
+	// its own budget so a clean atlas can be stated as fact rather than assumed.
+	{
+		static bool s_scanned = false;
+		if (!s_scanned && pixelBytes == 4) {
+			s_scanned = true;
+			const UnsignedByte* bits = (const UnsignedByte*)locked_rect.pBits;
+			long long hardRedTotal = 0, zeroTotal = 0;
+			Int reports = 0;
+			for (UnsignedInt y = 0; y < surface_desc.Height; y++) {
+				const UnsignedByte* rowPtr = bits + (size_t)y * surface_desc.Width * 4;
+				for (UnsignedInt x = 0; x < surface_desc.Width; x++) {
+					const Int bv = rowPtr[x*4+0], gv = rowPtr[x*4+1], rv = rowPtr[x*4+2];
+					const Int av = rowPtr[x*4+3];
+					if (rv >= 100 && gv*3 <= rv && bv*3 <= rv) {
+						++hardRedTotal;
+						if (reports < 12) { ++reports;
+							fprintf(stderr, "[TERRAIN] hardred at (%u,%u) rgba=(%d,%d,%d,%d)\n",
+								(unsigned)x, (unsigned)y, rv, gv, bv, av);
+						}
+					} else if ((rv | gv | bv | av) == 0) {
+						++zeroTotal;
+					}
+				}
+			}
+			fprintf(stderr, "[TERRAIN] atlas scan v2: hardred=%lld zero=%lld of %ux%u\n",
+				hardRedTotal, zeroTotal, (unsigned)surface_desc.Width, (unsigned)surface_desc.Height);
+			fflush(stderr);
+		}
+	}
 	surface_level->UnlockRect();
 	surface_level->Release();
 	// GeneralsX @performance Qoder 10/07/2026 Triangle instead of box filtering:
@@ -374,7 +410,17 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	DX8_ErrorCode(filter_hr);
 	fprintf(stderr, "[TERRAIN] D3DXFilterTexture(TRIANGLE) hr=0x%08X\n", (unsigned)filter_hr);
 	fflush(stderr);
-	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 identity probe: the diffuse atlas mirror answers with
+	// a silent false when the facade handle is null or the tex layer is not ready; name the outcome.
+	{
+		static bool s_once = false;
+		const bool mirrored = VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
+		if (!s_once) { s_once = true;
+			fprintf(stderr, "[TERRAIN] diffuse atlas mirror: d3d=%p ok=%d\n",
+				(void*)Peek_D3D_Texture(), mirrored ? 1 : 0);
+			fflush(stderr);
+		}
+	}
 	if (WW3D::Get_Texture_Reduction()) {
 		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
 	}
@@ -481,7 +527,16 @@ int TerrainTextureClass::updateNM(WorldHeightMap *htMap)
 
 	// Mips the same way the diffuse atlas does; an all-flat atlas mips to all-flat.
 	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, 0, D3DX_FILTER_TRIANGLE));
-	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 identity probe (same contract as the diffuse atlas).
+	{
+		static bool s_onceNM = false;
+		const bool mirrored = VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
+		if (!s_onceNM) { s_onceNM = true;
+			fprintf(stderr, "[TNM] nm atlas mirror: d3d=%p ok=%d\n",
+				(void*)Peek_D3D_Texture(), mirrored ? 1 : 0);
+			fflush(stderr);
+		}
+	}
 	if (WW3D::Get_Texture_Reduction()) {
 		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
 	}
@@ -974,6 +1029,10 @@ void AlphaTerrainTextureClass::Apply(unsigned int stage)
 LightMapTerrainTextureClass::LightMapTerrainTextureClass(AsciiString name, MipCountType mipLevelCount) :
 TextureClass(name.isEmpty()?"TSNoiseUrb.tga":name.str(),name.isEmpty()?"TSNoiseUrb.tga":name.str(), mipLevelCount )
 {
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 identity probe: pair this ctor with the mirror log to
+	// tell which stub texture key the battle lightmap lives under.
+	fprintf(stderr, "[TERRAIN] lightmap ctor: '%s' d3d=%p\n", Get_Texture_Name().str(), (void*)Peek_D3D_Texture());
+	fflush(stderr);
 	Get_Filter().Set_Min_Filter(TextureFilterClass::FILTER_TYPE_BEST);
 	Get_Filter().Set_Mag_Filter(TextureFilterClass::FILTER_TYPE_BEST);
 	Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_REPEAT);

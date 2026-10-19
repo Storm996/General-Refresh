@@ -249,6 +249,24 @@ UnsignedInt HeightMapRenderObjClass::doTheDynamicLight(VERTEX_FORMAT *vb, VERTEX
 	shadeG*=255.0f;
 	shadeB*=255.0f;
 
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: budgeted probe for saturated-red dynamic
+	// light tints written into terrain vertex diffuse (same strong rule as the atlas scan: r>=100
+	// with g and b under a third of r). doTheLight was covered by the redvert probe and never hit;
+	// this second vertex-diffuse writer was not.
+	{
+		static int s_redDynN = 0;
+		const Int pr = WWMath::Float_To_Int_Chop(shadeR);
+		const Int pg = WWMath::Float_To_Int_Chop(shadeG);
+		const Int pb = WWMath::Float_To_Int_Chop(shadeB);
+		if (pr >= 100 && pg*3 <= pr && pb*3 <= pr && s_redDynN < 12) {
+			++s_redDynN;
+			fprintf(stderr, "[TERRAIN] reddyn #%d at (%.0f,%.0f,%.0f) shade=(%d,%d,%d) lights=%d\n",
+				s_redDynN, (double)vbMirror->x, (double)vbMirror->y, (double)vbMirror->z,
+				pr, pg, pb, numLights);
+			fflush(stderr);
+		}
+	}
+
 //	(gth) faster float to int conversion, return the result so we can re-use it.
 //	vb->diffuse=REAL_TO_INT(shadeB) | (REAL_TO_INT(shadeG) << 8) | (REAL_TO_INT(shadeR) << 16) | ((int)alpha << 24);
 	UnsignedInt light_val = WWMath::Float_To_Int_Chop(shadeB) | (WWMath::Float_To_Int_Chop(shadeG) << 8) | (WWMath::Float_To_Int_Chop(shadeR) << 16) | ((int)alpha << 24);
@@ -1933,6 +1951,22 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 	W3DShaderManager::ShaderTypes st;
 	const Bool doCloud = useCloud();
 
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: three census runs produced not a
+	// single "[TERRAIN] path=" line, which means TerrainShaderPixelShader::set() was never reached and the
+	// ground was drawn by some other leg. This probe answers the two questions that decide it - does Render
+	// run at all, and which branch does it take - without touching any render state.
+	static unsigned s_terrainRenderProbe = 0u;
+	++s_terrainRenderProbe;
+	const Bool terrainProbeLog = (s_terrainRenderProbe <= 3u);
+	if (terrainProbeLog) {
+		fprintf(stderr, "[TERRAIN] heightmap render #%u hidden=%d customPass=%d extraPass=%d addPass=%d texEnabled=%d\n",
+			s_terrainRenderProbe, Is_Hidden() ? 1 : 0,
+			(int)((RTS3DScene *)rinfo.Camera.Get_User_Data())->getCustomPassMode(),
+			(int)((SceneClass *)rinfo.Camera.Get_User_Data())->Get_Extra_Pass_Polygon_Mode(),
+			rinfo.Additional_Pass_Count(), WW3D::Is_Texturing_Enabled() ? 1 : 0);
+		fflush(stderr);
+	}
+
 	if (doCloud)
 	{
 		// TheSuperHackers @tweak Updates the cloud movement before applying it to the world.
@@ -2063,6 +2097,13 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  		if (m_disableTextures)
  			devicePasses=1;	//force to 1 lighting-only pass
 
+ 		if (terrainProbeLog) {
+ 			fprintf(stderr, "[TERRAIN] heightmap shader=%d passes=%d disableTextures=%d useLightMap=%d cloud=%d\n",
+ 				(int)st, devicePasses, m_disableTextures ? 1 : 0,
+ 				TheGlobalData->m_useLightMap ? 1 : 0, doCloud ? 1 : 0);
+ 			fflush(stderr);
+ 		}
+
  		//Specify all textures that this shader may need.
  		W3DShaderManager::setTexture(0,m_stageZeroTexture);
  		W3DShaderManager::setTexture(1,m_stageZeroTexture);
@@ -2073,6 +2114,19 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  		// binds a 1x1 flat-normal fallback whenever no atlas exists, so maps without _nm sheets
  		// stay pixel-identical to the non-NM leg.
  		W3DShaderManager::setTexture(4,m_map ? m_map->getTerrainNormalTexture() : nullptr);
+		// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 identity probe: name the facade handles the
+		// terrain draw actually binds, so the mirror log can be attributed to cloud/lightmap/atlas.
+		{
+			static int s_stageProbeBudget = 4;
+			if (s_stageProbeBudget > 0) {
+				--s_stageProbeBudget;
+				fprintf(stderr, "[TERRAIN] stages: s0=%p s2cloud=%p s3noise=%p\n",
+					(void*)(m_stageZeroTexture ? m_stageZeroTexture->Peek_D3D_Texture() : nullptr),
+					(void*)(m_stageTwoTexture ? m_stageTwoTexture->Peek_D3D_Texture() : nullptr),
+					(void*)(m_stageThreeTexture ? m_stageThreeTexture->Peek_D3D_Texture() : nullptr));
+				fflush(stderr);
+			}
+		}
 		//Disable writes to destination alpha channel (if there is one)
 		if (DX8Wrapper::getBackBufferFormat() == WW3D_FORMAT_A8R8G8B8)
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
@@ -2096,23 +2150,6 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 			for (i=0; i<m_numVBTilesX; i++)
 			{
 				DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
-#ifdef PRE_TRANSFORM_VERTEX
-				if (m_xformedVertexBuffer && pass==0) {
-					// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
-					DX8Wrapper::Apply_Render_State_Changes();
-					int code = DX8Wrapper::_Get_D3D_Device8()->ProcessVertices(0, 0, numVertex, m_xformedVertexBuffer[j*m_numVBTilesX+i], 0);
-					::OutputDebugString("did process vertex\n");
-				}
-				if (m_xformedVertexBuffer) {
-					// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
-					DX8Wrapper::Apply_Render_State_Changes();
-					DX8Wrapper::_Get_D3D_Device8()->SetStreamSource(
-						0,
-						m_xformedVertexBuffer[j*m_numVBTilesX+i],
-						D3DXGetFVFVertexSize(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2));
-					DX8Wrapper::_Get_D3D_Device8()->SetFVF(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2);
-				}
-#endif
 				if (Is_Hidden() == 0) {
 					DX8Wrapper::Draw_Triangles(0, HEIGHTMAP_POLYGON_NUM, 0, HEIGHTMAP_VERTEX_NUM);
 				}
@@ -2214,23 +2251,6 @@ void HeightMapRenderObjClass::renderTerrainPass(CameraClass *pCamera)
 		for (Int i=0; i<m_numVBTilesX; i++)
 		{
 			DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
-#ifdef PRE_TRANSFORM_VERTEX
-			if (m_xformedVertexBuffer && pass==0) {
-				// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
-				DX8Wrapper::Apply_Render_State_Changes();
-				int code = DX8Wrapper::_Get_D3D_Device8()->ProcessVertices(0, 0, numVertex, m_xformedVertexBuffer[j*m_numVBTilesX+i], 0);
-				::OutputDebugString("did process vertex\n");
-			}
-			if (m_xformedVertexBuffer) {
-				// Note - m_xformedVertexBuffer should only be used for non T&L hardware.  jba.
-				DX8Wrapper::Apply_Render_State_Changes();
-				DX8Wrapper::_Get_D3D_Device8()->SetStreamSource(
-					0,
-					m_xformedVertexBuffer[j*m_numVBTilesX+i],
-					D3DXGetFVFVertexSize(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2));
-				DX8Wrapper::_Get_D3D_Device8()->SetFVF(D3DFVF_XYZRHW |D3DFVF_DIFFUSE|D3DFVF_TEX2);
-			}
-#endif
 			if (Is_Hidden() == 0) {
 				DX8Wrapper::Draw_Triangles(0, HEIGHTMAP_POLYGON_NUM, 0, HEIGHTMAP_VERTEX_NUM);
 			}

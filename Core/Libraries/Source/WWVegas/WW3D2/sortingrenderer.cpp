@@ -51,6 +51,37 @@
 #include <algorithm>
 #include <list>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+// GeneralsX @feature Qoder 19/10/2026 L12 probe V14B (task R-05): splits SortingRendererClass::Flush and
+// Flush_Sorting_Pool into segments to locate the ~0.95 ms CPU cost. Gated by GENERALSX_VKFPS_PHASES=1,
+// appends [V14B] lines to vkfps_phase14.log every 300 Flushes. Zero cost when the gate is off.
+namespace vkf14b {
+enum { SEG_SPLICE = 0, SEG_DIRECT, SEG_POOLINS, SEG_VCOPY, SEG_SORT, SEG_CHUNK, SEG_POOL, SEG_RESET, SEG_COUNT };
+struct Acc { long double us; int cnt; };
+static Acc g_seg[SEG_COUNT];
+static int g_ticks = 0;
+static const char* g_names[SEG_COUNT] = { "splice", "direct", "poolins", "vcopy", "sort", "chunk", "pool", "reset" };
+static inline long double now_us() {
+    return (long double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0L;
+}
+static inline bool on() { static int v = -1; if (v < 0) { const char* e = getenv("GENERALSX_VKFPS_PHASES"); v = (e && e[0] == '1') ? 1 : 0; } return v == 1; }
+struct Scope { int id; long double t0; bool act; Scope(bool on, int i) : id(i), t0(on ? now_us() : 0.0L), act(on) {} ~Scope() { if (act) { g_seg[id].us += now_us() - t0; g_seg[id].cnt++; } } };
+static void dump() {
+    FILE* f = fopen("vkfps_phase14.log", "at");
+    if (!f) return;
+    fprintf(f, "[V14B] win=%d", g_ticks);
+    for (int i = 0; i < SEG_COUNT; i++) if (g_seg[i].cnt) fprintf(f, " %s=%.1fus/n=%.2f", g_names[i], (double)(g_seg[i].us / g_ticks), (double)((long double)g_seg[i].cnt / (long double)g_ticks));
+    fprintf(f, "\n"); fflush(f); fclose(f);
+    for (int i = 0; i < SEG_COUNT; i++) { g_seg[i].us = 0; g_seg[i].cnt = 0; }
+    g_ticks = 0;
+}
+} // namespace vkf14b
+
+
 
 bool SortingRendererClass::_EnableTriangleDraw=true;
 static unsigned DEFAULT_SORTING_POLY_COUNT = 16384;	// (count * 3) must be less than 65536
@@ -414,12 +445,15 @@ static void Apply_Render_State(RenderStateStruct& render_state)
 void SortingRendererClass::Flush_Sorting_Pool()
 {
 	if (!overlapping_node_count) return;
+	const bool vk14p = vkf14b::on();
+	if (vk14p) vkf14b::g_seg[vkf14b::SEG_POOLINS].cnt += overlapping_node_count;
 
 	SNAPSHOT_SAY(("SortingSystem - Flush"));
 
 	// Fill dynamic index buffer with sorting index buffer vertices
 	TempIndexStruct* tis=Get_Temp_Index_Array(overlapping_polygon_count);
 
+	const long double t_vcopy = vk14p ? vkf14b::now_us() : 0.0L;
 	unsigned vertexAllocCount = overlapping_vertex_count;
 	if (DynamicVBAccessClass::Get_Default_Vertex_Count() < DEFAULT_SORTING_VERTEX_COUNT)
 		vertexAllocCount = DEFAULT_SORTING_VERTEX_COUNT;	//make sure that we force the DX8 dynamic vertex buffer to maximum size
@@ -514,13 +548,16 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			vertex_array_offset+=state->vertex_count;
 		}
 	}
+	if (vk14p) { vkf14b::g_seg[vkf14b::SEG_VCOPY].us += vkf14b::now_us() - t_vcopy; vkf14b::g_seg[vkf14b::SEG_VCOPY].cnt++; }
 
-	Sort(tis, tis + overlapping_polygon_count);
+	if (vk14p) { vkf14b::Scope s(vk14p, vkf14b::SEG_SORT); (void)s;
+	Sort(tis, tis + overlapping_polygon_count); }
 
 	// TheSuperHackers @fix stephanmeesters 10/06/2026
 	// Split rendering into chunks to prevent a crash when exceeding the 16-bit index buffer limit.
 	constexpr const unsigned MAX_INDEX_CHUNK = 65535;
 	unsigned chunkOffset = 0;
+	const long double t_chunk = vk14p ? vkf14b::now_us() : 0.0L;
 	while (chunkOffset < overlapping_polygon_count)
 	{
 		unsigned chunkCount = overlapping_polygon_count - chunkOffset;
@@ -581,6 +618,7 @@ void SortingRendererClass::Flush_Sorting_Pool()
 
 		chunkOffset += chunkCount;
 	}
+	if (vk14p) { vkf14b::g_seg[vkf14b::SEG_CHUNK].us += vkf14b::now_us() - t_chunk; vkf14b::g_seg[vkf14b::SEG_CHUNK].cnt++; }
 
 	// Release all references and return nodes back to the clean list for the frame...
 	for (unsigned node_id=0;node_id<overlapping_node_count;++node_id) {
@@ -601,6 +639,8 @@ void SortingRendererClass::Flush_Sorting_Pool()
 void SortingRendererClass::Flush()
 {
 	WWPROFILE("SortingRenderer::Flush");
+	const bool vk14 = vkf14b::on();
+	if (vk14) { vkf14b::g_ticks++; if (vkf14b::g_ticks >= 300) vkf14b::dump(); }
 	Matrix4x4 old_view;
 	Matrix4x4 old_world;
 	DX8Wrapper::Get_Transform(D3DTS_VIEW,old_view);
@@ -612,7 +652,8 @@ void SortingRendererClass::Flush()
 	while (node != sorted_list.end() && (*node)->transformed_center.Z > 0.0f) {
 		++node;
 	}
-	sorted_list.splice(node, unsorted_list);
+	if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_SPLICE); (void)s;
+	sorted_list.splice(node, unsorted_list); }
 
 	while (!sorted_list.empty()) {
 		SortingNodeStruct* state = sorted_list.front();
@@ -620,12 +661,16 @@ void SortingRendererClass::Flush()
 
 		if ((state->sorting_state.index_buffer_type==BUFFER_TYPE_SORTING || state->sorting_state.index_buffer_type==BUFFER_TYPE_DYNAMIC_SORTING) &&
 			(state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_SORTING || state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_DYNAMIC_SORTING)) {
-			Insert_To_Sorting_Pool(state);
+			if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_POOLINS); (void)s;
+			Insert_To_Sorting_Pool(state); }
 		}
 		else {
+			{
+			vkf14b::Scope s(vk14, vkf14b::SEG_DIRECT);
 			DX8Wrapper::Set_Render_State(state->sorting_state);
 			DX8Wrapper::Draw_Triangles(state->start_index,state->polygon_count,state->min_vertex_index,state->vertex_count);
 			DX8Wrapper::Release_Render_State();
+			}
 			Release_Refs(state);
 			clean_list.push_front(state);
 		}
@@ -633,9 +678,11 @@ void SortingRendererClass::Flush()
 
 	bool old_enable=DX8Wrapper::_Is_Triangle_Draw_Enabled();
 	DX8Wrapper::_Enable_Triangle_Draw(_EnableTriangleDraw);
-	Flush_Sorting_Pool();
+	if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_POOL); (void)s;
+	Flush_Sorting_Pool(); }
 	DX8Wrapper::_Enable_Triangle_Draw(old_enable);
 
+	if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_RESET); (void)s;
 	DX8Wrapper::Set_Index_Buffer(nullptr,0);
 	DX8Wrapper::Set_Vertex_Buffer(nullptr);
 	total_sorting_vertices=0;
@@ -645,7 +692,7 @@ void SortingRendererClass::Flush()
 
 
 	DX8Wrapper::Set_Transform(D3DTS_VIEW,old_view);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,old_world);
+	DX8Wrapper::Set_Transform(D3DTS_WORLD,old_world); }
 
 }
 

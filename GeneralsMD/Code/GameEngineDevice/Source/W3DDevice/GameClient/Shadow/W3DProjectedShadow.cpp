@@ -34,6 +34,9 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "WWLib/always.h"
 #include "GameClient/View.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include <vector>
+#endif
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
 #include "WW3D2/dx8wrapper.h"
@@ -58,6 +61,9 @@
 #include "GameClient/Drawable.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+// GeneralsX @feature Qoder 18/10/2026 wedge 9.G: surface rect copies do not touch the Vulkan mirror,
+// so the per-object shadow blob needs an explicit re-upload after Copy (no-op outside win64vk).
+#include "WW3D2/Backend/VulkanTexMirror.h"
 // GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: compileShaderAtBestProfile for the blur PS.
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 
@@ -97,6 +103,8 @@ extern int nShadowIndicesInBuf;	//model vetices in vertex buffer
 extern int nShadowStartBatchIndex;
 extern int SHADOW_VERTEX_SIZE;
 extern int SHADOW_INDEX_SIZE;
+extern int SHADOW_DECAL_VERTEX_SIZE;
+extern int SHADOW_DECAL_INDEX_SIZE;
 
 //Global streaming vertex buffer with x,y,z,u,v type.
 struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
@@ -107,6 +115,26 @@ struct SHADOW_DECAL_VERTEX	//vertex structure passed to D3D
 };
 
 #define SHADOW_DECAL_FVF	D3DFVF_XYZ|D3DFVF_TEX1|D3DFVF_DIFFUSE
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.F: the terrain-shadow and decal queues write
+// straight into raw D3D9 pools, which the facade has no backing for. These mirrors keep a CPU copy of the
+// same ranges so the recorder can describe the batch as a user-memory indexed draw. They grow to the
+// pools' declared sizes at first use; the write side checks capacity before every copy.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+static std::vector<unsigned char> s_vkShadowTerrainVerts;
+static std::vector<unsigned short> s_vkShadowTerrainIndices;
+static std::vector<SHADOW_DECAL_VERTEX> s_vkShadowDecalVerts;
+static std::vector<unsigned short> s_vkShadowDecalIndices;
+
+static void vk_shadow_mirror_reserve()
+{
+	const size_t terrainVertexBytes = (size_t)SHADOW_VERTEX_SIZE * 3u * sizeof(float);	// SHADOW_VOLUME_FVF is XYZ
+	if (s_vkShadowTerrainVerts.size() < terrainVertexBytes) s_vkShadowTerrainVerts.resize(terrainVertexBytes);
+	if (s_vkShadowTerrainIndices.size() < (size_t)SHADOW_INDEX_SIZE) s_vkShadowTerrainIndices.resize((size_t)SHADOW_INDEX_SIZE);
+	if (s_vkShadowDecalVerts.size() < (size_t)SHADOW_DECAL_VERTEX_SIZE) s_vkShadowDecalVerts.resize((size_t)SHADOW_DECAL_VERTEX_SIZE);
+	if (s_vkShadowDecalIndices.size() < (size_t)SHADOW_DECAL_INDEX_SIZE) s_vkShadowDecalIndices.resize((size_t)SHADOW_DECAL_INDEX_SIZE);
+}
+#endif
 
 // GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: a separable 5-tap gaussian (the two
 // "wide" weights 0.270659/0.060002 folded into offsets 1.3846/3.2308, classic linear-sampling
@@ -469,6 +497,15 @@ void W3DProjectedShadowManager::initBlurResources()
 		((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Unlock();
 	}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the two ping-pong targets and the atlas
+	// they read are written exclusively by facade draws (decal pool, projector quad, blur quad), so the
+	// recorder can follow them. Every other render target stays on D3D9 until its own family is converted.
+	DX8Wrapper::VK_Allow_Render_Target((void*)m_blurRT[0]->Peek_D3D_Texture());
+	DX8Wrapper::VK_Allow_Render_Target((void*)m_blurRT[1]->Peek_D3D_Texture());
+	DX8Wrapper::VK_Allow_Render_Target((void*)m_dynamicRenderTarget->Peek_D3D_Texture());
+#endif
+
 	m_blurReady = TRUE;
 	fprintf(stderr, "[SHADOWBLUR] enabled radius=%d profile=%s atlas=%d\n", m_blurRadius, profile, m_renderTargetSize);
 	fflush(stderr);
@@ -508,7 +545,11 @@ void W3DProjectedShadowManager::runBlurPass(void* srcTexture, void* dstSurface, 
 	if (dev == nullptr || srcTexture == nullptr || dstSurface == nullptr || m_blurShader == nullptr)
 		return;
 
-	dev->SetRenderTarget(0, (IDirect3DSurface9*)dstSurface);
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: publish the ping-pong target through the
+	// facade. The quad below is the only thing drawn here, and the target was opted in at creation, so
+	// the recorder stays on it for the whole pass instead of dropping these batches into the scene.
+	// No depth attachment: the quad tests nothing, and the surface overload would AddRef a null depth.
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)dstSurface, false);
 
 	D3DVIEWPORT9 vp;
 	vp.X = 0;
@@ -517,35 +558,63 @@ void W3DProjectedShadowManager::runBlurPass(void* srcTexture, void* dstSurface, 
 	vp.Height = m_renderTargetSize;
 	vp.MinZ = 0.0f;
 	vp.MaxZ = 1.0f;
-	dev->SetViewport(&vp);
+	DX8Wrapper::Set_Viewport(&vp);
 
-	dev->SetTexture(0, (IDirect3DBaseTexture9*)srcTexture);
+	DX8Wrapper::Set_DX8_Texture(0, (IDirect3DBaseTexture9*)srcTexture);
 	//Linear filtering is part of the gaussian: the 3-tap weights rely on sampling between texels.
-	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
 	float c0v[4] = { texelOffsetX, texelOffsetY, 0.0f, 0.0f };
-	dev->SetPixelShaderConstantF(0, c0v, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(0, c0v, 1);
 
 	//D18 lesson: SetFVF does not unbind a custom vertex shader left behind by another pass, so
 	//the null binding must be explicit or the quad could be drawn through a stale world VS.
-	dev->SetVertexShader(nullptr);
-	dev->SetPixelShader((IDirect3DPixelShader9*)m_blurShader);
+	DX8Wrapper::Set_Vertex_Shader(0);
+	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_blurShader));
 
-	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 
-	dev->SetStreamSource(0, (LPDIRECT3DVERTEXBUFFER9)m_blurVB, 0, sizeof(SHADOW_BLUR_VERTEX));
-	dev->SetIndices((LPDIRECT3DINDEXBUFFER9)m_blurIB);
-	dev->SetFVF(SHADOW_BLUR_FVF);
-	dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// Same quad the init path uploaded; the facade needs it in CPU memory to describe the batch.
+	static const SHADOW_BLUR_VERTEX kQuad[4] =
+	{
+		{ -1.0f, -1.0f, 0.5f, 1.0f, 0.0f, 0.0f },
+		{ -1.0f,  1.0f, 0.5f, 1.0f, 0.0f, 1.0f },
+		{  1.0f, -1.0f, 0.5f, 1.0f, 1.0f, 0.0f },
+		{  1.0f,  1.0f, 0.5f, 1.0f, 1.0f, 1.0f },
+	};
+	static const WORD kIndices[6] = {0, 1, 2, 1, 3, 2};
+	DX8Wrapper::Set_Vertex_FVF(SHADOW_BLUR_FVF);
+	const Bool vkOwned = DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST,
+			kQuad, 4, sizeof(SHADOW_BLUR_VERTEX), SHADOW_BLUR_FVF, kIndices, 6, 0);
+	{
+		// Bounded evidence that the blur pass itself is recorded, not just the pass that fills the atlas.
+		static Int vkProbe = 0;
+		if (vkProbe < 8) {
+			++vkProbe;
+			fprintf(stderr, "[SHADOWPROBE] blur vk=%d\n", vkOwned ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+#endif
+	{
+		// The blurred result is still consumed by a D3D9 surface Copy (updateTexture), which the
+		// recorder cannot fill, so the device gets the same quad as well. Both writes are therefore
+		// intentional: the Vulkan mirror for the recorder, the D3D9 target for the copy below.
+		dev->SetStreamSource(0, (LPDIRECT3DVERTEXBUFFER9)m_blurVB, 0, sizeof(SHADOW_BLUR_VERTEX));
+		dev->SetIndices((LPDIRECT3DINDEXBUFFER9)m_blurIB);
+		DX8Wrapper::Set_Vertex_FVF(SHADOW_BLUR_FVF);
+		dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+	}
 
-	dev->SetPixelShader(nullptr);
+	DX8Wrapper::Set_Pixel_Shader(0);
 }
 
 TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
@@ -559,8 +628,10 @@ TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
 
 	//Remember the shadow-render state we interrupt, so the caller's own device stays usable.
 	IDirect3DSurface9* prevRT = nullptr;
+	IDirect3DSurface9* prevDS = nullptr;
 	D3DVIEWPORT9 prevVP;
 	dev->GetRenderTarget(0, &prevRT);
+	dev->GetDepthStencilSurface(&prevDS);
 	dev->GetViewport(&prevVP);
 
 	//Radius is in texels per pass; the shader multiplies by 1.38/3.23 for the wide taps.
@@ -574,6 +645,10 @@ TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
 		runBlurPass((void*)m_dynamicRenderTarget->Peek_D3D_Texture(), (void*)hSurface->Peek_D3D_Surface(), step, 0.0f);
 		hSurface->Release_Ref();
 
+		// The wrapper only supports one custom target at a time (it parks the interrupted default on
+		// the side), so hand the device back before the second ping-pong pass binds the other texture.
+		DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)nullptr);
+
 		SurfaceClass* vSurface = m_blurRT[1] ? m_blurRT[1]->Get_Surface_Level() : nullptr;
 		if (vSurface)
 		{
@@ -583,11 +658,16 @@ TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
 		}
 	}
 
-	dev->SetRenderTarget(0, prevRT);
+	// Restore through the facade, not raw D3D: the wrapper has to release the device pointers it
+	// parked when the first blur pass switched away from this target, and publish the scene/owning
+	// target back to the Vulkan recorder at the same time.
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)nullptr);
 	if (prevRT)
 		prevRT->Release();
-	dev->SetViewport(&prevVP);
-	dev->SetTexture(0, nullptr);
+	if (prevDS)
+		prevDS->Release();
+	DX8Wrapper::Set_Viewport(&prevVP);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
 	//The detour wrote raw D3D state over everything DX8Wrapper caches (viewport, shaders, states).
 	DX8Wrapper::Invalidate_Cached_Render_States();
 
@@ -664,6 +744,13 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		Real mapScaleInv=1.0f/MAP_XY_FACTOR;
 		SHADOW_VOLUME_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
+		SHADOW_VOLUME_VERTEX *pvLockedVertices = nullptr;
+		UnsignedShort *pvLockedIndices = nullptr;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		unsigned vkVertOffset = 0;
+		unsigned vkIndexOffset = 0;
+		vk_shadow_mirror_reserve();
+#endif
 		LPDIRECT3DDEVICE9 m_pDev=DX8Wrapper::_Get_D3D_Device8();
 
 		if (!m_pDev)	return 0;
@@ -702,6 +789,12 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				return 0;
 		}
 
+		pvLockedVertices = pvVertices;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// nShadowStartBatchVertex is this batch's offset in both branches: the DISCARD path just reset it.
+		vkVertOffset = (unsigned)nShadowStartBatchVertex;
+#endif
+
 		if(pvVertices)
 		{
 			//insert each cell's bottom/left edge vertex
@@ -719,6 +812,15 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 			}
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedVertices) {
+			const size_t mirrorVerts = s_vkShadowTerrainVerts.size() / sizeof(SHADOW_VOLUME_VERTEX);
+			if ((size_t)vkVertOffset + (size_t)numVerts <= mirrorVerts) {
+				memcpy(s_vkShadowTerrainVerts.data() + (size_t)vkVertOffset * sizeof(SHADOW_VOLUME_VERTEX),
+					pvLockedVertices, (size_t)numVerts * sizeof(SHADOW_VOLUME_VERTEX));
+			}
+		}
+#endif
 		shadowVertexBufferD3D->Unlock();
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
@@ -735,6 +837,11 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		{	if (shadowIndexBufferD3D->Lock(nShadowIndicesInBuf*sizeof(short),numIndex*sizeof(short), (void**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return 0;
 		}
+
+		pvLockedIndices = pvIndices;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		vkIndexOffset = (unsigned)nShadowStartBatchIndex;
+#endif
 
 		if(pvIndices)
 		{
@@ -782,43 +889,72 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				}
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedIndices) {
+			if ((size_t)vkIndexOffset + (size_t)numIndex <= s_vkShadowTerrainIndices.size()) {
+				memcpy(s_vkShadowTerrainIndices.data() + vkIndexOffset, pvLockedIndices, (size_t)numIndex * sizeof(unsigned short));
+			}
+		}
+#endif
 		shadowIndexBufferD3D->Unlock();
-
-		m_pDev->SetIndices(shadowIndexBufferD3D);
-
-		m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
-
-		m_pDev->SetStreamSource(0,shadowVertexBufferD3D,0,sizeof(SHADOW_VOLUME_VERTEX));
-		m_pDev->SetFVF(SHADOW_VOLUME_FVF);
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 
-		m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
-		m_pDev->SetRenderState( D3DRS_STENCILENABLE, TRUE );
-		m_pDev->SetRenderState( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
-		m_pDev->SetRenderState( D3DRS_STENCILREF,      0x1 );
-		m_pDev->SetRenderState( D3DRS_STENCILMASK,     0xffffffff );
-		m_pDev->SetRenderState( D3DRS_STENCILWRITEMASK,0xffffffff );
-		m_pDev->SetRenderState( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-		m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-		m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x1 );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     0xffffffff );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILWRITEMASK,0xffffffff );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
 
-//    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
-		m_pDev->SetRenderState( D3DRS_LIGHTING, FALSE);
-		m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
-		m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_ZERO );
+//    DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, FALSE);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_DESTCOLOR);
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ZERO );
 
 
 		if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 		{
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys,numVerts,ShaderClass::_PresetOpaqueShader);
-			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowStartBatchVertex,0,numVerts,nShadowStartBatchIndex,numPolys);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.F: mWorld is the identity the raw
+			// transform below installs, so publishing it keeps the facade's world in step with the device.
+			DX8Wrapper::Set_Transform(D3DTS_WORLD, mWorld);
+			DX8Wrapper::Set_Vertex_FVF(SHADOW_VOLUME_FVF);
+			const Bool vkOwned = DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST,
+					s_vkShadowTerrainVerts.data(), numVerts, sizeof(SHADOW_VOLUME_VERTEX),
+					SHADOW_VOLUME_FVF,
+					s_vkShadowTerrainIndices.data() + nShadowStartBatchIndex,
+					numIndex, nShadowStartBatchVertex);
+			{
+				// GeneralsX @debug Qoder 18/10/2026 wedge 9.F: bounded evidence that this queue is
+				// consumed by the recorder instead of falling back to the raw device draw below.
+				static Int vkProbe = 0;
+				if (vkProbe < 12) {
+					++vkProbe;
+					fprintf(stderr, "[SHADOWPROBE] terrain vk=%d verts=%d polys=%d\n",
+						vkOwned ? 1 : 0, (int)numVerts, (int)numPolys);
+					fflush(stderr);
+				}
+			}
+			if (!vkOwned)
+#endif
+			{
+				m_pDev->SetIndices(shadowIndexBufferD3D);
+				m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
+				m_pDev->SetStreamSource(0,shadowVertexBufferD3D,0,sizeof(SHADOW_VOLUME_VERTEX));
+				DX8Wrapper::Set_Vertex_FVF(SHADOW_VOLUME_FVF);
+				m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowStartBatchVertex,0,numVerts,nShadowStartBatchIndex,numPolys);
+			}
 		}
 
-		m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
-		m_pDev->SetRenderState( D3DRS_STENCILENABLE, FALSE );
-//    m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
-		m_pDev->SetRenderState( D3DRS_LIGHTING, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
+//    DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
+		DX8Wrapper::Set_DX8_Render_State( D3DRS_LIGHTING, TRUE);
 
 		nShadowVertsInBuf += numVerts;
 		nShadowStartBatchVertex=nShadowVertsInBuf;
@@ -1025,64 +1161,152 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 
 	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
 
-//Alpha Blended Shadows
-//	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
-//	m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA  );
-/*	UnsignedInt color=TheW3DShadowManager->getShadowColor();
-	m_pDev->SetRenderState( D3DRS_TEXTUREFACTOR, 0xff000000 | color);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: the maroon footprint patches under buildings
+	// and units are drawn by exactly this call with the multiplicative preset (dst * pixel). A maroon
+	// result means the pixel reaching the blend is (L,0,0)-ish, so dump every input the device can be
+	// asked about: texture identity + one sampled texel + first vertex diffuse + blend/combiner state.
+	// Budget was one shared 60-line pool until 19/10: the blob (0x01) flushes consumed it all before
+	// the projected flushes ever got a turn, which is exactly the batch the maroon footprints are
+	// suspected of. Split the pool so both families are guaranteed on the record.
+	{
+		static Int s_blobForensic = 8;
+		static Int s_projForensic = 48;
+		Int& forensicBudget = (type == 0x01) ? s_blobForensic : s_projForensic;
+		if (forensicBudget > 0 && nShadowDecalVertsInBatch > 0) {
+			--forensicBudget;
+			TextureClass *t = texture->getTexture();
+			DWORD sb = 0, db = 0, ab = 0, at = 0, ar = 0, cop = 0, a1 = 0, a2 = 0, tf = 0;
+			m_pDev->GetRenderState(D3DRS_SRCBLEND, &sb);
+			m_pDev->GetRenderState(D3DRS_DESTBLEND, &db);
+			m_pDev->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
+			m_pDev->GetRenderState(D3DRS_ALPHATESTENABLE, &at);
+			m_pDev->GetRenderState(D3DRS_ALPHAREF, &ar);
+			m_pDev->GetRenderState(D3DRS_TEXTUREFACTOR, &tf);
+			m_pDev->GetTextureStageState(0, D3DTSS_COLOROP, &cop);
+			m_pDev->GetTextureStageState(0, D3DTSS_COLORARG1, &a1);
+			m_pDev->GetTextureStageState(0, D3DTSS_COLORARG2, &a2);
+			unsigned long long texelBits = 0; int texelFmt = -1;
+			unsigned texW = 0, texH = 0;
+			void *texKey = nullptr;
+			if (t) {
+				texW = (unsigned)t->Get_Width(); texH = (unsigned)t->Get_Height();
+				texKey = (void*)t->Peek_D3D_Texture();
+				IDirect3DSurface9 *sfc = t->Get_D3D_Surface_Level(0);
+				if (sfc) {
+					D3DSURFACE_DESC sd;
+					if (SUCCEEDED(sfc->GetDesc(&sd))) {
+						texelFmt = (int)sd.Format;
+						D3DLOCKED_RECT lr;
+						if (SUCCEEDED(sfc->LockRect(&lr, nullptr, D3DLOCK_READONLY)) && lr.pBits) {
+							const unsigned bpp = (sd.Format == D3DFMT_A8R8G8B8 || sd.Format == D3DFMT_X8R8G8B8) ? 4u
+								: (sd.Format == D3DFMT_A4R4G4B4 || sd.Format == D3DFMT_R5G6B5) ? 2u : 0u;
+							if (bpp && texW > 2 && texH > 2) {
+								const unsigned char* p = (const unsigned char*)lr.pBits
+									+ (size_t)(texH / 2) * lr.Pitch + (size_t)(texW / 2) * bpp;
+								if (bpp == 4) texelBits = *(const unsigned*)p;
+								else texelBits = *(const unsigned short*)p;
+							}
+							sfc->UnlockRect();
+						}
+					}
+					sfc->Release();
+				}
+			}
+			unsigned v0diff = 0;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			if (!s_vkShadowDecalVerts.empty()) v0diff = s_vkShadowDecalVerts[0].diffuse;
+#endif
+			fprintf(stderr, "[SHADOWPROBE] decal forensic type=0x%02x tex=%s key=%p %ux%u fmt=%d texel=%08llx "
+				"v0diff=%08x sb=%u db=%u ab=%u at=%u ar=%u tf=%08x op=%u a1=%x a2=%x\n",
+				(unsigned)type, t ? t->Get_Texture_Name().str() : "?", texKey, texW, texH, texelFmt, texelBits,
+				v0diff,
+				(unsigned)sb, (unsigned)db, (unsigned)ab, (unsigned)at, (unsigned)ar, (unsigned)tf,
+				(unsigned)cop, (unsigned)a1, (unsigned)a2);
+			fflush(stderr);
+		}
+	}
 
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+//Alpha Blended Shadows
+//	DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA );
+//	DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA  );
+/*	UnsignedInt color=TheW3DShadowManager->getShadowColor();
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_TEXTUREFACTOR, 0xff000000 | color);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
 */
 
-
-	m_pDev->SetIndices(shadowDecalIndexBufferD3D);
-	m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
-
-	m_pDev->SetStreamSource(0,shadowDecalVertexBufferD3D,0,sizeof(SHADOW_DECAL_VERTEX));
-	m_pDev->SetFVF(SHADOW_DECAL_FVF);
 
 //Hard Shadows using stencil
-/*	m_pDev->SetRenderState( D3DRS_SRCBLEND,  D3DBLEND_ZERO);
-	m_pDev->SetRenderState( D3DRS_DESTBLEND, D3DBLEND_ONE );
-	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
-	m_pDev->SetRenderState( D3DRS_STENCILENABLE, TRUE );
+/*	DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND,  D3DBLEND_ZERO);
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);	//should reject background pixels
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, TRUE );
 */
-/*	m_pDev->SetRenderState( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
-	m_pDev->SetRenderState( D3DRS_STENCILREF,      0x1 );
-	m_pDev->SetRenderState( D3DRS_STENCILMASK,     0xffffffff );
-	m_pDev->SetRenderState( D3DRS_STENCILWRITEMASK,0xffffffff );
-	m_pDev->SetRenderState( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
-	m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-	m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+/*	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFUNC,     D3DCMP_ALWAYS );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILREF,      0x1 );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILMASK,     0xffffffff );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILWRITEMASK,0xffffffff );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
+	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
 */
-//m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
+//DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );	//useful to see bounds
 
 	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
 	{
 		Debug_Statistics::Record_DX8_Polys_And_Vertices(nShadowDecalPolysInBatch,nShadowDecalVertsInBatch,ShaderClass::_PresetOpaqueShader);
-		m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowDecalStartBatchVertex,0,nShadowDecalVertsInBatch,nShadowDecalStartBatchIndex,nShadowDecalPolysInBatch);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.F: same identity world as the raw
+		// transform, published so the recorder's fixed-function state matches the device's.
+		DX8Wrapper::Set_Transform(D3DTS_WORLD, mWorld);
+		DX8Wrapper::Set_Vertex_FVF(SHADOW_DECAL_FVF);
+		const Bool vkOwned = DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST,
+				s_vkShadowDecalVerts.data(), nShadowDecalVertsInBatch, sizeof(SHADOW_DECAL_VERTEX),
+				SHADOW_DECAL_FVF,
+				s_vkShadowDecalIndices.data() + nShadowDecalStartBatchIndex,
+				nShadowDecalPolysInBatch * 3, nShadowDecalStartBatchVertex);
+		{
+			// GeneralsX @debug Qoder 18/10/2026 wedge 9.F: bounded evidence that this queue is consumed
+			// by the recorder instead of falling back to the raw device draw below.
+			static Int vkProbe = 0;
+			if (vkProbe < 12) {
+				++vkProbe;
+				fprintf(stderr, "[SHADOWPROBE] flushDecals vk=%d verts=%d polys=%d\n",
+					vkOwned ? 1 : 0, (int)nShadowDecalVertsInBatch, (int)nShadowDecalPolysInBatch);
+				fflush(stderr);
+			}
+		}
+		if (!vkOwned)
+#endif
+		{
+			m_pDev->SetIndices(shadowDecalIndexBufferD3D);
+			m_pDev->SetTransform(D3DTS_WORLD,(_D3DMATRIX *)&mWorld);
+			m_pDev->SetStreamSource(0,shadowDecalVertexBufferD3D,0,sizeof(SHADOW_DECAL_VERTEX));
+			DX8Wrapper::Set_Vertex_FVF(SHADOW_DECAL_FVF);
+			m_pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,nShadowDecalStartBatchVertex,0,nShadowDecalVertsInBatch,nShadowDecalStartBatchIndex,nShadowDecalPolysInBatch);
+		}
 	}
 
-//	m_pDev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
-//	m_pDev->SetRenderState( D3DRS_STENCILENABLE, FALSE );
-//m_pDev->SetRenderState( D3DRS_ALPHABLENDENABLE, TRUE );
+//	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);	//should reject background pixels
+//	DX8Wrapper::Set_DX8_Render_State( D3DRS_STENCILENABLE, FALSE );
+//DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
 
 
 	//Restore multiplicative sprite shader
-//	m_pDev->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);	//restore W3D state
-//	m_pDev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+//	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);	//restore W3D state
+//	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_ZERO);
 
-/*	m_pDev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-	m_pDev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+/*	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
 */
 	nShadowDecalStartBatchVertex=nShadowDecalVertsInBuf;
 	nShadowDecalStartBatchIndex=nShadowDecalIndicesInBuf;
@@ -1319,6 +1543,13 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 
 		SHADOW_DECAL_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
+		SHADOW_DECAL_VERTEX *pvLockedVertices = nullptr;
+		UnsignedShort *pvLockedIndices = nullptr;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		vk_shadow_mirror_reserve();
+		const unsigned vkVertOffset = (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts)) ? 0u : (unsigned)nShadowDecalVertsInBuf;
+		const unsigned vkIndexOffset = (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex)) ? 0u : (unsigned)nShadowDecalIndicesInBuf;
+#endif
 
 		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{
@@ -1336,6 +1567,8 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (void**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
+
+		pvLockedVertices = pvVertices;
 
 		//code to deal with rotated shadows based on sun direction, fix this later.  For now shadow rotates with object rotation.
 		//shadow->m_shadowTexture[0]->getDecalUVAxis(&uVector,&vVector);
@@ -1392,6 +1625,13 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedVertices) {
+			if ((size_t)vkVertOffset + (size_t)numVerts <= s_vkShadowDecalVerts.size()) {
+				memcpy(s_vkShadowDecalVerts.data() + vkVertOffset, pvLockedVertices, (size_t)numVerts * sizeof(SHADOW_DECAL_VERTEX));
+			}
+		}
+#endif
 		shadowDecalVertexBufferD3D->Unlock();
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
@@ -1411,6 +1651,8 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		{	if (shadowDecalIndexBufferD3D->Lock(nShadowDecalIndicesInBuf*sizeof(short),numIndex*sizeof(short), (void**)&pvIndices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
+
+		pvLockedIndices = pvIndices;
 
 		if(pvIndices)
 		{
@@ -1442,6 +1684,13 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedIndices) {
+			if ((size_t)vkIndexOffset + (size_t)numIndex <= s_vkShadowDecalIndices.size()) {
+				memcpy(s_vkShadowDecalIndices.data() + vkIndexOffset, pvLockedIndices, (size_t)numIndex * sizeof(unsigned short));
+			}
+		}
+#endif
 		shadowDecalIndexBufferD3D->Unlock();
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
@@ -1495,6 +1744,13 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 
 		SHADOW_DECAL_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
+		SHADOW_DECAL_VERTEX *pvLockedVertices = nullptr;
+		UnsignedShort *pvLockedIndices = nullptr;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		vk_shadow_mirror_reserve();
+		const unsigned vkVertOffset = (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts)) ? 0u : (unsigned)nShadowDecalVertsInBuf;
+		const unsigned vkIndexOffset = (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex)) ? 0u : (unsigned)nShadowDecalIndicesInBuf;
+#endif
 
 		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
 		{
@@ -1512,6 +1768,8 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		{	if (shadowDecalVertexBufferD3D->Lock(nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),numVerts*sizeof(SHADOW_DECAL_VERTEX), (void**)&pvVertices,D3DLOCK_NOOVERWRITE) != D3D_OK)
 				return;
 		}
+
+		pvLockedVertices = pvVertices;
 
 		objPos.Z=groundHeight;	//force decal to ground level
 		objPos += groundNormal * 1.0f;	//offset decal slightly above terrain to reduce z-fighting.
@@ -1556,6 +1814,13 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvVertices++;
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedVertices) {
+			if ((size_t)vkVertOffset + (size_t)numVerts <= s_vkShadowDecalVerts.size()) {
+				memcpy(s_vkShadowDecalVerts.data() + vkVertOffset, pvLockedVertices, (size_t)numVerts * sizeof(SHADOW_DECAL_VERTEX));
+			}
+		}
+#endif
 		shadowDecalVertexBufferD3D->Unlock();
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
@@ -1576,6 +1841,8 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 				return;
 		}
 
+		pvLockedIndices = pvIndices;
+
 		if(pvIndices)
 		{	pvIndices[0]=nShadowDecalVertsInBatch;
 			pvIndices[1]=nShadowDecalVertsInBatch+1;
@@ -1586,6 +1853,13 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvIndices += 6;
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		if (pvLockedIndices) {
+			if ((size_t)vkIndexOffset + (size_t)numIndex <= s_vkShadowDecalIndices.size()) {
+				memcpy(s_vkShadowDecalIndices.data() + vkIndexOffset, pvLockedIndices, (size_t)numIndex * sizeof(unsigned short));
+			}
+		}
+#endif
 		shadowDecalIndexBufferD3D->Unlock();
 
 		Int numPolys = 2;	//2 triangles per decal
@@ -2539,6 +2813,11 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		oldSurface->Copy(0,0,0,0,m_shadowTexture[0]->getTexture()->Get_Width(),m_shadowTexture[0]->getTexture()->Get_Height(),newSurface);
 		REF_PTR_RELEASE(newSurface);
 		REF_PTR_RELEASE(oldSurface);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// flushDecals samples the private texture through its Vulkan view; the rect copy above only
+		// wrote the D3D9 managed level, so push those bytes into the mirror now (blurred or sharp).
+		VKTex_Mirror_D3D_Texture(m_shadowTexture[0]->getTexture()->Peek_D3D_Texture());
+#endif
 		m_shadowTexture[0]->updateBounds(TheW3DShadowManager->getLightPosWorld(0),m_robj);	//update local shadow bounds
 	}
 	else

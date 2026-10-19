@@ -133,6 +133,12 @@ struct VKTex_Info {
 
 bool VKTex_Query(void* key, VKTex_Info* out);
 
+// GeneralsX @bugfix Qoder 19/10/2026 wedge 11: unlink (and reap) the mirror stored under 'key'. Mirrors
+// are keyed by the raw D3D texture pointer, and WW3D reuses freed object addresses: the sun shadow map
+// was created at the pointer of a dead normal map and inherited its upload mirror, which then shadowed
+// the render-target mirror in every sampled lookup. The owner must delete its mirror when it dies.
+void VKTex_Drop(void* key);
+
 // ---- wedge 5: geometry backing --------------------------------------------------------
 // Wedge 3.1's single shared 64 MiB bump ring proved the host-write path, but a ring that hands every
 // lock a new offset cannot back a draw: the pipeline needs a (VkBuffer, offset) pair that stays valid

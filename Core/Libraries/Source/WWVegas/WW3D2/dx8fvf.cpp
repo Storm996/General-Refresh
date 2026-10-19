@@ -57,6 +57,11 @@ FVFInfoClass::FVFInfoClass(unsigned FVF_)
 	blend_offset=location_offset;
 
 	if ((FVF&D3DFVF_XYZ)==D3DFVF_XYZ) blend_offset+=3*sizeof(float);
+	// GeneralsX @bugfix Qoder 19/10/2026 wedge 11: D3DFVF_XYZRHW is not part of the D3DFVF_XYZ family -
+	// it names the same position slot with FOUR floats (x, y, z, 1/w). Without this step every RHW batch
+	// got texcoord_offset[0]==0, and the Vulkan facade bound TEXCOORD0 on top of the position: the sun
+	// shadow casters wrote their pixel x (hundreds) into the map where the [0,1] depth belongs.
+	else if ((FVF&D3DFVF_XYZRHW)==D3DFVF_XYZRHW) blend_offset+=4*sizeof(float);
 	normal_offset=blend_offset;
 
 	if ( ((FVF&D3DFVF_XYZB4)==D3DFVF_XYZB4) &&

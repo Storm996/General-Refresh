@@ -44,6 +44,20 @@
 */
 DEFINE_AUTO_POOL(MultiListNodeClass, 256);
 
+// GeneralsX @bugfix Qoder 18/10/2026 #43 (exit code 139): the CRT always ran
+// ~ObjectPoolClass<MultiListNodeClass,256> in the atexit chain, and its unconditional block
+// walk hit pool memory an earlier teardown step had already released/poisoned - the wedge-9 replay
+// dumps show the read of 0xFFFFFFFFFFFFFFFF at dtor+0x15 with FEEEFEEE in the registers.
+// Any node left un-returned at shutdown additionally left FreeListHead dangling over freed
+// memory for the next operator delete. Specialize the destructor to leak the arena on
+// purpose: blocks stay live through every later static destructor, a late re-entrant
+// new/delete remains valid, and the OS reclaims the arena at process exit. Same
+// leak-on-purpose stance as the wedge-9-K stub pools.
+template<>
+ObjectPoolClass<MultiListNodeClass, 256>::~ObjectPoolClass()
+{
+}
+
 
 /***********************************************************************************************
 

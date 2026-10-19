@@ -82,6 +82,7 @@
 
 
 #include <stdlib.h>		// GeneralsX @build PS3.0-P2-1 14/10/2026 getenv/atoi for texture filter env overrides
+#include <chrono>			// GeneralsX @performance Qoder 19/10/2026 R-05 L3b begin-stage probe clock
 #include "ww3d.h"
 #include "WWLib/win.h"  // GeneralsX @build fbraz 10/02/2026 - For MMRESULT/timeBeginPeriod/BITMAP structures
 #include "rinfo.h"
@@ -860,6 +861,48 @@ void WW3D::Set_Anisotropy_Level(int level)
  * HISTORY:                                                                                    *
  *   3/24/98    GTH : Created.                                                                 *
  *=============================================================================================*/
+// GeneralsX @performance Qoder 19/10/2026 R-05 L3b: begin-stage forensics. After the text-chain fix the
+// phase2 begin bucket (this function) became the head item of the frame budget at ~9.9 ms. This probe
+// splits it into the calls it makes: TestCooperativeLevel, TextureLoader::Update, the dynamic VB/IB
+// reset, the parked viewport+clear, and Begin_Scene (which waits the Vulkan frame-slot fence). Gated by
+// the same GENERALSX_VKFPS_PHASES env as the other FPS probes; appends [B3_10] to vkfps_phase10.log.
+namespace {
+struct B3Probe {
+	long long calls;
+	long long coop_us, tl_us, dyn_us, clear_us, scene_us;
+	B3Probe() : calls(0), coop_us(0), tl_us(0), dyn_us(0), clear_us(0), scene_us(0) {}
+};
+B3Probe g_b3;
+inline long long b3NowUs() {
+	return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+inline bool b3On() {
+	static int checked = 0;
+	static int on = 0;
+	if (!checked) {
+		checked = 1;
+		const char* ev = getenv("GENERALSX_VKFPS_PHASES");
+		on = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+	}
+	return on == 1;
+}
+void b3Dump() {
+	if (g_b3.calls == 0) return;
+	const double inv = 1.0 / (double)g_b3.calls;
+	FILE* f = fopen("vkfps_phase10.log", "a");
+	if (!f) return;
+	fprintf(f, "[B3_10] frames=%lld avg_us coop=%.1f texloader=%.1f dynreset=%.1f clear=%.1f begin_scene=%.1f total=%.1f\n",
+		(long long)g_b3.calls,
+		(double)g_b3.coop_us * inv, (double)g_b3.tl_us * inv, (double)g_b3.dyn_us * inv,
+		(double)g_b3.clear_us * inv, (double)g_b3.scene_us * inv,
+		(double)(g_b3.coop_us + g_b3.tl_us + g_b3.dyn_us + g_b3.clear_us + g_b3.scene_us) * inv);
+	fflush(f);
+	fclose(f);
+	g_b3 = B3Probe();
+}
+}
+
 WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, float dest_alpha, void(*network_callback)())
 {
 	if (!IsInitted) {
@@ -869,6 +912,9 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	WWPROFILE("WW3D::Begin_Render");
 	WWASSERT(IsInitted);
 	HRESULT hr;
+
+	const bool b3 = b3On();
+	long long b3t = b3 ? b3NowUs() : 0;
 
 	SNAPSHOT_SAY(("=========================================="));
 	SNAPSHOT_SAY(("========== WW3D::Begin_Render ============"));
@@ -889,6 +935,7 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 
 		return WW3D_ERROR_GENERIC;
 	}
+	if (b3) { g_b3.coop_us += b3NowUs() - b3t; b3t = b3NowUs(); }
 
 	// Memory allocation statistics
 	LastFrameMemoryAllocations=WWMemoryLogClass::Get_Allocate_Count();
@@ -896,9 +943,11 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	WWMemoryLogClass::Reset_Counters();
 
 	TextureLoader::Update(network_callback);
+	if (b3) { g_b3.tl_us += b3NowUs() - b3t; b3t = b3NowUs(); }
 //	TextureClass::_Reset_Time_Stamp();
 	DynamicVBAccessClass::_Reset(true);
 	DynamicIBAccessClass::_Reset(true);
+	if (b3) { g_b3.dyn_us += b3NowUs() - b3t; b3t = b3NowUs(); }
 
 	Debug_Statistics::Begin_Statistics();
 
@@ -911,6 +960,7 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	IsRendering = true;
 
 	// If we want to clear the screen, we need to set the viewport to include the entire screen:
+	if (b3) { b3t = b3NowUs(); }
 	if (clear || clearz) {
 		RenderBackendViewport vp;
 		int width, height, bits;
@@ -925,9 +975,15 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 		Get_Render_Backend()->Set_Viewport(vp);
 		Get_Render_Backend()->Clear(clear, clearz, color, dest_alpha);
 	}
+	if (b3) { g_b3.clear_us += b3NowUs() - b3t; b3t = b3NowUs(); }
 
 	// Notify D3D that we are beginning to render the frame
 	Get_Render_Backend()->Begin_Scene();
+
+	if (b3) {
+		g_b3.scene_us += b3NowUs() - b3t;
+		if (++g_b3.calls % 600 == 0) b3Dump();
+	}
 
 	return WW3D_ERROR_OK;
 }

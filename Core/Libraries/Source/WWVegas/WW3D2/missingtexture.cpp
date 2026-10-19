@@ -20,6 +20,7 @@
 #include "missingtexture.h"
 #include "texture.h"
 #include "dx8wrapper.h"
+#include "Backend/VulkanTexMirror.h"
 #include <d3dx9core.h>
 
 static unsigned missing_image_width=128;
@@ -171,6 +172,10 @@ void MissingTexture::_Init()
 		src->Release();
 		dst->Release();
 	}
+
+	// GeneralsX @bugfix Qoder 18/10/2026 The fallback "missing" texture is CPU-filled on the spot and
+	// never sees the loader, so the Vulkan layer sampled white instead of the diagnostic pattern.
+	VKTex_Mirror_D3D_Texture(tex);
 
 	_MissingTexture=tex;
 /*

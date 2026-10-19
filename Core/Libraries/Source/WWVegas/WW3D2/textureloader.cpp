@@ -101,6 +101,34 @@ bool VKTex_Mirror_D3D_Texture(void* d3d_texture)
 		else all_locked = false;
 	}
 
+	// GeneralsX @bugfix Qoder 18/10/2026 Radar forensic probe: "the minimap is pure black" can be
+	// either a black CPU fill reaching the mirror or a correct fill that the draw layer never shows.
+	// Count the mip-0 texels while the lock is still held so the log answers which one it is.
+	unsigned rgbNonZero = 0, alphaNonZero = 0;
+	unsigned char alphaMin = 255, alphaMax = 0;
+	unsigned aZero = 0, aFog = 0, aMid = 0, aOpaque = 0;
+	const bool fourByte = (desc0.Format == D3DFMT_X8R8G8B8 || desc0.Format == D3DFMT_A8R8G8B8);
+	if (all_locked && fourByte && src[0].bits)
+	{
+		for (unsigned y = 0; y < desc0.Height; ++y)
+		{
+			const unsigned* row = (const unsigned*)(src[0].bits + (size_t)y * src[0].pitch);
+			for (unsigned x = 0; x < desc0.Width; ++x)
+			{
+				const unsigned v = row[x];
+				if (v & 0x00FFFFFFu) ++rgbNonZero;
+				const unsigned a = (v >> 24) & 0xFFu;
+				if (a) ++alphaNonZero;
+				if (a == 0) ++aZero;
+				else if (a == 127) ++aFog;
+				else if (a == 255) ++aOpaque;
+				else ++aMid;
+				if (a < alphaMin) alphaMin = (unsigned char)a;
+				if (a > alphaMax) alphaMax = (unsigned char)a;
+			}
+		}
+	}
+
 	bool mirrored = false;
 	if (all_locked)
 		mirrored = VKTex_Upload_2D(d3d_texture, desc0.Width, desc0.Height, levels, (int)fmt, src);
@@ -115,17 +143,75 @@ bool VKTex_Mirror_D3D_Texture(void* d3d_texture)
 	// dynamic convergence apart from the disk-loader uploads in a forensic run.
 	{
 		static unsigned long s_dynMirrorCalls = 0;
+		static unsigned long s_dynMirrorFails = 0;
 		++s_dynMirrorCalls;
-		if (mirrored && (s_dynMirrorCalls <= 8 || (s_dynMirrorCalls % 64) == 0))
+		const bool radarFmt = (desc0.Format == D3DFMT_X8R8G8B8);
+		if (mirrored && (s_dynMirrorCalls <= 8 || radarFmt || (s_dynMirrorCalls % 64) == 0))
 		{
-			fprintf(stderr, "[VKWP1] dyn mirror #%u: %ux%u levels=%u ww3dfmt=%d key=%p\n",
-				s_dynMirrorCalls, (unsigned)desc0.Width, (unsigned)desc0.Height, (unsigned)levels, (int)fmt, d3d_texture);
+			fprintf(stderr, "[VKWP1] dyn mirror #%u: %ux%u levels=%u ww3dfmt=%d key=%p rgb=%u/%u alpha=%u amin=%u amax=%u a0=%u a127=%u amid=%u a255=%u\n",
+				s_dynMirrorCalls, (unsigned)desc0.Width, (unsigned)desc0.Height, (unsigned)levels, (int)fmt, d3d_texture,
+				rgbNonZero, fourByte ? (unsigned)desc0.Width * desc0.Height : 0u,
+				alphaNonZero, (unsigned)alphaMin, (unsigned)alphaMax,
+				aZero, aFog, aMid, aOpaque);
+			fflush(stderr);
+		}
+		else if (!mirrored && (++s_dynMirrorFails <= 16))
+		{
+			fprintf(stderr, "[VKWP1] dyn mirror FAIL #%u: %ux%u levels=%u ww3dfmt=%d key=%p locked=%d\n",
+				s_dynMirrorCalls, (unsigned)desc0.Width, (unsigned)desc0.Height, (unsigned)levels, (int)fmt,
+				d3d_texture, all_locked ? 1 : 0);
 			fflush(stderr);
 		}
 	}
 	return mirrored;
 #else
 	(void)d3d_texture;
+	return false;
+#endif
+}
+
+// GeneralsX @bugfix Qoder 18/10/2026 The rect-copy upload path targets D3DPOOL_DEFAULT textures
+// (the 3D shroud mask is the live one) whose levels cannot be locked, so VKTex_Mirror_D3D_Texture
+// can never see them. The caller already holds the exact bytes in a system-memory staging texture;
+// this entry uploads those bytes under the destination's key instead.
+bool VKTex_Mirror_Texture_As(void* key, void* source_texture, unsigned levels)
+{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (!VKTex_Ready() || !key || !source_texture) return false;
+
+	IDirect3DTexture9* src_tex = static_cast<IDirect3DTexture9*>(source_texture);
+	const UINT available = src_tex->GetLevelCount();
+	if (!levels || levels > available || levels > 16) return false;
+
+	D3DSURFACE_DESC desc0;
+	if (FAILED(src_tex->GetLevelDesc(0, &desc0))) return false;
+	const WW3DFormat fmt = D3DFormat_To_WW3DFormat(desc0.Format);
+
+	VKTex_Mip_Source src[16];
+	bool all_locked = true;
+	for (UINT i = 0; i < levels; ++i)
+	{
+		D3DLOCKED_RECT lr;
+		src[i].bits = nullptr; src[i].pitch = 0;
+		if (SUCCEEDED(src_tex->LockRect(i, &lr, nullptr, D3DLOCK_READONLY)))
+		{
+			src[i].bits = (const unsigned char*)lr.pBits;
+			src[i].pitch = (unsigned int)lr.Pitch;
+		}
+		else all_locked = false;
+	}
+
+	bool mirrored = false;
+	if (all_locked)
+		mirrored = VKTex_Upload_2D(key, desc0.Width, desc0.Height, levels, (int)fmt, src);
+
+	for (UINT i = 0; i < levels; ++i)
+	{
+		if (src[i].bits) src_tex->UnlockRect(i);
+	}
+	return mirrored;
+#else
+	(void)key; (void)source_texture; (void)levels;
 	return false;
 #endif
 }
@@ -588,6 +674,11 @@ IDirect3DTexture9* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 		DX8_ErrorCode(sysmem_texture->UnlockRect(level));
 	}
 #ifdef USE_MANAGED_TEXTURES
+	// GeneralsX @bugfix Qoder 18/10/2026 Thumbnails become the live D3D resource while the full
+	// texture streams in, but they are only written here - the loader's Unlock_Surfaces mirror runs
+	// later on the full-size object. Without this the Vulkan layer sampled white for the first
+	// seconds after entering a map.
+	VKTex_Mirror_D3D_Texture(sysmem_texture);
 	return sysmem_texture;
 #else
 	IDirect3DTexture9* d3d_texture = DX8Wrapper::_Create_DX8_Texture(
@@ -1864,6 +1955,21 @@ void TextureLoadTaskClass::Unlock_Surfaces()
 		for (unsigned int i = 0; i < MipLevelCount; ++i)
 		{
 			if (src[i].bits) Peek_D3D_Texture()->UnlockRect(i);
+		}
+
+		// GeneralsX @bugfix Qoder 19/10/2026 R-02 census: name every mirrored disk-loader texture once
+		// so the key-only VKWHITE and binding lines can be read as filenames - the white building
+		// silhouette hunt needs to know whether those sources uploaded clean or already white.
+		{
+			static unsigned s_nmN = 0;
+			if (all_locked && Width >= 32u && s_nmN < 3000u)
+			{
+				++s_nmN;
+				const char* nm = Texture ? (const char*)Texture->Get_Texture_Name() : "?";
+				fprintf(stderr, "[VKTKNM] key=%p name='%s' %ux%u fmt=%d\n",
+					(void*)Peek_D3D_Texture(), nm ? nm : "?", Width, Height, (int)Format);
+				fflush(stderr);
+			}
 		}
 	}
 #endif

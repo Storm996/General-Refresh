@@ -57,6 +57,12 @@
 // GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the raw CPU-written flat-normal fallback
 // into the Vulkan texture store (unconditional: the symbol is a no-op unless the win64vk core is up).
 #include "WW3D2/Backend/VulkanTexMirror.h"
+#include "WW3D2/Backend/VulkanPgm.h"	// GeneralsX @feature Qoder 18/10/2026 wedge 8: HLSL source -> program tag
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanDraw.h"	// GeneralsX @feature Qoder 18/10/2026 step 9.H: VKDraw_Ready gate
+#include "WW3D2/Backend/VKD3DStubImpl.h"	// GeneralsX @feature Qoder 19/10/2026 BUG-03: VK_NOD3D_Enabled gate
+#endif
+#include "WW3D2/formconv.h"	// GeneralsX @feature Qoder 18/10/2026 step 9.H: depth surface -> WW3DZFormat
 #include "WWMath/wwmath.h"	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: Float_As_Int for FOGSTART/FOGEND
 #include "WW3D2/assetmgr.h"
 #include "Lib/BaseType.h"
@@ -97,8 +103,8 @@ public:
 	 ///do any custom resetting necessary to bring W3D in sync.
 	virtual void reset() {
 		ShaderClass::Invalidate();
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);};
+		DX8Wrapper::Set_DX8_Texture(0, nullptr);
+		DX8Wrapper::Set_DX8_Texture(1, nullptr);};
 	virtual Int init() = 0;			///<perform any one time initialization and validation
 	virtual Int shutdown() { return TRUE;};			///<release resources used by shader
 protected:
@@ -132,6 +138,10 @@ IDirect3DSurface9 *W3DShaderManager::m_rttColorSurface=nullptr;
 IDirect3DSurface9 *W3DShaderManager::m_rttDepthSurface=nullptr;
 // GeneralsX @tweak PS3.0-P2-3 14/10/2026 S6: consecutive RTT bind-failure counter (retry before fuse).
 Int W3DShaderManager::m_rttBindFailures=0;
+// GeneralsX @feature Qoder 18/10/2026 step 9.H: the offscreen pair only becomes a recorder target when
+// both keys were mirrored and opted in; until then the filters keep the D3D9 redirect.
+Bool W3DShaderManager::m_vkRttReady=false;
+Bool W3DShaderManager::m_vkRttPublished=false;
 /*===========================================================================================*/
 /*=========      Screen Shaders	=============================================================*/
 /*===========================================================================================*/
@@ -291,8 +301,6 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 	if (!tex) return false;
 	if (!set(mode)) return false;
 
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
 		DWORD color;   // diffuse color
@@ -302,7 +310,7 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,tex);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -326,9 +334,9 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 	reset();
 	return true;
@@ -352,7 +360,7 @@ Int ScreenDefaultFilter::set(FilterModes mode)
 
 void ScreenDefaultFilter::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -574,11 +582,30 @@ Int ScreenBloomFilter::set(FilterModes mode)
 
 void ScreenBloomFilter::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//release the bright pass texture from stage 0.
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//release the bright pass texture from stage 0.
 	// GeneralsX @bugfix 05/10/2026 Restore the blend state left enabled by the additive pass
 	// so the following UI and next-frame rendering start from a clean state.
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
 	DX8Wrapper::Invalidate_Cached_Render_States();
+}
+
+namespace {
+// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9: a filter whose offscreen pair was not
+// published still records its scene into the scene mirror while the D3D9 target stays empty. Its first
+// post quad is a fixed-function copy of that empty target, and the facade accepts it because the texture
+// has a Vulkan view - the copy then replaced the whole tactical view with black while the GUI, drawn
+// after the filter, stayed lit (bloom is the shipping case). Hold the facade off for the entire
+// un-migrated post chain; the scene target is published again on scope exit so the GUI and the next
+// frame record normally. Remove the guard for a family once its targets are published (task #33).
+class ScopedD3DOnlyPostPass
+{
+public:
+	ScopedD3DOnlyPostPass() { DX8Wrapper::VK_Suspend_Scene_Target(); }
+	~ScopedD3DOnlyPostPass() { DX8Wrapper::VK_Publish_Scene_Target(); }
+private:
+	ScopedD3DOnlyPostPass(const ScopedD3DOnlyPostPass&);
+	ScopedD3DOnlyPostPass& operator=(const ScopedD3DOnlyPostPass&);
+};
 }
 
 Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
@@ -637,19 +664,19 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	}
 	if (doWindowGamma)
 	{
-		pDev->SetVertexShader(nullptr);
-		pDev->SetPixelShader(m_gammaCopyPS);
+		DX8Wrapper::Set_Vertex_Shader(0);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_gammaCopyPS));
 		float gammaConst[4] = { invGamma, 0.0f, 0.0f, 0.0f };
-		pDev->SetPixelShaderConstantF(0, gammaConst, 1);
-		pDev->SetTexture(0, tex);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, gammaConst, 1);
+		DX8Wrapper::Set_DX8_Texture(0, tex);
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
 		BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, 0xffffffff);
 		DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
-		pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+		DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 		//D18 contract: unbind before the fixed-function stages below expect the default state.
-		pDev->SetPixelShader(nullptr);
-		pDev->SetTexture(0, nullptr);
+		DX8Wrapper::Set_Pixel_Shader(0);
+		DX8Wrapper::Set_DX8_Texture(0, nullptr);
 	}
 	else
 	{
@@ -658,11 +685,11 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
-	pDev->SetTexture(0, tex);
+	DX8Wrapper::Set_DX8_Texture(0, tex);
 	BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, 0xffffffff);
 	DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 	}	// GeneralsX @feature PS3.0-P3-24 14/10/2026 closes the fixed-function scene-copy branch
 
 	// Pass 1: extract bright areas into the quarter-resolution buffer.
@@ -697,52 +724,52 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 
 		// Bright pass: scene texture -> quarter-res buffer through the knee.
 		float thr[4] = { 0.45f, 0.25f, 0.0f, 0.0f };
-		pDev->SetVertexShader(nullptr);
-		pDev->SetPixelShader(m_brightPS);
-		pDev->SetPixelShaderConstantF(0, thr, 1);
-		pDev->SetTexture(0, tex);
+		DX8Wrapper::Set_Vertex_Shader(0);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_brightPS));
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, thr, 1);
+		DX8Wrapper::Set_DX8_Texture(0, tex);
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, FALSE );
 		BuildBloomQuad(v, u0*BLOOM_TEX_SIZE, v0*BLOOM_TEX_SIZE, u1*BLOOM_TEX_SIZE, v1*BLOOM_TEX_SIZE, u0, v0, u1, v1, 0xffffffff);
 		DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
-		pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+		DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 		// First blur level: 256 -> 128, tent spread of two source texels.
 		pDev->SetRenderTarget(0, m_midSurface);
-		pDev->SetPixelShader(m_blurPS);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_blurPS));
 		float spread[4] = { 2.0f / BLOOM_TEX_SIZE, 2.0f / BLOOM_TEX_SIZE, 0.0f, 0.0f };
-		pDev->SetPixelShaderConstantF(0, spread, 1);
-		pDev->SetTexture(0, m_bloomTexture);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, spread, 1);
+		DX8Wrapper::Set_DX8_Texture(0, m_bloomTexture);
 		BuildBloomQuad(v, 0.0f, 0.0f, (Real)BLOOM_MID_SIZE, (Real)BLOOM_MID_SIZE, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
 		DX8Wrapper::Apply_Render_State_Changes();
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 		// Second blur level: 128 -> 64, same program, wider spread in source uv units.
 		pDev->SetRenderTarget(0, m_smallSurface);
 		spread[0] = 2.0f / BLOOM_MID_SIZE;
 		spread[1] = 2.0f / BLOOM_MID_SIZE;
-		pDev->SetPixelShaderConstantF(0, spread, 1);
-		pDev->SetTexture(0, m_midTexture);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, spread, 1);
+		DX8Wrapper::Set_DX8_Texture(0, m_midTexture);
 		BuildBloomQuad(v, 0.0f, 0.0f, (Real)BLOOM_SMALL_SIZE, (Real)BLOOM_SMALL_SIZE, 0.0f, 0.0f, 1.0f, 1.0f, 0xffffffff);
 		DX8Wrapper::Apply_Render_State_Changes();
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 		// Composite: 64px halo upscaled over the tactical view, scaled by the float intensity.
 		pDev->SetRenderTarget(0, backSurface);
-		pDev->SetPixelShader(m_compositePS);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_compositePS));
 		float inten[4] = { bloomIntensity, 0.0f, 0.0f, 0.0f };
-		pDev->SetPixelShaderConstantF(0, inten, 1);
-		pDev->SetTexture(0, m_smallTexture);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, inten, 1);
+		DX8Wrapper::Set_DX8_Texture(0, m_smallTexture);
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, D3DBLEND_ONE );
 		DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
 		BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, 0xffffffff);
 		DX8Wrapper::Apply_Render_State_Changes();
-		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 		//D18 contract: whoever bound the shader unbinds it before the fixed-function next pass.
-		pDev->SetPixelShader(nullptr);
-		pDev->SetVertexShader(nullptr);
+		DX8Wrapper::Set_Pixel_Shader(0);
+		DX8Wrapper::Set_Vertex_Shader(0);
 		backSurface->Release();
 		SAFE_RELEASE(depthSurface);
 		reset();
@@ -755,8 +782,8 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_TEXTUREFACTOR, 0x007f7f7f );	// ~50% luminance threshold.
 	BuildBloomQuad(v, u0*BLOOM_TEX_SIZE, v0*BLOOM_TEX_SIZE, u1*BLOOM_TEX_SIZE, v1*BLOOM_TEX_SIZE, u0, v0, u1, v1, 0xffffffff);
 	DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 	// Pass 2: add the (implicitly blurred) bright pass back on top of the scene.
 	pDev->SetRenderTarget(0, backSurface);
@@ -771,7 +798,7 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_ALPHABLENDENABLE, TRUE );
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_SRCBLEND, D3DBLEND_ONE );
 	DX8Wrapper::Set_DX8_Render_State( D3DRS_DESTBLEND, D3DBLEND_ONE );
-	pDev->SetTexture(0, m_bloomTexture);
+	DX8Wrapper::Set_DX8_Texture(0, m_bloomTexture);
 	// GeneralsX @feature PS3.0 Qoder 17/10/2026: the fixed-function fallback used to hard-code the
 	// 0x33 (~20%) retail glow byte, so the BloomIntensity row was silently ignored on any host that
 	// did not get the programmable chain. The same live getter now feeds both legs; on the shipping
@@ -783,8 +810,8 @@ Bool ScreenBloomFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &
 	// Vertex diffuse color scales the glow intensity (0x33 was the hard-coded ~20%).
 	BuildBloomQuad(v, (Real)xpos, (Real)ypos, (Real)(xpos+width), (Real)(ypos+height), u0, v0, u1, v1, glowColor);
 	DX8Wrapper::Apply_Render_State_Changes();	//flush cached states before drawing directly through the device.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(BloomQuadVertex));
 
 	reset();
 	return true;
@@ -933,6 +960,30 @@ HRESULT W3DShaderManager::compileShaderAtBestProfile(const char* hlslSource, Boo
 
 		if (!failed)
 		{
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8: offer the raw source to the
+			// translated-program registry. The hash is over hlslSource (not the prefixed buffer), because
+			// that is the bytes the exported block and scripts/pgm_hash.py describe. A source with no row
+			// is logged once and simply leaves the D3D9 path in charge.
+			const unsigned boundTag = VKPgm_Note_Compiled(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, hlslSource, logTag);
+			// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under no-d3d9 an untagged handle has no twin to
+			// execute, and the draw path refuses every batch that binds one - the whole family would
+			// disappear instead of staying on its fixed-function leg. Release the handle and fail the
+			// compile, which routes the caller down the same branch a null answer always took. On the
+			// d3d9 leg an untagged handle still runs natively, so the guard fires only there.
+#if defined(SAGE_USE_VULKAN_CORE)
+			if (!boundTag && pHandle && *pHandle && VKPgm_On() && VK_NOD3D_Enabled())
+			{
+				if (ShaderType)
+					reinterpret_cast<IDirect3DVertexShader9*>(*pHandle)->Release();
+				else
+					reinterpret_cast<IDirect3DPixelShader9*>(*pHandle)->Release();
+				*pHandle = nullptr;
+				fprintf(stderr, "%s %s has no translated twin under no-d3d9; the fixed-function leg stays\n",
+					logTag ? logTag : "[SHADER]", target);
+				fflush(stderr);
+				return E_FAIL;
+			}
+#endif
 			if (outProfile) *outProfile=target;
 			return S_OK;
 		}
@@ -1066,8 +1117,6 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 	if (!tex) return false;
 	if (!set(mode)) return false;
 
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
 		DWORD color;   // diffuse color
@@ -1077,7 +1126,7 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,tex);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -1101,9 +1150,9 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 	reset();
 	return true;
@@ -1210,7 +1259,7 @@ void ScreenBWFilter::reset()
 	// rendered frame is a bare IDirect3DTexture9 from endRenderToTexture(), never a TextureBaseClass, so
 	// it was never in the wrapper's texture cache for this stage and there is no cached reference to
 	// release. The shader unbind does go through the wrapper, which is what keeps the handle cache right.
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
 	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
@@ -1259,8 +1308,6 @@ Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool 
 	if (!tex) return false;
 	if (!set(mode)) return false;
 
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
 		DWORD color;   // diffuse color
@@ -1296,7 +1343,7 @@ Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool 
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
 	//Draw B&W version first
 	if (DX8Wrapper::Get_Current_Caps()->Support_Dot3())
@@ -1320,9 +1367,9 @@ Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool 
 		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
 	}
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,tex);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
 
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 	//Draw normal view blended by current fade level
 	ShaderClass::Invalidate();	//reset DOT3 blend from above.
@@ -1333,7 +1380,7 @@ Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool 
 	//replace texture alpha with vertex alpha
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
 
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 	reset();
 	return true;
@@ -1399,7 +1446,7 @@ Int ScreenBWFilterDOT3::set(FilterModes mode)
 
 void ScreenBWFilterDOT3::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -1529,8 +1576,6 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 	if (!tex) return false;
 	if (!set(mode)) return false;
 
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
 		DWORD color;   // diffuse color
@@ -1543,9 +1588,9 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 	Int xpos, ypos, width, height;
 	Real radius = 0.0f;
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,tex);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
 	if (mode == FM_VIEW_CROSSFADE_CIRCLE)
-	{	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1,m_fadePatternTexture->Peek_D3D_Texture());
+	{	DX8Wrapper::Set_DX8_Texture(1,m_fadePatternTexture->Peek_D3D_Texture());
 		//Use the current fade level to scale the mask texture, for other modes the texture
 		//comes pre-scaled so doesn't require uv scaling.
 		radius = (1.0f-m_curFadeValue)*2.0f;
@@ -1589,12 +1634,9 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
 
-//		m_pDev->SetTextureStageState(0,D3DSAMP_MAGFILTER,D3DTEXF_POINT);
-//		m_pDev->SetTextureStageState(0,D3DSAMP_MINFILTER,D3DTEXF_POINT);
-
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 	reset();
 	return true;
@@ -1643,7 +1685,7 @@ void ScreenCrossFadeFilter::reset()
 {
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -1700,8 +1742,6 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 	if (!tex) return false;
 	if (!set(mode)) return false;
 
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	Bool continueEffect = true;
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
@@ -1712,7 +1752,7 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,tex);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -1746,7 +1786,7 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
 	DX8Wrapper::Apply_Render_State_Changes();
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
 	Coord2D center;
 	center.x = 0.5f;
@@ -1810,10 +1850,10 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 			v[i].v = ((v[i].v-center.y)*factor) + center.y;
 		}
 	}
-	pDev->SetTextureStageState(0,D3DTSS_ALPHAARG1, D3DTA_CURRENT);
-	pDev->SetTextureStageState(0,D3DTSS_ALPHAARG2, D3DTA_TEXTURE);
-	pDev->SetTextureStageState(0,D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG2, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
 
 	DX8Wrapper::Apply_Render_State_Changes();
@@ -1841,7 +1881,7 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 					v[i].v = ((v[i].v-center.y)*factor) + center.y;
 				}
 			}
-			pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+			DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 		}
 	}
@@ -1914,7 +1954,7 @@ Int ScreenMotionBlurFilter::set(FilterModes mode)
 
 void ScreenMotionBlurFilter::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0,nullptr);	//previously rendered frame inside this texture
+	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -2342,8 +2382,8 @@ void TerrainShader2Stage::reset()
 	ShaderClass::Invalidate();
 
 	//Free references to textures
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Texture(1, nullptr);
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
@@ -2388,6 +2428,17 @@ void TerrainShader2Stage::updateNoise2(D3DXMATRIX *destMatrix,D3DXMATRIX *curVie
 
 Int TerrainShader2Stage::set(Int pass)
 {
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: the pixel-shader leg prints its
+	// own path, but the fallbacks were silent, so a census with no "[TERRAIN] path=" line could not say
+	// what actually drew the ground. One line per 4096 sets names the leg without touching state.
+	{
+		static unsigned sStage2Sets = 0u;
+		if ((sStage2Sets++ & 4095u) == 0u) {
+			fprintf(stderr, "[TERRAIN] path=stage2 pass=%d\n", pass);
+			fflush(stderr);
+		}
+	}
+
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	DX8Wrapper::Apply_Render_State_Changes();
 
@@ -2407,7 +2458,11 @@ Int TerrainShader2Stage::set(Int pass)
 	switch (pass)
 	{
 		case 0:
-			DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
+			// GeneralsX @bugfix Qoder 18/10/2026 Bind through the facade, not the raw device. The Vulkan
+			// draw layer takes its textures from DX8Wrapper's shadow (Textures[]), so a device-direct
+			// SetTexture left it sampling whatever the previous batch had bound - the terrain atlas never
+			// arrived and the ground rendered as a flat untinted surface.
+			DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(0));
 			DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 			DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
@@ -2422,7 +2477,7 @@ Int TerrainShader2Stage::set(Int pass)
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,false);
 			break;
 		case 1:
-			DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
+			DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(1));
 			DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 			DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
@@ -2469,7 +2524,7 @@ Int TerrainShader2Stage::set(Int pass)
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE12)
 			{
 				//setup cloud pass
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(2));
 
 				updateNoise1((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
@@ -2478,7 +2533,7 @@ Int TerrainShader2Stage::set(Int pass)
 				DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 
 				//setup noise pass
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(1, W3DShaderManager::getShaderTexture(3));
 
 				updateNoise2((D3DXMATRIX*)&curView,&inv);
 				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
@@ -2504,7 +2559,7 @@ Int TerrainShader2Stage::set(Int pass)
 				if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE1)
 				{
 					//setup cloud pass
-					DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+					DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(2));
 					updateNoise1((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 					DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 					DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -2512,7 +2567,7 @@ Int TerrainShader2Stage::set(Int pass)
 				else
 				{
 					//setup noise pass
-					DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+					DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(3));
 					updateNoise2((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 					DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 					DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -2551,6 +2606,16 @@ Int TerrainShader8Stage::init()
 
 Int TerrainShader8Stage::set(Int pass)
 {
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: names the 8-stage fallback leg,
+	// sibling of the stage2 probe above.
+	{
+		static unsigned sStage8Sets = 0u;
+		if ((sStage8Sets++ & 4095u) == 0u) {
+			fprintf(stderr, "[TERRAIN] path=stage8 pass=%d\n", pass);
+			fflush(stderr);
+		}
+	}
+
 	if (pass == 0)
 	{
 		//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
@@ -2570,8 +2635,8 @@ Int TerrainShader8Stage::set(Int pass)
 			TextureFilterClass::Apply_Player_Filter(1,bilinearHint,trilinearHint);
 		}
 
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(0));
+		DX8Wrapper::Set_Texture(1, W3DShaderManager::getShaderTexture(1));
 
 		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
 		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0);
@@ -2666,8 +2731,8 @@ void TerrainShader8Stage::reset()
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_COLOROP, D3DTOP_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Texture(1, nullptr);
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
@@ -2795,6 +2860,12 @@ Real W3DShaderManager::getShadowMapStrength()
 {
 	if (s_shadowStrengthLive < 0.0f)
 		s_shadowStrengthLive = (Real)OptionPreferences().getShadowMapIntensity() * 0.01f;
+	// GeneralsX @debug Qoder 19/10/2026 exaggerated-shadow QA knob: GENERALSX_SMAP_X=<mult> multiplies
+	// the shadow term so a suspect-but-invisible shadow becomes visible to the eye (mult 3 with the 5x5
+	// PCF saturates any pixel with one third of tap coverage to black). Unset = shipped behavior.
+	const char* xm = getenv("GENERALSX_SMAP_X");
+	if (xm != nullptr && *xm != 0)
+		return s_shadowStrengthLive * (Real)atof(xm);
 	return s_shadowStrengthLive;
 }
 
@@ -2917,8 +2988,8 @@ static void Upload_Terrain30_Fog_Constants(void)
 	// on a struct read; no allocation and no new plumbing.
 	Vector4 haze, ramp;
 	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(0, (const float*)&haze, 1);
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(1, (const float*)&ramp, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(0, (const float*)&haze, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)&ramp, 1);
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio below has
@@ -3014,6 +3085,11 @@ Int TerrainShaderPixelShader::init()
 #ifdef DISABLE_PIXEL_SHADERS
 	return false;
 #endif
+	// GeneralsX @bugfix Qoder 18/10/2026: init also runs after a device reset, and shutdown() does
+	// not touch the file-scope HLSL switches. Clearing them here keeps set() from taking the ps_3_0
+	// relay/constant path with handles that this pass may load from the retail .pso trio instead.
+	s_terrainHlslFog = FALSE;
+	s_terrainPPL = FALSE;
 	//this shader will also use the 2Stage shader for some of the passes so initialize it too.
 	if (terrainShader2Stage.init() && (res=W3DShaderManager::getChipset()) >= DC_GENERIC_PIXEL_SHADER_1_1)
 	{
@@ -3065,17 +3141,13 @@ Int TerrainShaderPixelShader::init()
 			}
 
 			// Only set pixel shader mode if ALL shaders loaded successfully
-			if (pixelShadersAvailable)
-			{
-				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE]=&terrainShaderPixelShader;
-				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE1]=&terrainShaderPixelShader;
-				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE2]=&terrainShaderPixelShader;
-				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=&terrainShaderPixelShader;
-				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE]=1;
-				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE1]=1;
-				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE2]=1;
-				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=1;
-				DEBUG_LOG(("W3DShaderManager: Using pixel shader path for terrain"));
+			// GeneralsX @bugfix Qoder 18/10/2026: the ps_3_0 HLSL trio no longer lives inside the
+			// retail .pso gate. A Zero Hour install ships only the "f" family in ShadersZH.big, so
+			// terrain.pso/terrainnoise*.pso are legitimately absent there and the experimental
+			// Terrain30Shading path could never install. Retail .pso and HLSL are now two independent
+			// sources for the same three handles; either one is enough to register this shader.
+			Bool terrainPixelActive = pixelShadersAvailable;
+			Bool terrainHlslInstalled = FALSE;
 
 				// GeneralsX @feature PS3.0 batch8 G1 14/10/2026 ps_3_0 terrain trio with per-pixel haze.
 				// The shipped .pso files are ps_1_1 ramps that cannot read eye depth, so their exact math
@@ -3416,7 +3488,17 @@ Int TerrainShaderPixelShader::init()
 				// GeneralsX @feature PS3.0 L2.2 17/10/2026: the switch is now also a Graphics Options
 				// page checkbox (Options.ini "Terrain30Shading"). The getter keeps the QA env winner and
 				// the OFF factory default, so retail parity is unchanged unless the user opts in.
-				const bool terrain30On = (OptionPreferences().getTerrain30Shading() != FALSE);
+				// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under GENERALSX_VK_NOD3D the retail .pso trio
+				// can never run - the stub device hands out identity handles with no driver behind them and
+				// the draw path refuses every batch whose shader pair carries no translated twin - so the
+				// HLSL trio, the only source the Vulkan program registry knows, is not an experiment there
+				// but the only renderable terrain. Force it on; the batch22 opt-out stays on the d3d9 leg.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+				const bool vkNod3d = VK_NOD3D_Enabled();
+#else
+				const bool vkNod3d = false;
+#endif
+				const bool terrain30On = (OptionPreferences().getTerrain30Shading() != FALSE) || vkNod3d;
 
 				// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: read the normal-pass switches once,
 				// here where the terrain leg decides its shader variants. NM defaults ON but is only
@@ -3460,6 +3542,8 @@ Int TerrainShaderPixelShader::init()
 						m_dwBasePixelShader = hlslBase;
 						m_dwBaseNoise1PixelShader = hlslNoise;
 						m_dwBaseNoise2PixelShader = hlslNoise12;
+						terrainHlslInstalled = TRUE;
+						terrainPixelActive = TRUE;
 						s_terrainHlslFog = TRUE;
 						// GeneralsX @feature Qoder 17/10/2026 P4: the PPL trio is now the live trio;
 						// arm the per-pass K upload in set() (and only then).
@@ -3477,13 +3561,39 @@ Int TerrainShaderPixelShader::init()
 						fflush(stderr);
 					}
 				}
-			}
-			else
+			// GeneralsX @bugfix Qoder 18/10/2026: register the pixel-shader terrain only when at
+			// least one of the two sources above produced all three handles. The old unconditional
+			// return TRUE registered a shader whose handles were all null on any install without
+			// the retail terrain.pso family; set() then bound nothing and the whole ground
+			// vanished - the Zero Hour "all terrain gone" report. FALSE hands the terrain slots to
+			// the next candidate in TerrainShaderList (8Stage / 2Stage).
+			// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under no-d3d9 a retail .pso trio is a trio
+			// nothing can execute: its handles carry no translated twin in the Vulkan program registry,
+			// so every terrain batch would be refused at draw time and the ground would vanish again
+			// behind a "registered" log line. There, only the HLSL trio may register; the 2Stage
+			// fixed-function fallback is the renderable leg.
+			if (vkNod3d && !terrainHlslInstalled)
+				terrainPixelActive = FALSE;
+			if (terrainPixelActive)
 			{
-				DEBUG_LOG(("W3DShaderManager: Falling back to 2-stage shader for terrain (pixel shaders unavailable)"));
+				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE]=this;
+				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE1]=this;
+				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE2]=this;
+				W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=this;
+				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE]=1;
+				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE1]=1;
+				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE2]=1;
+				W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=1;
+				DEBUG_LOG(("W3DShaderManager: terrain pixel shader registered"));
+				fprintf(stderr, "[TERRAIN] pixel trio registered source=%s nm=%d ppl=%d\n",
+					terrainHlslInstalled ? "hlsl" : "retail_pso", s_terrainNMEnv ? 1 : 0, s_terrainPPL ? 1 : 0);
+				fflush(stderr);
+				return TRUE;
 			}
-			// GeneralsX @bugfix BenderAI 13/02/2026 - Always return TRUE if 2-stage shader initialized
-			return TRUE;
+			fprintf(stderr, "[TERRAIN] no pixel-shader trio (pso=%d hlsl=%d); falling back to stage shaders\n",
+				pixelShadersAvailable ? 1 : 0, terrainHlslInstalled ? 1 : 0);
+			fflush(stderr);
+			return FALSE;
 		}
 	}
 	return FALSE;
@@ -3491,6 +3601,20 @@ Int TerrainShaderPixelShader::init()
 
 Int TerrainShaderPixelShader::set(Int pass)
 {
+	// GeneralsX @feature Qoder 18/10/2026 read-only terrain path census: which leg actually drew, one
+	// line per 4096 sets. The leg is chosen at init time, so this is the only place that can say whether
+	// the retail .pso trio or an HLSL trio owns the ground this run.
+	{
+		static unsigned sTerrainPathSets = 0u;
+		if ((sTerrainPathSets++ & 4095u) == 0u)
+		{
+			fprintf(stderr, "[TERRAIN] path=%s pass=%d nm=%d ppl=%d\n",
+				s_terrainHlslFog ? (s_terrainPPL ? "ps30_ppl" : "ps30_nm") : "retail_pso",
+				pass, s_terrainNMEnv ? 1 : 0, s_terrainPPL ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	DX8Wrapper::Apply_Render_State_Changes();
 
@@ -3538,7 +3662,10 @@ Int TerrainShaderPixelShader::set(Int pass)
 			}
 			if (nmTex != nullptr)
 			{
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(4, nmTex);
+				// GeneralsX @bugfix Qoder 18/10/2026 wedge 8: through the facade, not the device. The draw
+				// layer builds descriptor slot 4 from the facade's shadow, so a device-direct bind left the
+				// terrain normal atlas invisible to Vulkan while D3D9 still sampled it.
+				DX8Wrapper::Set_DX8_Texture(4, nmTex);
 				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -3558,7 +3685,7 @@ Int TerrainShaderPixelShader::set(Int pass)
 					else { sun[0] = L.X / mag; sun[1] = L.Y / mag; sun[2] = L.Z / mag; }
 					sun[3] = s_terrainNMGain;
 				}
-				DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(2, sun, 1);
+				DX8Wrapper::Set_Pixel_Shader_Constant(2, sun, 1);
 
 				// GeneralsX @feature PS3.0 L2.1 TNM: one evidence line per session (change detector
 				// not needed - sun is static unless a script moves it, and the binding state only
@@ -3577,8 +3704,8 @@ Int TerrainShaderPixelShader::set(Int pass)
 	}
 
 	//setup base pass
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
+	DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(0));
+	DX8Wrapper::Set_Texture(1, W3DShaderManager::getShaderTexture(1));
 
 	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	DX8Wrapper::Set_DX8_Sampler_State( 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -3623,9 +3750,9 @@ Int TerrainShaderPixelShader::set(Int pass)
 			//full shader
 			DX8Wrapper::Set_DX8_Sampler_State(3,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
 			DX8Wrapper::Set_DX8_Sampler_State(3,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-			DX8Wrapper::_Get_D3D_Device8()->SetTexture(2, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
-			DX8Wrapper::_Get_D3D_Device8()->SetTexture(3, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
-			DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBaseNoise2PixelShader);
+			DX8Wrapper::Set_Texture(2, W3DShaderManager::getShaderTexture(2));
+			DX8Wrapper::Set_Texture(3, W3DShaderManager::getShaderTexture(3));
+			DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBaseNoise2PixelShader));
 
 			DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 			DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -3655,12 +3782,12 @@ Int TerrainShaderPixelShader::set(Int pass)
 		else
 		{
 			//single noise texture shader
-			DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBaseNoise1PixelShader);
+			DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBaseNoise1PixelShader));
 
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE1)
 			{
 				//cloud map
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(2, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(2, W3DShaderManager::getShaderTexture(2));
 				terrainShader2Stage.updateNoise1((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 				DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 				DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -3668,7 +3795,7 @@ Int TerrainShaderPixelShader::set(Int pass)
 			else
 			{
 				//light map
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(2, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(2, W3DShaderManager::getShaderTexture(3));
 				terrainShader2Stage.updateNoise2((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 				DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 				DX8Wrapper::Set_DX8_Sampler_State(2, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -3694,7 +3821,7 @@ Int TerrainShaderPixelShader::set(Int pass)
 			Matrix4x4 identM(true);
 			DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, identM);
 		}
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBasePixelShader);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBasePixelShader));
 	}
 
 	// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: per-pass macro-normal reconstruction matrix for
@@ -3724,7 +3851,7 @@ Int TerrainShaderPixelShader::set(Int pass)
 				}
 				kmat[row * 4 + 3] = 0.0f;
 			}
-			DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstantF(3, kmat, 3);
+			DX8Wrapper::Set_Pixel_Shader_Constant(3, kmat, 3);
 		}
 	}
 
@@ -3733,14 +3860,16 @@ Int TerrainShaderPixelShader::set(Int pass)
 
 void TerrainShaderPixelShader::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(2,nullptr);	//release reference to any texture
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(3,nullptr);	//release reference to any texture
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(4,nullptr);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 normal atlas
+	DX8Wrapper::Set_DX8_Texture(2,nullptr);	//release reference to any texture
+	DX8Wrapper::Set_DX8_Texture(3,nullptr);	//release reference to any texture
+	// GeneralsX @bugfix Qoder 18/10/2026 wedge 8: release stage 4 through the facade as well, otherwise
+	// the shadow keeps a dangling normal-atlas pointer after reset and the next draw binds freed memory.
+	DX8Wrapper::Set_DX8_Texture(4, nullptr);	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026 normal atlas
 
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);	//turn off pixel shader
+	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Texture(1, nullptr);
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
@@ -3811,7 +3940,7 @@ Int CloudTextureShader::set(Int stage)
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(stage, W3DShaderManager::getShaderTexture(stage)->Peek_D3D_Texture());
+	DX8Wrapper::Set_Texture(stage, W3DShaderManager::getShaderTexture(stage));
 
 	m_stageOfSet=stage;
 	return TRUE;
@@ -3820,7 +3949,7 @@ Int CloudTextureShader::set(Int stage)
 void CloudTextureShader::reset()
 {
 	//Free reference to texture
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(m_stageOfSet, nullptr);
+	DX8Wrapper::Set_DX8_Texture(m_stageOfSet, nullptr);
 	//Turn off texture projection
 	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|m_stageOfSet);
@@ -4020,7 +4149,7 @@ Int RoadShaderPixelShader::set(Int pass)
 		Matrix4x4 identM(true);
 		DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE3, identM);
 	}
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBaseNoise2PixelShader);
+	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBaseNoise2PixelShader));
 
 	DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 	DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -4044,7 +4173,7 @@ Int RoadShaderPixelShader::set(Int pass)
 void RoadShaderPixelShader::reset()
 {
 
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);	//turn off pixel shader
+	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
@@ -5908,6 +6037,10 @@ void W3DShaderManager::releaseRenderToTextureSurfaces()
 	SAFE_RELEASE(m_oldDepthSurface);
 	SAFE_RELEASE(m_rttColorSurface);
 	SAFE_RELEASE(m_rttDepthSurface);
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: the recorder target died with the surfaces. The
+	// publish flag is deliberately kept: if the fuse pulls the pair out mid-redirect, the next
+	// endRenderToTexture still has to hand the recorder back to the scene rather than stranding it.
+	m_vkRttReady = false;
 }
 
 enum RttModes
@@ -5954,7 +6087,7 @@ void W3DShaderManager::init()
 {
 	int i,j;
 
-	D3DSURFACE_DESC desc;
+	D3DSURFACE_DESC desc = {};
 	// For now, check & see if we are gf3 or higher on the food chain.
 
 	ChipsetType res=DC_UNKNOWN;
@@ -5967,73 +6100,115 @@ void W3DShaderManager::init()
 		LPDIRECT3DDEVICE9 device=DX8Wrapper::_Get_D3D_Device8();
 		HRESULT hr=device->GetRenderTarget(0,&m_oldRenderSurface);
 
-		if (hr != S_OK || !m_oldRenderSurface)
-			return;
-
-		m_oldRenderSurface->GetDesc(&desc);
-
-		hr = device->GetDepthStencilSurface(&m_oldDepthSurface);
-		if (hr != S_OK || !m_oldDepthSurface)
+		// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: a failed render-target probe must not skip the
+		// shader and filter registration at the end of this function. The two early returns this
+		// replaces were dead code on a real D3D9 device - GetRenderTarget(0) cannot fail right after
+		// the device was created - but the Vulkan stub device answers with a null surface, the first
+		// return fired, every W3DShadersPassCount entry stayed 0, and the terrain, shroud, road and
+		// cloud passes (getShaderPasses()==0 draws nothing) vanished with it: the "all terrain gone"
+		// report. RTT unavailability is already a reported mode and the post filters stay off without
+		// it; the custom shaders do not depend on the offscreen pair and must still be built.
+		Bool rttProbeOk = (hr == S_OK && m_oldRenderSurface != nullptr);
+		D3DSURFACE_DESC depthDesc = {};
+		if (rttProbeOk)
 		{
-			releaseRenderToTextureSurfaces();
-			Report_Render_To_Texture_Mode(RTT_MODE_UNAVAILABLE, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
-			return;
+			m_oldRenderSurface->GetDesc(&desc);
+
+			hr = device->GetDepthStencilSurface(&m_oldDepthSurface);
+			if (hr == S_OK && m_oldDepthSurface)
+				m_oldDepthSurface->GetDesc(&depthDesc);
+			else
+			{
+				releaseRenderToTextureSurfaces();
+				rttProbeOk = FALSE;
+			}
 		}
 
-		D3DSURFACE_DESC depthDesc;
-		m_oldDepthSurface->GetDesc(&depthDesc);
-
-		// GeneralsX @bugfix PS3.0 batch6 12/10/2026 -------------------------------------------------------
-		// Redirecting the scene into a single-sample texture while the device keeps binding the back
-		// buffer's multisampled depth buffer is the DX8 API violation that made the code below force a
-		// creation failure as soon as the back buffer was multisampled. The cost of that shortcut was
-		// silent: canRenderToTexture() went false for every player with antialiasing enabled and took the
-		// whole filter family with it - default, bloom, monochrome, motion blur and cross-fade. The legal
-		// shape is a color/depth pair that always shares one sample count, so the offscreen target now
-		// brings its own depth buffer instead of borrowing the back buffer's.
-		hr=device->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&m_renderTexture,nullptr);
-		if (hr == S_OK)
-			hr = m_renderTexture->GetSurfaceLevel(0, &m_newRenderSurface);
-
-		Int mode=RTT_MODE_UNAVAILABLE;
-		if (hr == S_OK)
+		if (rttProbeOk)
 		{
-			if (desc.MultiSampleType != D3DMULTISAMPLE_NONE)
+			// GeneralsX @feature Qoder 18/10/2026 step 9.H: decide once whether this init can hand the
+			// offscreen pair to the recorder. The multisampled route below is a bare surface with no texture
+			// container, so it can be neither followed nor sampled by Vulkan; whenever the draw path is up
+			// the single-sample texture pair is the only shape that can serve both roles.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			const Bool preferVkMirror = VKDraw_Ready();
+#else
+			const Bool preferVkMirror = FALSE;
+#endif
+
+			// GeneralsX @bugfix PS3.0 batch6 12/10/2026 -------------------------------------------------------
+			// Redirecting the scene into a single-sample texture while the device keeps binding the back
+			// buffer's multisampled depth buffer is the DX8 API violation that made the code below force a
+			// creation failure as soon as the back buffer was multisampled. The cost of that shortcut was
+			// silent: canRenderToTexture() went false for every player with antialiasing enabled and took the
+			// whole filter family with it - default, bloom, monochrome, motion blur and cross-fade. The legal
+			// shape is a color/depth pair that always shares one sample count, so the offscreen target now
+			// brings its own depth buffer instead of borrowing the back buffer's.
+			hr=device->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&m_renderTexture,nullptr);
+			if (hr == S_OK)
+				hr = m_renderTexture->GetSurfaceLevel(0, &m_newRenderSurface);
+
+			Int mode=RTT_MODE_UNAVAILABLE;
+			if (hr == S_OK)
 			{
-				// Preferred route: keep the sample count of the scene render, then resolve it into the
-				// single-sample texture the filters sample. Antialiasing survives the post pass.
-				const DWORD qualities[2] = { desc.MultiSampleQuality, 0 };
-				for (Int attempt=0; attempt<2 && !m_rttColorSurface; ++attempt)
+				if (desc.MultiSampleType != D3DMULTISAMPLE_NONE && !preferVkMirror)
 				{
-					if (device->CreateRenderTarget(desc.Width,desc.Height,desc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttColorSurface,nullptr) != S_OK)
-						continue;
-					if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttDepthSurface,nullptr) == S_OK)
+					// Preferred route: keep the sample count of the scene render, then resolve it into the
+					// single-sample texture the filters sample. Antialiasing survives the post pass.
+					const DWORD qualities[2] = { desc.MultiSampleQuality, 0 };
+					for (Int attempt=0; attempt<2 && !m_rttColorSurface; ++attempt)
 					{
-						mode=RTT_MODE_MSAA_RESOLVE;
-						break;
+						if (device->CreateRenderTarget(desc.Width,desc.Height,desc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttColorSurface,nullptr) != S_OK)
+							continue;
+						if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,desc.MultiSampleType,qualities[attempt],FALSE,&m_rttDepthSurface,nullptr) == S_OK)
+						{
+							mode=RTT_MODE_MSAA_RESOLVE;
+							break;
+						}
+						SAFE_RELEASE(m_rttColorSurface);
 					}
-					SAFE_RELEASE(m_rttColorSurface);
+				}
+
+				if (mode == RTT_MODE_UNAVAILABLE)
+				{
+					// Either the back buffer needs no samples at all, or this device will not give us a
+					// multisampled offscreen target: bind the single-sample texture against a single-sample
+					// depth buffer of its own. The scene loses MSAA for as long as a filter is active, which
+					// is still better than the filter not existing.
+					if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,D3DMULTISAMPLE_NONE,0,FALSE,&m_rttDepthSurface,nullptr) == S_OK)
+					{
+						m_rttColorSurface=m_newRenderSurface;
+						m_rttColorSurface->AddRef();
+						mode = desc.MultiSampleType != D3DMULTISAMPLE_NONE ? RTT_MODE_OWN_DEPTH : RTT_MODE_PLAIN;
+					}
 				}
 			}
+
+			// GeneralsX @feature Qoder 18/10/2026 step 9.H: give the recorder mirrors for the pair the filters
+			// bind. The colour key is the texture the post passes sample, so one registration makes the target
+			// followable and the sampled source valid; the depth surface has no container and is registered by
+			// pointer, the same shape the sun shadow map uses. A refusal leaves every filter on the raw D3D9
+			// redirect, which is the pre-9.H behaviour.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			if (mode != RTT_MODE_UNAVAILABLE && preferVkMirror)
+			{
+				const WW3DZFormat zfmt = D3DFormat_To_WW3DZFormat((D3DFORMAT)depthDesc.Format);
+				m_vkRttReady = DX8Wrapper::VK_Register_Render_Target(m_renderTexture,
+					(unsigned)desc.Width, (unsigned)desc.Height, (int)desc.Format,
+					m_rttDepthSurface, (int)zfmt);
+				fprintf(stderr, "[RTT] vulkan mirror %s for %ux%u color=%p depth=%p zfmt=%d\n",
+					m_vkRttReady ? "registered" : "refused", (unsigned)desc.Width, (unsigned)desc.Height,
+					(void*)m_renderTexture, (void*)m_rttDepthSurface, (int)zfmt);
+				fflush(stderr);
+			}
+#endif
 
 			if (mode == RTT_MODE_UNAVAILABLE)
-			{
-				// Either the back buffer needs no samples at all, or this device will not give us a
-				// multisampled offscreen target: bind the single-sample texture against a single-sample
-				// depth buffer of its own. The scene loses MSAA for as long as a filter is active, which
-				// is still better than the filter not existing.
-				if (device->CreateDepthStencilSurface(desc.Width,desc.Height,depthDesc.Format,D3DMULTISAMPLE_NONE,0,FALSE,&m_rttDepthSurface,nullptr) == S_OK)
-				{
-					m_rttColorSurface=m_newRenderSurface;
-					m_rttColorSurface->AddRef();
-					mode = desc.MultiSampleType != D3DMULTISAMPLE_NONE ? RTT_MODE_OWN_DEPTH : RTT_MODE_PLAIN;
-				}
-			}
+				releaseRenderToTextureSurfaces();
+			Report_Render_To_Texture_Mode(mode, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
 		}
-
-		if (mode == RTT_MODE_UNAVAILABLE)
-			releaseRenderToTextureSurfaces();
-		Report_Render_To_Texture_Mode(mode, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
+		else
+			Report_Render_To_Texture_Mode(RTT_MODE_UNAVAILABLE, desc.Width, desc.Height, desc.MultiSampleType, desc.MultiSampleQuality);
 	}
 
 	W3DShaderInterface **shaders;
@@ -6144,9 +6319,16 @@ void W3DShaderManager::resetShader(ShaderTypes shader)
 Bool W3DShaderManager::filterPreRender(FilterTypes filter, Bool &skipRender, CustomScenePassModes &scenePassMode)
 {
 	if (W3DFilters[filter])
-	{	Bool result=W3DFilters[filter]->preRender(skipRender,scenePassMode);
-		if (result)
-			m_currentFilter = filter;
+	{
+		// GeneralsX @bugfix Qoder 18/10/2026 step 9.H: m_currentFilter has to name the filter *while*
+		// preRender runs. startRenderToTexture reads it for the soft-water alpha-only clear and, since
+		// 9.H, for the render-target publish decision; assigning it after the call left both looking at
+		// the previous filter. A filter that declines keeps the old value, as before.
+		const FilterTypes previous = m_currentFilter;
+		m_currentFilter = filter;
+		Bool result=W3DFilters[filter]->preRender(skipRender,scenePassMode);
+		if (!result)
+			m_currentFilter = previous;
 		return result;
 	}
 	return FALSE;
@@ -6159,7 +6341,18 @@ Bool W3DShaderManager::filterPreRender(FilterTypes filter, Bool &skipRender, Cus
 Bool W3DShaderManager::filterPostRender(FilterTypes filter, FilterModes mode, Coord2D &scrollDelta, Bool &doExtraRender)
 {
 	if (W3DFilters[filter])
+	{
+		// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9: m_vkRttPublished is the verdict
+		// startRenderToTexture reached for this pass. When it is false the scene never left the mirror
+		// and the family's offscreen textures have no Vulkan content, so the whole post chain has to
+		// stay on D3D9; letting any quad through overwrites the recorded 3D with an empty copy.
+		if (!m_vkRttPublished)
+		{
+			ScopedD3DOnlyPostPass vkD3DOnly;
+			return W3DFilters[filter]->postRender(mode, scrollDelta, doExtraRender);
+		}
 		return W3DFilters[filter]->postRender(mode, scrollDelta,doExtraRender);
+	}
 
 	m_currentFilter = FT_NULL_FILTER;
 	return FALSE;
@@ -6192,8 +6385,6 @@ void W3DShaderManager::SetBloomFilterEnabled(Bool enabled)
 /*Draws 2 triangles covering the viewport given the current render states*/
 void W3DShaderManager::drawViewport(Int color)
 {
-	LPDIRECT3DDEVICE9 pDev=DX8Wrapper::_Get_D3D_Device8();
-
 	struct _TRANS_LIT_TEX_VERTEX {
 		D3DXVECTOR4 p;
 		DWORD color;   // diffuse color
@@ -6226,9 +6417,12 @@ void W3DShaderManager::drawViewport(Int color)
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-	pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: the offscreen pair is published to the recorder before
+	// this quad arrives, so the alpha-only clear is a normal facade draw. The facade still falls back to
+	// D3D9 on refusal, which keeps the non-Vulkan runs and the filters that did not opt in unchanged.
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 }
 
 // GeneralsX @feature PS3.0 Weather W2 + W4 16/10/2026 ==================================================
@@ -6552,16 +6746,16 @@ void W3DShaderManager::drawWeatherScreen()
 
 	DWORD oldBlendEnable, oldSrcBlend, oldDstBlend, oldZEnable, oldZWrite, oldZFunc;
 	DWORD oldAlphaTest, oldCull, oldFog, oldLighting;
-	pDev->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldBlendEnable);
-	pDev->GetRenderState(D3DRS_SRCBLEND, &oldSrcBlend);
-	pDev->GetRenderState(D3DRS_DESTBLEND, &oldDstBlend);
-	pDev->GetRenderState(D3DRS_ZENABLE, &oldZEnable);
-	pDev->GetRenderState(D3DRS_ZWRITEENABLE, &oldZWrite);
-	pDev->GetRenderState(D3DRS_ZFUNC, &oldZFunc);
-	pDev->GetRenderState(D3DRS_ALPHATESTENABLE, &oldAlphaTest);
-	pDev->GetRenderState(D3DRS_CULLMODE, &oldCull);
-	pDev->GetRenderState(D3DRS_FOGENABLE, &oldFog);
-	pDev->GetRenderState(D3DRS_LIGHTING, &oldLighting);
+	oldBlendEnable = DX8Wrapper::VK_Read_RS(D3DRS_ALPHABLENDENABLE);
+	oldSrcBlend = DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND);
+	oldDstBlend = DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND);
+	oldZEnable = DX8Wrapper::VK_Read_RS(D3DRS_ZENABLE);
+	oldZWrite = DX8Wrapper::VK_Read_RS(D3DRS_ZWRITEENABLE);
+	oldZFunc = DX8Wrapper::VK_Read_RS(D3DRS_ZFUNC);
+	oldAlphaTest = DX8Wrapper::VK_Read_RS(D3DRS_ALPHATESTENABLE);
+	oldCull = DX8Wrapper::VK_Read_RS(D3DRS_CULLMODE);
+	oldFog = DX8Wrapper::VK_Read_RS(D3DRS_FOGENABLE);
+	oldLighting = DX8Wrapper::VK_Read_RS(D3DRS_LIGHTING);
 
 	// The fixed-function legs rewrite stage 0/1; the programmable legs ignore them, but saving and
 	// restoring is cheap and keeps the cache honest either way.
@@ -6611,13 +6805,13 @@ void W3DShaderManager::drawWeatherScreen()
 			float c0[4] = { mulR, mulG, mulB, vig };
 			float c1[4] = { aspect, 0.0f, 0.0f, 0.0f };
 			DX8Wrapper::Apply_Render_State_Changes();
-			pDev->SetVertexShader(nullptr);
-			pDev->SetPixelShader(s_cloudPS);
-			pDev->SetPixelShaderConstantF(0, c0, 1);
-			pDev->SetPixelShaderConstantF(1, c1, 1);
-			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-			pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
-			pDev->SetPixelShader(nullptr);
+			DX8Wrapper::Set_Vertex_Shader(0);
+			DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(s_cloudPS));
+			DX8Wrapper::Set_Pixel_Shader_Constant(0, c0, 1);
+			DX8Wrapper::Set_Pixel_Shader_Constant(1, c1, 1);
+			DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+			DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
+			DX8Wrapper::Set_Pixel_Shader(0);
 		}
 		else
 		{
@@ -6626,7 +6820,7 @@ void W3DShaderManager::drawWeatherScreen()
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 			DX8Wrapper::Apply_Render_State_Changes();
-			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 			WeatherScreenVertex row[2 * WEATHER_GRID_COLS];
 			for (Int r = 0; r + 1 < WEATHER_GRID_ROWS; ++r)
 			{
@@ -6646,7 +6840,7 @@ void W3DShaderManager::drawWeatherScreen()
 					row[i + 1].p = D3DXVECTOR4(x, yA, 0.0f, 1.0f);
 					row[i + 1].color = Weather_Pack_Color(mulR * fa, mulG * fa, mulB * fa);
 				}
-				pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
+				DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
 			}
 		}
 	}
@@ -6669,13 +6863,13 @@ void W3DShaderManager::drawWeatherScreen()
 			float c0[4] = { s_phase, density, flash, aspect };
 			float c1[4] = { veilR, veilG, veilB, 0.0f };
 			DX8Wrapper::Apply_Render_State_Changes();
-			pDev->SetVertexShader(nullptr);
-			pDev->SetPixelShader(s_veilPS);
-			pDev->SetPixelShaderConstantF(0, c0, 1);
-			pDev->SetPixelShaderConstantF(1, c1, 1);
-			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-			pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
-			pDev->SetPixelShader(nullptr);
+			DX8Wrapper::Set_Vertex_Shader(0);
+			DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(s_veilPS));
+			DX8Wrapper::Set_Pixel_Shader_Constant(0, c0, 1);
+			DX8Wrapper::Set_Pixel_Shader_Constant(1, c1, 1);
+			DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+			DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, vbQuad, sizeof(BloomQuadVertex));
+			DX8Wrapper::Set_Pixel_Shader(0);
 		}
 		else
 		{
@@ -6684,7 +6878,7 @@ void W3DShaderManager::drawWeatherScreen()
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 			DX8Wrapper::Apply_Render_State_Changes();
-			pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+			DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 			WeatherScreenVertex row[2 * WEATHER_GRID_COLS];
 			for (Int r = 0; r + 1 < WEATHER_GRID_ROWS; ++r)
 			{
@@ -6705,7 +6899,7 @@ void W3DShaderManager::drawWeatherScreen()
 					row[i + 1].p = D3DXVECTOR4(x, yA, 0.0f, 1.0f);
 					row[i + 1].color = Weather_Pack_Veil(wa, wa + flash, flash, veilR, veilG, veilB);
 				}
-				pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
+				DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2 * (WEATHER_GRID_COLS - 1), row, sizeof(WeatherScreenVertex));
 			}
 		}
 	}
@@ -6727,7 +6921,7 @@ void W3DShaderManager::drawWeatherScreen()
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, oldStage1[0]);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_ALPHAOP, oldStage1[1]);
 	if (usedShader)
-		pDev->SetVertexShader(nullptr);	//D18 contract: nothing raw-bound may outlive this call
+		DX8Wrapper::Set_Vertex_Shader(0);	//D18 contract: nothing raw-bound may outlive this call
 	DX8Wrapper::Apply_Render_State_Changes();
 
 	// One line per leg on the first draw of a type, so a capture can tell "weather is off" apart from
@@ -6779,6 +6973,34 @@ void W3DShaderManager::startRenderToTexture()
 	}
 	if (m_rttBindFailures != 0)
 		m_rttBindFailures = 0;
+
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: point the recorder at the offscreen pair before the
+	// depth clear and the soft-water alpha quad below, so both land in the target the scene is about to
+	// use. Only a family whose entire pass is facade-consumable opts in; bloom and the HLSL B&W filter
+	// keep the recorder on the scene mirror, because their runtime-compiled post shaders would be refused
+	// after the scene had already left that mirror.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (m_vkRttReady && VKDraw_Ready() && W3DFilters[m_currentFilter] &&
+			W3DFilters[m_currentFilter]->canVulkanRtt())
+	{
+		const Bool owned = DX8Wrapper::VK_Publish_Render_Target(m_rttColorSurface, m_rttDepthSurface);
+		m_vkRttPublished = true;
+		// GeneralsX @feature Qoder 18/10/2026 step 9.H: one line per filter family, so a run that
+		// actually reaches this pass proves the recorder followed the redirect instead of only proving
+		// the mirror was registered at init time.
+		{
+			static unsigned reportedFilters = 0;
+			const unsigned bit = 1u << (unsigned)m_currentFilter;
+			if (m_currentFilter > FT_NULL_FILTER && m_currentFilter < FT_MAX && !(reportedFilters & bit))
+			{
+				reportedFilters |= bit;
+				fprintf(stderr, "[RTT] recorder target published filter=%d owned=%d color=%p depth=%p\n",
+					(int)m_currentFilter, (int)owned, (void*)m_rttColorSurface, (void*)m_rttDepthSurface);
+				fflush(stderr);
+			}
+		}
+	}
+#endif
 
 	// GeneralsX @bugfix PS3.0 batch6 13/10/2026 The offscreen depth buffer has to be cleared here. The per-frame
 	// clear (WW3D::Begin_Render) ran against the back buffer before the switch, and the depth that comes with it
@@ -6840,6 +7062,17 @@ IDirect3DTexture9 *W3DShaderManager::endRenderToTexture()
 	DEBUG_ASSERTCRASH(hr==S_OK, ("Set target failed unexpectedly."));
 	if (hr == S_OK)
 	{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 step 9.H: the scene target is current again, so hand the
+		// recorder back before the filter's quad arrives. That quad is what copies the offscreen image
+		// into the mirror the present chain reads, which is why the family had to opt in before the switch.
+		if (m_vkRttPublished)
+		{
+			DX8Wrapper::VK_Publish_Scene_Target();
+			m_vkRttPublished = false;
+		}
+#endif
+
 		// GeneralsX @bugfix Storm996 12/10/2026 A multisampled surface is not sampler-readable, so the scene
 		// we just drew into m_rttColorSurface has to be resolved into the texture below. This runs after the
 		// back buffer is current again because a surface bound as render target cannot be a StretchRect source.
@@ -7184,6 +7417,22 @@ HRESULT W3DShaderManager::LoadAndCreateD3DShader(const char* strFilePath, const 
 	if (getChipset() < DC_GENERIC_PIXEL_SHADER_1_1)
 		return E_FAIL;	//don't allow loading any shaders if hardware can't handle it.
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: a shipped .pso/.vso bytecode asset has no executable
+	// representation under no-d3d9. The Vulkan program registry matches translated twins by HLSL
+	// source; pre-compiled DX8 bytecode names no source, so a live handle here would be untagged and
+	// the draw path would refuse every batch that binds it - the ground-vanishing pattern again.
+	// Failing the load drives each caller's existing "asset not found" branch, which keeps the
+	// fixed-function leg (or the HLSL twin, when the family has one) exactly like a bare ZH install.
+	if (VK_NOD3D_Enabled())
+	{
+		fprintf(stderr, "[SHADER] bytecode asset skipped under no-d3d9: '%s'\n",
+			strFilePath ? strFilePath : "(null)");
+		fflush(stderr);
+		return E_FAIL;
+	}
+#endif
+
 	try
 	{
 		File *file = nullptr;
@@ -7196,7 +7445,15 @@ HRESULT W3DShaderManager::LoadAndCreateD3DShader(const char* strFilePath, const 
 
 		// GeneralsX @bugfix BenderAI 18/02/2026 Normalize path for cross-platform compatibility (fighter19 pattern)
 		// On Linux, backslashes must be converted to forward slashes for VFS path lookup
-		AsciiString normalizedPath = FileSystem::normalizePath(AsciiString(strFilePath));
+		// GeneralsX @bugfix Qoder 18/10/2026 The VFS key must stay RELATIVE. On Windows
+		// LocalFileSystem::normalizePath is GetFullPathNameA, so the lookup became
+		// "D:\...\shaders\terrain.pso" and ArchiveFileSystem could never match it - every
+		// .pso/.vso asset in every BIG was reported missing. POSIX normalizePath already keeps
+		// the path relative and only normalizes separators, so the Windows leg now skips it.
+		AsciiString normalizedPath = AsciiString(strFilePath);
+#ifndef _WIN32
+		normalizedPath = FileSystem::normalizePath(AsciiString(strFilePath));
+#endif
 		if (normalizedPath.isEmpty())
 		{
 			// Normalization failed - path might be invalid
@@ -7256,6 +7513,13 @@ HRESULT W3DShaderManager::LoadAndCreateD3DShader(const char* strFilePath, const 
 		{
 			hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader(pShader, reinterpret_cast<IDirect3DPixelShader9**>(pHandle));
 		}
+
+		// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: a device that answers S_OK with a null handle did
+		// not create the shader. compileShaderAtBestProfile grew the same guard on 18/10 for the same
+		// reason - without it the no-d3d9 runs "succeeded" into handles that set() then bound as
+		// nothing, and the whole ground vanished behind a successful load log.
+		if (SUCCEEDED(hr) && pHandle != nullptr && *pHandle == nullptr)
+			hr = D3DERR_INVALIDCALL;
 
 		// GeneralsX @bugfix BenderAI 13/02/2026 Use delete[] instead of HeapFree (fighter19 pattern)
 		delete[] pShader;
@@ -7496,8 +7760,8 @@ void FlatTerrainShader2Stage::reset()
 	ShaderClass::Invalidate();
 
 	//Free references to textures
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Texture(1, nullptr);
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
@@ -7532,7 +7796,7 @@ Int FlatTerrainShader2Stage::set(Int pass)
 			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
 			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
 			if (W3DShaderManager::getShaderTexture(0)) {
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(0));
 				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
 				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_CURRENT );
 				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
@@ -7632,7 +7896,7 @@ Int FlatTerrainShader2Stage::set(Int pass)
 				//clouds always need bilinear filtering
 				DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 				DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(2));
 
 				//setup noise pass
 
@@ -7652,7 +7916,7 @@ Int FlatTerrainShader2Stage::set(Int pass)
 
 				DX8Wrapper::Set_DX8_Sampler_State( 1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
 				DX8Wrapper::Set_DX8_Sampler_State( 1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-				DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				DX8Wrapper::Set_Texture(1, W3DShaderManager::getShaderTexture(3));
 			}
 			else
 			{
@@ -7661,7 +7925,7 @@ Int FlatTerrainShader2Stage::set(Int pass)
 				if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE1)
 				{
 					//setup cloud pass
-					DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+					DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(2));
 					terrainShader2Stage.updateNoise1((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 					DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 					DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -7669,7 +7933,7 @@ Int FlatTerrainShader2Stage::set(Int pass)
 				else
 				{
 					//setup noise pass
-					DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+					DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(3));
 					terrainShader2Stage.updateNoise2((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 					DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 					DX8Wrapper::Set_DX8_Sampler_State(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -7772,6 +8036,16 @@ Int FlatTerrainShaderPixelShader::init()
 
 Int FlatTerrainShaderPixelShader::set(Int pass)
 {
+	// GeneralsX @feature Qoder 18/10/2026 read-only terrain path census: flat/untextured leg.
+	{
+		static unsigned sFlatTerrainPathSets = 0u;
+		if ((sFlatTerrainPathSets++ & 4095u) == 0u)
+		{
+			fprintf(stderr, "[TERRAIN] path=flat pass=%d\n", pass);
+			fflush(stderr);
+		}
+	}
+
 	//setup base pass
 	Int curStage = 1;
 	// setup terrain [3/31/2003]
@@ -7847,7 +8121,7 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 		DX8Wrapper::Set_DX8_Sampler_State( curStage, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 		DX8Wrapper::Set_DX8_Sampler_State( curStage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 		DX8Wrapper::Set_DX8_Sampler_State( curStage, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(curStage, shroud->getShroudTexture()->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(curStage, shroud->getShroudTexture());
 		curStage++;
 		if (curStage==1) curStage++;
 	}
@@ -7868,7 +8142,7 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 
 		DX8Wrapper::Set_DX8_Sampler_State(curStage,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
 		DX8Wrapper::Set_DX8_Sampler_State(curStage,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(curStage, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(curStage, W3DShaderManager::getShaderTexture(2));
 		terrainShader2Stage.updateNoise1((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+curStage), curView);
 		DX8Wrapper::Set_DX8_Sampler_State(curStage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -7895,7 +8169,7 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 
 		DX8Wrapper::Set_DX8_Sampler_State(curStage,  D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
 		DX8Wrapper::Set_DX8_Sampler_State(curStage,  D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
-		DX8Wrapper::_Get_D3D_Device8()->SetTexture(curStage, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+		DX8Wrapper::Set_Texture(curStage, W3DShaderManager::getShaderTexture(3));
 		terrainShader2Stage.updateNoise2((D3DXMATRIX*)&curView,&inv);	//update curView with texture matrix
 		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+curStage), curView);
 		DX8Wrapper::Set_DX8_Sampler_State(curStage, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -7905,29 +8179,30 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 		if (curStage==1) curStage++;
 	}
 	if (curStage<2) {
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBase0PixelShader);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBase0PixelShader));
 	}	else if (curStage==2) {
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBasePixelShader);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBasePixelShader));
 	}	else if (curStage==3) {
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBaseNoise1PixelShader);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBaseNoise1PixelShader));
 	}else if (curStage==4) {
-		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_dwBaseNoise2PixelShader);
+		DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_dwBaseNoise2PixelShader));
 	}
-	DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ALPHABLENDENABLE, false);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, false);
 	DX8Wrapper::Apply_Render_State_Changes();
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(curStage, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+	// GeneralsX @bugfix Qoder 18/10/2026 Facade bind: the Vulkan draw layer only sees Textures[].
+	DX8Wrapper::Set_Texture(curStage, W3DShaderManager::getShaderTexture(3));
 	return TRUE;
 }
 
 void FlatTerrainShaderPixelShader::reset()
 {
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(2,nullptr);	//release reference to any texture
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(3,nullptr);	//release reference to any texture
+	DX8Wrapper::Set_DX8_Texture(2,nullptr);	//release reference to any texture
+	DX8Wrapper::Set_DX8_Texture(3,nullptr);	//release reference to any texture
 
-	DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(nullptr);	//turn off pixel shader
+	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
 
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(0, nullptr);
-	DX8Wrapper::_Get_D3D_Device8()->SetTexture(1, nullptr);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Texture(1, nullptr);
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);

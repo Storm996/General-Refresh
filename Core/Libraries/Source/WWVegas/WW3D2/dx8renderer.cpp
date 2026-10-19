@@ -50,6 +50,7 @@
 #include "dx8normalmap.h"   // GeneralsX @feature T3-0 M4 (段E): dot3 网格着色器挂载 hook
 #include "lightenvironment.h" // GeneralsX @feature PS3.0 L2: GN gate inspects the mesh light env
 #include <cstdio>           // GeneralsX @debug T3-0 mount diagnostics (fprintf)
+#include <cstdlib>          // GeneralsX @feature Qoder 18/10/2026 P3 diagnostics (getenv)
 #include "dx8rendererdebugger.h"
 #include "WWDebug/wwdebug.h"
 #include "WWDebug/wwprofile.h"
@@ -63,6 +64,69 @@
 #include "camera.h"
 #include "stripoptimizer.h"
 #include "meshgeometry.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+// GeneralsX @feature Qoder 19/10/2026 L12 probe V14A (task R-05): splits DX8MeshRendererClass::Flush into
+// its five submit regions to locate the ~1.47 ms CPU cost (the opaque-mesh segment of RTS3DScene::Flush).
+// Gated by GENERALSX_VKFPS_PHASES=1, appends [V14A] lines to vkfps_phase14.log every 300 flushes.
+namespace vkf14a {
+enum { SEG_STAT = 0, SEG_RIGID, SEG_SKIN, SEG_DECAL, SEG_DELAYED, SEG_NULLS, SEG_COUNT };
+struct Acc { long double us; int cnt; };
+static Acc g_seg[SEG_COUNT];
+static int g_ticks = 0;
+static int g_depth = 0;      // re-entrancy: DX8MeshRenderer::Flush nested inside another Flush pass
+static int g_nested = 0;     // count of depth>1 entries per window
+static int g_maxdepth = 0;
+static const char* g_names[SEG_COUNT] = { "stat", "rigid", "skin", "decal", "delayed", "nulls" };
+static inline long double now_us() {
+    return (long double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0L;
+}
+static inline bool on() { static int v = -1; if (v < 0) { const char* e = getenv("GENERALSX_VKFPS_PHASES"); v = (e && e[0] == '1') ? 1 : 0; } return v == 1; }
+struct Scope { int id; long double t0; bool act; Scope(bool on, int i) : id(i), t0(on ? now_us() : 0.0L), act(on) {} ~Scope() { if (act) { g_seg[id].us += now_us() - t0; g_seg[id].cnt++; } } };
+static void dump() {
+    FILE* f = fopen("vkfps_phase14.log", "at");
+    if (!f) return;
+    fprintf(f, "[V14A] win=%d nested=%d maxdepth=%d", g_ticks, g_nested, g_maxdepth);
+    g_nested = 0; g_maxdepth = 0;
+    for (int i = 0; i < SEG_COUNT; i++) if (g_seg[i].cnt) fprintf(f, " %s=%.1fus/n=%.2f", g_names[i], (double)(g_seg[i].us / g_ticks), (double)((long double)g_seg[i].cnt / (long double)g_ticks));
+    fprintf(f, "\n"); fflush(f); fclose(f);
+    for (int i = 0; i < SEG_COUNT; i++) { g_seg[i].us = 0; g_seg[i].cnt = 0; }
+    g_ticks = 0;
+}
+} // namespace vkf14a
+
+// GeneralsX @feature Qoder 19/10/2026 L13 probe V15 (task R-05): splits DX8TextureCategoryClass::Render
+// (the workhorse inside the 1.45 ms rigid/skin segments) into setup / per-prt-other / gate / draw / tail.
+// Gated by GENERALSX_VKFPS_PHASES=1, appends [V15] lines to vkfps_phase14.log every 3000 categories.
+namespace vkf15 {
+enum { SEG_SETUP = 0, SEG_OTHER, SEG_GATE, SEG_DRAW, SEG_TAIL, SEG_COUNT };
+struct Acc { long double us; };
+static Acc g_seg[SEG_COUNT];
+static long g_calls = 0;
+static long g_prts = 0;
+static const char* g_names[SEG_COUNT] = { "setup", "other", "gate", "draw", "tail" };
+static inline long double now_us() {
+    return (long double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0L;
+}
+static inline bool on() { static int v = -1; if (v < 0) { const char* e = getenv("GENERALSX_VKFPS_PHASES"); v = (e && e[0] == '1') ? 1 : 0; } return v == 1; }
+struct Scope { int id; long double t0; bool act; Scope(bool on, int i) : id(i), t0(on ? now_us() : 0.0L), act(on) {} ~Scope() { if (act) g_seg[id].us += now_us() - t0; } };
+static inline void add(int id, long double d) { g_seg[id].us += d; }
+static void dump() {
+    FILE* f = fopen("vkfps_phase14.log", "at");
+    if (!f) return;
+    fprintf(f, "[V15] calls=%ld prts/call=%.2f", g_calls, (double)((long double)g_prts / (long double)g_calls));
+    for (int i = 0; i < SEG_COUNT; i++) fprintf(f, " %s=%.1fus", g_names[i], (double)(g_seg[i].us / g_calls));
+    fprintf(f, "\n"); fflush(f); fclose(f);
+    for (int i = 0; i < SEG_COUNT; i++) g_seg[i].us = 0;
+    g_calls = 0; g_prts = 0;
+}
+} // namespace vkf15
+
 
 /*
 ** Global Instance of the DX8MeshRender
@@ -1837,6 +1901,9 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 void DX8TextureCategoryClass::Render()
 {
+	const bool vk15 = vkf15::on();
+	const long double vk15T = vk15 ? vkf15::now_us() : 0.0L;
+	if (vk15) { vkf15::g_calls++; if (vkf15::g_calls >= 3000) vkf15::dump(); }
 	#ifdef WWDEBUG
 	if (!WW3D::Expose_Prelit()) {
 	#endif
@@ -1899,6 +1966,7 @@ void DX8TextureCategoryClass::Render()
 	** pipeline unmounts BEFORE it draws; and the category always leaves clean state, exactly like
 	** the old per-prt Restore did. Draw order and every gate condition are unchanged.
 	*/
+	if (vk15) vkf15::add(vkf15::SEG_SETUP, vkf15::now_us() - vk15T);
 	int mountedKind = 0;	// 0 = fixed pipeline, 1 = DX8NormalMap (dot3/PBR), 2 = DX8GeomNormal
 	// GeneralsX @feature Qoder 17/10/2026 P2: the FVF a mounted GN pass has to restore to. For rigid
 	// containers this is the nominal container FVF (what it always was); for skin batches it is the
@@ -1909,6 +1977,8 @@ void DX8TextureCategoryClass::Render()
 	static unsigned s_stickyPrts = 0, s_stickyInstalls = 0, s_stickyUnmounts = 0;
 
 	while (prt) {
+		const long double vk15Ta = vk15 ? vkf15::now_us() : 0.0L;
+		if (vk15) vkf15::g_prts++;
 
 		/*
 		** Dig out the parameters for this render task
@@ -1982,6 +2052,8 @@ void DX8TextureCategoryClass::Render()
 		** If the user is not installing LightEnvironmentClasses, we leave the lighting render
 		** states untouched.  This way they can set a couple global lights that affect the entire scene.
 		*/
+		long double vk15Tb = 0.0L;
+		if (vk15) { vkf15::add(vkf15::SEG_OTHER, vkf15::now_us() - vk15Ta); vk15Tb = vkf15::now_us(); }
 		LightEnvironmentClass * lenv = mesh->Get_Lighting_Environment();
 		if (lenv != nullptr) {
 			SNAPSHOT_SAY(("LightEnvironment, lights: %d",lenv->Get_Light_Count()));
@@ -2129,6 +2201,15 @@ void DX8TextureCategoryClass::Render()
 				if (lenv->isPointLight(li)) { gnLenvSafe = false; break; }
 			}
 		}
+		// GeneralsX @feature Qoder 18/10/2026 P3 diagnostics: the only replay available carries two point
+		// lights, so the GN pair never mounts in it and the submit-side probe stays silent. This default-off
+		// env knob lets the translated pair run on that scene for data collection only. Point lights are
+		// outside the GN contract, so the resulting image is NOT a correctness reference and the knob must
+		// never be treated as a fix or shipped on.
+		{
+			static const bool s_gnDiagIgnorePoints = (getenv("GENERALSX_GN_DIAG_IGNORE_POINTS") != nullptr);
+			if (s_gnDiagIgnorePoints) gnLenvSafe = true;
+		}
 		// GeneralsX @feature Qoder 17/10/2026 P2 (光影T0阶段): the EFFECTIVE vertex layout for the GN
 		// mount. The skin container's nominal FVF (DX8_FVF_XYZNUV1) is only a label - the CPU skinning
 		// pass writes the dynamic layout (dynamic_fvf_type == DX8_FVF_XYZNDUV2 with a real COLOR0
@@ -2154,6 +2235,38 @@ void DX8TextureCategoryClass::Render()
 					? (unsigned)DX8_FVF_XYZNDUV1TG3 : (unsigned)DX8_FVF_XYZNDUV2;
 		} else {
 			gnVBLayout = Get_Container()->Get_FVF();
+		}
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: GNPROBE samples every
+		// candidate before nmApplied/Ready are known; this second probe samples the batches where GN is
+		// actually ready and prints the remaining gate inputs, so a mount that never happens can be
+		// attributed to one clause. Point-light count is explicit because gnLenvSafe is the only gate
+		// input GNPROBE does not show.
+		if (!nmApplied && DX8GeomNormal::Ready_To_Render()) {
+			static unsigned s_gnProbe2 = 0;
+			if (s_gnProbe2 < 24u) {
+				++s_gnProbe2;
+				unsigned pointLights = 0u;
+				if (lenv) {
+					for (int li = 0; li < lenv->Get_Light_Count(); ++li)
+						if (lenv->isPointLight(li)) ++pointLights;
+				}
+				const bool layoutOk = (gnVBLayout == (unsigned)DX8_FVF_XYZNUV1
+					|| gnVBLayout == (unsigned)DX8_FVF_XYZNUV2
+					|| gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2
+					|| gnVBLayout == (unsigned)DX8_FVF_XYZNDUV1TG3);
+				const bool gate = gnLenvSafe && layoutOk
+					&& mesh->Peek_Model()->Get_Pass_Count() == 1
+					&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
+					&& mesh->Get_Alpha_Override() == 1.0f
+					&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
+					&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
+					&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO;
+				fprintf(stderr, "[GNPROBE2] #%u layout=0x%08X layoutOk=%d lenvSafe=%d lc=%d pts=%u nmap=%d gate=%d\n",
+					s_gnProbe2, gnVBLayout, layoutOk ? 1 : 0, gnLenvSafe ? 1 : 0,
+					lenv ? lenv->Get_Light_Count() : 0, pointLights,
+					Get_Container()->Is_Normal_Map_Batch() ? 1 : 0, gate ? 1 : 0);
+				fflush(stderr);
+			}
 		}
 		if (!nmApplied && gnLenvSafe && DX8GeomNormal::Ready_To_Render()
 			&& (gnVBLayout == (unsigned)DX8_FVF_XYZNUV1 || gnVBLayout == (unsigned)DX8_FVF_XYZNUV2
@@ -2243,6 +2356,8 @@ void DX8TextureCategoryClass::Render()
 
 
 //--------------------------------------------------------------------
+		long double vk15Tc = 0.0L;
+		if (vk15) { vkf15::add(vkf15::SEG_GATE, vkf15::now_us() - vk15Tb); vk15Tc = vkf15::now_us(); }
 		if (mesh->Get_ObjectScale() != 1.0f)
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_NORMALIZENORMALS, TRUE);
 //--------------------------------------------------------------------
@@ -2321,6 +2436,7 @@ void DX8TextureCategoryClass::Render()
 
         }
 
+		if (vk15) vkf15::add(vkf15::SEG_DRAW, vkf15::now_us() - vk15Tc);
 		/*
 		** GeneralsX @performance PS3.0 #71: the old per-prt Restore pair (T3-0 M4 段E / L2) is gone -
 		** that teardown/rewire round-trip between same-kind tasks was the switching cost. The sticky
@@ -2343,6 +2459,7 @@ void DX8TextureCategoryClass::Render()
 		delete prt;
 		prt = next_prt;
 	}
+	const long double vk15Td = vk15 ? vkf15::now_us() : 0.0L;
 
 	if (mountedKind == 1) {
 		DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
@@ -2356,6 +2473,7 @@ void DX8TextureCategoryClass::Render()
 		WWASSERT(!render_task_head);
 		Clear_Render_List();
 	}
+	if (vk15) vkf15::add(vkf15::SEG_TAIL, vkf15::now_us() - vk15Td);
 }
 
 void DX8TextureCategoryClass::Clear_Render_List()
@@ -2536,6 +2654,8 @@ void DX8MeshRendererClass::Register_Mesh_Type(MeshModelClass* mmc)
 	}
 }
 
+
+
 static unsigned statistics_requested=0;
 
 void DX8MeshRendererClass::Request_Log_Statistics()
@@ -2574,7 +2694,16 @@ void DX8MeshRendererClass::Flush()
 
 	WWPROFILE("DX8MeshRenderer::Flush");
 	if (!camera) return;
-	Log_Statistics_String(true);
+	const bool vk14 = vkf14a::on();
+	if (vk14) {
+		vkf14a::g_ticks++;
+		vkf14a::g_depth++;
+		if (vkf14a::g_depth > 1) vkf14a::g_nested++;
+		if (vkf14a::g_depth > vkf14a::g_maxdepth) vkf14a::g_maxdepth = vkf14a::g_depth;
+		if (vkf14a::g_ticks >= 300) vkf14a::dump();
+	}
+	struct VK14AClose { ~VK14AClose() { if (vkf14a::g_depth > 0) vkf14a::g_depth--; } } vk14close;
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_STAT); Log_Statistics_String(true); }
 
 	/*
 	** Render the FVF categories.  Note that it is critical that skins be
@@ -2585,24 +2714,29 @@ void DX8MeshRendererClass::Flush()
 	** bulk of the meshes have already been drawn (there would be extra overhead involved
 	** in solving this for skins)
 	*/
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_RIGID);
 	for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
 		Render_FVF_Category_Container_List(*texture_category_container_lists_rigid[i]);
-	}
+	} }
 
-	Render_FVF_Category_Container_List(*texture_category_container_list_skin);
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_SKIN);
+	Render_FVF_Category_Container_List(*texture_category_container_list_skin); }
 
-	Render_Decal_Meshes();
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_DECAL);
+	Render_Decal_Meshes(); }
 
 	/*
 	** Render the translucent procedural material passes that were applied to meshes that
 	** had their base passes disabled.
 	*/
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_DELAYED);
 	for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
 		Render_FVF_Category_Container_List_Delayed_Passes(*texture_category_container_lists_rigid[i]);
-	}
+	} }
 
+	{ vkf14a::Scope s(vk14, vkf14a::SEG_NULLS);
 	DX8Wrapper::Set_Vertex_Buffer(nullptr);
-	DX8Wrapper::Set_Index_Buffer(nullptr,0);
+	DX8Wrapper::Set_Index_Buffer(nullptr,0); }
 }
 
 

@@ -47,6 +47,7 @@
 //-----------------------------------------------------------------------------
 
 #include <stdlib.h>
+#include <stdio.h>	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 redvert probe
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
 #include <WWMath/tri.h>
@@ -646,6 +647,19 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, const Vector3*li
 	shadeR*=255.0f;
 	shadeG*=255.0f;
 	shadeB*=255.0f;
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: budgeted probe for reddish terrain vertex tints
+	// (R well above G and B). The maroon stepped patches ask whether the CPU lighting itself turns red
+	// (lamps/dynamic lights) or the Vulkan consumer misreads a grey value - this settles it per vertex.
+	{
+		static int s_redVertN = 0;
+		const Int pr = REAL_TO_INT(shadeR), pg = REAL_TO_INT(shadeG), pb = REAL_TO_INT(shadeB);
+		if (pr > pg + 40 && pr > pb + 40 && s_redVertN < 12) {
+			++s_redVertN;
+			fprintf(stderr, "[TERRAIN] redvert #%d at (%.0f,%.0f,%.0f) shade=(%d,%d,%d) alpha=%d\n",
+				s_redVertN, vb->x, vb->y, vb->z, pr, pg, pb, (Int)alpha);
+			fflush(stderr);
+		}
+	}
 	vb->diffuse = REAL_TO_INT(shadeB) | (REAL_TO_INT(shadeG) << 8) | (REAL_TO_INT(shadeR) << 16) | ((Int)alpha << 24);
 #endif
 }

@@ -233,6 +233,13 @@ static bool sunShadowMapEnabled()
 // so while GN reception is mounted the overlay is parked and the map is pushed to DX8GeomNormal instead:
 // buildings and units (the rigid XYZNUV1/2 batches the GN pass already lights per-pixel) now receive each
 // other's sun shadows, with the light-0-only attenuation the S-line spec asks for.
+// "black grid" overlay conclusion was measured on the raw D3D9 runtime.  GeneralsX @bugfix Qoder
+// 19/10/2026 wedge 11 follow-up: under the pure-Vulkan recorder the overlay IS the working receiver -
+// every shadow frame the user accepted (shots_def 13:43, shots 17:51) was drawn by recv#N vk=1, while
+// the GN sun-shadow variants never sample the mirrored map there: with GN armed the overlay parks and
+// the screen shows zero shadow at all.  So GN reception is refused while the recorder owns drawing
+// (GENERALSX_VKDRAW=1, set by every pure-Vulkan launcher and by nothing else); the D3D9/DXVK path
+// keeps the P3-21b behaviour unchanged.
 static bool sunShadowGNReception()
 {
 	static int s_gn = -1;
@@ -240,6 +247,9 @@ static bool sunShadowGNReception()
 	{
 		const char* e = getenv("GENERALSX_SMAP_GNRECV");
 		s_gn = (e != nullptr && strcmp(e, "0") == 0) ? 0 : 1;
+		const char* v = getenv("GENERALSX_VKDRAW");
+		if (v != nullptr && v[0] == '1')
+			s_gn = 0;
 	}
 	return s_gn != 0;
 }
@@ -458,6 +468,19 @@ static bool ensureResources(IDirect3DDevice9* dev)
 			fprintf(stderr, "[SMAP] PROBLEM map wrapper allocation failed, GN reception off\n");
 	}
 
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the map and its depth surface were
+	// created behind the facade's back, so the recorder has no mirror for either. Register both keys
+	// before the first pass; the depth side is a bare surface, which publish resolves by pointer. A
+	// format outside the mirror table leaves this false and the whole pass stays on D3D9.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (DX8Wrapper::VK_Register_Render_Target(g_mapTex, (unsigned)g_mapSize, (unsigned)g_mapSize,
+		(int)g_mapFmt, g_depthSurface, WW3D_ZFORMAT_D24S8))
+	{
+		fprintf(stderr, "[SMAP] vulkan mirror registered size=%d fmt=%s\n", g_mapSize, mapFmtName(g_mapFmt));
+		fflush(stderr);
+	}
+#endif
+
 	g_resourcesReady = true;
 	g_initAttempted = true;
 	fprintf(stderr, "[SMAP] installed size=%d fmt=%s profile=%s recvVS=%d\n",
@@ -519,8 +542,14 @@ public:
 		}
 
 		static const DWORD kSinkFVF = D3DFVF_XYZRHW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE2(0);
-		dev->SetFVF(kSinkFVF);
-		dev->SetVertexShader(nullptr);
+		DX8Wrapper::Set_Vertex_FVF(kSinkFVF);
+		DX8Wrapper::Set_Vertex_Shader(0);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// The map is an owned recorder target, so the casters also go to its mirror; the raw draw below
+		// still feeds the D3D9 map for consumers that have not moved to the facade yet.
+		DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST, &m_scratch[0], (unsigned)vcount,
+			sizeof(RHWV), kSinkFVF, &indices[0], (unsigned)tri_count * 3u, 0);
+#endif
 		if (SUCCEEDED(dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vcount, tri_count,
 			&indices[0], D3DFMT_INDEX16, &m_scratch[0], sizeof(RHWV))))
 		{
@@ -567,30 +596,34 @@ static void renderOccluderPass(IDirect3DDevice9* dev)
 	dev->GetDepthStencilSurface(&prevDS);
 	dev->GetViewport(&prevVP);
 
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the D3D9 switch stays raw because this
+	// pass runs inside the already-open scene and the wrapper's one custom-target slot belongs to
+	// pillarbox; the recorder is told about the target pair explicitly instead.
 	dev->SetRenderTarget(0, g_mapSurface);
 	dev->SetDepthStencilSurface(g_depthSurface);
+	DX8Wrapper::VK_Publish_Render_Target(g_mapSurface, g_depthSurface);
 
 	D3DVIEWPORT9 vp;
 	vp.X = 0; vp.Y = 0; vp.Width = (DWORD)g_mapSize; vp.Height = (DWORD)g_mapSize;
 	vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
-	dev->SetViewport(&vp);
+	DX8Wrapper::Set_Viewport(&vp);
 
 	// Common fixed-function neutralization for RHW drawing.  RHW vertices skip the transform
-	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
 	// GeneralsX @bugfix Qoder 13/10/2026 T6 diag: the game leaves scissor state from the previous
 	// frame's UI/RT renders; a stale or empty scissor rect silently drops every occluder pixel.
-	dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-	dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	dev->SetRenderState(D3DRS_COLORWRITEENABLE,
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_SCISSORTESTENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,
 		D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
-	dev->SetVertexShader(nullptr);
-	dev->SetPixelShader(g_fillPS);
-	dev->SetFVF(D3DFVF_XYZRHW);
+	DX8Wrapper::Set_Vertex_Shader(0);
+	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(g_fillPS));
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW);
 
 	// Fill the map with "far" (red = 1).  R32F Clear semantics are unreliable, so this is drawn
 	// as one fullscreen RHW quad - pixel coordinates, per probe lesson 9.
@@ -602,16 +635,29 @@ static void renderOccluderPass(IDirect3DDevice9* dev)
 			{ 0.0f, (float)g_mapSize, 1.0f, 1.0f },
 			{ (float)g_mapSize, (float)g_mapSize, 1.0f, 1.0f },
 		};
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the map is an owned recorder target
+		// now, so the far fill reaches the mirror as well; the raw copy below still feeds the D3D9 map
+		// that untranslated consumers sample.
+		const Bool fillVk = DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+		static int s_fillProbe = 0;
+		if (s_fillProbe < 8) {
+			++s_fillProbe;
+			fprintf(stderr, "[SMAP] occluder fill vk=%d\n", fillVk ? 1 : 0);
+			fflush(stderr);
+		}
+#endif
 		dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
 	}
 
-	// Depth clear for the occluder Z competition (the RT itself is already filled).
-	dev->Clear(0, nullptr, D3DCLEAR_ZBUFFER, 0x00000000u, 1.0f, 0);
+	// Depth clear for the occluder Z competition (the RT itself is already filled). The facade issues the
+	// same D3D9 clear and records it against the map's depth mirror in one call.
+	DX8Wrapper::Clear(false, true, Vector3(0.0f, 0.0f, 0.0f), 0.0f, 1.0f, 0);
 
-	dev->SetPixelShader(g_depthPS);
-	dev->SetRenderState(D3DRS_ZENABLE, TRUE);
-	dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-	dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS);
+	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(g_depthPS));
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, TRUE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, TRUE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESS);
 
 	// Walk both caster lists.  Culling beyond the ortho box is free: the RHW pipeline clips
 	// against the map viewport (probe lesson 8), so off-box triangles simply do not rasterize.
@@ -634,10 +680,19 @@ static void renderOccluderPass(IDirect3DDevice9* dev)
 		}
 	}
 
-	dev->SetPixelShader(nullptr);
+	DX8Wrapper::Set_Pixel_Shader(0);
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: restore the raw pair this pass saved and
+	// hand the recorder back to the scene mirrors (the facade-owned scene target), without going through
+	// the wrapper's custom-target slot.
 	dev->SetRenderTarget(0, prevRT);
 	dev->SetDepthStencilSurface(prevDS);
-	dev->SetViewport(&prevVP);
+	DX8Wrapper::VK_Publish_Scene_Target();
+	// GeneralsX @feature Qoder 19/10/2026 wedge 11 forensics: the receiver reads 0 from the map mirror
+	// under the recorder, and the two candidate causes (fill never landed vs sample reads wrong bytes)
+	// need the mirror's own pixels to split. The recorder copies it to staging when asked and logs an
+	// R-channel census at the next fence; no cost unless GENERALSX_VKRTPROBE=1.
+	DX8Wrapper::VK_RT_Probe(g_mapTex);
+	DX8Wrapper::Set_Viewport(&prevVP);
 	if (prevRT) prevRT->Release();
 	if (prevDS) prevDS->Release();
 	if (ownScene)
@@ -792,18 +847,18 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	DX8Wrapper::Set_Transform(D3DTS_VIEW, view);
 	DX8Wrapper::Set_Transform(D3DTS_PROJECTION, proj);
 
-	dev->SetTexture(0, g_mapTex);
+	DX8Wrapper::Set_DX8_Texture(0, g_mapTex);
 	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: POINT taps for PCF.  The shell-black root cause was
 	// the fixed-function-vertex + pixel-shader combination: its PS texture reads return 0 for ANY bound
 	// texture on this runtime (P2W0n probes: constant-PS draw fine, map echo and plain-dummy echo both
 	// read 0).  The receiver now runs through a pass-through vertex shader; POINT + NONE mip filtering
 	// stays because the D3D9 capability model does not guarantee LINEAR for float RT formats and the
 	// 3x3 taps at 1.25-texel spread do not need it.
-	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);	// single-level RT texture; stale LINEAR mip state must not leak in
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);	// single-level RT texture; stale LINEAR mip state must not leak in
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
 	float bias = 1.5f / zSpan;			// ~1.5 world units of acne guard, in [0,1] depth
 	float spread = 1.25f / (float)g_mapSize;
@@ -814,32 +869,46 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	const float strength = (float)W3DShaderManager::getShadowMapStrength();
 
 	float c0[4] = { spread, spread, bias, strength };
-	dev->SetPixelShaderConstantF(0, c0, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(0, c0, 1);
 
-	dev->SetVertexShader(g_recvVS);
-	dev->SetPixelShader(g_pcfPS);
-	dev->SetFVF(kRecvFVF);
+	DX8Wrapper::Set_Vertex_Shader(reinterpret_cast<UINT_PTR>(g_recvVS));
+	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(g_pcfPS));
+	DX8Wrapper::Set_Vertex_FVF(kRecvFVF);
 
 	// Multiplicative darkening exactly like _PresetMultiplicativeShader: result = dst * src.rgb.
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-	dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
-	dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCCOLOR);
-	dev->SetRenderState(D3DRS_COLORWRITEENABLE,
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_SRCCOLOR);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,
 		D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
-	dev->SetRenderState(D3DRS_ZENABLE, TRUE);
-	dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-	dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-	dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-	dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, TRUE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_FOGENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 
 	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: the raw DIPUP below uses whatever the DEVICE
 	// actually holds, while DX8Wrapper::Set_Transform only defers WORLD/VIEW (dirty flags, applied by
 	// the sorting renderer) and writes PROJECTION through - the transforms are set through the wrapper
 	// above so the multi-view layouts leave the device holding the primary view this pass planned for.
-	const HRESULT drawHr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)triCount,
-		&indices[0], D3DFMT_INDEX16, &verts[0], sizeof(RecvV));
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the receiver draws onto the scene
+	// target the facade owns. When the recorder can describe this batch (translated VS/PS, mirrored
+	// map) the raw call would only duplicate pixels into a D3D9 image that is no longer presented; if
+	// it cannot, the raw path below keeps the overlay visible exactly as before.
+	HRESULT drawHr = D3DERR_INVALIDCALL;
+	Bool vkDrew = FALSE;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	vkDrew = DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST, &verts[0], (unsigned)verts.size(),
+		sizeof(RecvV), kRecvFVF, &indices[0], (unsigned)triCount * 3u, 0);
+	if (vkDrew) drawHr = D3D_OK;
+#endif
+	if (!vkDrew)
+	{
+		drawHr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)triCount,
+			&indices[0], D3DFMT_INDEX16, &verts[0], sizeof(RecvV));
+	}
 
 	// GeneralsX @bugfix PS3.0-T6-shell 14/10/2026: a once-only log hid a later-frame failure; repeat
 	// the hr for the first four receiver draws.
@@ -847,17 +916,17 @@ static void renderTerrainGrid(IDirect3DDevice9* dev, CameraClass* sceneCamera)
 	if (s_recvLogged < 4)
 	{
 		++s_recvLogged;
-		fprintf(stderr, "[SMAP] recv#%d grid=%dx%d stride=%d tris=%d hr=0x%08X strength=%.2f halfW=%.1f zSpan=%.1f cells=[%d..%d]x[%d..%d]\n",
-			s_recvLogged, gw, gh, stride, triCount, (unsigned)drawHr, (double)strength,
+		fprintf(stderr, "[SMAP] recv#%d vk=%d grid=%dx%d stride=%d tris=%d hr=0x%08X strength=%.2f halfW=%.1f zSpan=%.1f cells=[%d..%d]x[%d..%d]\n",
+			s_recvLogged, vkDrew ? 1 : 0, gw, gh, stride, triCount, (unsigned)drawHr, (double)strength,
 			(double)g_sunHalfWidth, (double)zSpan, startX, endX, startY, endY);
 		fflush(stderr);
 	}
 
-	dev->SetPixelShader(nullptr);
-	dev->SetVertexShader(nullptr);
-	dev->SetTexture(0, nullptr);
-	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	dev->SetRenderState(D3DRS_COLORWRITEENABLE,
+	DX8Wrapper::Set_Pixel_Shader(0);
+	DX8Wrapper::Set_Vertex_Shader(0);
+	DX8Wrapper::Set_DX8_Texture(0, nullptr);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,
 		D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
 	DX8Wrapper::Invalidate_Cached_Render_States();
 }
@@ -975,8 +1044,16 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 		// is 1.25 texels for 3x3 and 2.5 for 5x5, and dividing by the map edge keeps the world-space
 		// penumbra constant when the resolution tier moves (512 -> 2048).
 		const float spreadFactor = (sunShadowPCFTaps() == 5) ? 2.5f : 1.25f;
+		// GeneralsX @debug Qoder 19/10/2026 exaggerated-shadow QA knob: with GENERALSX_SMAP_X set the
+		// acne guard is dropped to zero so the tap coverage (and with it the darkening) is maximal.
+		float sunBias = (zSpan > 1.0f) ? 1.5f / zSpan : 0.0f;
+		{
+			const char* xb = getenv("GENERALSX_SMAP_X");
+			if (xb != nullptr && *xb != 0)
+				sunBias = 0.0f;
+		}
 		DX8GeomNormal::Set_Sun_Shadow(g_mapTexWrapper, g_sunM,
-			spreadFactor / (float)g_mapSize, (zSpan > 1.0f) ? 1.5f / zSpan : 0.0f, gnIntensity);
+			spreadFactor / (float)g_mapSize, sunBias, gnIntensity);
 		g_gnArmed = true;         // GeneralsX @feature PS3.0-P3-23: composition queries see reception live
 		g_gnStrength = gnIntensity;
 		static bool s_gnPushedLogged = false;
@@ -1002,7 +1079,10 @@ void W3DSunShadowMap::preSceneUpdate(CameraClass *sceneCamera)
 		}
 	}
 
-	if ((++g_frameCounter % 300) == 0)
+	// GeneralsX @tweak Qoder 19/10/2026 wedge 11: cadence 300 -> 60. A forensic session under the recorder
+	// spans ~280 frames and never printed a pxbox line, which is the one measurement that splits "the
+	// engine's CPU-side sun depth is already out of [0,1]" from "the GPU path corrupted it".
+	if ((++g_frameCounter % 60) == 0)
 	{
 		fprintf(stderr, "[SMAP] frame %d casters=%d draws=%d skipped=%d tris=%d bbox=%d\n",
 			g_frameCounter, g_statCastors, 0, g_statSkipped, g_sink.m_triTotal, g_sink.m_bbValid ? 1 : 0);
@@ -1050,6 +1130,12 @@ void W3DSunShadowMap::renderTerrainReceiver(CameraClass *sceneCamera)
 bool W3DSunShadowMap::isReceptionActive()
 {
 	return g_gnArmed;
+}
+
+// GeneralsX @refactor Qoder 19/10/2026 R-05: expose the once-read ShadowMap gate (see header).
+bool W3DSunShadowMap::isWanted()
+{
+	return sunShadowMapEnabled();
 }
 
 float W3DSunShadowMap::receptionStrength()

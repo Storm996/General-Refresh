@@ -245,6 +245,13 @@ protected:
 	// switches itself off after the fuse threshold is hit in a row, so a single bad frame no
 	// longer kills bloom/monochrome/motion-blur/cross-fade for the whole session.
 	static Int m_rttBindFailures;
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: TRUE when init() registered the offscreen pair with
+	// the recorder. Registration is what lets vk_publish_render_target follow the redirect; without it the
+	// family has to stay on D3D9 or the scene would leave the mirror the present chain reads.
+	static Bool m_vkRttReady;
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: set when startRenderToTexture hands the recorder the
+	// offscreen pair, so endRenderToTexture knows it owns handing it back to the scene.
+	static Bool m_vkRttPublished;
 	// GeneralsX @bugfix Storm996 12/10/2026 One owner for the lifetime of the offscreen target: init() runs
 	// again on height-map rebuild and a rejected SetRenderTarget switches the feature off at runtime.
 	static void releaseRenderToTextureSurfaces();
@@ -260,6 +267,12 @@ public:
 	virtual Bool preRender(Bool &skipRender, CustomScenePassModes &scenePassMode) {skipRender=false; return false;} ///< Set up at start of render.  Only applies to screen filter shaders.
 	virtual Bool postRender(FilterModes mode, Coord2D &scrollDelta, Bool &doExtraRender){return false;} ///< Called after render.  Only applies to screen filter shaders.
 	virtual Bool setup(FilterModes mode){return false;} ///< Called when the filter is started, one time before the first prerender.
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: TRUE only when the scene this filter redirects and the
+	// quad it draws afterwards are both fixed-function work the Vulkan facade can record. A filter that
+	// still binds a runtime-compiled pixel shader has to stay FALSE: publishing its target would move the
+	// scene onto an offscreen mirror while the post pass falls back to D3D9, leaving the present chain
+	// reading a mirror that never received the frame.
+	virtual Bool canVulkanRtt() const { return FALSE; }
 protected:
 	virtual Int set(FilterModes mode) = 0;		///<setup shader for the specified rendering pass.
 	 ///do any custom resetting necessary to bring W3D in sync.
@@ -279,6 +292,9 @@ public:
 	virtual Bool preRender(Bool &skipRender, CustomScenePassModes &scenePassMode) override; ///< Set up at start of render.  Only applies to screen filter shaders.
 	virtual Bool postRender(FilterModes mode, Coord2D &scrollDelta, Bool &doExtraRender) override; ///< Called after render.  Only applies to screen filter shaders.
 	virtual Bool setup(FilterModes mode) override; ///< Called when the filter is started, one time before the first prerender.
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: texture read, alpha-combiner quad and additive echo
+	// quads are all fixed-function; the whole pass is consumable by the recorder.
+	virtual Bool canVulkanRtt() const override { return TRUE; }
 	ScreenMotionBlurFilter();
 
 	static void setZoomToPos(const Coord3D *pos) {m_zoomToPos = *pos; m_zoomToValid = true;}
@@ -336,6 +352,10 @@ public:
 	virtual Bool preRender(Bool &skipRender, CustomScenePassModes &scenePassMode) override; ///< Set up at start of render.  Only applies to screen filter shaders.
 	virtual Bool postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender) override; ///< Called after render.  Only applies to screen filter shaders.
 	virtual Bool setup(FilterModes mode) override {return true;} ///< Called when the filter is started, one time before the first prerender.
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: this variant draws only through D3DTSS combiners and
+	// Draw_User_Primitive, so the recorder can consume its post pass. The base ScreenBWFilter stays FALSE
+	// because its pixel shader is compiled at runtime and has no program tag.
+	virtual Bool canVulkanRtt() const override { return TRUE; }
 protected:
 	virtual Int set(FilterModes mode) override;		///<setup shader for the specified rendering pass.
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
@@ -351,6 +371,9 @@ public:
 	virtual Bool preRender(Bool &skipRender, CustomScenePassModes &scenePassMode) override; ///< Set up at start of render.  Only applies to screen filter shaders.
 	virtual Bool postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender) override; ///< Called after render.  Only applies to screen filter shaders.
 	virtual Bool setup(FilterModes mode) override {return true;} ///< Called when the filter is started, one time before the first prerender.
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H: two-texture fixed-function quad; both the offscreen
+	// image and the mask are sampleable mirrors, so the post pass is consumable by the recorder.
+	virtual Bool canVulkanRtt() const override { return TRUE; }
 	static void setFadeParameters(Int fadeFrames, Int direction)
 	{
 		m_curFadeFrame = 0;

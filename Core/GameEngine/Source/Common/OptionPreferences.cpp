@@ -31,6 +31,8 @@
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
+#include <stdio.h>	// GeneralsX @feature Qoder 18/10/2026 [OPT] stderr diagnostics
+
 #include "Common/AudioSettings.h"
 #include "Common/GameAudio.h"
 #include "Common/GameLOD.h"
@@ -1181,7 +1183,11 @@ Bool OptionPreferences::getShadowMapEnabled() const
 	if (env != nullptr)
 		return (atoi(env) > 0) ? TRUE : FALSE;
 
-	return (getInt("ShadowMap", 0) != 0) ? TRUE : FALSE;
+	// GeneralsX @feature Qoder 19/10/2026 wedge 11: default ON. The depth-buffered sun shadow map
+	// (W3DSunShadowMap) is verified working under the pure-Vulkan backend and replaces the legacy
+	// projected/volumetric shadow stack as the default scheme; Options.ini "ShadowMap=0" still
+	// switches it off, and GENERALSX_SHADOWMAP stays the QA override above.
+	return (getInt("ShadowMap", 1) != 0) ? TRUE : FALSE;
 }
 
 Int OptionPreferences::getShadowMapIntensity() const
@@ -1337,10 +1343,26 @@ Int OptionPreferences::getTodPreview() const
 Bool OptionPreferences::getTerrain30Shading() const
 {
 	const char* env = getenv("GENERALSX_TERRAIN30");
+	Bool result;
 	if (env != nullptr && *env != 0)
-		return (atoi(env) != 0 || strcmp(env, "0") != 0) ? TRUE : FALSE;
+		result = (atoi(env) != 0 || strcmp(env, "0") != 0) ? TRUE : FALSE;
+	else
+		result = (getInt("Terrain30Shading", 0) != 0) ? TRUE : FALSE;
 
-	return (getInt("Terrain30Shading", 0) != 0) ? TRUE : FALSE;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: one line per process naming the
+	// ini file actually loaded, the env override and the raw key. "Set in Options.ini but the engine
+	// behaves otherwise" can only be explained here - wrong file (instance split), env override, or a
+	// parse miss.
+	{
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			fprintf(stderr, "[OPT] Terrain30Shading file='%s' env='%s' ini=%d -> %d\n",
+				m_filename.str(), env ? env : "(unset)", getInt("Terrain30Shading", -999), result ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+	return result;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1353,10 +1375,23 @@ Bool OptionPreferences::getTerrain30Shading() const
 Bool OptionPreferences::getTerrainPerPixel() const
 {
 	const char* env = getenv("GENERALSX_TERRAIN_PPL");
+	Bool result;
 	if (env != nullptr && *env != 0)
-		return atoi(env) != 0 ? TRUE : FALSE;
+		result = atoi(env) != 0 ? TRUE : FALSE;
+	else
+		result = (getInt("TerrainPerPixel", 0) != 0) ? TRUE : FALSE;
 
-	return (getInt("TerrainPerPixel", 0) != 0) ? TRUE : FALSE;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: sibling of the T30 line above.
+	{
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			fprintf(stderr, "[OPT] TerrainPerPixel file='%s' env='%s' ini=%d -> %d\n",
+				m_filename.str(), env ? env : "(unset)", getInt("TerrainPerPixel", -999), result ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+	return result;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1373,9 +1408,24 @@ Bool OptionPreferences::getTerrainPerPixel() const
 Bool OptionPreferences::getPerPixelLighting() const
 {
 	const char* env = getenv("GENERALSX_GEOMNORMAL");
+	Bool result;
 	if (env != nullptr && *env != 0)
-		return (strcmp(env, "0") != 0) ? TRUE : FALSE;
+		result = (strcmp(env, "0") != 0) ? TRUE : FALSE;
+	else
+		result = (getInt("PerPixelLighting", 1) != 0) ? TRUE : FALSE;
 
-	return (getInt("PerPixelLighting", 1) != 0) ? TRUE : FALSE;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: the 2x2 census had runs whose
+	// GNPROBE lines did not match the Options.ini value they were launched with. This line settles which
+	// file was read and whether an env variable won before the renderer ever sees the switch.
+	{
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			fprintf(stderr, "[OPT] PerPixelLighting file='%s' env='%s' ini=%d -> %d\n",
+				m_filename.str(), env ? env : "(unset)", getInt("PerPixelLighting", -999), result ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+	return result;
 }
 

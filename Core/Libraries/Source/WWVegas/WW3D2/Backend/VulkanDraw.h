@@ -29,7 +29,19 @@
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 
 #define VKDRAW_MAX_STREAMS 8
-#define VKDRAW_MAX_TEX_SLOTS 4
+// GeneralsX @feature Qoder 18/10/2026 Wedge 8: the descriptor array grew from four to eight slots
+// so the terrain NM programs (which sample register s4 for the tangent-space normal atlas) can be
+// represented at all. The old four was a mirror-phase convenience, not a hardware limit.
+#define VKDRAW_MAX_TEX_SLOTS 8
+// vkff.frag still declares four texture samples; the FF interpreter therefore cannot use slots
+// 4..7 even though the descriptor array now carries them. Keep the accounting honest.
+#define VKFF_SAMPLED_SLOTS 4
+// Which fixed-function stage a cached pipeline was built with. Two bits, not a bool: wedge 6 stands up the
+// vertex side and wedge 7 the pixel side, and a pipeline object has to record both decisions separately or
+// a half-gated run could reuse a full-FF pipeline for a batch that asked for only one of them (or the
+// reverse). The pipeline cache's ff field is one of these combinations.
+#define VKDRAW_FF_VERT_BIT 1u
+#define VKDRAW_FF_PIX_BIT  2u
 // Wedge 6 widened this from 12: the fixed-function vertex stage reads position, normal, two vertex colours
 // and up to four texture-coordinate sets (8 attributes) plus PSIZE, and a batch with FVF_XYZ|NORMAL|DIFFUSE
 // |SPECULAR|TEX4 already needs 8 - so the table has to hold the widest layout the engine can hand it
@@ -88,6 +100,17 @@ struct VKDraw_PSO_Key {
     unsigned  depth_write;             // 0/1  (D3DRS_ZWRITEENABLE)
     unsigned  depth_cmp;               // D3DCMPFUNC: 1 never .. 8 always
     unsigned  stencil_test;            // 0/1
+    // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: the rest of the D3D9 stencil block. The
+    // single test bit could describe the player-colour pass in name only - the pass that matters writes
+    // the player index on ZFAIL, zeroes MISS and compares EQUAL later, so a bool would paint the whole
+    // screen. Every field is the raw D3D ordinal; the layer only maps it.
+    unsigned  stencil_func;            // D3DCMPFUNC
+    unsigned  stencil_ref;             // 0..255 (D3D9 truncates the DWORD reference to 8 bits)
+    unsigned  stencil_mask;            // D3DRS_STENCILMASK, compare mask
+    unsigned  stencil_write_mask;      // D3DRS_STENCILWRITEMASK
+    unsigned  stencil_fail;            // D3DSTENCILOP, stencil test failed
+    unsigned  stencil_zfail;           // D3DSTENCILOP, stencil passed / depth failed
+    unsigned  stencil_pass;            // D3DSTENCILOP
     unsigned  blend_enable;            // 0/1  (D3DRS_ALPHABLENDENABLE)
     unsigned  src_blend;               // D3DBLEND ordinal
     unsigned  dst_blend;               // D3DBLEND ordinal
@@ -111,7 +134,12 @@ struct VKDraw_PSO_Key {
 //
 // Scalars that are not colours are carried as raw D3D enum ordinals and decoded in the shader, the same
 // way the pipeline key carries them: the layer stays a translator, not a second opinion on the state.
-#define VKFF_STATE_BYTES 1792u
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan step 9.I: 1792 -> 1824. The point registers live in the
+// two vec4 slots appended after the combiner block (see VKDraw_FF_State::point / point_scale).
+// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: 1824 -> 2336. The eight D3DTS_TEXTUREn matrices are appended
+// after them; the terrain passes project camera-space positions with TEXTURE2/3 and nothing rendered right
+// without them (see VKDraw_FF_State::tex_mat).
+#define VKFF_STATE_BYTES 2336u
 #define VKFF_LIGHT_VEC4  7u
 #define VKFF_MAX_STAGES  8u
 
@@ -129,6 +157,11 @@ struct VKDraw_PSO_Key {
 #define VKFF_FLAG_HAS_SPECULAR    (1u << 7)   // FVF: D3DFVF_SPECULAR present
 #define VKFF_FLAG_RHW             (1u << 8)   // FVF: D3DFVF_XYZRHW - already transformed, skip the matrices
 #define VKFF_FLAG_POSITION_ONLY   (1u << 9)   // FVF: D3DFVF_XYZ, nothing else lights or warps
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan step 9.I: D3DRS_POINTSPRITEENABLE. D3D9 generated the
+// point's texture coordinate (0..1 across the sprite) itself; Vulkan exposes the same value as
+// gl_PointCoord, so the pixel stage substitutes it for the stage's coordinate set 0. Point SIZE is a
+// separate state (D3DRS_POINTSIZE and the scale registers), so this bit only decides the UV source.
+#define VKFF_FLAG_POINT_SPRITE    (1u << 10)
 
 // flags.y packs the small enums: light mask in bits 0..7, texture-coordinate set count in 8..10,
 // vertex fog mode in 11..13, table fog mode in 14..16, and the four material colour sources two bits
@@ -142,6 +175,20 @@ struct VKDraw_PSO_Key {
 #define VKFF_DIFFUSE_SRC(f)   (((f) >> 19) & 3u)
 #define VKFF_SPECULAR_SRC(f)  (((f) >> 21) & 3u)
 #define VKFF_EMISSIVE_SRC(f)  (((f) >> 23) & 3u)
+
+// flags[2] is wedge 7's, and it carries the one part of the fixed-function pixel pipeline Vulkan has no
+// hardware counterpart for: D3DRS_ALPHATESTENABLE / ALPHAFUNC / ALPHAREF. D3D9 tests the alpha the combiner
+// stages produced against an 8-bit reference, which a modern API can only do inside the pixel stage - so the
+// interpreter reads these three from one word instead of the pipeline state, and the pipeline key keeps its
+// own copies only as a description of what the wedge-5 mechanism path was told. The reference is the raw
+// 0..255 integer the shadow holds (VK_Read_RS's documented default is 0), the compare is the D3DCOMPAREFUNC
+// ordinal (0 never .. 7 always), and bit 0 says whether either is consulted at all.
+// flags[3] stays reserved.
+#define VKFF_ALPHA_TEST_ENABLE(f) ((f) & 1u)
+#define VKFF_ALPHA_FUNC(f)        (((f) >> 1) & 7u)
+#define VKFF_ALPHA_REF(f)         (((f) >> 8) & 0xFFu)
+#define VKFF_PACK_ALPHA_TEST(en, func, ref) \
+    (((en) ? 1u : 0u) | (((func) & 7u) << 1) | (((ref) & 0xFFu) << 8))
 
 // One light: 7 vec4. D3DLIGHT9 fields land in these slots (see DX8Wrapper::Set_Light for what the engine
 // actually fills in - it puts the spot EXPONENT in Falloff and both cone angles in Phi/Theta).
@@ -198,7 +245,22 @@ struct VKDraw_FF_State {
     // invert a matrix, and hands it over here.
     float   eye_position[4];        // +1392  xyz = world-space eye, w = 1 when it could be computed
     // +1408. The combiner registers the wedge-7 pixel interpreter consumes, one VKDraw_FF_TSS per stage.
-    VKDraw_FF_TSS tss[VKFF_MAX_STAGES];   // +1408  8 * 48 = 384, ends +1792 = VKFF_STATE_BYTES
+    VKDraw_FF_TSS tss[VKFF_MAX_STAGES];   // +1408  8 * 48 = 384, ends +1792
+    // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan step 9.I: the point family. D3D9 sized a point from
+    // D3DRS_POINTSIZE scaled by the distance curve in the three POINTSCALE coefficients; the vertex stage
+    // reproduces that formula and writes gl_PointSize. The registers are carried verbatim (floats, not
+    // ordinals) because every one of them is a float in D3D9.
+    float   point[4];               // +1792  x = POINTSIZE, y = POINTSIZE_MIN, z = POINTSIZE_MAX,
+                                    //        w = 1 when POINTSCALEENABLE is on
+    float   point_scale[4];         // +1808  x = POINTSCALE_A, y = _B, z = _C, w unused
+    // GeneralsX @bugfix Qoder 19/10/2026 BUG-03: the texture matrix stack. D3D8 multiplies the TEXCOORD
+    // generator output by D3DTS_TEXTUREn whenever D3DTSS_TEXTURETRANSFORMFLAGS names a coordinate count
+    // (D3DTTFF_COUNT1..4), which is how the terrain passes turn camera-space positions into the cloud and
+    // lightmap uv the noise shaders sample - without the matrices the multiply lands on raw camPos and the
+    // ground renders black. The bytes are the same ones DX8CALL(SetTransform) would have handed the device,
+    // taken from DX8Wrapper::DX8Transforms with the device-default identity standing in for never-written
+    // slots (the shadow is memset to zero by Set_Transform_Dirty).
+    float   tex_mat[VKFF_MAX_STAGES][16];   // +1824  8 * 64 = 512, ends +2336
 };
 
 // One indexed draw, fully described: no hidden device state is consulted at submit time, because on
@@ -241,6 +303,12 @@ struct VKDraw_Submit {
 // in this header is a no-op returning false when this is false, so the facade can call unconditionally.
 bool VKDraw_Ready();
 
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: is the interpreted fixed-function PIXEL stage in
+// force (GENERALSX_VKFFPIX, which also needs the vertex stage it reads its varyings from)? The facade
+// consults it before counting a combiner construct the interpreter has no row for, so a run with the gate
+// off reports nothing about a path it never took.
+bool VKDraw_FF_Pixel_On();
+
 // Build the pipeline layer (pipeline layout, shader modules, the scene target, the pass/framebuffer and
 // pipeline caches). Called from VulkanCore::Init behind the gate; idempotent.
 bool VKDraw_Create();
@@ -273,6 +341,10 @@ void VKDraw_Set_Present_Rect(unsigned x, unsigned y, unsigned width, unsigned he
 // clears one tile of a big render target must leave the other tiles alone. Null rect = the whole target.
 void VKDraw_Clear(int clear_color, int clear_z_stencil, const float color[4], float z, unsigned stencil,
                   const unsigned* rect);
+
+// GeneralsX @feature Qoder 19/10/2026 wedge 11 forensics: copy a colour mirror to host staging at the
+// next frame boundary and log its R-channel census (see VulkanDraw.cpp). No-op unless GENERALSX_VKRTPROBE=1.
+void VKDraw_RTProbe(void* key);
 
 // Frame boundaries, hooked to DX8Wrapper::Begin_Scene / the present call. Begin waits the slot's fence
 // and opens the frame's command buffer; End closes the still-open render pass and the command buffer.
@@ -307,11 +379,32 @@ bool VK_Draw_User_Primitive(unsigned primitive_type, const void* vertex_data, un
                            unsigned stride, unsigned polygon_count, const VKDraw_Attr* attrs,
                            unsigned attr_count, const VKDraw_PSO_Key* key);
 
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: the same user-memory path with the facade's
+// complete submit. 'state' carries the pipeline key, textures, samplers, constants and fixed-function
+// block the shadow held when the game issued the DrawPrimitiveUP; this entry point only supplies the
+// geometry (copied into the scratch ring) and the generated index sequence.
+bool VK_Draw_User_Primitive_State(unsigned primitive_type, const void* vertex_data, unsigned vertex_count,
+                                  unsigned stride, unsigned polygon_count, const VKDraw_Submit* state);
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed twin of the user-memory path for the
+// families that used to drive a raw IDirect3DVertexBuffer9/IDirect3DIndexBuffer9 pair (water, shadow
+// volumes). Both arrays are copied into the scratch ring, so the caller may free or reuse its CPU mirror
+// as soon as the call returns. 'vertex_count' is D3D9's NumVertices and is read starting at
+// 'base_vertex' (D3D9 BaseVertexIndex); indices are 16-bit, the only format those paths ever built.
+bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
+                                          const void* vertex_data, unsigned vertex_count, unsigned stride,
+                                          const void* index_data, unsigned index_count, unsigned base_vertex,
+                                          const VKDraw_Submit* state);
+
 // ---- counters and the wedge-5 self test -------------------------------------------
 struct VKDraw_Stats {
     unsigned long long draws, drawsSkipped, drawsBad, psoCreated, psoReused, psoFailed;
     unsigned long long passes, framebuffers, buffersCreated, buffersDropped, ringRotations;
     unsigned long long sceneCopies, clears, setsBuilt, setsReused;
+    // GeneralsX @feature Qoder 19/10/2026 BUG-04 forensics: WW3D::Begin_Render clears before Begin_Scene, so
+    // those requests arrive with no Vulkan frame open yet. Counted here (and parked in the recorder) to keep
+    // "the engine never asked" distinguishable from "the ask arrived outside the frame".
+    unsigned long long clearsDeferred;
     unsigned long long fanRewrites, topologyRefusals;
     unsigned long long framesBegun, framesPresented, framesFailed;
     // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5 forensics: a backing that was retired while
@@ -321,6 +414,15 @@ struct VKDraw_Stats {
 };
 void VKDraw_Get_Stats(VKDraw_Stats* out);
 void VKDraw_Log_Stats();          // periodic one-liner from the draw path
+
+// GeneralsX @bugfix Qoder 19/10/2026 R-02 forensics: the constant rings' in-frame overwrite history. A
+// wrap is the ring reusing its own frame window while that window still holds the payloads the frame's
+// EARLIEST recorded batches point at - the GPU replays later data for them. Ring order: 0 vertex,
+// 1 pixel, 2 fixed-function. 'peak' is the current frame's window high-water in bytes.
+void VKDraw_Get_Const_Wraps(unsigned long long wraps[3]);
+void VKDraw_Get_Const_Spills(unsigned long long spills[3]);
+void VKDraw_Get_Const_Peaks(unsigned long long peaks[3]);
+unsigned long long VKDraw_Get_Const_WindowCap(int ring);   // the window half, spill excluded
 
 #endif // _WIN32 && SAGE_USE_VULKAN_CORE
 #endif // GENERALSX_VULKANDRAW_H

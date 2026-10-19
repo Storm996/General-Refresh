@@ -323,8 +323,12 @@ Bool W3DSmudgeManager::testHardwareSupport()
 
 		//draw polygons like this is very inefficient but for only 2 triangles, it's
 		//not worth bothering with index/vertex buffers.
-		pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+		DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
+		// GeneralsX @feature Qoder 18/10/2026: this pair is a hardware probe, not a frame: it paints a solid
+		// block with D3D9 and immediately reads it back through copyRect. A Vulkan submission would land in
+		// the scene mirror, which copyRect cannot read, and the probe would report smudge unsupported on
+		// every machine. It stays a device call until the probe itself is Vulkan-aware.
 		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 
 		DWORD refData[BLOCK_SIZE*BLOCK_SIZE];
@@ -346,6 +350,7 @@ Bool W3DSmudgeManager::testHardwareSupport()
 		v[2].color = 0xffffffff;
 		v[3].color = 0xffffffff;
 
+		// GeneralsX @feature Qoder 18/10/2026: second half of the readback probe above; same reason.
 		pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
 		bufSize=copyRect((unsigned char *)testData,sizeof(testData),0,0,BLOCK_SIZE,BLOCK_SIZE);
 
@@ -603,15 +608,6 @@ flushSmudges:
 
 		DX8Wrapper::Draw_Triangles(0,smudgesInRenderBatch*4, 0, smudgesInRenderBatch*5);
 
-//Debug Code which draws outline around smudge
-/*		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG2);
-		DX8Wrapper::Draw_Triangles(	0,smudgesInRenderBatch*4, 0, smudgesInRenderBatch*5);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_FILLMODE,D3DFILL_SOLID);
-		DX8Wrapper::_Get_D3D_Device8()->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
-*/
 		smudgesRemaining -= smudgesInRenderBatch;
 	}
 

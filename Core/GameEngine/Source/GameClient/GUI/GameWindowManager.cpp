@@ -60,6 +60,137 @@
 GameWindowManager *TheWindowManager = nullptr;
 UnsignedInt WindowLayoutCurrentVersion = 2;
 
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 4: level-5 probe inside winRepaint.
+// Splits the GUI repaint into leaf costs: per-window m_draw callbacks, winDrawBorder,
+// TheTransitionHandler->draw(), and the pure list walk. Also buckets callback time by the
+// callback function pointer so the worst draw procs can be named later. Env-gated with
+// GENERALSX_VKFPS_PHASES=1; averages over 300 winRepaint calls dumped to vkfps_phase5.log.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct GwmProbe
+	{
+		bool enabled;
+		bool checked;
+		long long repaints;
+		long long total;
+		long long drawCb;
+		long long border;
+		long long trans;
+		long long below;
+		long long mid;
+		long long above;
+		long long drawCalls;
+		long long borderCalls;
+		long long windowsWalked;
+		struct Slot { const char* name; long long us; long long calls; };
+		Slot slots[24];
+	};
+	GwmProbe g_gwm;
+
+	inline long long gwmNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool gwmProbeOn()
+	{
+		if (!g_gwm.checked)
+		{
+			g_gwm.checked = true;
+			g_gwm.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_gwm.enabled;
+	}
+
+	inline void gwmNoteCallback(const char* name, long long us)
+	{
+		if (!name)
+			name = "(none)";
+		for (int i = 0; i < 24; ++i)
+		{
+			if (g_gwm.slots[i].name == name)
+			{
+				g_gwm.slots[i].us += us;
+				++g_gwm.slots[i].calls;
+				return;
+			}
+		}
+		for (int i = 0; i < 24; ++i)
+		{
+			if (g_gwm.slots[i].name == nullptr)
+			{
+				g_gwm.slots[i].name = name;
+				g_gwm.slots[i].us = us;
+				g_gwm.slots[i].calls = 1;
+				return;
+			}
+		}
+		// fallback: distinct-name pool exhausted; match by string so the frame cost is still attributed
+		for (int i = 0; i < 24; ++i)
+		{
+			if (g_gwm.slots[i].name && strcmp(g_gwm.slots[i].name, name) == 0)
+			{
+				g_gwm.slots[i].us += us;
+				++g_gwm.slots[i].calls;
+				return;
+			}
+		}
+	}
+
+	inline void gwmTickAndDump()
+	{
+		if (!g_gwm.enabled)
+			return;
+		++g_gwm.repaints;
+		if ((g_gwm.repaints % 300) != 0)
+			return;
+
+		FILE* f = fopen("vkfps_phase5.log", "a");
+		if (!f)
+			return;
+		// GeneralsX @performance Qoder 19/10/2026: the module base lets callback slot addresses
+		// be converted to RVAs (cb - base) and resolved to names against the map file.
+		fprintf(f, "[GWM5] module_base=%p\n", (void*)GetModuleHandleA(nullptr));
+		long long walk = g_gwm.total - g_gwm.drawCb - g_gwm.border - g_gwm.trans;
+		fprintf(f, "[GWM5] repaints=300 avg_us total=%.1f drawcb=%.1f border=%.1f trans=%.1f walk=%.1f | below=%.1f mid=%.1f above=%.1f | calls/frame draw=%.1f border=%.1f walked=%.1f\n",
+			g_gwm.total / 300.0, g_gwm.drawCb / 300.0, g_gwm.border / 300.0, g_gwm.trans / 300.0, walk / 300.0,
+			g_gwm.below / 300.0, g_gwm.mid / 300.0, g_gwm.above / 300.0,
+			g_gwm.drawCalls / 300.0, g_gwm.borderCalls / 300.0, g_gwm.windowsWalked / 300.0);
+		for (int i = 0; i < 24; ++i)
+		{
+			if (g_gwm.slots[i].name == nullptr)
+				continue;
+			fprintf(f, "[GWM5]   cb=%s avg_us=%.2f calls/frame=%.2f total_us=%.1f\n",
+				g_gwm.slots[i].name,
+				g_gwm.slots[i].us / 300.0,
+				g_gwm.slots[i].calls / 300.0,
+				(double)g_gwm.slots[i].us);
+		}
+		fflush(f);
+		fclose(f);
+
+		g_gwm.total = g_gwm.drawCb = g_gwm.border = g_gwm.trans = 0;
+		g_gwm.below = g_gwm.mid = g_gwm.above = 0;
+		g_gwm.drawCalls = g_gwm.borderCalls = g_gwm.windowsWalked = 0;
+		for (int i = 0; i < 24; ++i)
+		{
+			g_gwm.slots[i].name = nullptr;
+			g_gwm.slots[i].us = 0;
+			g_gwm.slots[i].calls = 0;
+		}
+	}
+
+	struct GwmScope
+	{
+		long long* out;
+		long long t0;
+		GwmScope(long long* o) : out(o), t0(o ? gwmNowUs() : 0) { }
+		~GwmScope() { if (out) *out += gwmNowUs() - t0; }
+	};
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // PRIVATE FUNCTIONS //////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1217,16 +1348,33 @@ Int GameWindowManager::drawWindow( GameWindow *window )
 
 	if( BitIsSet( window->m_status, WIN_STATUS_HIDDEN ) == FALSE )
 	{
+		// GeneralsX @performance Qoder 19/10/2026 R-05 wave 4: level-5 leaf probes (see GWM5 block above).
+		const bool gwmP = gwmProbeOn();
+		if (gwmP) ++g_gwm.windowsWalked;
 
 		if( !BitIsSet( window->m_status, WIN_STATUS_SEE_THRU ) && window->m_draw )
+		{
+			long long t0 = gwmP ? gwmNowUs() : 0;
 			window->m_draw( window, &window->m_instData );
+			if (gwmP)
+			{
+				long long dt = gwmNowUs() - t0;
+				g_gwm.drawCb += dt;
+				++g_gwm.drawCalls;
+				gwmNoteCallback(window->m_instData.m_decoratedNameString.str(), dt);
+			}
+		}
 
 		/// @todo visit list boxes and borders, this is stupid!
 		// for list boxes only draw the borders BEFORE the children
 		if( BitIsSet( window->winGetStyle(), GWS_SCROLL_LISTBOX ) )
 			if( BitIsSet( window->m_status, WIN_STATUS_BORDER ) == TRUE &&
 					!BitIsSet( window->m_status, WIN_STATUS_SEE_THRU ) )
+			{
+				GwmScope s(gwmP ? &g_gwm.border : nullptr);
+				if (gwmP) ++g_gwm.borderCalls;
 				window->winDrawBorder();
+			}
 
 		// draw children in reverse order just like the window list
 		child = window->m_child;
@@ -1243,7 +1391,11 @@ Int GameWindowManager::drawWindow( GameWindow *window )
 		if( !BitIsSet( window->winGetStyle(), GWS_SCROLL_LISTBOX ) )
 			if( BitIsSet( window->m_status, WIN_STATUS_BORDER ) == TRUE &&
 					!BitIsSet( window->m_status, WIN_STATUS_SEE_THRU ) )
+			{
+				GwmScope s(gwmP ? &g_gwm.border : nullptr);
+				if (gwmP) ++g_gwm.borderCalls;
 				window->winDrawBorder();
+			}
 
 	}
 
@@ -1258,16 +1410,26 @@ void GameWindowManager::winRepaint()
 {
 	GameWindow *window, *next;
 
-	// draw below windows
-	for( window = m_windowTail; window; window = next )
-	{
-		next = window->m_prev;
+	// GeneralsX @performance Qoder 19/10/2026 R-05 wave 4: level-5 repaint probe.
+	const bool gwmP = gwmProbeOn();
+	if (gwmP) gwmTickAndDump();
+	GwmScope sTotal(gwmP ? &g_gwm.total : nullptr);
 
-		if( BitIsSet( window->m_status, WIN_STATUS_BELOW ) )
-			drawWindow( window );
+	// draw below windows
+	{
+		GwmScope s(gwmP ? &g_gwm.below : nullptr);
+		for( window = m_windowTail; window; window = next )
+		{
+			next = window->m_prev;
+
+			if( BitIsSet( window->m_status, WIN_STATUS_BELOW ) )
+				drawWindow( window );
+		}
 	}
 
 	// draw non-above and non-below windows
+	{
+	GwmScope s(gwmP ? &g_gwm.mid : nullptr);
 	for( window = m_windowTail; window; window = next )
 	{
 		next = window->m_prev;
@@ -1276,8 +1438,11 @@ void GameWindowManager::winRepaint()
 																	 WIN_STATUS_BELOW ) == FALSE)
 			drawWindow( window );
 	}
+	}
 
 	// draw above windows
+	{
+	GwmScope s(gwmP ? &g_gwm.above : nullptr);
 	for( window = m_windowTail; window; window = next )
 	{
 		next = window->m_prev;
@@ -1285,9 +1450,13 @@ void GameWindowManager::winRepaint()
 		if( BitIsSet( window->m_status, WIN_STATUS_ABOVE ) )
 			drawWindow( window );
 	}
+	}
 
 	if(TheTransitionHandler)
+	{
+		GwmScope s(gwmP ? &g_gwm.trans : nullptr);
 		TheTransitionHandler->draw();
+	}
 }
 
 //-------------------------------------------------------------------------------------------------

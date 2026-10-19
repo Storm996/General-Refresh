@@ -2151,9 +2151,98 @@ void W3DDisplay::step()
 /** Draw the entire W3D Display */
 //=============================================================================
 //DECLARE_PERF_TIMER(W3DDisplay_draw)
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 3: breakdown of the display draw() call: which part
+// of the frame's render traversal costs the CPU. Same env switch as the other phase probes
+// (GENERALSX_VKFPS_PHASES). Temporary forensic instrumentation, retire with the other probes.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct VKFph2
+	{
+		long long prea, terlod, preb, shroud, prert, begin, sunmap, views, receiver, ingameui, mouse, endr, total, frames;
+		bool enabled, checked;
+		VKFph2() : prea(0), terlod(0), preb(0), shroud(0), prert(0), begin(0), sunmap(0), views(0), receiver(0), ingameui(0),
+			mouse(0), endr(0), total(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKFph2 g_fph2;
+
+	inline long long fph2NowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fph2On()
+	{
+		if (!g_fph2.checked)
+		{
+			g_fph2.checked = true;
+			g_fph2.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fph2.enabled;
+	}
+
+	struct VKFph2Scope
+	{
+		long long* out;
+		long long t0;
+		VKFph2Scope(long long* o) : out(o), t0(o ? fph2NowUs() : 0) { }
+		~VKFph2Scope() { if (out) *out += fph2NowUs() - t0; }
+	};
+
+	inline void fph2TickAndDump()
+	{
+		if (!g_fph2.enabled) return;
+		if ((++g_fph2.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase2.log", "a");
+		if (out)
+		{
+			fprintf(out, "[VKFPH2] frames=300 avg_us prea=%lld terlod=%lld preb=%lld shroud=%lld prert=%lld begin=%lld sunmap=%lld views=%lld "
+				"receiver=%lld ingameui=%lld mouse=%lld endr=%lld total=%lld\n",
+				(long long)(g_fph2.prea / 300), (long long)(g_fph2.terlod / 300), (long long)(g_fph2.preb / 300),
+				(long long)(g_fph2.shroud / 300), (long long)(g_fph2.prert / 300), (long long)(g_fph2.begin / 300),
+				(long long)(g_fph2.sunmap / 300), (long long)(g_fph2.views / 300), (long long)(g_fph2.receiver / 300),
+				(long long)(g_fph2.ingameui / 300), (long long)(g_fph2.mouse / 300), (long long)(g_fph2.endr / 300),
+				(long long)(g_fph2.total / 300));
+			fclose(out);
+		}
+		g_fph2.prea = g_fph2.terlod = g_fph2.preb = 0;
+		g_fph2.shroud = g_fph2.prert = g_fph2.begin = g_fph2.sunmap = g_fph2.views = 0;
+		g_fph2.receiver = g_fph2.ingameui = g_fph2.mouse = g_fph2.endr = g_fph2.total = 0;
+	}
+}
+
 void W3DDisplay::draw()
 {
 	//USE_PERF_TIMER(W3DDisplay_draw)
+	const bool vkP = fph2On();
+	fph2TickAndDump();
+	VKFph2Scope sTotal(vkP ? &g_fph2.total : nullptr);
+	long long tPre = vkP ? fph2NowUs() : 0;
+
+	// GeneralsX @feature Qoder 19/10/2026 BUG-03 forensics: a QA skirmish run presented nothing at all - the
+	// window stayed black and the shutdown census recorded ZERO BeginScene/Clear calls on the device, while
+	// the logic clearly kept running (unit weapon sounds at 8 minutes in). That narrows the fault to this
+	// function returning before WW3D::Begin_Render(), but every early return here reads a different flag and
+	// the release build compiles the DEBUG_LOG out of the one that matters. Report which gate is holding the
+	// door, once every 300 calls, from the same values the returns test.
+	{
+		static unsigned s_drawProbe = 0;
+		if ((++s_drawProbe % 300u) == 1u) {
+			extern HWND ApplicationHWnd;
+			fprintf(stderr, "[VKWP1] draw #%u iconic=%d headless=%d breakMovie=%d disableRender=%d "
+				"loadScreenRender=%d frame=%d inGame=%d\n",
+				s_drawProbe,
+				(ApplicationHWnd && ::IsIconic(ApplicationHWnd)) ? 1 : 0,
+				TheGlobalData->m_headless ? 1 : 0,
+				TheGlobalData->m_breakTheMovie ? 1 : 0,
+				TheGlobalData->m_disableRender ? 1 : 0,
+				TheGlobalData->m_loadScreenRender ? 1 : 0,
+				TheGameLogic ? TheGameLogic->getFrame() : -1,
+				(TheGameLogic && TheGameLogic->isInGame()) ? 1 : 0);
+			fflush(stderr);
+		}
+	}
 
 	// GeneralsX @feature xxorza 15/04/2026 Process deferred window resize for pillarbox
 	DX8Wrapper::Pillarbox_Process_Resize();
@@ -2183,7 +2272,9 @@ void W3DDisplay::draw()
 
 	if (TheGlobalData->m_terrainLOD == TERRAIN_LOD_AUTOMATIC && TheTerrainRenderObject)
 	{
+		if (vkP) { g_fph2.prea += fph2NowUs() - tPre; tPre = fph2NowUs(); }
 		calculateTerrainLOD();
+		if (vkP) { g_fph2.terlod += fph2NowUs() - tPre; tPre = fph2NowUs(); }
 	}
 #ifdef EXTENDED_STATS
 AGAIN:
@@ -2257,8 +2348,10 @@ AGAIN:
 
 	Debug_Statistics::Begin_Statistics();	//reset all counters (polygons, vertices, etc) before drawing
 
+	if (vkP) { g_fph2.preb += fph2NowUs() - tPre; tPre = fph2NowUs(); }
 	if(TheGlobalData->m_loadScreenRender != TRUE)
 	{
+		VKFph2Scope s(vkP ? &g_fph2.shroud : nullptr);
 		//Shroud data is needed to render all other views, so handle this first.
 		if (TheTerrainRenderObject)
 		{
@@ -2290,6 +2383,8 @@ AGAIN:
 
 	do {
 
+		{
+		VKFph2Scope s(vkP ? &g_fph2.prert : nullptr);
 		if (DX8Wrapper::_Get_D3D_Device8() && (DX8Wrapper::_Get_D3D_Device8()->TestCooperativeLevel()) == D3D_OK)
 		{
 			// TheSuperHackers @info The views are updated in W3DDisplay::update, except in the repeated passes
@@ -2307,9 +2402,12 @@ AGAIN:
 			if (TheW3DProjectedShadowManager)
 				TheW3DProjectedShadowManager->updateRenderTargetTextures();
 
-			// GeneralsX @feature PS3.0 T6 sun shadow map: depth pass before the scene opens,
-			// receiver right after drawViews below.  No-ops unless GENERALSX_SHADOWMAP is set.
-			W3DSunShadowMap::preSceneUpdate(primaryW3DView->get3DCamera());
+			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the sun shadow depth pass moved
+			// below, inside the open render frame (just before drawViews). Its facade draws are recorded
+			// into the Vulkan command buffer, and that buffer only exists between Begin_Render and
+			// End_Render - running it here, before the scene opens, silently refused every one of them.
+			// The pass still runs before anything samples the map, so GN reception sees this frame's
+			// depths exactly as it did when the pass lived here.
 		}
 
 		viewsUpdated = FALSE;
@@ -2317,6 +2415,7 @@ AGAIN:
 		DX8Wrapper::Pillarbox_Begin();
 
 		Debug_Statistics::End_Statistics();	//record number of polygons rendered in RenderTargetTextures.
+		}
 
 		//Store number of polygons rendered in renderTargetTextures.
 		Int numRenderTargetPolygons=Debug_Statistics::Get_DX8_Polygons();
@@ -2331,7 +2430,13 @@ AGAIN:
 		{
 			//USE_PERF_TIMER(BigAssRenderLoop)
 			static Bool couldRender = true;
-			if ((TheGlobalData->m_breakTheMovie == FALSE) && (TheGlobalData->m_disableRender == false) && WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity ) == WW3D_ERROR_OK)
+			Bool vkBeginOK = FALSE;
+			if (TheGlobalData->m_breakTheMovie == FALSE && TheGlobalData->m_disableRender == false)
+			{
+				VKFph2Scope s(vkP ? &g_fph2.begin : nullptr);
+				vkBeginOK = (WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity ) == WW3D_ERROR_OK);
+			}
+			if (vkBeginOK)
 			{
 
 				if(TheGlobalData->m_loadScreenRender == TRUE)
@@ -2347,21 +2452,38 @@ AGAIN:
 				if (numRenderTargetPolygons || numRenderTargetVertices)
 					Debug_Statistics::Record_DX8_Polys_And_Vertices(numRenderTargetPolygons,numRenderTargetVertices,ShaderClass::_PresetOpaqueShader);
 
+				// GeneralsX @feature PS3.0 T6 sun shadow map: depth pass immediately before drawViews, so
+				// this frame's map is what the GN shadows and the terrain receiver sample. Nothing has
+				// drawn the world yet, and the render frame is open (wedge 9.G moved it here).
+				W3DSunShadowMap::preSceneUpdate(primaryW3DView->get3DCamera());
+
 				// draw all views of the world
-				drawViews();
+				{
+					VKFph2Scope s(vkP ? &g_fph2.views : nullptr);
+					drawViews();
+				}
 
 				// GeneralsX @feature PS3.0 T6 sun shadow map: darken terrain where this frame's
 				// depth map says casters occlude the sun.  Inside the open scene, like the UI.
-				W3DSunShadowMap::renderTerrainReceiver(primaryW3DView->get3DCamera());
+				{
+					VKFph2Scope s(vkP ? &g_fph2.receiver : nullptr);
+					W3DSunShadowMap::renderTerrainReceiver(primaryW3DView->get3DCamera());
+				}
 
 				// draw the user interface
-				TheInGameUI->DRAW();
+				{
+					VKFph2Scope s(vkP ? &g_fph2.ingameui : nullptr);
+					TheInGameUI->DRAW();
+				}
 
 				// end of video example code
 
 				// draw the mouse
 				if( TheMouse )
+				{
+					VKFph2Scope s(vkP ? &g_fph2.mouse : nullptr);
 					TheMouse->DRAW();
+				}
 
 				if ( m_videoStream && m_videoBuffer )
 				{
@@ -2444,13 +2566,21 @@ AGAIN:
 				}
 
 				// render is all done!
-				WW3D::End_Render();
+				{
+					VKFph2Scope s(vkP ? &g_fph2.endr : nullptr);
+					WW3D::End_Render();
+				}
 			}
 			else
 			{
 				if (couldRender)
 				{
 					couldRender = false;
+					// GeneralsX @feature Qoder 19/10/2026 BUG-03 forensics: DEBUG_LOG is compiled out of a
+					// release build, so this branch - the one that says "the frame was refused" - was silent
+					// for the whole black-screen run. Say it where the QA log will show it.
+					fprintf(stderr, "[VKWP1] draw refused: Begin_Render failed (TestCooperativeLevel) or movie break / render disable latched\n");
+					fflush(stderr);
 					DEBUG_LOG(("Could not do WW3D::Begin_Render()!  Are we ALT-Tabbed out?"));
 				}
 			}

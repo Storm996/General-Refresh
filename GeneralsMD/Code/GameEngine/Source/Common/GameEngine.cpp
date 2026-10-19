@@ -1189,6 +1189,48 @@ Bool GameEngine::canUpdateRegularGameLogic(UnsignedInt logicTimeQueryFlags)
 	return false;
 }
 
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 3: env-gated main-loop phase probes.
+// Attributes per-frame engine CPU time (outside the Vulkan draw layer). Enable with
+// GENERALSX_VKFPS_PHASES=1; prints averaged microseconds per frame to stderr every 300 frames.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct VKPhaseProbe
+	{
+		long long radar, audio, gclient, msg, net, ngmp, logic, updateTotal, pace, draw;
+		long long frames;
+		bool enabled;
+		bool checked;
+		VKPhaseProbe() : radar(0), audio(0), gclient(0), msg(0), net(0), ngmp(0), logic(0),
+			updateTotal(0), pace(0), draw(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKPhaseProbe g_vkPhase;
+
+	inline long long vkPhaseNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool vkPhaseProbeOn()
+	{
+		if (!g_vkPhase.checked)
+		{
+			g_vkPhase.checked = true;
+			g_vkPhase.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_vkPhase.enabled;
+	}
+
+	struct VKPhaseScope
+	{
+		long long* out;
+		long long t0;
+		VKPhaseScope(long long* o) : out(o), t0(o ? vkPhaseNowUs() : 0) { }
+		~VKPhaseScope() { if (out) *out += vkPhaseNowUs() - t0; }
+	};
+}
+
 /// -----------------------------------------------------------------------------------------------
 DECLARE_PERF_TIMER(GameEngine_update)
 
@@ -1198,43 +1240,68 @@ DECLARE_PERF_TIMER(GameEngine_update)
 void GameEngine::update()
 {
 	USE_PERF_TIMER(GameEngine_update)
+	const bool vkProbe = vkPhaseProbeOn();
+	long long vkT0 = vkProbe ? vkPhaseNowUs() : 0;
+	if (vkProbe) ++g_vkPhase.frames;
 	{
+		// VERIFY CRC needs to be in this code block.  Please to not pull TheGameLogic->update() inside this block.
+		VERIFY_CRC
+
+		{ VKPhaseScope s(vkProbe ? &g_vkPhase.radar : nullptr); TheRadar->UPDATE(); }
+
+		/// @todo Move audio init, update, etc, into GameClient update
+
+		{ VKPhaseScope s(vkProbe ? &g_vkPhase.audio : nullptr); TheAudio->UPDATE(); }
+
+		{ VKPhaseScope s(vkProbe ? &g_vkPhase.gclient : nullptr); TheGameClient->UPDATE(); }
+
+		{ VKPhaseScope s(vkProbe ? &g_vkPhase.msg : nullptr); TheMessageStream->propagateMessages(); }
+
+		if (TheNetwork != nullptr)
 		{
-			// VERIFY CRC needs to be in this code block.  Please to not pull TheGameLogic->update() inside this block.
-			VERIFY_CRC
-
-			TheRadar->UPDATE();
-
-			/// @todo Move audio init, update, etc, into GameClient update
-
-			TheAudio->UPDATE();
-
-			TheGameClient->UPDATE();
-
-			TheMessageStream->propagateMessages();
-
-			if (TheNetwork != nullptr)
-			{
-				TheNetwork->UPDATE();
-			}
-
-#ifdef SAGE_USE_NGMP
-			if (!TheGlobalData->m_headless)
-			{
-				NGMP_OnlineServicesManager::getInstance().update();
-			}
-#endif
+			VKPhaseScope s(vkProbe ? &g_vkPhase.net : nullptr);
+			TheNetwork->UPDATE();
 		}
 
-		// TheSuperHackers @info Ignores frozen time because the script engine needs updating in the logic update regardless.
-		if (canUpdateGameLogic(FramePacer::IgnoreFrozenTime))
+#ifdef SAGE_USE_NGMP
+		if (!TheGlobalData->m_headless)
 		{
-			TheGameLogic->UPDATE();
+			VKPhaseScope s(vkProbe ? &g_vkPhase.ngmp : nullptr);
+			NGMP_OnlineServicesManager::getInstance().update();
+		}
+#endif
+	}
 
-			if (!TheFramePacer->isTimeFrozen())
+	// TheSuperHackers @info Ignores frozen time because the script engine needs updating in the logic update regardless.
+	if (canUpdateGameLogic(FramePacer::IgnoreFrozenTime))
+	{
+		VKPhaseScope s(vkProbe ? &g_vkPhase.logic : nullptr);
+		TheGameLogic->UPDATE();
+
+		if (!TheFramePacer->isTimeFrozen())
+		{
+			TheGameClient->step();
+		}
+	}
+
+	if (vkProbe)
+	{
+		g_vkPhase.updateTotal += vkPhaseNowUs() - vkT0;
+		if ((g_vkPhase.frames % 300) == 0)
+		{
+			// GeneralsX @tweak Qoder 19/10/2026 the dumps go to their own small file, not stderr: the
+			// log-IO A/B run sends all forensic stdout to NUL and must still produce readings.
+			FILE* vkOut = fopen("vkfps_phase1.log", "a");
+			if (vkOut)
 			{
-				TheGameClient->step();
+				fprintf(vkOut, "[VKFPHASE] frames=300 avg_us radar=%lld audio=%lld gclient=%lld msg=%lld net=%lld ngmp=%lld logic=%lld update=%lld pace=%lld\n",
+					(long long)(g_vkPhase.radar / 300), (long long)(g_vkPhase.audio / 300), (long long)(g_vkPhase.gclient / 300),
+					(long long)(g_vkPhase.msg / 300), (long long)(g_vkPhase.net / 300), (long long)(g_vkPhase.ngmp / 300),
+					(long long)(g_vkPhase.logic / 300), (long long)(g_vkPhase.updateTotal / 300), (long long)(g_vkPhase.pace / 300));
+				fclose(vkOut);
 			}
+			g_vkPhase.radar = g_vkPhase.audio = g_vkPhase.gclient = g_vkPhase.msg = 0;
+			g_vkPhase.net = g_vkPhase.ngmp = g_vkPhase.logic = g_vkPhase.updateTotal = g_vkPhase.pace = 0;
 		}
 	}
 }
@@ -1322,7 +1389,7 @@ void GameEngine::execute()
 			// also throttles the input sampling rate. A low FPS cap therefore makes the mouse feel
 			// laggy (hard to click moving units) even though the fixed 30 Hz simulation is unchanged.
 			// See RenderFpsPreset::s_fpsValues in FrameRateLimit.cpp for the full explanation.
-			TheFramePacer->update();
+			{ VKPhaseScope s(vkPhaseProbeOn() ? &g_vkPhase.pace : nullptr); TheFramePacer->update(); }
 
 			// NOTE: TheDisplay->draw() is called via TheGameClient->UPDATE() above.
 			// GameClient::update() dispatches TheDisplay->DRAW() each frame.

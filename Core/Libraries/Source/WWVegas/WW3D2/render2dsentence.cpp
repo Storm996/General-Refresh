@@ -41,7 +41,77 @@
 #include "WWDebug/wwmemlog.h"
 #include "dx8wrapper.h"
 #include "PlatformPaths.h"
+#include "WW3D2/Backend/VulkanTexMirror.h"
 #include <cstdlib>
+#include <cstdio>
+#include <chrono>
+
+////////////////////////////////////////////////////////////////////////////////////
+// GeneralsX @feature Qoder 19/10/2026 R-05 level-8 probe: the DS6 render bracket (sentence
+// Render) costs ~1.1ms/draw while the R2_7 leaf (one Render2DClass::Render) averages ~4us, so
+// the time lives in Build_Textures (glyph atlas churn), not the quad submit. Split it: BT vs
+// loop per Render call, and inside Build_Textures per surface: texture create vs DX blit vs
+// VK mirror upload. Same GENERALSX_VKFPS_PHASES gate as the other phase probes.
+namespace {
+struct R8Probe {
+    long long calls;
+    long long bt_us;
+    long long loop_us;
+    long long bt_runs;      // Build_Textures passes that had pending surfaces
+    long long surfaces;     // atlas pages converted in total
+    long long newtex_us;    // TextureClass ctor + filter setup
+    long long copy_us;      // _Copy_DX8_Rects
+    long long mirror_us;    // VKTex_Mirror_D3D_Texture
+    unsigned max_w, max_h;
+};
+R8Probe g_r8 = {};
+
+long long r8NowUs()
+{
+    return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool r8ProbeOn()
+{
+    static int checked = 0;
+    static int on = 0;
+    if (!checked) {
+        checked = 1;
+        const char* ev = getenv("GENERALSX_VKFPS_PHASES");
+        on = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+    }
+    return on == 1;
+}
+
+void r8Dump()
+{
+    if (g_r8.calls == 0) return;
+    const double inv = 1.0 / (double)g_r8.calls;
+    FILE* f = fopen("vkfps_phase8.log", "a");
+    if (!f) return;
+    fprintf(f, "[R8_8] per%lldcalls avg_us total=%.2f build_textures=%.2f loop=%.2f"
+        " | bt_runs=%lld surfaces=%lld newtex/surf=%.2f copy/surf=%.2f mirror/surf=%.2f max=%ux%u\n",
+        (long long)g_r8.calls,
+        (double)(g_r8.bt_us + g_r8.loop_us) * inv,
+        (double)g_r8.bt_us * inv, (double)g_r8.loop_us * inv,
+        g_r8.bt_runs, g_r8.surfaces,
+        g_r8.surfaces ? (double)g_r8.newtex_us / (double)g_r8.surfaces : 0.0,
+        g_r8.surfaces ? (double)g_r8.copy_us / (double)g_r8.surfaces : 0.0,
+        g_r8.surfaces ? (double)g_r8.mirror_us / (double)g_r8.surfaces : 0.0,
+        g_r8.max_w, g_r8.max_h);
+    fflush(f);
+    fclose(f);
+    g_r8 = {};
+}
+
+struct R8Scope {
+    long long t0;
+    long long* acc;
+    explicit R8Scope(long long* a) : t0(a ? r8NowUs() : 0), acc(a) {}
+    ~R8Scope() { if (acc) *acc += r8NowUs() - t0; }
+};
+}
 
 ////////////////////////////////////////////////////////////////////////////////////
 // GeneralsX @tweak PS3.0-P2-2 14/10/2026 I7: shared env gate for the 8-bit glyph atlas
@@ -217,16 +287,25 @@ Render2DSentenceClass::Set_Shader (ShaderClass shader)
 void
 Render2DSentenceClass::Render ()
 {
+	const bool r8 = r8ProbeOn();
+	const long long r8t0 = r8 ? r8NowUs() : 0;
 	//
 	//	Build any textures that are pending
 	//
 	Build_Textures ();
-
+	const long long r8t1 = r8 ? r8NowUs() : 0;
 	//
 	//	Ask each renderer to draw its contents
 	//
 	for (int i = 0; i < Renderers.Count (); i ++) {
 		Renderers[i].Renderer->Render ();
+	}
+	if (r8) {
+		const long long r8t2 = r8NowUs();
+		++g_r8.calls;
+		g_r8.bt_us += r8t1 - r8t0;
+		g_r8.loop_us += r8t2 - r8t1;
+		if (g_r8.calls >= 2000) r8Dump();
 	}
 }
 
@@ -362,6 +441,11 @@ Render2DSentenceClass::Build_Textures ()
 	//
 	//	Convert all pending surfaces to textures
 	//
+	const bool r8b = r8ProbeOn();
+	if (r8b && PendingSurfaces.Count () > 0) {
+		++g_r8.bt_runs;
+		g_r8.surfaces += PendingSurfaces.Count ();
+	}
 	for (int index = 0; index < PendingSurfaces.Count (); index ++) {
 		PendingSurfaceStruct &surface_info = PendingSurfaces[index];
 		SurfaceClass *curr_surface = surface_info.Surface;
@@ -381,6 +465,12 @@ Render2DSentenceClass::Build_Textures ()
 		// per the 14/10/2026 user verdict that the linear-filtered CJK glyphs read as blurry.
 		// Mip stays FILTER_TYPE_NONE (MIP_LEVELS_1, UI text is never mipmapped).
 		const bool font8 = Font8Atlas_Enabled();
+		long long r8tn = 0, r8tc = 0, r8tm = 0;
+		if (r8b) {
+			g_r8.max_w = desc.Width > g_r8.max_w ? (unsigned)desc.Width : g_r8.max_w;
+			g_r8.max_h = desc.Height > g_r8.max_h ? (unsigned)desc.Height : g_r8.max_h;
+			r8tn = r8NowUs();
+		}
 		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width,
 			font8 ? WW3D_FORMAT_A8R8G8B8 : WW3D_FORMAT_A4R4G4B4, MIP_LEVELS_1);
 		SurfaceClass *texture_surface = new_texture->Get_Surface_Level ();
@@ -392,11 +482,30 @@ Render2DSentenceClass::Build_Textures ()
 		new_texture->Get_Filter().Set_Mag_Filter(font8 ? TextureFilterClass::FILTER_TYPE_FAST
 			: TextureFilterClass::FILTER_TYPE_NONE);
 		new_texture->Get_Filter().Set_Mip_Mapping(TextureFilterClass::FILTER_TYPE_NONE);
+		if (r8b) { const long long now = r8NowUs(); g_r8.newtex_us += now - r8tn; r8tc = now; }
 
 		//
 		//	Copy the contents of the texture from the surface
 		//
 		DX8Wrapper::_Copy_DX8_Rects (curr_surface->Peek_D3D_Surface (), nullptr, 0, texture_surface->Peek_D3D_Surface (), nullptr);
+		// GeneralsX @bugfix Qoder 18/10/2026 The Vulkan draw layer samples its own keyed mirror, not the
+		// D3D9 texture. This atlas is CPU-filled through _Copy_DX8_Rects and never travels through the disk
+		// loader, so without this call every glyph quad sampled the built-in white fallback - the UI
+		// frame drew correctly but carried no glyphs.
+		if (r8b) { const long long now = r8NowUs(); g_r8.copy_us += now - r8tc; r8tm = now; }
+		const bool atlas_mirrored = VKTex_Mirror_D3D_Texture (new_texture->Peek_D3D_Texture ());
+		if (r8b) g_r8.mirror_us += r8NowUs() - r8tm;
+		{
+			// GeneralsX @feature Qoder 18/10/2026 release-visible proof that the first glyph atlas reached
+			// the Vulkan mirror; without it an empty UI text area cannot be told apart from a missed upload.
+			static bool atlas_logged = false;
+			if (!atlas_logged) {
+				atlas_logged = true;
+				fprintf (stderr, "[VKFONT] glyph atlas %ux%u mirror=%d\n",
+					(unsigned)desc.Width, (unsigned)desc.Width, atlas_mirrored ? 1 : 0);
+				fflush (stderr);
+			}
+		}
 		REF_PTR_RELEASE (texture_surface);
 
 		//

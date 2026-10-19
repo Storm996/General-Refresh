@@ -37,6 +37,8 @@
 #include "Common/GameType.h"
 #include "Common/Snapshot.h"
 
+#include <vector>
+
 #define INVALID_WATER_HEIGHT 0.0f	///water height guaranteed to be below all terrain.
 
 #define NUM_BUMP_FRAMES 32	///number of animation frames in bump map
@@ -166,6 +168,12 @@ protected:
 	Bool										m_waveHlsl;
 	Int	m_numVertices;				///<number of vertices in D3D vertex buffer
 	Int m_numIndices;				///<number of indices in D3D index buffer
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: CPU mirrors of the raw vertex/index buffers.
+	// The water pass fills those buffers through Lock/Unlock, so the same bytes are kept here and handed to
+	// DX8Wrapper::Draw_Indexed_User_Primitive; the D3D9 buffers remain the fallback and stay authoritative
+	// for every path this layer has to refuse.
+	std::vector<unsigned char> m_vkVertexMirror;
+	std::vector<unsigned char> m_vkIndexMirror;
 	IDirect3DTexture9* m_pBumpTexture[NUM_BUMP_FRAMES]; ///<animation frames
 	IDirect3DTexture9* m_pBumpTexture2[NUM_BUMP_FRAMES]; ///<animation frames
 	Real				m_fBumpFrame;	///<current animation frame

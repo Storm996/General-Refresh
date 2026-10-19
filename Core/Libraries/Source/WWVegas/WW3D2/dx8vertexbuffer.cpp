@@ -50,6 +50,32 @@
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
 #include <d3dx9core.h>
+#include <stdio.h>   // GeneralsX @feature wedge 9.J2d: no-d3d9 fall-through probe writes to stderr
+#include <stdlib.h>  // getenv
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J2d: declared here rather than included, because
+// Backend/VKD3DStubImpl.h carries the whole D3D9 COM stub class set and this TU does not want it.
+void VK_NOD3D_Watch_Arm(void* obj);
+void VK_NOD3D_Watch_Check(const char* where);
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J2d: forensic dump of the DX9 pool object every
+// time the no-d3d9 fall-through touches it. The run shows the object alive (vptr points at a module vtable)
+// at one lock and zeroed at the very next one with no destructor ever running, so somebody wrote over the
+// block. The window is what names the writer's shape: one qword cleared is a targeted pointer store, a long
+// zero run is a memset/recycle, and the qword before the object says whether a neighbouring allocation ran
+// off its end. Armed only by GENERALSX_VK_NOD3D; the DXVK path never calls this.
+static void vk_nod3d_dump_dx9_object(const char* tag, unsigned long long seq, void* obj)
+{
+	static int nod3d = -1;
+	if (nod3d < 0) nod3d = (getenv("GENERALSX_VK_NOD3D") && atoi(getenv("GENERALSX_VK_NOD3D")) != 0) ? 1 : 0;
+	if (!nod3d || seq > 64 || !obj) return;
+	const uintptr_t* q = static_cast<const uintptr_t*>(obj);
+	fprintf(stderr, "[VKNOD3D] %s #%llu obj=%p q[-1]=%p q0=%p q1=%p q2=%p q3=%p q4=%p q5=%p q6=%p q7=%p\n",
+		tag, seq, obj, (const void*)q[-1], (const void*)q[0], (const void*)q[1], (const void*)q[2],
+		(const void*)q[3], (const void*)q[4], (const void*)q[5], (const void*)q[6], (const void*)q[7]);
+	fflush(stderr);
+}
+#endif
 
 #define DEFAULT_VB_SIZE 5000
 
@@ -223,6 +249,9 @@ VertexBufferClass::WriteLockClass::WriteLockClass(VertexBufferClass* VertexBuffe
 			}
 		}
 #endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine VB writelock");
+#endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
 			0,
 			0,
@@ -251,6 +280,9 @@ VertexBufferClass::WriteLockClass::~WriteLockClass()
 		DX8_Assert();
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
+#endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine VB writelock unlock");
 #endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
 		break;
@@ -317,6 +349,9 @@ VertexBufferClass::AppendLockClass::AppendLockClass(VertexBufferClass* VertexBuf
 			}
 		}
 #endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine VB appendlock");
+#endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
 			start_index*VertexBuffer->FVF_Info().Get_FVF_Size(),
 			index_range*VertexBuffer->FVF_Info().Get_FVF_Size(),
@@ -345,6 +380,9 @@ VertexBufferClass::AppendLockClass::~AppendLockClass()
 		DX8_Assert();
 #ifdef VERTEX_BUFFER_LOG
 		WWDEBUG_SAY(("VertexBuffer->Unlock()"));
+#endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine VB appendlock unlock");
 #endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
 		break;
@@ -989,11 +1027,49 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 		}
 #endif
 		// Lock with discard contents if the buffer offset is zero
-		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Lock(
-			DynamicVBAccess->VertexBufferOffset*_DynamicDX8VertexBuffer->FVF_Info().Get_FVF_Size(),
-			DynamicVBAccess->Get_Vertex_Count()*DynamicVBAccess->VertexBuffer->FVF_Info().Get_FVF_Size(),
-			(void**)&Vertices,
-			D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE)));
+		// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9.J2d: the stride used to come from
+		// _DynamicDX8VertexBuffer - the pool for the *non*-normal-mapped dynamic FVF - while the buffer being
+		// locked here is DynamicVBAccess->VertexBuffer, which is _DynamicDX8VertexBufferNM whenever this access
+		// is the NM variant. The two pools carry the same FVF so the deref was harmless as long as something had
+		// ever allocated the non-NM pool; in a run where only the NM pool exists it is a null this and the process
+		// dies reading the FVF pointer. Taking the stride off the buffer that is actually locked is both correct
+		// and always valid, and is what the code above already does.
+		//
+		// The three pointers this call dereferences are taken into locals first. That is the only way a no-d3d9
+		// run can name the object it faulted on: the inlined form reports a read at a member offset and says
+		// nothing about which pointer was zero. The log line is armed only by GENERALSX_VK_NOD3D, so the DXVK
+		// path is unchanged and silent.
+		{
+			VertexBufferClass* pool_vb = DynamicVBAccess->VertexBuffer;
+			IDirect3DVertexBuffer9* dx8_vb = pool_vb ? static_cast<DX8VertexBufferClass*>(pool_vb)->Get_DX8_Vertex_Buffer() : nullptr;
+			const unsigned pool_fvf_size = pool_vb ? pool_vb->FVF_Info().Get_FVF_Size() : 0;
+			static int nod3d = -1;
+			if (nod3d < 0) nod3d = (getenv("GENERALSX_VK_NOD3D") && atoi(getenv("GENERALSX_VK_NOD3D")) != 0) ? 1 : 0;
+			static unsigned long lock_calls = 0;
+			if (nod3d && ++lock_calls <= 64) {
+				// vptr is the qword the virtual call reads before it can dispatch: a zero here means dx8_vb is
+				// not a constructed COM object, and the "read of 0x58" the VEH reports is the vtable slot fetch,
+				// not the buffer. slot11 is the address the call would jump through.
+				void* vptr = dx8_vb ? *(void**)(void*)dx8_vb : (void*)0x1;
+				void* slot11 = vptr ? ((void**)(void*)vptr)[11] : nullptr;
+				fprintf(stderr, "[VKNOD3D] dynamic VB lock #%lu: access=%p vb=%p dx8vb=%p vptr=%p slot11=%p poolNM=%p "
+					"type=%u count=%u offset=%u fvf_size=%u\n",
+					lock_calls, (void*)DynamicVBAccess, (void*)pool_vb, (void*)dx8_vb, vptr, slot11,
+					(void*)_DynamicDX8VertexBufferNM,
+					DynamicVBAccess->Type, DynamicVBAccess->VertexCount, DynamicVBAccess->VertexBufferOffset,
+					pool_fvf_size);
+				fflush(stderr);
+			}
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			vk_nod3d_dump_dx9_object("pre-lock", lock_calls, dx8_vb);
+			VK_NOD3D_Watch_Arm(dx8_vb);
+#endif
+			DX8_ErrorCode(dx8_vb->Lock(
+				DynamicVBAccess->VertexBufferOffset*pool_fvf_size,
+				DynamicVBAccess->Get_Vertex_Count()*pool_fvf_size,
+				(void**)&Vertices,
+				D3DLOCK_NOSYSLOCK | (!DynamicVBAccess->VertexBufferOffset ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE)));
+		}
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:
 		Vertices=static_cast<SortingVertexBufferClass*>(DynamicVBAccess->VertexBuffer)->VertexBuffer;
@@ -1022,6 +1098,18 @@ DynamicVBAccessClass::WriteLockClass::~WriteLockClass()
 		WWDEBUG_SAY(("DynamicVertexBuffer->Unlock()"));
 #endif
 		DX8_Assert();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		{
+			// The pair of lines around a lock window is what brackets the writer: if the object is live at
+			// pre-lock and dead at post-unlock, the engine's own vertex writes are the suspect.
+			static unsigned long unlock_seq = 0;
+			vk_nod3d_dump_dx9_object("post-unlock", ++unlock_seq,
+				static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer());
+		}
+#endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine dyn unlock");
+#endif
 		DX8_ErrorCode(static_cast<DX8VertexBufferClass*>(DynamicVBAccess->VertexBuffer)->Get_DX8_Vertex_Buffer()->Unlock());
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:

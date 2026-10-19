@@ -515,6 +515,16 @@ void GameClient::update()
 			delete m_intro;
 			m_intro = nullptr;
 
+			// GeneralsX @bugfix Qoder 19/10/2026 Release the render gate when the intro sequence ends.
+			// Intro::doPostIntro() latches GlobalData::m_breakTheMovie = TRUE every frame the intro state
+			// machine sits in its Done state, and W3DDisplay::draw() refuses WW3D::Begin_Render() while that
+			// flag is up. Only MainMenuInit clears it - but launching straight into a game (-file, or the
+			// QA auto-skirmish hook, both of which set m_initialFile so Shell::showShell/showShellMap
+			// early-return) never runs a menu init, so the latch outlives the movie it was meant to break
+			// and the whole session draws nothing. The movie is over at this point, so the latch has served
+			// its purpose; clear it here instead of leaving it to a menu that may never appear.
+			TheWritableGlobalData->m_breakTheMovie = FALSE;
+
 			TheShell->showShellMap(TRUE);
 			TheShell->showShell();
 

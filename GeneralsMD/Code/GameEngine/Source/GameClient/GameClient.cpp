@@ -527,9 +527,71 @@ void GameClient::registerDrawable( Drawable *draw )
  */
 DECLARE_PERF_TIMER(GameClient_update)
 DECLARE_PERF_TIMER(GameClient_draw)
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 3: second-level breakdown of the gclient bucket.
+// Same env switch as the GameEngine::update probe (GENERALSX_VKFPS_PHASES); prints averaged microseconds
+// per call every 300 calls to stderr. Temporary forensic instrumentation, retire with the other probes.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct VKFph3
+	{
+		long long input, winmgr, drawables, terrainVisual, dispupd, psys, draw, total, frames;
+		bool enabled, checked;
+		VKFph3() : input(0), winmgr(0), drawables(0), terrainVisual(0), dispupd(0), psys(0),
+			draw(0), total(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKFph3 g_fph3;
+
+	inline long long fph3NowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fph3On()
+	{
+		if (!g_fph3.checked)
+		{
+			g_fph3.checked = true;
+			g_fph3.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fph3.enabled;
+	}
+
+	struct VKFph3Scope
+	{
+		long long* out;
+		long long t0;
+		VKFph3Scope(long long* o) : out(o), t0(o ? fph3NowUs() : 0) { }
+		~VKFph3Scope() { if (out) *out += fph3NowUs() - t0; }
+	};
+
+	// Dump the previous window at the top of the 300th call so every exit path of the caller is covered.
+	inline void fph3TickAndDump()
+	{
+		if (!g_fph3.enabled) return;
+		if ((++g_fph3.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase3.log", "a");
+		if (out)
+		{
+			fprintf(out, "[VKFPH3] frames=300 avg_us input=%lld winmgr=%lld drawables=%lld terrainVis=%lld "
+				"dispUpd=%lld psys=%lld draw=%lld total=%lld\n",
+				(long long)(g_fph3.input / 300), (long long)(g_fph3.winmgr / 300), (long long)(g_fph3.drawables / 300),
+				(long long)(g_fph3.terrainVisual / 300), (long long)(g_fph3.dispupd / 300), (long long)(g_fph3.psys / 300),
+				(long long)(g_fph3.draw / 300), (long long)(g_fph3.total / 300));
+			fclose(out);
+		}
+		g_fph3.input = g_fph3.winmgr = g_fph3.drawables = g_fph3.terrainVisual = 0;
+		g_fph3.dispupd = g_fph3.psys = g_fph3.draw = g_fph3.total = 0;
+	}
+}
+
 void GameClient::update()
 {
 	USE_PERF_TIMER(GameClient_update)
+	const bool vkP = fph3On();
+	fph3TickAndDump();
+	VKFph3Scope sTotal(vkP ? &g_fph3.total : nullptr);
 	PROFILER_FRAME_MARK;
 	PROFILER_SECTION_COLOR(0x2196F3);
 	// create the FRAME_TICK message
@@ -545,6 +607,16 @@ void GameClient::update()
 		{
 			delete m_intro;
 			m_intro = nullptr;
+
+			// GeneralsX @bugfix Qoder 19/10/2026 Release the render gate when the intro sequence ends.
+			// Intro::doPostIntro() latches GlobalData::m_breakTheMovie = TRUE every frame the intro state
+			// machine sits in its Done state, and W3DDisplay::draw() refuses WW3D::Begin_Render() while that
+			// flag is up. Only MainMenuInit clears it - but launching straight into a game (-file, or the
+			// QA auto-skirmish hook, both of which set m_initialFile so Shell::showShell/showShellMap
+			// early-return) never runs a menu init, so the latch outlives the movie it was meant to break
+			// and the whole session draws nothing. The movie is over at this point, so the latch has served
+			// its purpose; clear it here instead of leaving it to a menu that may never appear.
+			TheWritableGlobalData->m_breakTheMovie = FALSE;
 
 			TheShell->showShellMap(TRUE);
 			TheShell->showShell();
@@ -568,6 +640,8 @@ void GameClient::update()
 	TheAnim2DCollection->UPDATE();
 
 	// update the keyboard
+	{
+	VKFph3Scope sIn(vkP ? &g_fph3.input : nullptr);
 	if( TheKeyboard )
 	{
 		TheKeyboard->UPDATE();
@@ -584,6 +658,7 @@ void GameClient::update()
 		TheMouse->UPDATE();
 		TheMouse->createStreamMessages();
 
+	}
 	}
 
 
@@ -608,6 +683,7 @@ void GameClient::update()
 
 	// update the window system itself
 	{
+		VKFph3Scope s(vkP ? &g_fph3.winmgr : nullptr);
 		TheWindowManager->UPDATE();
 	}
 
@@ -622,7 +698,8 @@ void GameClient::update()
 
 	if (!freezeTime)
 	{
-		Int numPlayers = ThePlayerList->getPlayerCount();
+		VKFph3Scope s(vkP ? &g_fph3.drawables : nullptr);
+	Int numPlayers = ThePlayerList->getPlayerCount();
 		Int numNonLocalPlayers = 0;
 		Int nonLocalPlayerIndices[MAX_PLAYER_COUNT];
 
@@ -716,11 +793,13 @@ void GameClient::update()
 
 	// update the terrain visuals
 	{
+		VKFph3Scope s(vkP ? &g_fph3.terrainVisual : nullptr);
 		TheTerrainVisual->UPDATE();
 	}
 
 	// update display
 	{
+		VKFph3Scope s(vkP ? &g_fph3.dispupd : nullptr);
 		TheDisplay->UPDATE();
 	}
 
@@ -729,12 +808,14 @@ void GameClient::update()
 	// moves bone-attached particle systems to the current client bone transforms of their drawables.
 	if( !freezeTime && TheGameLogic->hasUpdated() )
 	{
+		VKFph3Scope s(vkP ? &g_fph3.psys : nullptr);
 		TheParticleSystemManager->setLocalPlayerIndex(localPlayerIndex);
 		TheParticleSystemManager->UPDATE();
 	}
 
 	{
 		USE_PERF_TIMER(GameClient_draw)
+		VKFph3Scope s(vkP ? &g_fph3.draw : nullptr);
 
 	// redraw all views, update the GUI
 	//if(TheGameLogic->getFrame() >= 2)

@@ -195,9 +195,9 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	static const Real kMaskR[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 	static const Real kMaskG[4] = {0.0f, 1.0f, 0.0f, 0.0f};
 	static const Real kMaskB[4] = {0.0f, 0.0f, 1.0f, 0.0f};
-	device->SetPixelShaderConstantF(0, kMaskR, 1);
-	device->SetPixelShaderConstantF(1, kMaskG, 1);
-	device->SetPixelShaderConstantF(2, kMaskB, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(0, kMaskR, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(1, kMaskG, 1);
+	DX8Wrapper::Set_Pixel_Shader_Constant(2, kMaskB, 1);
 
 	// draw texture scaled-down onto a small surface
 	struct QuadVertex
@@ -215,7 +215,7 @@ void W3DProfilerFrameCapture::Capture(UnsignedInt displayWidth, UnsignedInt disp
 	vtx[3] = {left,  top,    0.0f, 1.0f, 0.0f, 0.0f};
 	DX8Wrapper::Set_DX8_Texture(0, intermediateTexture);
 	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_TEX1); // GeneralsX @bugfix d3d9 port 12/10/2026 FVF through SetFVF
-	device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vtx, sizeof(QuadVertex));
+	DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, vtx, sizeof(QuadVertex));
 	DX8Wrapper::Set_Pixel_Shader(0);
 	DX8Wrapper::Set_DX8_Texture(0, nullptr);
 	DX8Wrapper::Set_Viewport(&restoreViewport);

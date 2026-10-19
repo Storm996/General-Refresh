@@ -50,6 +50,7 @@
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+#include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @refactor Qoder 19/10/2026 R-05 wave 4: legacy shadow retirement gate
 #include "W3DDevice/GameClient/W3DStatusCircle.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
@@ -64,6 +65,120 @@
 #include "WW3D2/colorspace.h"
 
 #include "WW3D2/shdlib.h"
+
+// GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13B): splits RTS3DScene's render traversal
+// into the segments that can hold the 3.25 ms views= CPU cost measured at 4K@240: the light
+// environment prep, visibility cull, per-frame updates, the terrain pass, the drawable loop, the
+// shadow/particle queues, and the final batch flush. Same env gate as the other phase probes
+// (GENERALSX_VKFPS_PHASES). Temporary forensic instrumentation, retire with the rest.
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+namespace {
+	struct VKFphB
+	{
+		long long lightenv, vis, upd, terrain, drawables, shadowq, particles, flush, frames;
+		bool enabled, checked;
+		VKFphB() : lightenv(0), vis(0), upd(0), terrain(0), drawables(0), shadowq(0), particles(0),
+			flush(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKFphB g_fphB;
+
+	inline long long fphbNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fphbOn()
+	{
+		if (!g_fphB.checked)
+		{
+			g_fphB.checked = true;
+			g_fphB.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fphB.enabled;
+	}
+
+	struct VKFphBScope
+	{
+		long long* out;
+		long long t0;
+		VKFphBScope(long long* o) : out(o), t0(o ? fphbNowUs() : 0) { }
+		~VKFphBScope() { if (out) *out += fphbNowUs() - t0; }
+	};
+
+	inline void fphbTickAndDump()
+	{
+		if (!g_fphB.enabled) return;
+		if ((++g_fphB.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase13.log", "a");
+		if (out)
+		{
+			fprintf(out, "[V13B] frames=300 avg_us lightenv=%lld vis=%lld upd=%lld terrain=%lld "
+				"drawables=%lld shadowq=%lld particles=%lld flush=%lld\n",
+				(long long)(g_fphB.lightenv / 300), (long long)(g_fphB.vis / 300),
+				(long long)(g_fphB.upd / 300), (long long)(g_fphB.terrain / 300),
+				(long long)(g_fphB.drawables / 300), (long long)(g_fphB.shadowq / 300),
+				(long long)(g_fphB.particles / 300), (long long)(g_fphB.flush / 300));
+			fclose(out);
+		}
+		g_fphB.lightenv = g_fphB.vis = g_fphB.upd = g_fphB.terrain = 0;
+		g_fphB.drawables = g_fphB.shadowq = g_fphB.particles = g_fphB.flush = 0;
+	}
+
+	// GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13C): RTS3DScene::Flush is the scene's
+	// own submit chain (shadow prep, decals, mesh renderer, occluded/stencil, trees, static sorts,
+	// translucents, particles, sorting flush) - the phase-13 read put 4.2-6.1 ms per frame here.
+	// Split it into its twelve stages. Same env gate, dump every 600 flushes.
+	struct VKFphC
+	{
+		long long prep, decalsh, mesh, occluded, shd, trees, stencilsh, staticsort, translucent,
+			particles, sorting, del, calls;
+		bool enabled, checked;
+		VKFphC() : prep(0), decalsh(0), mesh(0), occluded(0), shd(0), trees(0), stencilsh(0),
+			staticsort(0), translucent(0), particles(0), sorting(0), del(0), calls(0),
+			enabled(false), checked(false) { }
+	};
+	VKFphC g_fphC;
+
+	inline bool fphcOn()
+	{
+		if (!g_fphC.checked)
+		{
+			g_fphC.checked = true;
+			g_fphC.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fphC.enabled;
+	}
+
+	struct VKFphCScope
+	{
+		long long* out;
+		long long t0;
+		VKFphCScope(long long* o) : out(o), t0(o ? fphbNowUs() : 0) { }
+		~VKFphCScope() { if (out) *out += fphbNowUs() - t0; }
+	};
+
+	inline void fphcDump()
+	{
+		if (!g_fphC.enabled) return;
+		if ((++g_fphC.calls % 600) != 0) return;
+		FILE* out = fopen("vkfps_phase13.log", "a");
+		if (out)
+		{
+			fprintf(out, "[V13C] flushes=600 avg_us prep=%.1f decalsh=%.1f mesh=%.1f occluded=%.1f shd=%.1f "
+				"trees=%.1f stencilsh=%.1f staticsort=%.1f translucent=%.1f particles=%.1f sorting=%.1f del=%.1f\n",
+				g_fphC.prep / 600.0, g_fphC.decalsh / 600.0, g_fphC.mesh / 600.0, g_fphC.occluded / 600.0,
+				g_fphC.shd / 600.0, g_fphC.trees / 600.0, g_fphC.stencilsh / 600.0, g_fphC.staticsort / 600.0,
+				g_fphC.translucent / 600.0, g_fphC.particles / 600.0, g_fphC.sorting / 600.0, g_fphC.del / 600.0);
+			fclose(out);
+		}
+		g_fphC.prep = g_fphC.decalsh = g_fphC.mesh = g_fphC.occluded = g_fphC.shd = g_fphC.trees = 0;
+		g_fphC.stencilsh = g_fphC.staticsort = g_fphC.translucent = g_fphC.particles = g_fphC.sorting = g_fphC.del = 0;
+	}
+}
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // DEFINITIONS ////////////////////////////////////////////////////////////////
@@ -844,49 +959,51 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 /**Draw everything that was submitted from this scene*/
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
+	const bool vkCc = fphcOn();
+	fphcDump();
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
-	PrepareShadows();
+	{ VKFphCScope s(vkCc ? &g_fphC.prep : nullptr); PrepareShadows(); }
 
 	//don't draw shadows in this mode because they interfere with destination alpha or are invisible (wireframe)
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
+	{ VKFphCScope s(vkCc ? &g_fphC.decalsh : nullptr); DoShadows(rinfo, false); }	//draw all non-stencil shadows (decals) since they fall under other objects.
 
-	TheDX8MeshRenderer.Flush();	//draw all non-translucent objects.
+	{ VKFphCScope s(vkCc ? &g_fphC.mesh : nullptr); TheDX8MeshRenderer.Flush(); }	//draw all non-translucent objects.
 
 	//draw all non-translucent objects which were separated because they are hidden and need custom rendering.
 #ifdef USE_NON_STENCIL_OCCLUSION
-	flushOccludedObjects(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.occluded : nullptr); flushOccludedObjects(rinfo); }
 #else
 	if (DX8Wrapper::Has_Stencil())
-		flushOccludedObjectsIntoStencil(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.occluded : nullptr); flushOccludedObjectsIntoStencil(rinfo); }
 #endif
 
 	// (gth) CNC3 Flush the shader meshes
-	SHD_FLUSH;
+	{ VKFphCScope s(vkCc ? &g_fphC.shd : nullptr); SHD_FLUSH; }
 
 	// Draw the trees last so they alpha blend onto everything correctly.
-	DoTrees(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.trees : nullptr); DoTrees(rinfo); }
 
 	//don't draw shadows in this mode because they interfere with destination alpha
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		DoShadows(rinfo, true);	//draw all stencil shadows
+	{ VKFphCScope s(vkCc ? &g_fphC.stencilsh : nullptr); DoShadows(rinfo, true); }	//draw all stencil shadows
 
-	WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
+	{ VKFphCScope s(vkCc ? &g_fphC.staticsort : nullptr); WW3D::Render_And_Clear_Static_Sort_Lists(rinfo); }	//draws things like water
 
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		flushTranslucentObjects(rinfo);	//draw all translucent meshes which don't need per-polygon sorting.
+	{ VKFphCScope s(vkCc ? &g_fphC.translucent : nullptr); flushTranslucentObjects(rinfo); }	//draw all translucent meshes which don't need per-polygon sorting.
 
 	{
 		//USE_PERF_TIMER(translucentRender)
 
 		//don't draw transparent in this mode because they interfere with destination alpha
 		if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-			DoParticles(rinfo);	//queue up particles for rendering.
+		{ VKFphCScope s(vkCc ? &g_fphC.particles : nullptr); DoParticles(rinfo); }	//queue up particles for rendering.
 
-		SortingRendererClass::Flush();	//draw sorted translucent polygons like particles.
+		{ VKFphCScope s(vkCc ? &g_fphC.sorting : nullptr); SortingRendererClass::Flush(); }	//draw sorted translucent polygons like particles.
 	}
-	TheDX8MeshRenderer.Clear_Pending_Delete_Lists();
+	{ VKFphCScope s(vkCc ? &g_fphC.del : nullptr); TheDX8MeshRenderer.Clear_Pending_Delete_Lists(); }
 }
 
 /**Generate a predefined light environment(s) that will be applied to many objects.  Useful for things like totally fogged
@@ -981,10 +1098,16 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 		if (m_customPassMode == SCENE_PASS_DEFAULT)
 		{
 			//Regular rendering pass with no effects
-			updatePlayerColorPasses();///@todo: this probably doesn't need to be done each frame.
-			updateFixedLightEnvironments(rinfo);
+			{
+				VKFphBScope sLe(fphbOn() ? &g_fphB.lightenv : nullptr);
+				updatePlayerColorPasses();///@todo: this probably doesn't need to be done each frame.
+				updateFixedLightEnvironments(rinfo);
+			}
 			Customized_Render(rinfo);
-			Flush(rinfo);
+			{
+				VKFphBScope sFl(fphbOn() ? &g_fphB.flush : nullptr);
+				Flush(rinfo);
+			}
 		}
 		else if (m_customPassMode == SCENE_PASS_ALPHA_MASK)
 		{
@@ -1101,6 +1224,8 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 //=============================================================================
 void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 {
+	const bool vkB = fphbOn();
+	fphbTickAndDump();
 #ifdef DIRTY_CONDITION_FLAGS
 	StDrawableDirtyStuffLocker lockDirtyStuff;
 #endif
@@ -1115,6 +1240,7 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 
    if (!Visibility_Checked) {
       // set the visibility bit in all render objects in all layers.
+	   VKFphBScope sVis(vkB ? &g_fphB.vis : nullptr);
 	   Visibility_Check(&rinfo.Camera);
 #ifdef USE_NON_STENCIL_OCCLUSION
 	   flagOccludedObjects(&rinfo.Camera);
@@ -1125,6 +1251,8 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 
 	RefRenderObjListIterator it(&UpdateList);
 	// allow all objects in the update list to do their "every frame" processing
+	{
+	VKFphBScope sUpd(vkB ? &g_fphB.upd : nullptr);
 	for (it.First(); !it.Is_Done(); it.Next()) {
 		RenderObjClass * robj = it.Peek_Obj();
 		if (robj->Class_ID() == RenderObjClass::CLASSID_TILEMAP)
@@ -1136,10 +1264,12 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 			it.Peek_Obj()->On_Frame_Update();
 		}
 	}
+	}
 
 	//terrain needs to be rendered first
 	if (terrainObject)	// Don't check visibility - terrain is always visible. jba.
 	{
+		VKFphBScope sTer(vkB ? &g_fphB.terrain : nullptr);
 		robj=terrainObject;
 		rinfo.light_environment = nullptr;		// Terrain is self lit.
 		rinfo.Camera.Set_User_Data(this);	//pass the scene to terrain via user data.
@@ -1169,6 +1299,8 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 #endif
 
 	// loop through all render objects in the list:
+	{
+	VKFphBScope sDrw(vkB ? &g_fphB.drawables : nullptr);
 	for (it.First(&RenderList); !it.Is_Done();)
 	{
 		// get the render object
@@ -1191,20 +1323,33 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 				renderOneObject(rinfo, robj, localPlayerIndex);
 		}
 	}
+	}
 
 	//Tell shadow manager to render shadows at the end of this frame
 	//Don't draw shadows if there is no terrain present.
+	{
+	VKFphBScope sShd(vkB ? &g_fphB.shadowq : nullptr);
 	if (TheW3DShadowManager && terrainObject && !ShaderClass::Is_Backface_Culling_Inverted() &&
 		Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
-		TheW3DShadowManager->queueShadows(TRUE);
+		// GeneralsX @refactor Qoder 19/10/2026 R-05 wave 4: the phase-13 read put the legacy projected
+		// (decal) + volumetric (stencil) passes at 2.6 ms of CPU per frame inside scene Flush. The sun
+		// shadow map replaced that whole system (PS3.0 verdict: run it, keep it, retire the old path),
+		// so once its gate is on we never arm the legacy queue - isShadowScene() stays false and both
+		// DoShadows legs no-op. GENERALSX_SHADOWMAP=0 / Options.ini ShadowMap=0 restores the old path.
+		if (!W3DSunShadowMap::isWanted())
+			TheW3DShadowManager->queueShadows(TRUE);
+	}
 	}
 
 	// only render particles once per frame
+	{
+	VKFphBScope sPtc(vkB ? &g_fphB.particles : nullptr);
 	if (terrainObject != nullptr && TheParticleSystemManager != nullptr &&
 		Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
 		TheParticleSystemManager->queueParticleRender();
+	}
 	}
 }
 
@@ -1275,7 +1420,7 @@ void renderStenciledPlayerColor( UnsignedInt color, UnsignedInt stencilRef, Bool
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	m_pDev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+	DX8Wrapper::Set_Vertex_FVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 
 	// Set stencil states
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, TRUE );
@@ -1297,7 +1442,7 @@ void renderStenciledPlayerColor( UnsignedInt color, UnsignedInt stencilRef, Bool
 		//disable writes to color buffer
 		if (DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps().PrimitiveMiscCaps & D3DPMISCCAPS_COLORWRITEENABLE)
 		{
-			DX8Wrapper::_Get_D3D_Device8()->GetRenderState(D3DRS_COLORWRITEENABLE, &oldColorWriteEnable);
+			oldColorWriteEnable = DX8Wrapper::VK_Read_RS(D3DRS_COLORWRITEENABLE);
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,0);
 		}
 		else
@@ -1325,7 +1470,7 @@ void renderStenciledPlayerColor( UnsignedInt color, UnsignedInt stencilRef, Bool
 	}
 
 	if (DX8Wrapper::_Is_Triangle_Draw_Enabled())
-		m_pDev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANSLITVERTEX));
+		DX8Wrapper::Draw_User_Primitive(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANSLITVERTEX));
 
 	// turn off the stencil buffer
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILENABLE, FALSE );

@@ -1966,8 +1966,67 @@ void W3DView::drawView()
 }
 
 //DECLARE_PERF_TIMER(W3DView_drawView)
+
+// GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13A): the views=drawViews segment of the
+// phase-2 probe measured 3.25 ms of CPU per frame at 4K@240. This splits one view's draw() into the
+// four sub-segments that can hold that time: the filter pre-render (bloom redirect), the 3D scene
+// pass, the filter post-render, and the weather screen quads. Same env gate as the other phase
+// probes (GENERALSX_VKFPS_PHASES). Temporary forensic instrumentation, retire with the rest.
+#include <chrono>
+#include <cstdio>
+namespace {
+	struct VKFphA
+	{
+		long long pre, scene, post, weather, frames;
+		bool enabled, checked;
+		VKFphA() : pre(0), scene(0), post(0), weather(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKFphA g_fphA;
+
+	inline long long fphaNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fphaOn()
+	{
+		if (!g_fphA.checked)
+		{
+			g_fphA.checked = true;
+			g_fphA.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fphA.enabled;
+	}
+
+	struct VKFphAScope
+	{
+		long long* out;
+		long long t0;
+		VKFphAScope(long long* o) : out(o), t0(o ? fphaNowUs() : 0) { }
+		~VKFphAScope() { if (out) *out += fphaNowUs() - t0; }
+	};
+
+	inline void fphaTickAndDump()
+	{
+		if (!g_fphA.enabled) return;
+		if ((++g_fphA.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase13.log", "a");
+		if (out)
+		{
+			fprintf(out, "[V13A] frames=300 avg_us pre=%lld scene=%lld post=%lld weather=%lld\n",
+				(long long)(g_fphA.pre / 300), (long long)(g_fphA.scene / 300),
+				(long long)(g_fphA.post / 300), (long long)(g_fphA.weather / 300));
+			fclose(out);
+		}
+		g_fphA.pre = g_fphA.scene = g_fphA.post = g_fphA.weather = 0;
+	}
+}
+
 void W3DView::draw()
 {
+	const bool vkA = fphaOn();
+	fphaTickAndDump();
 	//USE_PERF_TIMER(W3DView_drawView)
 	Bool skipRender = false;
 	Bool doExtraRender = false;
@@ -1992,10 +2051,45 @@ void W3DView::draw()
 		setViewFilter(FT_VIEW_BLOOM_FILTER);
 	}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 step 9.H diagnostic: the fixed-function filter families are
+	// normally reached only from mission scripts (CAMERA_MOTION_BLUR) or the RTS_DEBUG key map, so a
+	// replay cannot exercise them. This hook forces one family on the tactical view when the environment
+	// variable names its FilterTypes value (1 BW, 2 motion blur, 3 cross-fade); it is inert otherwise.
+	if (this == TheTacticalView &&
+		(m_viewFilter == FT_VIEW_DEFAULT || m_viewFilter == FT_NULL_FILTER))
+	{
+		static Int forcedFilter = -2;
+		if (forcedFilter == -2)
+		{
+			const char *name = getenv("GENERALSX_VK_TEST_FILTER");
+			forcedFilter = name ? atoi(name) : -1;
+			if (name)
+			{
+				fprintf(stderr, "[RTT] forced filter test: env='%s' filter=%d\n", name, forcedFilter);
+				fflush(stderr);
+			}
+		}
+		if (forcedFilter > FT_NULL_FILTER && forcedFilter < FT_MAX)
+		{
+			FilterModes mode = FM_NULL_MODE;
+			if (forcedFilter == FT_VIEW_BW_FILTER) mode = FM_VIEW_BW_RED_AND_WHITE;
+			else if (forcedFilter == FT_VIEW_MOTION_BLUR_FILTER) mode = FM_VIEW_MB_IN_AND_OUT_ALPHA;
+			else if (forcedFilter == FT_VIEW_CROSSFADE) mode = FM_VIEW_CROSSFADE_FB_MASK;
+			if (mode != FM_NULL_MODE)
+			{
+				setViewFilter((FilterTypes)forcedFilter);
+				setViewFilterMode(mode);
+			}
+		}
+	}
+#endif
+
 	if (m_viewFilterMode &&
 			m_viewFilter > FT_NULL_FILTER &&
 			m_viewFilter < FT_MAX)
 	{
+		VKFphAScope sPre(vkA ? &g_fphA.pre : nullptr);
 		// Most likely will redirect rendering to a texture.
 		preRenderResult=W3DShaderManager::filterPreRender(m_viewFilter, skipRender, customScenePassMode);
 		if (!skipRender && getCameraLock())
@@ -2042,7 +2136,10 @@ void W3DView::draw()
 		// scene and nothing else - the 2D scene, UI, mouse and the filter passes below stay outside.
 		// No-ops while the graphics-page 距离雾 switch is off or at strength 0.
 		W3DShaderManager::beginFixedFunctionHaze();
-		W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		{
+			VKFphAScope sScene(vkA ? &g_fphA.scene : nullptr);
+			W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		}
 		W3DShaderManager::endFixedFunctionHaze();
 		W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_DISABLE);
 		m_isWireFrameEnabled = m_nextWireFrameEnabled;
@@ -2055,6 +2152,7 @@ void W3DView::draw()
 			m_viewFilter > FT_NULL_FILTER &&
 			m_viewFilter < FT_MAX)
 	{
+		VKFphAScope sPost(vkA ? &g_fphA.post : nullptr);
 		Coord2D deltaScroll;
 		calcDeltaScroll(deltaScroll);
 		Bool continueTheEffect = false;
@@ -2107,7 +2205,10 @@ void W3DView::draw()
 	// the path debug lines, the status bars or the user interface, and composes with bloom instead of
 	// competing for the single filter slot. Tactical view only: the quads are sized from TheTacticalView.
 	if (this == TheTacticalView)
+	{
+		VKFphAScope sWx(vkA ? &g_fphA.weather : nullptr);
 		W3DShaderManager::drawWeatherScreen();
+	}
 
 	if( TheGlobalData->m_debugAI )
 	{

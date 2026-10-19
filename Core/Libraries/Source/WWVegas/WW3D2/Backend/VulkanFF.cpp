@@ -92,6 +92,147 @@ enum {
     BB_FOG_LINEAR = 3
 };
 
+// ----------------------------------------------------------------------------
+// wedge 7: the texture combiner
+//
+// The D3DTOP ordinals of d3d8types.h / d3d9types.h - the two headers number them identically, which was
+// checked against Windows Kits/10/Include/10.0.26100.0/shared/d3d9types.h before this table was written,
+// because an off-by-one here turns MODULATE into SELECTARG2 and every textured surface in the game into a
+// colour block. The row-by-row results below are the documented ones; three corners of the table depend on
+// registers the state block does not carry (D3DTSS_CONSTANT, the bump-env matrices) and are documented as
+// approximations in both vkff.frag and the reference, so a visual difference names the same corner twice.
+// ----------------------------------------------------------------------------
+enum {
+    BB_TOP_DISABLE = 1,   BB_TOP_SELECTARG1,        BB_TOP_SELECTARG2,     BB_TOP_MODULATE,
+    BB_TOP_MODULATE2X,    BB_TOP_MODULATE4X,        BB_TOP_ADD,            BB_TOP_ADDSIGNED,
+    BB_TOP_ADDSIGNED2X,   BB_TOP_SUBTRACT,          BB_TOP_ADDSMOOTH,      BB_TOP_BLENDDIFFUSEALPHA,
+    BB_TOP_BLENDTEXTUREALPHA, BB_TOP_BLENDFACTORALPHA, BB_TOP_BLENDTEXTUREALPHAPM, BB_TOP_BLENDCURRENTALPHA,
+    BB_TOP_PREMODULATE,   BB_TOP_MODULATEALPHA_ADDCOLOR, BB_TOP_MODULATECOLOR_ADDALPHA,
+    BB_TOP_MODULATEINVALPHA_ADDCOLOR, BB_TOP_MODULATEINVCOLOR_ADDALPHA,
+    BB_TOP_BUMPENVMAP,    BB_TOP_BUMPENVMAPLUMINANCE, BB_TOP_DOTPRODUCT3,  BB_TOP_MULTIPLYADD,
+    BB_TOP_LERP           // = 26
+};
+
+enum {
+    BB_TA_DIFFUSE = 0, BB_TA_CURRENT = 1, BB_TA_TEXTURE = 2, BB_TA_TFACTOR = 3,
+    BB_TA_SPECULAR = 4, BB_TA_TEMP = 5, BB_TA_CONSTANT = 6,
+    BB_TA_COMPLEMENT = 0x10, BB_TA_ALPHAREPLICATE = 0x20
+};
+
+// The D3DCMP_* ordinals the folded-in alpha test decodes out of flags[2]. d3d8types.h numbers them from 0.
+enum {
+    BB_CMP_NEVER = 0, BB_CMP_LESS, BB_CMP_EQUAL, BB_CMP_LESSEQUAL,
+    BB_CMP_GREATER, BB_CMP_NOTEQUAL, BB_CMP_GREATEREQUAL, BB_CMP_ALWAYS
+};
+
+inline float bb_sat(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
+inline void  bb_mix(float* d, const float* a, const float* b, float t)
+{
+    for (int i = 0; i < 3; ++i) d[i] = a[i] + (b[i] - a[i]) * t;
+}
+
+// One D3DTA_* argument, selector then modifiers. The documented order matters: ALPHAREPLICATE broadcasts
+// the alpha into all four channels and COMPLEMENT then inverts that, which is what makes
+// TEXTURE|ALPHAREPLICATE|COMPLEMENT mean "one minus the texel alpha" in every channel.
+void bb_arg(unsigned bits, const VKDraw_FF_State& ff, const float* texel, const float* current,
+            const float* temp, const float* vcolor, const float* vspec, float* out)
+{
+    switch (bits & 0x0Fu) {
+    case BB_TA_DIFFUSE:  c4_copy(out, vcolor); break;
+    case BB_TA_CURRENT:  c4_copy(out, current); break;
+    case BB_TA_TEXTURE:  c4_copy(out, texel); break;
+    case BB_TA_TFACTOR:  c4_copy(out, ff.tex_factor); break;
+    case BB_TA_SPECULAR: c4_copy(out, vspec); break;
+    case BB_TA_TEMP:     c4_copy(out, temp); break;
+    default:             c4_zero(out); break;      // BB_TA_CONSTANT: not carried in the block
+    }
+    if ((bits & BB_TA_ALPHAREPLICATE) != 0u) { const float a = out[3]; out[0] = out[1] = out[2] = a; }
+    if ((bits & BB_TA_COMPLEMENT) != 0u)     { for (int i = 0; i < 4; ++i) out[i] = 1.0f - out[i]; }
+}
+
+// The three scalars the blend and add-family rows read from elsewhere: the diffuse alpha (D3DTA_DIFFUSE's
+// own channel), the current alpha and the texture factor's alpha.
+void bb_top_rgb(unsigned op, const float* a0, const float* a1, const float* a2,
+                float a1a, float a2a, float difA, float curA, float tfA, float* rgb)
+{
+    switch (op) {
+    case BB_TOP_SELECTARG1: case BB_TOP_DISABLE:              rgb[0] = a1[0]; rgb[1] = a1[1]; rgb[2] = a1[2]; break;
+    case BB_TOP_SELECTARG2:                                   rgb[0] = a2[0]; rgb[1] = a2[1]; rgb[2] = a2[2]; break;
+    case BB_TOP_MODULATE: case BB_TOP_PREMODULATE:            for (int i = 0; i < 3; ++i) rgb[i] = a1[i] * a2[i]; break;
+    // The four "specular mapping" rows, transcribed from the register comment in d3d9types.h rather than
+    // from prose: MODULATEALPHA_ADDCOLOR is Arg1.RGB + Arg1.A*Arg2.RGB, MODULATECOLOR_ADDALPHA is
+    // Arg1.RGB*Arg2.RGB + Arg1.A, and the two INV variants swap which argument is complemented. All four
+    // are marked COLOROP only there, which is why bb_top_alpha keeps a plain product for them and the probe
+    // never names them in an alpha group. Getting these right matters: every first transcription (this
+    // file's and the GLSL's) dropped the additive term and kept only the product.
+    case BB_TOP_MODULATEALPHA_ADDCOLOR:    for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + a1a * a2[i]; break;
+    case BB_TOP_MODULATECOLOR_ADDALPHA:    for (int i = 0; i < 3; ++i) rgb[i] = a1[i] * a2[i] + a1a; break;
+    case BB_TOP_MODULATEINVALPHA_ADDCOLOR: for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + (1.0f - a1a) * a2[i]; break;
+    case BB_TOP_MODULATEINVCOLOR_ADDALPHA: for (int i = 0; i < 3; ++i) rgb[i] = a1a + (1.0f - a1[i]) * a2a; break;
+    case BB_TOP_MODULATE2X:          for (int i = 0; i < 3; ++i) rgb[i] = 2.0f * a1[i] * a2[i]; break;
+    case BB_TOP_MODULATE4X:          for (int i = 0; i < 3; ++i) rgb[i] = 4.0f * a1[i] * a2[i]; break;
+    case BB_TOP_ADD:                 for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + a2[i]; break;
+    case BB_TOP_ADDSIGNED:           for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + a2[i] - 0.5f; break;
+    case BB_TOP_ADDSIGNED2X:         for (int i = 0; i < 3; ++i) rgb[i] = 2.0f * (a1[i] + a2[i] - 0.5f); break;
+    case BB_TOP_SUBTRACT:            for (int i = 0; i < 3; ++i) rgb[i] = a1[i] - a2[i]; break;
+    case BB_TOP_ADDSMOOTH:           for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + a2[i] * (1.0f - a1[i]); break;
+    case BB_TOP_BLENDDIFFUSEALPHA:   for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + (a2[i] - a1[i]) * difA; break;
+    case BB_TOP_BLENDTEXTUREALPHA:   for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + (a2[i] - a1[i]) * a2a; break;
+    case BB_TOP_BLENDFACTORALPHA:    for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + (a2[i] - a1[i]) * tfA; break;
+    case BB_TOP_BLENDTEXTUREALPHAPM: for (int i = 0; i < 3; ++i) rgb[i] = a1[i] * (1.0f - a2a) + a2[i]; break;
+    case BB_TOP_BLENDCURRENTALPHA:   for (int i = 0; i < 3; ++i) rgb[i] = a1[i] + (a2[i] - a1[i]) * curA; break;
+    // The SDK header's own description of the op, quoted in vkff.frag: the sum of the three component
+    // products, each component first scaled and offset to be signed (c' = 2c - 1), the scalar replicated
+    // into the colour channels, colour-only. The census never shows this op - the engine's dot3 normal
+    // path is a real pixel shader, not a combiner - but the row is probed anyway, because a row nobody
+    // measured is a row nobody may claim.
+    case BB_TOP_DOTPRODUCT3: {
+        const float d = (2.0f * a1[0] - 1.0f) * (2.0f * a2[0] - 1.0f)
+                      + (2.0f * a1[1] - 1.0f) * (2.0f * a2[1] - 1.0f)
+                      + (2.0f * a1[2] - 1.0f) * (2.0f * a2[2] - 1.0f);
+        rgb[0] = rgb[1] = rgb[2] = d;
+        break;
+    }
+    case BB_TOP_MULTIPLYADD:         for (int i = 0; i < 3; ++i) rgb[i] = a0[i] + a1[i] * a2[i]; break;
+    case BB_TOP_LERP:                for (int i = 0; i < 3; ++i) rgb[i] = a0[i] + (a2[i] - a0[i]) * a1[i]; break;
+    // The two bump rows need D3DTSS_BUMPENVMAT00..11, which the block does not carry; at zero matrices the
+    // documented equation is exactly arg1's colour, so that is what they do here and in the shader.
+    default:                         rgb[0] = a1[0]; rgb[1] = a1[1]; rgb[2] = a1[2]; break;
+    }
+}
+
+float bb_top_alpha(unsigned op, float a0, float a1, float a2, float difA, float curA, float tfA)
+{
+    // The four ADDCOLOR/ADDALPHA rows and DOTPRODUCT3 are marked COLOROP only in d3d9types.h, so their
+    // behaviour as an ALPHAOP is not specified anywhere. This table and vkff.frag's agree on a plain
+    // product for them - which is the only thing a scalar-only signature can do - and the probe never
+    // names them in an alpha group.
+    switch (op) {
+    case BB_TOP_SELECTARG1: case BB_TOP_DISABLE:  return a1;
+    case BB_TOP_SELECTARG2:                       return a2;
+    case BB_TOP_MODULATE: case BB_TOP_PREMODULATE:
+    case BB_TOP_MODULATEALPHA_ADDCOLOR: case BB_TOP_MODULATECOLOR_ADDALPHA:
+    case BB_TOP_DOTPRODUCT3:                      return a1 * a2;
+    case BB_TOP_MODULATEINVALPHA_ADDCOLOR:        return (1.0f - a1) * a2;
+    case BB_TOP_MODULATEINVCOLOR_ADDALPHA:        return a1 * (1.0f - a2);
+    case BB_TOP_MODULATE2X:                       return 2.0f * a1 * a2;
+    case BB_TOP_MODULATE4X:                       return 4.0f * a1 * a2;
+    case BB_TOP_ADD:                              return a1 + a2;
+    case BB_TOP_ADDSIGNED:                        return a1 + a2 - 0.5f;
+    case BB_TOP_ADDSIGNED2X:                      return 2.0f * (a1 + a2 - 0.5f);
+    case BB_TOP_SUBTRACT:                         return a1 - a2;
+    case BB_TOP_ADDSMOOTH:                        return a1 + a2 * (1.0f - a1);
+    case BB_TOP_BLENDDIFFUSEALPHA:                return a1 + (a2 - a1) * difA;
+    case BB_TOP_BLENDTEXTUREALPHA:                return a1 + (a2 - a1) * a2;
+    case BB_TOP_BLENDFACTORALPHA:                 return a1 + (a2 - a1) * tfA;
+    case BB_TOP_BLENDTEXTUREALPHAPM:              return a1 * (1.0f - a2) + a2;
+    case BB_TOP_BLENDCURRENTALPHA:                return a1 + (a2 - a1) * curA;
+    case BB_TOP_MULTIPLYADD:                      return a0 + a1 * a2;
+    case BB_TOP_LERP:                             return a0 + (a2 - a0) * a1;
+    default:                                      return a1;
+    }
+}
+
 } // anon
 
 void VKFF_Vertex_Ref(const VKDraw_FF_State& ff, const VKFF_Vertex_In& in, VKFF_Vertex_Out* out)
@@ -239,4 +380,108 @@ void VKFF_Vertex_Ref(const VKDraw_FF_State& ff, const VKFF_Vertex_In& in, VKFF_V
     c4_add(out->color, out->color, emisCol);
     out->color[3] = diffCol[3];    // the vertex alpha rides through; light alphas are 1.0 by convention
     c4_mul(out->specular, specCol, sumSpecular);
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the combiner interpreter's second side.
+//
+// The eight-stage loop, exactly as D3D8 documents it: the current register starts at the diffuse vertex
+// colour (which is what the vertex stage's vColor is, lit or unlit), each stage reads its texel from the
+// texture slot of the same index, and D3DTSS_RESULTARG decides whether the result lands in the current
+// register or in the per-stage temp that the next stage's D3DTA_TEMP reads. A stage whose colour AND alpha
+// ops are both DISABLE writes nothing at all - the census found that configuration on the majority of
+// draws, because the engine disables every stage above the ones a pass uses.
+int VKFF_Combine_Ref(const VKDraw_FF_State& ff, const VKFF_Pixel_In& in, float* out_rgba)
+{
+    float current[4], temp[4], result[4], texel[4];
+    c4_copy(current, in.color);
+    c4_zero(temp);
+    const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    for (int s = 0; s < (int)VKFF_MAX_STAGES; ++s) {
+        const VKDraw_FF_TSS& T = ff.tss[s];
+        if (T.col[0] == BB_TOP_DISABLE && T.alp[0] == BB_TOP_DISABLE) continue;
+
+        // Slot 's' for the first four stages; the descriptor set carries four sampler bindings, so a
+        // fixed-function stage above that samples the built-in white - the same convention vkff.frag uses
+        // and the same one the facade counts before it lets a batch through.
+        c4_copy(texel, (s < 4) ? in.texel[s] : white);
+
+        float a0c[4], a1c[4], a2c[4], a0a[4], a1a[4], a2a[4];
+        bb_arg(T.col[1], ff, texel, current, temp, in.color, in.specular, a0c);
+        bb_arg(T.col[2], ff, texel, current, temp, in.color, in.specular, a1c);
+        bb_arg(T.col[3], ff, texel, current, temp, in.color, in.specular, a2c);
+        bb_arg(T.alp[1], ff, texel, current, temp, in.color, in.specular, a0a);
+        bb_arg(T.alp[2], ff, texel, current, temp, in.color, in.specular, a1a);
+        bb_arg(T.alp[3], ff, texel, current, temp, in.color, in.specular, a2a);
+
+        c4_copy(result, current);
+        if (T.col[0] != BB_TOP_DISABLE) {
+            float rgb[3];
+            bb_top_rgb(T.col[0], a0c, a1c, a2c, a1c[3], a2c[3], in.color[3], current[3], ff.tex_factor[3], rgb);
+            for (int i = 0; i < 3; ++i) result[i] = bb_sat(rgb[i]);
+        }
+        if (T.alp[0] != BB_TOP_DISABLE) {
+            result[3] = bb_sat(bb_top_alpha(T.alp[0], a0a[3], a1a[3], a2a[3],
+                                            in.color[3], current[3], ff.tex_factor[3]));
+        }
+
+        if (T.res[0] == BB_TA_TEMP) c4_copy(temp, result);
+        else                        c4_copy(current, result);
+    }
+
+    // D3D9 adds the vertex specular register after the last stage. With SPECULARENABLE off the vertex stage
+    // writes a zero vSpecular, so this is a no-op for the batches the census says dominate.
+    for (int i = 0; i < 3; ++i) current[i] = bb_sat(current[i] + in.specular[i]);
+
+    // The alpha test Vulkan has no pipeline state for, read out of the word wedge 6 left reserved. The
+    // pixel's alpha is truncated to the 8-bit scale D3DRS_ALPHAREF is written in, which makes a pixel
+    // exactly on the reference fail a GREATER compare - the fixed-function unit's behaviour, and the knife
+    // edge the probe's rigs stay away from. A discard writes nothing at all, so the caller is told.
+    if (VKFF_ALPHA_TEST_ENABLE(ff.flags[2])) {
+        const float a = bb_sat(current[3]);
+        const float pa = floorf(a * 255.0f);
+        const float pr = (float)VKFF_ALPHA_REF(ff.flags[2]);
+        const unsigned cmp = VKFF_ALPHA_FUNC(ff.flags[2]);
+        bool pass;
+        switch (cmp) {
+        case BB_CMP_LESS:         pass = pa <  pr; break;
+        case BB_CMP_EQUAL:        pass = pa == pr; break;
+        case BB_CMP_LESSEQUAL:    pass = pa <= pr; break;
+        case BB_CMP_GREATER:      pass = pa >  pr; break;
+        case BB_CMP_NOTEQUAL:     pass = pa != pr; break;
+        case BB_CMP_GREATEREQUAL: pass = pa >= pr; break;
+        case BB_CMP_NEVER:        pass = false;    break;
+        default:                  pass = true;     break;   // BB_CMP_ALWAYS, and any other ordinal
+        }
+        if (!pass) return 0;      // the shader writes nothing either: the target keeps what was already there
+    }
+
+    // Fog blends the colour channels toward D3DRS_FOGCOLOR and leaves alpha alone - the documented fixed
+    // function behaviour, and the reason a fogged surface keeps its transparency. The table mode wins over
+    // the vertex mode when both are set, because the table value supersedes the interpolated one.
+    if ((ff.flags[0] & VKFF_FLAG_FOG_ENABLE) != 0u) {
+        const unsigned tm = VKFF_FOG_TABLE(ff.flags[1]);
+        float f = 1.0f;
+        if (tm != BB_FOG_NONE) {
+            const float depth = in.fog_depth;
+            if (tm == BB_FOG_LINEAR) {
+                const float start = ff.fog_params[0], end = ff.fog_params[1];
+                f = (end == start) ? 1.0f : (end - depth) / (end - start);
+            } else if (tm == BB_FOG_EXP) {
+                f = expf(-ff.fog_params[2] * depth);
+            } else if (tm == BB_FOG_EXP2) {
+                const float d = ff.fog_params[2] * depth;
+                f = expf(-d * d);
+            }
+            f = bb_sat(f);
+        } else {
+            f = in.fog_vertex;
+        }
+        float rgb[3];
+        bb_mix(rgb, ff.fog_color, current, f);
+        for (int i = 0; i < 3; ++i) current[i] = rgb[i];
+    }
+
+    c4_copy(out_rgba, current);
+    return 1;
 }

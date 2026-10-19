@@ -48,6 +48,7 @@
 #include "Common/GameMemory.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/textureloader.h"
+#include "WW3D2/Backend/VulkanTexMirror.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
 
 //----------------------------------------------------------------------------
@@ -194,6 +195,12 @@ void		W3DVideoBuffer::unlock()
 		m_surface->Unlock();
 		m_surface->Release_Ref();
 		m_surface = nullptr;
+
+		// GeneralsX @bugfix Qoder 18/10/2026 FMV / load-screen frames are CPU-written into this
+		// texture every frame and never pass through the disk loader, so the Vulkan mirror lacked
+		// every video frame and the whole surface rendered white. One mirror per unlock re-uploads
+		// into the same keyed image.
+		VKTex_Mirror_D3D_Texture(m_texture->Peek_D3D_Texture());
 	}
 }
 

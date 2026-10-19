@@ -89,6 +89,10 @@
 #include "Backend/VulkanCore.h"
 #include "Backend/VulkanGeo.h" // wedge 3.4: render-target/depth mirror alloc hooks
 #include "Backend/VulkanDraw.h" // wedge 5: frame boundaries, render targets and the draw path
+#include "Backend/VulkanDesc.h"  // wedge 7: the sampler LUT the submit loop reads through
+#include "Backend/VulkanPgm.h"   // wedge 8: IDirect3D*Shader9 handle -> translated program tag
+#include "Backend/VKD3DStubImpl.h" // wedge 9.J: the no-d3d9 driver front and its hit census
+#include "Backend/VulkanTexMirror.h" // wedge 3.2: dynamic texture payloads -> keyed VkImage
 #endif
 #include "light.h"
 #include "assetmgr.h"
@@ -106,6 +110,71 @@
 #include "DbgHelpGuard.h"
 
 #include "shdlib.h"
+// GeneralsX @performance Qoder 19/10/2026 R-05 L15 (V17): two-tier split of the facade indexed-draw
+// emitter. Outer tier names VK_Emit_Indexed_Draw legs (tags/bind/fill/setup/ntx/probe/submit), inner
+// tier names VK_Fill_Submit_State legs (rs/view/census/samp/pack; tgt is the fill-minus-parts residual
+// printed at dump). Gate GENERALSX_VKFPS_PHASES costs one branch per add when off. Temporary forensic
+// instrumentation, retire with the other probes.
+#include <chrono>
+namespace vkf17
+{
+	enum { E_TAGS = 0, E_BIND, E_FILL, E_SETUP, E_NTX, E_PROBE, E_SUBMIT,
+		F_RS, F_VIEW, F_CENSUS, F_SAMP, F_PACK, SEG_COUNT };
+	inline long long now()
+	{
+		return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+	bool g_on = false;
+	bool g_checked = false;
+	long long g_seg[SEG_COUNT];
+	long long g_calls = 0;
+	inline bool on()
+	{
+		if (!g_checked) {
+			g_checked = true;
+			const char* e = getenv("GENERALSX_VKFPS_PHASES");
+			g_on = (e != nullptr && atoi(e) != 0);
+		}
+		return g_on;
+	}
+	inline void add(int i, long long& tt)
+	{
+		if (!g_on) return;
+		const long long n = now();
+		g_seg[i] += n - tt;
+		tt = n;
+	}
+	inline void tick()
+	{
+		if (!g_on) return;
+		if ((++g_calls % 3000) != 0) return;
+		FILE* out = fopen("vkfps_phase17.log", "a");
+		if (out) {
+			const double part = (double)(g_seg[F_RS] + g_seg[F_VIEW] + g_seg[F_CENSUS] + g_seg[F_SAMP] + g_seg[F_PACK]);
+			const double tgt = (double)g_seg[E_FILL] - part;
+			fprintf(out, "[V17] win=3000 tags=%.2f bind=%.2f fill=%.2f setup=%.2f ntx=%.2f probe=%.2f submit=%.2f | rs=%.2f view=%.2f census=%.2f samp=%.2f pack=%.2f tgt=%.2f\n",
+				(double)g_seg[E_TAGS] / 3000.0, (double)g_seg[E_BIND] / 3000.0, (double)g_seg[E_FILL] / 3000.0,
+				(double)g_seg[E_SETUP] / 3000.0, (double)g_seg[E_NTX] / 3000.0, (double)g_seg[E_PROBE] / 3000.0,
+				(double)g_seg[E_SUBMIT] / 3000.0,
+				(double)g_seg[F_RS] / 3000.0, (double)g_seg[F_VIEW] / 3000.0, (double)g_seg[F_CENSUS] / 3000.0,
+				(double)g_seg[F_SAMP] / 3000.0, (double)g_seg[F_PACK] / 3000.0, tgt / 3000.0);
+			fclose(out);
+		}
+		for (int i = 0; i < SEG_COUNT; ++i) g_seg[i] = 0;
+	}
+	// GeneralsX @performance Qoder 19/10/2026 R-05 wave-5: the BUG-forensics draw probes below all
+	// delivered their verdicts (BUG-01/03 closed), but their per-draw condition loops were still
+	// billed ~1 us to the emit leg. GENERALSX_VKDRAWDIAG=1 puts them back on; off is a static bool.
+	inline bool diag()
+	{
+		static const bool s_diag = [] {
+			const char* e = getenv("GENERALSX_VKDRAWDIAG");
+			return e != nullptr && atoi(e) != 0;
+		}();
+		return s_diag;
+	}
+}
 
 const int DEFAULT_RESOLUTION_WIDTH = 640;
 const int DEFAULT_RESOLUTION_HEIGHT = 480;
@@ -547,8 +616,26 @@ unsigned char						DX8Wrapper::VK_TSS_Touched[33];
 unsigned char						DX8Wrapper::VK_Samp_Touched[16];
 DWORD								DX8Wrapper::Vertex_Format = 0;
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @debug Qoder 19/10/2026 BUG-03: the blend/colour-mask/stencil write ring - see the header
+// declaration, the push in Set_DX8_Render_State and the replay in VK_FF_NTX_Census.
+DX8Wrapper::VK_RS_Watch_Entry			DX8Wrapper::VK_RS_Watch[64];
+unsigned								DX8Wrapper::VK_RS_Watch_N = 0;
+
+void DX8Wrapper::VK_RS_Watch_Push(unsigned state, unsigned value, void *ret)
+{
+	const unsigned slot = VK_RS_Watch_N & 63u;
+	++VK_RS_Watch_N;
+	VK_RS_Watch[slot].frame = VKCore_Frame_No();
+	VK_RS_Watch[slot].state = state;
+	VK_RS_Watch[slot].value = value;
+	VK_RS_Watch[slot].ret = ret;
+}
+#endif
+
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>		// GeneralsX @performance Qoder 19/10/2026 R-05 L9 begin-scene probe clock
 
 namespace
 {
@@ -1138,6 +1225,15 @@ unsigned DX8Wrapper::VK_Read_RS(unsigned token)
 	case D3DRS_COLORWRITEENABLE:       return 0x0000000Fu;
 	case D3DRS_STENCILENABLE:          return FALSE;
 	case D3DRS_STENCILFUNC:            return D3DCMP_ALWAYS;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: the rest of D3D9's stencil block. These
+	// defaults are what the retired device applied to a batch that never named them, and the player-colour
+	// pass names only some of them before it draws.
+	case D3DRS_STENCILREF:             return 0u;
+	case D3DRS_STENCILMASK:            return 0xFFFFFFFFu;
+	case D3DRS_STENCILWRITEMASK:       return 0xFFFFFFFFu;
+	case D3DRS_STENCILFAIL:            return D3DSTENCILOP_KEEP;
+	case D3DRS_STENCILZFAIL:           return D3DSTENCILOP_KEEP;
+	case D3DRS_STENCILPASS:            return D3DSTENCILOP_KEEP;
 	case D3DRS_CLIPPLANEENABLE:        return 0u;
 	case D3DRS_MULTISAMPLEANTIALIAS:   return FALSE;
 	case D3DRS_SRGBWRITEENABLE:        return 0u;
@@ -1164,6 +1260,23 @@ unsigned DX8Wrapper::VK_Read_RS_Default_bits(unsigned token, float fallback)
 unsigned DX8Wrapper::VK_Read_TSS(unsigned stage, unsigned token, unsigned fallback)
 {
 	const unsigned raw = TextureStageStates[stage & (MAX_TEXTURE_STAGES - 1u)][token & 0x3Fu];
+	return (raw == 0x12345678u) ? fallback : raw;
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the sampler twin of the read above. Token is
+// the D3DSAMP_* ordinal the facade stores the value at (1..10), which is why the row is 16 wide.
+//
+// The fallbacks are not all D3D9's documented initial values, and the difference is deliberate rather than
+// a slip: D3D9 brings up MIN/MAG/MIPFILTER at POINT and ADDRESSU/V/W at WRAP, and a batch that never
+// wrote a sampler would therefore have drawn nearest with no mip chain. The census says no such batch
+// exists in the game - every one of the 23.4 M draws that bound a texture had stage 0 written - so this
+// only has to answer the probe and any future caller. POINT there would make a freshly-invalidated slot
+// look like a broken filter rather than like the bilinear sampling the engine uses everywhere else, so
+// the filters fall to LINEAR/LINEAR/POINT and the addresses to WRAP, which is the tuple W3D installs for
+// almost every real texture.
+unsigned DX8Wrapper::VK_Read_Sampler(unsigned stage, unsigned token, unsigned fallback)
+{
+	const unsigned raw = SamplerStates[stage & (MAX_TEXTURE_STAGES - 1u)][token & 0xFu];
 	return (raw == 0x12345678u) ? fallback : raw;
 }
 
@@ -1596,6 +1709,31 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Invalidate_Cached_Render_States();
 
 	if (!lite) {
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J: the no-d3d9 driver. GENERALSX_VK_NOD3D=1
+		// asks for an IDirect3D9 that the Vulkan backend owns instead of the one loaded out of d3d9.dll, so the
+		// d3d9 library is never even mapped in. It needs a live Vulkan core (adapter identity and the
+		// capability block are read from the physical device), and it is a diagnostic wedge: everything the
+		// Vulkan backend does not back yet falls to the inert stub and is counted by VK_Stub_Census_Dump.
+		// Default off, so nothing about the shipping path changes.
+		if (VK_NOD3D_Enabled()) {
+			VulkanCore_Try_Init(_Hwnd);
+			if (VulkanCore_Get() && VulkanCore_Get()->IsReady()) {
+				D3DInterface = VK_Stub_Create_D3D9(_Hwnd);
+			}
+			if (D3DInterface != nullptr) {
+				fprintf(stderr, "[VKNOD3D] Init: d3d9.dll not loaded, driver=%p\n", (void*)D3DInterface);
+				fflush(stderr);
+				IsInitted = true;
+				WWDEBUG_SAY(("Enumerate devices"));
+				Enumerate_Devices();
+				WWDEBUG_SAY(("DX8Wrapper Init completed"));
+				return(true);
+			}
+			fprintf(stderr, "[VKNOD3D] requested but unavailable - the Vulkan core must be up first; loading d3d9.dll\n");
+			fflush(stderr);
+		}
+#endif
 		// GeneralsX @build BenderAI 10/02/2026 - Platform-specific DLL/SO/DYLIB loading (Phase 5: macOS)
 #ifdef _WIN32
 		D3D9Lib = LoadLibrary("d3d9.dll");
@@ -1673,6 +1811,13 @@ void DX8Wrapper::Shutdown()
 	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: final census dump while the shadow state is
 	// still intact (the periodic dumps mean a killed run still leaves data).
 	VK_Census_Dump("shutdown");
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J: in no-d3d9 mode this dump is the work list.
+	// Every line is a D3D9 method the Vulkan backend has not taken over yet; a line that never appears is a
+	// method the engine does not need at all.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (VK_NOD3D_Enabled()) VK_Stub_Census_Dump("shutdown");
+#endif
 
 	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: tear the co-created Vulkan core down first.
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
@@ -1808,6 +1953,9 @@ void DX8Wrapper::Invalidate_Cached_Render_States()
 	Vertex_Shader=0;
 	Pixel_Shader=0;
 	Vertex_Declaration=nullptr;
+	// NOTE: the translated-program map is NOT cleared here. Invalidate_Cached_Render_States is also the
+	// pillarbox path at the end of a frame (End_Scene), so clearing here dropped every binding once per
+	// frame. The map dies with the handles in Reset_Device instead, where the device really is reset.
 	if (_Get_D3D_Device8()) {
 		_Get_D3D_Device8()->SetVertexShader(nullptr);
 		_Get_D3D_Device8()->SetPixelShader(nullptr);
@@ -1888,6 +2036,77 @@ bool DX8Wrapper::Create_Device()
 	}
 
 	::ZeroMemory(&CurrentAdapterIdentifier, sizeof(D3DADAPTER_IDENTIFIER9));
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J: the no-d3d9 stub device has to advertise
+	// the same capability block that DXVK reports today, or every caps-driven feature silently changes
+	// between the two modes. GENERALSX_VK_CAPDUMP=1 prints the fields DX8Caps and the facade actually
+	// consume, so Backend/VKD3DStubImpl.cpp can be filled from a measurement instead of a guess.
+	if (getenv("GENERALSX_VK_CAPDUMP")) {
+		fprintf(stderr,
+			"[VKCAPS] Caps=%08x Caps2=%08x Caps3=%08x DevCaps=%08x DevCaps2=%08x PrimitiveMiscCaps=%08x "
+			"RasterCaps=%08x ZCmpCaps=%08x SrcBlendCaps=%08x DestBlendCaps=%08x AlphaCmpCaps=%08x "
+			"ShadeCaps=%08x TextureCaps=%08x TextureFilterCaps=%08x TextureAddressCaps=%08x "
+			"VertexTextureFilterCaps=%08x LineCaps=%08x StencilCaps=%08x FVFCaps=%08x TextureOpCaps=%08x "
+			"VS20Caps=%08x PS20Caps=%08x DeclTypes=%08x PresentationIntervals=%08x NumSimultaneousRTs=%u "
+			"MaxTextureBlendStages=%u MaxSimultaneousTextures=%u MaxActiveLights=%u MaxUserClipPlanes=%u "
+			"MaxVertexBlendMatrices=%u MaxVertexBlendMatrixIndex=%u MaxPointSize=%f MaxPrimitiveCount=%u "
+			"MaxVertexIndex=%u MaxStreams=%u MaxStreamStride=%u VertexShaderVersion=%08x "
+			"MaxVertexShaderConst=%u PixelShaderVersion=%08x PixelShader1xMaxValue=%u "
+			"MaxTextureAspectRatio=%u MaxAnisotropy=%d MaxVShaderInstrExec=%u MaxPShaderInstrExec=%u "
+			"MaxVS30InstrSlots=%u MaxPS30InstrSlots=%u MaxNpatchTessellationLevel=%f AdapterOrdinal=%u DeviceType=%u\n",
+			(unsigned)caps.Caps, (unsigned)caps.Caps2, (unsigned)caps.Caps3,
+			(unsigned)caps.DevCaps, (unsigned)caps.DevCaps2, (unsigned)caps.PrimitiveMiscCaps,
+			(unsigned)caps.RasterCaps, (unsigned)caps.ZCmpCaps, (unsigned)caps.SrcBlendCaps,
+			(unsigned)caps.DestBlendCaps, (unsigned)caps.AlphaCmpCaps, (unsigned)caps.ShadeCaps,
+			(unsigned)caps.TextureCaps, (unsigned)caps.TextureFilterCaps, (unsigned)caps.TextureAddressCaps,
+			(unsigned)caps.VertexTextureFilterCaps, (unsigned)caps.LineCaps, (unsigned)caps.StencilCaps,
+			(unsigned)caps.FVFCaps, (unsigned)caps.TextureOpCaps, (unsigned)caps.VS20Caps.Caps,
+			(unsigned)caps.PS20Caps.Caps, (unsigned)caps.DeclTypes, (unsigned)caps.PresentationIntervals,
+			(unsigned)caps.NumSimultaneousRTs, (unsigned)caps.MaxTextureBlendStages,
+			(unsigned)caps.MaxSimultaneousTextures, (unsigned)caps.MaxActiveLights,
+			(unsigned)caps.MaxUserClipPlanes, (unsigned)caps.MaxVertexBlendMatrices,
+			(unsigned)caps.MaxVertexBlendMatrixIndex, (float)caps.MaxPointSize,
+			(unsigned)caps.MaxPrimitiveCount, (unsigned)caps.MaxVertexIndex, (unsigned)caps.MaxStreams,
+			(unsigned)caps.MaxStreamStride, (unsigned)caps.VertexShaderVersion,
+			(unsigned)caps.MaxVertexShaderConst, (unsigned)caps.PixelShaderVersion,
+			(unsigned)caps.PixelShader1xMaxValue, (unsigned)caps.MaxTextureAspectRatio,
+			(int)caps.MaxAnisotropy, (unsigned)caps.MaxVShaderInstructionsExecuted,
+			(unsigned)caps.MaxPShaderInstructionsExecuted, (unsigned)caps.MaxVertexShader30InstructionSlots,
+			(unsigned)caps.MaxPixelShader30InstructionSlots, (double)caps.MaxNpatchTessellationLevel,
+			(unsigned)caps.AdapterOrdinal, (unsigned)caps.DeviceType);
+		fflush(stderr);
+		// GeneralsX @feature Qoder 18/10/2026 wedge 9.J2b: the named fields above are what the engine is
+		// known to read, but the faults come from the ones nobody listed (a missing MaxTextureHeight was
+		// enough to divide by zero in Validate_Texture_Size). So dump the block verbatim: the stub copies
+		// this byte string instead of a hand-written subset, and running the same probe in both modes makes
+		// "the capability block is identical" a byte-for-byte check rather than an argument.
+		{
+			const unsigned char* raw = (const unsigned char*)&caps;
+			fprintf(stderr, "[VKCAPSBIN] sizeof=%u rva=%u bytes=", (unsigned)sizeof(D3DCAPS9),
+				(unsigned)caps.AdapterOrdinal);
+			for (unsigned i = 0; i < sizeof(D3DCAPS9); ++i) {
+				fprintf(stderr, "%02x", raw[i]);
+			}
+			fprintf(stderr, "\n");
+			fflush(stderr);
+		}
+		// The stub device also has to answer GetAdapterIdentifier with something the device list and the
+		// driver-version parser can use, so record what DXVK reports today.
+		D3DADAPTER_IDENTIFIER9 ident;
+		::ZeroMemory(&ident, sizeof(ident));
+		if (D3DInterface->GetAdapterIdentifier(CurRenderDevice, 0, &ident) == D3D_OK) {
+			fprintf(stderr, "[VKCAPS] devicename=%s description=%s driver=%s vendorid=%04x deviceid=%04x "
+				"subsysid=%08x revision=%08x whql=%u version=%u.%u.%u.%u\n",
+				ident.DeviceName, ident.Description, ident.Driver,
+				(unsigned)ident.VendorId, (unsigned)ident.DeviceId,
+				(unsigned)ident.SubSysId, (unsigned)ident.Revision, (unsigned)ident.WHQLLevel,
+				(unsigned)HIWORD(ident.DriverVersion.HighPart), (unsigned)LOWORD(ident.DriverVersion.HighPart),
+				(unsigned)HIWORD(ident.DriverVersion.LowPart), (unsigned)LOWORD(ident.DriverVersion.LowPart));
+			fflush(stderr);
+		}
+	}
+#endif
 
 	if
 	(
@@ -1992,6 +2211,43 @@ bool DX8Wrapper::Create_Device()
 
 	dbgHelpGuard.deactivate();
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.K: once d3d9 is gone the device *is* the state
+	// machine, and an all-zero initial table would silently differ from what the engine sees today. This
+	// prints every state a fresh device reports as non-zero - before Do_Onetime_Device_Dependent_Inits and
+	// before any engine code has written one - so Backend/VKD3DStubImpl.cpp stores measurements.
+	if (getenv("GENERALSX_VK_CAPDUMP")) {
+		for (DWORD s = 0; s <= 511; ++s) {
+			DWORD v = 0;
+			if (SUCCEEDED(D3DDevice->GetRenderState((D3DRENDERSTATETYPE) s, &v)) && v != 0) {
+				fprintf(stderr, "[VKRS] rs 0x%03x=0x%08x\n", (unsigned) s, (unsigned) v);
+			}
+		}
+		for (DWORD stage = 0; stage < 8; ++stage) {
+			for (DWORD t = 0; t <= 63; ++t) {
+				DWORD v = 0;
+				if (SUCCEEDED(D3DDevice->GetTextureStageState(stage, (D3DTEXTURESTAGESTATETYPE) t, &v)) && v != 0) {
+					fprintf(stderr, "[VKRS] tss %u 0x%02x=0x%08x\n", (unsigned) stage, (unsigned) t, (unsigned) v);
+				}
+			}
+			for (DWORD t = 0; t <= 15; ++t) {
+				DWORD v = 0;
+				if (SUCCEEDED(D3DDevice->GetSamplerState(stage, (D3DSAMPLERSTATETYPE) t, &v)) && v != 0) {
+					fprintf(stderr, "[VKRS] samp %u 0x%02x=0x%08x\n", (unsigned) stage, (unsigned) t, (unsigned) v);
+				}
+			}
+		}
+		// The SM2 sub-blocks feed the SM3_CAPS line; only Caps was captured by the first caps dump.
+		fprintf(stderr, "[VKCAPS] VS20 caps=%08x dynFlow=%d temps=%d staticFlow=%d | PS20 caps=%08x dynFlow=%d "
+			"temps=%d staticFlow=%d slots=%d\n",
+			(unsigned)caps.VS20Caps.Caps, (int)caps.VS20Caps.DynamicFlowControlDepth, (int)caps.VS20Caps.NumTemps,
+			(int)caps.VS20Caps.StaticFlowControlDepth, (unsigned)caps.PS20Caps.Caps,
+			(int)caps.PS20Caps.DynamicFlowControlDepth, (int)caps.PS20Caps.NumTemps,
+			(int)caps.PS20Caps.StaticFlowControlDepth, (int)caps.PS20Caps.NumInstructionSlots);
+		fflush(stderr);
+	}
+#endif
+
 	/*
 	** Initialize all subsystems
 	*/
@@ -2043,6 +2299,10 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 			}
 		}
 		Invalidate_Cached_Render_States();
+		// GeneralsX @feature Qoder 18/10/2026 wedge 8: every IDirect3D*Shader9 handle dies with the
+		// device, so a tag keyed by one must die with it too. SHD_INIT_SHADERS below recompiles the
+		// engine's programs, which re-registers them through VKPgm_Note_Compiled.
+		VKPgm_Reset_All();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
@@ -3156,11 +3416,26 @@ void DX8Wrapper::Begin_Scene()
 {
 	DX8_THREAD_ASSERT();
 
+	// GeneralsX @performance Qoder 19/10/2026 R-05 L9: phase11 outer probe. B3_10 (ww3d.cpp) pinned 9-10 ms
+	// of frame time on this call; V11_11 times VKDraw_Begin_Frame's steps. This line splits what is left -
+	// the facade BeginScene and the browser updates - so the two probes together must add up to begin_scene.
+	static const bool s11On = [] {
+		const char* e = getenv("GENERALSX_VKFPS_PHASES");
+		return e != nullptr && atoi(e) != 0;
+	}();
+	static long long s11Calls = 0, s11Stub = 0, s11Vk = 0, s11Wb = 0;
+	auto s11Now = [] {
+		return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	};
+	long long s11t = s11On ? s11Now() : 0;
+
 #if ENABLE_EMBEDDED_BROWSER
 	DX8WebBrowser::Update();
 #endif
 
 	DX8CALL(BeginScene());
+	if (s11On) { s11Stub += s11Now() - s11t; s11t = s11Now(); }
 
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 	// GeneralsX @feature Qoder 18/10/2026 wedge 5: open the Vulkan frame that this scene's batches record
@@ -3173,12 +3448,28 @@ void DX8Wrapper::Begin_Scene()
 		VKDraw_Set_Scene_Extent((unsigned)ResolutionWidth, (unsigned)ResolutionHeight);
 		VKDraw_Begin_Frame();
 	}
+	if (s11On) { s11Vk += s11Now() - s11t; s11t = s11Now(); }
 #endif
 
 	// GeneralsX @build BenderAI 10/02/2026 - Embedded browser Windows-only
 #ifdef _WIN32
 	DX8WebBrowser::Update();
 #endif
+	if (s11On) {
+		s11Wb += s11Now() - s11t;
+		if (++s11Calls % 600 == 0) {
+			FILE* fp11 = fopen("vkfps_phase11.log", "a");
+			if (fp11) {
+				const double inv = 1.0 / 600.0;
+				fprintf(fp11, "[S11_11] frames=600 avg_us stub_beginscene=%.1f vk_begin_frame=%.1f post=%.1f total=%.1f\n",
+					(double)s11Stub * inv, (double)s11Vk * inv, (double)s11Wb * inv,
+					(double)(s11Stub + s11Vk + s11Wb) * inv);
+				fflush(fp11);
+				fclose(fp11);
+			}
+			s11Stub = s11Vk = s11Wb = 0;
+		}
+	}
 }
 
 void DX8Wrapper::End_Scene(bool flip_frames)
@@ -3499,6 +3790,13 @@ namespace {
 		unsigned long long programmable;	// custom vertex/pixel shader: wedge 8 owns those
 		unsigned long long refused;		// the layer itself said no
 		unsigned long long materialized;	// backings copied out of the D3D9 resource on first draw
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the two ways a batch can be *described*
+		// but still not drawn right. Both are silent by construction - the descriptor set has four sampled
+		// image slots and the interpreter has a finite op table - so without a counter a fifth texture stage
+		// or a construct the table cannot say would look like a content bug in the frame, not a gap in this
+		// wedge. Neither has fired in a game run; they exist so a run that starts firing them says so.
+		unsigned long long texBeyondSlots;	// a texture bound at a stage with no descriptor slot
+		unsigned long long ffUnsupported;	// a stage state the pixel interpreter has no row for
 		unsigned long long lastLog;
 	};
 	VKDrawFillCounters VKF;
@@ -3513,6 +3811,49 @@ namespace {
 		bool     valid;
 	};
 	VKViewportShadow VK_VP = { 0, 0, 0, 0, false };
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: render-target ownership. The recorder
+	// draws into exactly one mirror at a time, and following a target switch is only correct when every
+	// batch drawn there can be consumed - a single fallback would split the target between the D3D9
+	// resource and the Vulkan mirror. So a family opts in per texture through
+	// DX8Wrapper::VK_Allow_Render_Target, and every other target keeps 'owned' false while it is bound:
+	// facade draws are refused (D3D9 runs them) and the recorder stays on the scene it last described.
+	struct VKRTOwnership {
+		bool     owned;			// current target is described by the recorder
+		// GeneralsX @tweak Qoder 18/10/2026 step 9.H: 32, not 8. W3DShaderManager::init re-runs on every
+		// height-map rebuild and re-registers the offscreen color/depth pair under fresh D3D9 pointers;
+		// the list never forgets a key, so a small fixed capacity would silently lock the screen-filter
+		// family out after a few map loads and freeze the viewport on its first redirected frame.
+		void*    allowed[32];	// texture keys whose families have opted in
+		unsigned allowedCount;
+		unsigned refusedLogged;	// bounded diagnostic lines
+	};
+	VKRTOwnership VK_RT = { true, { nullptr }, 0u, 0u };
+
+	bool vk_rt_allowed(void* key)
+	{
+		for (unsigned i = 0; i < VK_RT.allowedCount; ++i) if (VK_RT.allowed[i] == key) return true;
+		return false;
+	}
+
+	// Uploaded art answers through VKTex; a target the recorder wrote answers through VKRT. Both are
+	// valid sampled sources, so a texture slot accepts either. Depth mirrors are attachment-only.
+	void* vk_texture_view(void* key)
+	{
+		VKTex_Info ti;
+		if (VKTex_Query(key, &ti) && ti.view) return ti.view;
+		VKRT_Info ri;
+		if (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) return ri.view;
+		return nullptr;
+	}
+
+	void vk_note_rt_refusal()
+	{
+		if (VK_RT.refusedLogged >= 8u) return;
+		++VK_RT.refusedLogged;
+		fprintf(stderr, "[VKRT] facade draw refused: current render target is not Vulkan-owned\n");
+		fflush(stderr);
+	}
 
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A forensics: a batch whose vertex buffer has no
 	// backing falls back to D3D9, and the counters say how often - but not which buffer or why. Every WW3D
@@ -3606,6 +3947,84 @@ namespace {
 		return dst != nullptr;
 	}
 
+}
+
+void DX8Wrapper::VK_Allow_Render_Target(void* texture_key)
+{
+	if (!texture_key) return;
+	if (vk_rt_allowed(texture_key)) return;
+	if (VK_RT.allowedCount >= (unsigned)(sizeof(VK_RT.allowed) / sizeof(VK_RT.allowed[0]))) {
+		fprintf(stderr, "[VKRT] allow list full; %p stays on D3D9\n", texture_key);
+		fflush(stderr);
+		return;
+	}
+	VK_RT.allowed[VK_RT.allowedCount++] = texture_key;
+	fprintf(stderr, "[VKRT] render target allowed key=%p\n", texture_key);
+	fflush(stderr);
+}
+
+bool DX8Wrapper::VK_Register_Render_Target(void* color_key, unsigned width, unsigned height,
+	int d3d_color_format, void* depth_key, int ww3d_zformat)
+{
+	if (!color_key || !width || !height) return false;
+	const WW3DFormat colorFormat = D3DFormat_To_WW3DFormat((D3DFORMAT)d3d_color_format);
+	bool ok = VKRT_Alloc_Color(color_key, width, height, (int)colorFormat);
+	if (depth_key && !VKRT_Alloc_Depth(depth_key, width, height, ww3d_zformat)) ok = false;
+	if (!ok) {
+		fprintf(stderr, "[VKRT] register failed color=%p depth=%p fmt=%d zfmt=%d\n",
+			color_key, depth_key, (int)colorFormat, ww3d_zformat);
+		fflush(stderr);
+		return false;
+	}
+	VK_Allow_Render_Target(color_key);
+	if (depth_key) VK_Allow_Render_Target(depth_key);
+	return true;
+}
+
+static IDirect3DTexture9* vk_surface_texture(IDirect3DSurface9* surface)
+{
+	if (!surface) return nullptr;
+	IDirect3DTexture9* texture = nullptr;
+	if (FAILED(surface->GetContainer(IID_IDirect3DTexture9, (void**)&texture))) return nullptr;
+	return texture;	// caller releases
+}
+
+// Publish the target the device is now on to the recorder. A null colour is the engine's "default"
+// target, which in this port is the scene mirror the present chain reads - not the swapchain image.
+static bool vk_publish_render_target(IDirect3DSurface9* color, IDirect3DSurface9* depth)
+{
+	if (!VKDraw_Ready()) { VK_RT.owned = false; return false; }
+	if (!color) {
+		void* ck = nullptr; void* dk = nullptr; unsigned w = 0, h = 0;
+		VKDraw_Scene_Targets(&ck, &dk, &w, &h);
+		VK_RT.owned = ck != nullptr;
+		if (ck) VKDraw_Set_Targets(ck, dk, w, h);
+		return VK_RT.owned;
+	}
+	IDirect3DTexture9* ctex = vk_surface_texture(color);
+	if (!ctex) {
+		// The back buffer and surfaces whose container is not a texture never opt in; the recorder
+		// stays where it was and every facade draw during this target is refused.
+		VK_RT.owned = false;
+		return false;
+	}
+	VKRT_Info ci;
+	const bool owned = VKRT_Query(ctex, &ci) && ci.view && vk_rt_allowed(ctex);
+	// A depth surface that is not a texture (the sun shadow map's raw D24S8) carries no container to
+	// look up, so it is registered by its own pointer and resolved that way.
+	IDirect3DTexture9* dtex = depth ? vk_surface_texture(depth) : nullptr;
+	void* depthKey = nullptr;
+	VKRT_Info di;
+	if (dtex) {
+		if (VKRT_Query(dtex, &di) && di.view && vk_rt_allowed(dtex)) depthKey = dtex;
+	} else if (depth) {
+		if (VKRT_Query(depth, &di) && di.view && vk_rt_allowed(depth)) depthKey = depth;
+	}
+	if (owned) VKDraw_Set_Targets(ctex, depthKey, ci.width, ci.height);
+	VK_RT.owned = owned;
+	if (dtex) dtex->Release();
+	ctex->Release();
+	return owned;
 }
 
 void DX8Wrapper::VK_Shadow_Viewport(const D3DVIEWPORT9* viewport)
@@ -3757,6 +4176,17 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	if (fvf & D3DFVF_XYZRHW)   fx |= VKFF_FLAG_RHW;
 	if ((fvf & D3DFVF_XYZ) && !(fvf & (D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEXCOUNT_MASK)))
 		fx |= VKFF_FLAG_POSITION_ONLY;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan step 9.I: the point-sprite UV source. The size
+	// registers travel in the two point slots below; this bit is only the coordinate decision.
+	if (VK_Read_RS(D3DRS_POINTSPRITEENABLE)) fx |= VKFF_FLAG_POINT_SPRITE;
+	// GeneralsX @bugfix Qoder 19/10/2026 R-02 vColor forensics: GENERALSX_VKVCOL raises a spare flags.x
+	// bit (11) that vkff.frag reads as "paint the interpolated vertex colour, scaled by a quarter, and
+	// nothing else". The i/j censuses proved the engine-side arithmetic cannot reach pure white, so the
+	// measurement has to come from the GPU side: a blob that shows dark cream under this probe carries a
+	// vColor near 1 and is NOT painted by these batches; a blob that shows clipped white carries vColor
+	// >= 4 and the lit vertex path is the multiplier. Probe only - never a fix.
+	static const bool s_vkcolFlag = [] { return getenv("GENERALSX_VKVCOL") != nullptr; }();
+	if (s_vkcolFlag) fx |= (1u << 11);
 
 	unsigned fy = lightMask;
 	fy |= (texcount & 7u) << 8;
@@ -3768,12 +4198,21 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	fy |= (VK_Read_RS(D3DRS_EMISSIVEMATERIALSOURCE) & 3u) << 23;
 	ff.flags[0] = fx;
 	ff.flags[1] = fy;
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the alpha test, which has no Vulkan pipeline
+	// state to live in and is therefore carried to the pixel stage as state. D3DRS_ALPHAFUNC's ordinal is
+	// the compare, D3DRS_ALPHAREF is the 0..255 reference the shadow holds, and the enable bit decides
+	// whether either is consulted. flags[3] stays reserved.
+	ff.flags[2] = VKFF_PACK_ALPHA_TEST(VK_Read_RS(D3DRS_ALPHATESTENABLE) ? 1u : 0u,
+	                                   VK_Read_RS(D3DRS_ALPHAFUNC) & 7u,
+	                                   VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu);
+	// flags[3] carries the last enabled combiner stage; it is written after the tss loop below.
 
 	// ---- the per-stage coordinate source ------------------------------------------------------
-	// The whole fixed-function texture surface the census measured is these two registers plus the
-	// combiner state wedge 7 reads: nothing in the engine ever writes D3DTS_TEXTURE0..7, so there is no
-	// texture matrix stack to carry, and D3DTTFF_PROJECTED is the only transform flag the FVF_XYZRHW
-	// path can reach.
+	// The TSS register pair the vertex stage needs, plus (below) the D3DTS_TEXTUREn matrices that
+	// D3DTTFF_COUNT1..4 multiplies the generator output with. The old census note here claimed nothing in
+	// the engine ever writes the texture transforms; the terrain noise passes in W3DShaderManager
+	// (D3DTS_TEXTURE2/3) and the water pass (TEXTURE1/2) disprove it, and the ground rendered black until
+	// BUG-03 carried the matrices.
 	for (unsigned s = 0; s < VKFF_MAX_STAGES; ++s) {
 		const unsigned tci  = VK_Read_TSS(s, D3DTSS_TEXCOORDINDEX, s);
 		const unsigned ttff = VK_Read_TSS(s, D3DTSS_TEXTURETRANSFORMFLAGS, 0);
@@ -3789,6 +4228,176 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 			: (bits == D3DFVF_TEXTUREFORMAT3) ? 3u : 4u;
 	}
 
+	// ---- the texture matrices (BUG-03) ---------------------------------------------------------
+	// One entry per stage slot, taken from the same shadow DX8CALL(SetTransform) would have been handed:
+	// DX8Wrapper::_Set_DX8_Transform stores the engine matrix verbatim before forwarding it, and the
+	// vertex stage contract (vkff.vert) is to multiply generator output with those verbatim bytes, which
+	// reproduces D3D's row-vector v*M exactly. A never-written slot is the zero the memset left behind,
+	// not the device default identity, so identity stands in there - the same fallback render_state uses
+	// for an unclaimed WORLD/VIEW.
+	{
+		static const float kIdentityTex[16] = { 1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1 };
+		for (unsigned s = 0; s < VKFF_MAX_STAGES; ++s) {
+			const Matrix4x4& m = DX8Transforms[D3DTS_TEXTURE0 + s];
+			const float* src = &m[0][0];
+			bool allZero = true;
+			for (unsigned k = 0; k < 16; ++k) if (src[k] != 0.0f) { allZero = false; break; }
+			if (allZero) memcpy(&ff.tex_mat[s][0], kIdentityTex, sizeof(kIdentityTex));
+			else memcpy(&ff.tex_mat[s][0], src, sizeof(ff.tex_mat[s]));
+		}
+		// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 probe: name the first packed batches whose stage TTFF
+		// asks for a transform, so the log can say whether the terrain TEXTURE2/3 matrices actually reach
+		// the FF block. Budget 6, then silent.
+		static int s_texMatProbe = 6;
+		const bool camPosStage2 = (ff.stage[2].tci >> 16) == 2u;   // D3DTSS_TCI_CAMERASPACEPOSITION
+		const bool camPosStage3 = (ff.stage[3].tci >> 16) == 2u;
+		if (s_texMatProbe > 0 && (camPosStage2 || camPosStage3)) {
+			--s_texMatProbe;
+			fprintf(stderr, "[VKFF] texmat probe: tci2=%u ttff2=%u m2=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f] ttff3=%u m3=[%.3f %.3f %.3f %.3f]\n",
+				ff.stage[2].tci, ff.stage[2].ttff,
+				ff.tex_mat[2][0], ff.tex_mat[2][1], ff.tex_mat[2][2], ff.tex_mat[2][3],
+				ff.tex_mat[2][4], ff.tex_mat[2][5], ff.tex_mat[2][6], ff.tex_mat[2][7],
+				ff.stage[3].ttff,
+				ff.tex_mat[3][0], ff.tex_mat[3][1], ff.tex_mat[3][2], ff.tex_mat[3][3]);
+			fflush(stderr);
+		}
+	}
+
+	// ---- the combiner registers (wedge 7) -----------------------------------------------------
+	// The texture-combiner state the pixel interpreter replays, straight out of the same shadow the D3D9
+	// path would have been handed. Fallbacks are the documented D3D9 device defaults, not zero: a stage
+	// nobody wrote is MODULATE(TEXTURE, CURRENT) for colour and MODULATE(TEXTURE, DIFFUSE) for alpha,
+	// with the result landing in CURRENT. A stage with nothing bound to its texture slot is disabled
+	// outright, which is what the device does and what the last block of this loop now enforces.
+	unsigned maxStage = 0;
+	for (unsigned s = 0; s < VKFF_MAX_STAGES; ++s) {
+		VKDraw_FF_TSS& t = ff.tss[s];
+		unsigned cop = VK_Read_TSS(s, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+		unsigned arg0c = VK_Read_TSS(s, D3DTSS_COLORARG0, D3DTA_DIFFUSE);
+		unsigned arg1c = VK_Read_TSS(s, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		unsigned arg2c = VK_Read_TSS(s, D3DTSS_COLORARG2, D3DTA_CURRENT);
+		unsigned aop = VK_Read_TSS(s, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
+		unsigned arg0a = VK_Read_TSS(s, D3DTSS_ALPHAARG0, D3DTA_DIFFUSE);
+		unsigned arg1a = VK_Read_TSS(s, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		unsigned arg2a = VK_Read_TSS(s, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		unsigned res = VK_Read_TSS(s, D3DTSS_RESULTARG, D3DTA_CURRENT);
+		// GeneralsX @bugfix Qoder 19/10/2026 BUG-02: an empty texture slot DISABLES the raster stage on a
+		// real device - the incoming register passes through untouched, the stage's op is never evaluated.
+		// Binding the built-in white instead (the layer's passthrough for unmirrored slots) is only
+		// equivalent for the colour chain, where MODULATE(WHITE, CURRENT) == CURRENT. The documented alpha
+		// default is MODULATE(TEXTURE, DIFFUSE), which does not read CURRENT at all, so every stage above
+		// the last bound one overwrote the alpha the pass had just built with the vertex diffuse alpha.
+		// For the glyph atlas batches - stage 0 correctly producing MODULATE(TEXTURE, DIFFUSE) under
+		// SRCALPHA/INVSRCALPHA, stages 1..7 left unwritten - that made the transparent texels of every
+		// cell opaque black, which is the black rectangle behind the menu and HUD text. The engine relies
+		// on this bypass everywhere: Apply_Default_State leaves the stages at MODULATE and binds nothing.
+		if (!Textures[s]) { cop = D3DTOP_DISABLE; aop = D3DTOP_DISABLE; }
+		t.col[0] = cop;
+		t.col[1] = arg0c;
+		t.col[2] = arg1c;
+		t.col[3] = arg2c;
+		t.alp[0] = aop;
+		t.alp[1] = arg0a;
+		t.alp[2] = arg1a;
+		t.alp[3] = arg2a;
+		t.res[0] = res;
+		// GeneralsX @performance Qoder 18/10/2026 pure-Vulkan wedge 7: the interpreter used to run
+		// all eight stage slots for every pixel because the loop bound was a compile-time constant. The
+		// engine disables every slot above the ones a pass uses, so the last enabled slot is the only
+		// bound the frame needs. It rides in flags[3], which wedge 7 had left reserved.
+		if (t.col[0] != D3DTOP_DISABLE || t.alp[0] != D3DTOP_DISABLE)
+			maxStage = s + 1u;
+	}
+	ff.flags[3] = maxStage;
+
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: the maroon footprint patches stay even though
+	// W3DProjectedShadow::flushDecals never draws a non-empty batch, so they come from some other
+	// modulate-blend pass (dst * pixel). Attribute them from the recorder side: one line per distinct
+	// stage-0 texture seen under a ZERO/SRCCOLOR blend, with the bytes the FF pixel interpreter will
+	// actually combine. Dedup key is the D3D texture pointer; budget 16.
+	{
+		static void* s_modKeys[16];
+		static int s_modN = 0;
+		const bool modulate = VK_Read_RS(D3DRS_ALPHABLENDENABLE)
+			&& VK_Read_RS(D3DRS_SRCBLEND) == (unsigned)D3DBLEND_ZERO
+			&& VK_Read_RS(D3DRS_DESTBLEND) == (unsigned)D3DBLEND_SRCCOLOR;
+		TextureBaseClass* t0 = render_state.Textures[0];
+		void* key = t0 ? (void*)t0->Peek_D3D_Base_Texture() : nullptr;
+		if (modulate && key) {
+			bool seen = false;
+			for (int i = 0; i < s_modN; ++i) if (s_modKeys[i] == key) { seen = true; break; }
+			if (!seen && s_modN < 16) {
+				s_modKeys[s_modN++] = key;
+				TextureClass* tc = t0->As_TextureClass();
+				const D3DMATERIAL9& mm = Peek_DX8_Material();
+				fprintf(stderr, "[VKFF] modulate draw #%d: tex='%s' key=%p %dx%d fmt=%d fvf=%08x "
+					"op0=%u arg1=%x arg2=%x aop=%u atest=%u aref=%u tf=%08x rs=%08x "
+					"matD=(%.2f,%.2f,%.2f,%.2f) matA=(%.2f,%.2f,%.2f) matS=(%.2f,%.2f,%.2f)\n",
+					s_modN, t0->Get_Texture_Name().str(), key,
+					t0->Get_Width(), t0->Get_Height(), tc ? (int)tc->Get_Texture_Format() : -1,
+					fvf, ff.tss[0].col[0], ff.tss[0].col[2], ff.tss[0].col[3], ff.tss[0].alp[0],
+					VK_Read_RS(D3DRS_ALPHATESTENABLE), VK_Read_RS(D3DRS_ALPHAREF),
+					VK_Read_RS(D3DRS_TEXTUREFACTOR), VK_Read_RS(D3DRS_DIFFUSEMATERIALSOURCE),
+					mm.Diffuse.r, mm.Diffuse.g, mm.Diffuse.b, mm.Diffuse.a,
+					mm.Ambient.r, mm.Ambient.g, mm.Ambient.b,
+					mm.Specular.r, mm.Specular.g, mm.Specular.b);
+				fflush(stderr);
+				// GeneralsX @debug Qoder 19/10/2026 BUG-02: the atlas-multiply line never enters the
+				// [VKATLAS] probe (that one keys render_state and catches only facade-bound batches),
+				// so the black glyph cells must be attributed from here: same RtlCaptureStackBackTrace
+				// form as [VKFFRED], offsets resolved offline against GeneralsMD/Release/GeneralRefresh.map.
+				{
+					void* fr[12];
+					const unsigned n9 = RtlCaptureStackBackTrace(0, 12, fr, nullptr);
+					const char* b9 = (const char*)GetModuleHandleA(nullptr);
+					fprintf(stderr, "[VKMODSTK] #%d f=%llu frames=%u", s_modN, VKCore_Frame_No(), n9);
+					for (unsigned i9 = 0; i9 < n9; ++i9) {
+						const long long r9 = (const char*)fr[i9] - b9;
+						fprintf(stderr, " %d=0x%llX", (int)i9, (unsigned long long)(r9 > 0 ? r9 : 0));
+					}
+					fprintf(stderr, "\n");
+					fflush(stderr);
+				}
+			}
+		}
+	}
+
+	// ---- what this wedge cannot say (wedge 7) ---------------------------------------------------
+	// The interpreter has a row for every documented combiner op except the two bump-map ones, which it
+	// answers by reducing to arg1 - correct at the identity BUMPENVMAT the facade's own reset installs,
+	// wrong if the game ever sets a real bump matrix. And the FF fragment shader samples four textures
+	// (VKFF_SAMPLED_SLOTS) even though the descriptor set now carries eight, so an enabled stage above
+	// slot 3 has its combiner replayed against the passthrough white instead of its texture. Both are
+	// silent by construction, so each is counted, and only while the pixel gate is actually in force.
+	if (VKDraw_FF_Pixel_On()) {
+		for (unsigned s = 0; s < VKFF_MAX_STAGES; ++s) {
+			const unsigned cop = ff.tss[s].col[0];
+			const unsigned aop = ff.tss[s].alp[0];
+			const bool enabled = (cop != D3DTOP_DISABLE || aop != D3DTOP_DISABLE);
+			if (!enabled) continue;
+			if (cop == D3DTOP_BUMPENVMAP || cop == D3DTOP_BUMPENVMAPLUMINANCE ||
+			    aop == D3DTOP_BUMPENVMAP || aop == D3DTOP_BUMPENVMAPLUMINANCE) ++VKF.ffUnsupported;
+			if (s >= VKFF_SAMPLED_SLOTS && Textures[s]) ++VKF.texBeyondSlots;
+		}
+	}
+
+	// ---- the point registers (step 9.I) -------------------------------------------------------
+	// D3D9 stores every one of these as the bit pattern of a float, and the documented defaults are not
+	// zero (size 1, min 0, max 64, scale A=1 B=0 C=0), so an unwritten register must fall back to those
+	// numbers rather than to the shadow's invalid sentinel. The vertex stage consumes this block only when
+	// it writes gl_PointSize, which is every draw: a non-point topology ignores the value, and a point
+	// topology whose states were never named then gets exactly the size the retired device used.
+	{
+		union { unsigned u; float f; } pb;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSIZE, 1.0f);     ff.point[0] = pb.f;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSIZE_MIN, 0.0f); ff.point[1] = pb.f;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSIZE_MAX, 64.0f); ff.point[2] = pb.f;
+		ff.point[3] = VK_Read_RS(D3DRS_POINTSCALEENABLE) ? 1.0f : 0.0f;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSCALE_A, 1.0f);  ff.point_scale[0] = pb.f;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSCALE_B, 0.0f);  ff.point_scale[1] = pb.f;
+		pb.u = VK_Read_RS_Default_bits(D3DRS_POINTSCALE_C, 0.0f);  ff.point_scale[2] = pb.f;
+	}
+
 	// ---- the viewport ------------------------------------------------------------------------
 	// The RHW path arrives in this space already, and only this path can say which rectangle was current.
 	unsigned tw = 0, th = 0;
@@ -3801,50 +4410,11 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	}
 }
 
-bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_type,
-	unsigned short first_index, unsigned short polygon_count,
-	unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex)
+void DX8Wrapper::VK_Fill_Submit_State(VKDraw_Submit& s, VKDraw_FF_State& ffState,
+	const FVFInfoClass& info, unsigned vsTag, unsigned psTag, unsigned primitive_type)
 {
-	(void)min_vertex_index;	// a range hint for D3D9, not something Vulkan binds against
-	if (!VKDraw_Ready()) { ++VKF.notReady; return false; }
-
-	VertexBufferClass* vb = static_cast<VertexBufferClass*>(vb_);
-	IndexBufferClass*  ib = static_cast<IndexBufferClass*>(ib_);
-	if (!vb || !ib || !polygon_count) return false;
-
-	// A batch with a custom shader is a wedge-8 pipeline variant. The mechanism vertex/pixel stages this
-	// wedge stands up know nothing about those programs, so such a batch is reported as not consumable and
-	// the D3D9 call still runs - which is what keeps every intermediate state of this port playable.
-	if (Vertex_Shader || Pixel_Shader) { ++VKF.programmable; return false; }
-
-	void* vbBuf = nullptr; void* ibBuf = nullptr;
-	unsigned long long vbOff = 0, ibOff = 0;
-	unsigned vbBytes = 0, ibBytes = 0;
-	if (!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
-		if (!vk_materialize_vertex_backing(vb) ||
-			!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
-			++VKF.noVertexBacking;
-			vk_report_missing_vb(vb);
-			return false;
-		}
-		++VKF.materialized;
-	}
-	if (!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
-		if (!vk_materialize_index_backing(ib) ||
-			!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
-			++VKF.noIndexBacking;
-			return false;
-		}
-		++VKF.materialized;
-	}
-
-	// The vertex layout comes from the buffer, exactly like the D3D9 path takes it from the buffer:
-	// Apply_Render_State_Changes re-asserts SetFVF(vb->FVF_Info().Get_FVF()) on every buffer change, so
-	// this is the format the batch was drawn with, not merely the last one the game named.
-	const FVFInfoClass& info = vb->FVF_Info();
 	const unsigned fvf = info.Get_FVF();
-	const unsigned stride = info.Get_FVF_Size();
-	if (!fvf || !stride) { ++VKF.refused; return false; }
+	long long t17f = vkf17::on() ? vkf17::now() : 0;
 
 	VKDraw_Attr attrs[VKDRAW_MAX_ATTRS];
 	unsigned attr_count = 0;
@@ -3883,15 +4453,13 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 			: (bits == D3DFVF_TEXTUREFORMAT3) ? 3u : 4u;
 		attrs[attr_count++] = { 4u + t, info.Get_Tex_Offset(t), comps, 0u };
 	}
-	if (!attr_count) { ++VKF.refused; return false; }
 
-	VKDraw_Submit s = {};
 	s.key.shader_bits = (unsigned long long)(unsigned&)render_state.shader;
 	s.key.fvf         = fvf;
 	unsigned mask = 0;
 	for (unsigned i = 0; i < 8; ++i) if (render_state.LightEnable[i]) mask |= (1u << i);
 	s.key.light_mask  = mask;
-	s.key.vs_tag = 0u; s.key.ps_tag = 0u;	// wedge 8 replaces these with registry indices
+	s.key.vs_tag = vsTag; s.key.ps_tag = psTag;	// wedge 8: registry indices, 0 = fixed function
 	s.key.topology = primitive_type;
 	// The attachment formats are filled in by the recorder from the images the pass is built on, so the
 	// facade does not have to know which mirror it is drawing into.
@@ -3899,13 +4467,24 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 	s.key.sample_count = 1u;
 	s.key.cull_mode   = VK_Read_RS(D3DRS_CULLMODE);
 	// DX8 has no D3DRS_FRONTFACE, so the front-face declaration is a fixed part of this port's contract with
-	// the rasterizer rather than a shadowed state; see vk_cull() for what the pair means.
-	s.key.front_ccw   = 0u;
+	// the rasterizer rather than a shadowed state. Apply_Default_State sets D3DCULL_CW, which D3D defines
+	// as culling clockwise back faces - so this engine's visible faces are counter-clockwise. The flag was
+	// 0 (clockwise-front) until 18/10/2026, which inverted every cull; see vk_cull().
+	s.key.front_ccw   = 1u;
 	s.key.fill_mode   = VK_Read_RS(D3DRS_FILLMODE);
 	s.key.depth_test  = VK_Read_RS(D3DRS_ZENABLE)  != D3DZB_FALSE ? 1u : 0u;
 	s.key.depth_write = VK_Read_RS(D3DRS_ZWRITEENABLE) ? 1u : 0u;
 	s.key.depth_cmp   = VK_Read_RS(D3DRS_ZFUNC);
 	s.key.stencil_test = VK_Read_RS(D3DRS_STENCILENABLE) ? 1u : 0u;
+	// The full stencil block travels even when the test is off: the pipeline cache keys on it, and a draw
+	// that enables the test in the same batch must not alias onto the pipeline built with defaults.
+	s.key.stencil_func       = VK_Read_RS(D3DRS_STENCILFUNC);
+	s.key.stencil_ref        = VK_Read_RS(D3DRS_STENCILREF) & 0xFFu;
+	s.key.stencil_mask       = VK_Read_RS(D3DRS_STENCILMASK);
+	s.key.stencil_write_mask = VK_Read_RS(D3DRS_STENCILWRITEMASK);
+	s.key.stencil_fail       = VK_Read_RS(D3DRS_STENCILFAIL);
+	s.key.stencil_zfail      = VK_Read_RS(D3DRS_STENCILZFAIL);
+	s.key.stencil_pass       = VK_Read_RS(D3DRS_STENCILPASS);
 	s.key.blend_enable = VK_Read_RS(D3DRS_ALPHABLENDENABLE) ? 1u : 0u;
 	s.key.src_blend   = VK_Read_RS(D3DRS_SRCBLEND);
 	s.key.dst_blend   = VK_Read_RS(D3DRS_DESTBLEND);
@@ -3917,32 +4496,263 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 	s.key.alpha_cmp   = VK_Read_RS(D3DRS_ALPHAFUNC);
 	s.key.scissor_test = 0u;	// likewise absent from DX8; the recorder always sets one scissor
 
-	s.stream_count = 1;
-	s.streams[0].vk_buffer   = vbBuf;
-	s.streams[0].offset      = vbOff;
-	s.streams[0].stride      = stride;
-	s.streams[0].vertex_count = vb->Get_Vertex_Count();
-
 	for (unsigned i = 0; i < attr_count; ++i) s.attrs[i] = attrs[i];
 	s.attr_count = attr_count;
-
-	s.vk_index_buffer = ibBuf;
-	s.index_offset    = ibOff;
-	s.start_index     = first_index;
-	// How many indices the backing actually holds from here: D3D9 guarded the same read, and the layer
-	// refuses a batch that would run past it instead of reading another object's geometry.
-	s.index_count     = (ib->Get_Index_Count() > (unsigned)first_index)
-		? ib->Get_Index_Count() - (unsigned)first_index : 0u;
-	s.polygon_count   = polygon_count;
-	s.base_vertex     = (unsigned)base_vertex;
+	vkf17::add(vkf17::F_RS, t17f);
 
 	// Textures the D3D path had bound are handed over as views so the descriptor set is the real one; an
 	// unmirrored or empty slot falls to the layer's built-in white, which is the passthrough the D3D
-	// combiners used there. Samplers wait for wedge 7, which reads them out of the stage state.
+	// combiners used there.
 	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
-		VKTex_Info ti;
-		if (Textures[t] && VKTex_Query((void*)Textures[t], &ti) && ti.view) s.texture_views[t] = ti.view;
+		if (!Textures[t]) continue;
+		// Generated art and engine render targets are both sampled here. The latter has no upload
+		// mirror by construction - its content was written by the recorder - so the lookup falls back
+		// to the render-target mirror instead of silently binding the white texel.
+		s.texture_views[t] = vk_texture_view((void*)Textures[t]);
 	}
+	vkf17::add(vkf17::F_VIEW, t17f);
+
+	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: binding census for every distinct custom pixel
+	// program. The GPU-side atlas mirror proved byte-clean, so the red terrain patches must come from
+	// what a slot actually resolves to (a wrong texture, or nullptr binding the built-in white). The
+	// first pass logged only the first draw per tag and that turned out to be a warm-up batch with
+	// placeholder bindings, so this keeps a small per-tag budget and also prints the facade keys, which
+	// cross-reference the "mirror create: key=" lines to name the exact image behind each view.
+	{
+		static unsigned s_bcTags[24];
+		static unsigned s_bcHits[24];
+		static unsigned s_bcN = 0;
+		if (psTag != 0u) {
+			unsigned slotIdx = 0xFFFFFFFFu;
+			for (unsigned i2 = 0; i2 < s_bcN; ++i2) if (s_bcTags[i2] == psTag) { slotIdx = i2; break; }
+			if (slotIdx == 0xFFFFFFFFu && s_bcN < 24u) { slotIdx = s_bcN; s_bcTags[s_bcN++] = psTag; s_bcHits[s_bcN - 1] = 0u; }
+			if (slotIdx != 0xFFFFFFFFu && s_bcHits[slotIdx] < 12u) {
+				++s_bcHits[slotIdx];
+				fprintf(stderr, "[VKBIND] ps_tag=%u #%u:", psTag, s_bcHits[slotIdx]);
+				for (unsigned t2 = 0; t2 < VKDRAW_MAX_TEX_SLOTS; ++t2) {
+					const char* tn = render_state.Textures[t2]
+						? (const char*)render_state.Textures[t2]->Get_Texture_Name() : "-";
+					fprintf(stderr, " |%u %s k=%p v=%p", t2, tn, Textures[t2], s.texture_views[t2]);
+				}
+				fprintf(stderr, "\n");
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @feature Qoder 19/10/2026 R-02/R-03 probe: unmirrored-but-bound textures. A slot with a
+	// facade texture but no resolved view samples the layer's built-in white - the signature of the
+	// "everything turns white after a camera move" report. VKBIND above only covers custom pixel
+	// programs, and the same white fallback also hits fixed-function batches (psTag 0), so this census
+	// runs on every submit state and names the offending textures, five lines per name.
+	{
+		static char s_nvNames[24][64];
+		static unsigned s_nvHits[24];
+		static unsigned s_nvN = 0;
+		static unsigned s_nvTotal = 0;
+		for (unsigned t3 = 0; t3 < VKDRAW_MAX_TEX_SLOTS && s_nvTotal < 150u; ++t3) {
+			if (!Textures[t3] || s.texture_views[t3]) continue;
+			const char* nm = (const char*)render_state.Textures[t3]->Get_Texture_Name();
+			unsigned slotIdx = 0xFFFFFFFFu;
+			for (unsigned i3 = 0; i3 < s_nvN; ++i3) if (!strcmp(s_nvNames[i3], nm)) { slotIdx = i3; break; }
+			if (slotIdx == 0xFFFFFFFFu && s_nvN < 24u) {
+				slotIdx = s_nvN;
+				strncpy_s(s_nvNames[s_nvN], nm, _TRUNCATE);
+				s_nvHits[s_nvN++] = 0u;
+			}
+			if (slotIdx != 0xFFFFFFFFu && s_nvHits[slotIdx] < 5u) {
+				++s_nvHits[slotIdx];
+				++s_nvTotal;
+				fprintf(stderr, "[VKNULL] slot=%u name='%s' key=%p ps_tag=%u\n", t3, nm, (void*)Textures[t3], psTag);
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @bugfix Qoder 19/10/2026 R-02 ff census, third form: the i-run proved the load/cutscene
+	// census never reaches the white phase - the per-name hash cycles (five states for nbwarfact alone,
+	// every frame, on fields the line does not print) burned the 400-line budget by frame ~100, while the
+	// run's own screenshots show the stable white+red-fleck phase is the MENU plateau at frames 226+. So:
+	// reset the table once when the frame counter crosses 226, cap each name at 8 dumps so one churning
+	// texture cannot starve the rest, print the three hidden hash inputs (fvf, write mask, depth triple)
+	// so two states that print alike can be told apart, and count what the phase actually submits (ff vs
+	// the untranslated-shader skip) so a census that stays empty in the plateau is itself an answer.
+	if (psTag == 0u) {
+		static char s_ffNames[64][64];
+		static unsigned s_ffLast[64];
+		static unsigned s_ffCaps[64];
+		static unsigned s_ffN = 0;
+		static unsigned s_ffLines = 0;
+		static bool s_phase2 = false;
+		static bool s_phase2Done = false;
+		static unsigned long long s_emittedAt226 = 0, s_progAt226 = 0;
+		static unsigned long long s_ffSubmits = 0, s_namedSubmits = 0;
+		const unsigned long long fn = VKCore_Frame_No();
+		if (!s_phase2 && !s_phase2Done && fn >= 226ull) {
+			s_phase2 = true;
+			s_ffLines = 0;
+			s_ffSubmits = 0; s_namedSubmits = 0;
+			s_emittedAt226 = VKF.emitted; s_progAt226 = VKF.programmable;
+			for (unsigned i4 = 0; i4 < 64u; ++i4) { s_ffLast[i4] = 0xFFFFFFFFu; s_ffCaps[i4] = 0u; }
+		}
+		if (s_phase2) {
+			++s_ffSubmits;
+			for (unsigned t5 = 0; t5 < VKDRAW_MAX_TEX_SLOTS; ++t5) if (Textures[t5]) { ++s_namedSubmits; break; }
+			if (fn >= 240ull) {
+				fprintf(stderr, "[VKFFPHASE] frames 226..240: ffSubmits=%llu named=%llu emitted=%llu progSkips=%llu\n",
+					s_ffSubmits, s_namedSubmits, VKF.emitted - s_emittedAt226, VKF.programmable - s_progAt226);
+				fflush(stderr);
+				s_phase2 = false;
+				s_phase2Done = true;   // one window only; the census table stays open for transitions
+			}
+		}
+		for (unsigned t4 = 0; t4 < VKDRAW_MAX_TEX_SLOTS && s_ffLines < 400u; ++t4) {
+			if (!Textures[t4]) continue;
+			const char* nm = (const char*)render_state.Textures[t4]->Get_Texture_Name();
+			if (!nm || !*nm) continue;
+			unsigned idx = 0xFFFFFFFFu;
+			for (unsigned i4 = 0; i4 < s_ffN; ++i4) if (!strcmp(s_ffNames[i4], nm)) { idx = i4; break; }
+			if (idx == 0xFFFFFFFFu && s_ffN < 64u) {
+				idx = s_ffN;
+				strncpy_s(s_ffNames[s_ffN], nm, _TRUNCATE);
+				s_ffLast[s_ffN] = 0xFFFFFFFFu;
+				s_ffCaps[s_ffN++] = 0u;
+			}
+			if (idx == 0xFFFFFFFFu || s_ffCaps[idx] >= 8u) continue;
+			unsigned h5 = 2166136261u;
+			#define VKFF_MIX(v) h5 = (h5 ^ (unsigned)(v)) * 16777619u
+			const D3DMATERIAL9& m5 = Peek_DX8_Material();
+			VKFF_MIX(fvf);
+			VKFF_MIX(s.key.blend_enable); VKFF_MIX(s.key.src_blend); VKFF_MIX(s.key.dst_blend);
+			VKFF_MIX(s.key.write_mask); VKFF_MIX(s.key.alpha_test_enable); VKFF_MIX(s.key.alpha_ref);
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_LIGHTING));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_COLORVERTEX));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_AMBIENTMATERIALSOURCE));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_DIFFUSEMATERIALSOURCE));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_SPECULARMATERIALSOURCE));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_EMISSIVEMATERIALSOURCE));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_SPECULARENABLE));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_AMBIENT));
+			VKFF_MIX(DX8Wrapper::VK_Read_RS(D3DRS_TEXTUREFACTOR));
+			VKFF_MIX((unsigned)(m5.Diffuse.r * 255.0f)); VKFF_MIX((unsigned)(m5.Diffuse.g * 255.0f));
+			VKFF_MIX((unsigned)(m5.Diffuse.b * 255.0f)); VKFF_MIX((unsigned)(m5.Diffuse.a * 255.0f));
+			VKFF_MIX((unsigned)(m5.Ambient.r * 255.0f)); VKFF_MIX((unsigned)(m5.Ambient.g * 255.0f));
+			VKFF_MIX((unsigned)(m5.Ambient.b * 255.0f));
+			VKFF_MIX((unsigned)(m5.Emissive.r * 255.0f)); VKFF_MIX((unsigned)(m5.Emissive.g * 255.0f));
+			VKFF_MIX((unsigned)(m5.Emissive.b * 255.0f));
+			VKFF_MIX((unsigned)(m5.Power * 8.0f));
+			for (unsigned li = 0; li < 8u; ++li) {
+				if (!render_state.LightEnable[li]) { VKFF_MIX(0u); continue; }
+				const D3DLIGHT9& l5 = render_state.Lights[li];
+				VKFF_MIX((unsigned)l5.Type + 1u);
+				VKFF_MIX((unsigned)(l5.Ambient.r * 255.0f)); VKFF_MIX((unsigned)(l5.Ambient.g * 255.0f));
+				VKFF_MIX((unsigned)(l5.Ambient.b * 255.0f));
+				VKFF_MIX((unsigned)(l5.Diffuse.r * 255.0f)); VKFF_MIX((unsigned)(l5.Diffuse.g * 255.0f));
+				VKFF_MIX((unsigned)(l5.Diffuse.b * 255.0f));
+				VKFF_MIX((unsigned)(l5.Attenuation0 * 1000.0f)); VKFF_MIX((unsigned)(l5.Attenuation1 * 100000.0f));
+				VKFF_MIX((unsigned)(l5.Attenuation2 * 100000.0f));
+			}
+			for (unsigned st2 = 0; st2 < 4u; ++st2) {
+				VKFF_MIX(DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLOROP, 1u));
+				VKFF_MIX(DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLORARG1, 0u));
+				VKFF_MIX(DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLORARG2, 0u));
+			}
+			VKFF_MIX((unsigned)(size_t)s.texture_views[t4]);
+			VKFF_MIX((unsigned)((size_t)s.texture_views[t4] >> 16));
+			#undef VKFF_MIX
+			if (h5 == s_ffLast[idx]) continue;
+			const unsigned old5 = s_ffLast[idx];
+			s_ffLast[idx] = h5;
+			++s_ffLines;
+			++s_ffCaps[idx];
+			{
+				// The change line names the texture and carries the arithmetic that will paint it: the
+				// four combiner stages' colour ops/args, the factor, lighting and the blend pair, then
+				// the material/light second line. A white silhouette over a clean texture can only come
+				// from one of these saying something the load-phase dump did not. fvf, the write mask and
+				// the depth triple join the line because they are hash inputs the earlier form left
+				// unprinted, and the i-run cycles turned on exactly those.
+				fprintf(stderr, "[VKFFBIND] f=%llu '%s' slot=%u key=%p v=%p h=%08X<-%08X fvf=%08x wm=%u z=%u/%u/%u",
+					VKCore_Frame_No(), nm, t4, (void*)Textures[t4], s.texture_views[t4], h5, old5,
+					fvf, s.key.write_mask, s.key.depth_test, s.key.depth_write, s.key.depth_cmp);
+				for (unsigned st2 = 0; st2 < 4u; ++st2) {
+					fprintf(stderr, " |st%u op=%u a1=%u a2=%u", st2,
+						DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLOROP, 1u),
+						DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLORARG1, 0u),
+						DX8Wrapper::VK_Read_TSS(st2, D3DTSS_COLORARG2, 0u));
+				}
+				fprintf(stderr, " tf=%08x light=%u bl=%u/%u/%u alpha=%u/%02x amb=%06x",
+					DX8Wrapper::VK_Read_RS(D3DRS_TEXTUREFACTOR),
+					DX8Wrapper::VK_Read_RS(D3DRS_LIGHTING),
+					s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+					s.key.alpha_test_enable, s.key.alpha_ref,
+					DX8Wrapper::VK_Read_RS(D3DRS_AMBIENT) & 0xFFFFFFu);
+				for (unsigned li = 0; li < 8u; ++li) {
+					const D3DCOLORVALUE& d = render_state.Lights[li].Diffuse;
+					unsigned dr = (unsigned)(d.r * 255.0f), dg = (unsigned)(d.g * 255.0f), db = (unsigned)(d.b * 255.0f);
+					fprintf(stderr, " L%u=%u/%02X%02X%02X", li, render_state.LightEnable[li] ? 1u : 0u,
+						dr > 255u ? 255u : dr, dg > 255u ? 255u : dg, db > 255u ? 255u : db);
+				}
+				fprintf(stderr, "\n");
+				// Second line: the arithmetic the vertex stage will run, resolved through the same
+				// default table the shader is fed, so a change here is a change in what gets painted.
+				{
+					const D3DMATERIAL9& m = Peek_DX8_Material();
+					fprintf(stderr, "[VKFFMAT] '%s' cv=%u ams=%u dms=%u sms=%u ems=%u spec_en=%u "
+						"matD=(%.2f,%.2f,%.2f,%.2f) matA=(%.2f,%.2f,%.2f) matE=(%.2f,%.2f,%.2f) "
+						"matS=(%.2f,%.2f,%.2f) pow=%.1f\n",
+						nm,
+						DX8Wrapper::VK_Read_RS(D3DRS_COLORVERTEX),
+						DX8Wrapper::VK_Read_RS(D3DRS_AMBIENTMATERIALSOURCE),
+						DX8Wrapper::VK_Read_RS(D3DRS_DIFFUSEMATERIALSOURCE),
+						DX8Wrapper::VK_Read_RS(D3DRS_SPECULARMATERIALSOURCE),
+						DX8Wrapper::VK_Read_RS(D3DRS_EMISSIVEMATERIALSOURCE),
+						DX8Wrapper::VK_Read_RS(D3DRS_SPECULARENABLE),
+						m.Diffuse.r, m.Diffuse.g, m.Diffuse.b, m.Diffuse.a,
+						m.Ambient.r, m.Ambient.g, m.Ambient.b,
+						m.Emissive.r, m.Emissive.g, m.Emissive.b,
+						m.Specular.r, m.Specular.g, m.Specular.b, m.Power);
+					for (unsigned li = 0; li < 8u; ++li) {
+						if (!render_state.LightEnable[li]) continue;
+						const D3DLIGHT9& l = render_state.Lights[li];
+						fprintf(stderr, "[VKFFMAT] '%s' L%u type=%u amb=(%.2f,%.2f,%.2f) dif=(%.2f,%.2f,%.2f) "
+							"spec=(%.2f,%.2f,%.2f) att=%.3f/%.5f/%.5f range=%.1f pos=(%.1f,%.1f,%.1f)\n",
+							nm, li, (unsigned)l.Type,
+							l.Ambient.r, l.Ambient.g, l.Ambient.b,
+							l.Diffuse.r, l.Diffuse.g, l.Diffuse.b,
+							l.Specular.r, l.Specular.g, l.Specular.b,
+							l.Attenuation0, l.Attenuation1, l.Attenuation2, l.Range,
+							l.Position.x, l.Position.y, l.Position.z);
+					}
+				}
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @bugfix Qoder 19/10/2026 R-02 untextured ff census: moved to VK_FF_NTX_Census, called from
+	// the draw sites once the submit carries its real counts - this point of the fill has neither the
+	// stream binding nor the polygon/index fields, which is why the i/j lines printed polys=0.
+	vkf17::add(vkf17::F_CENSUS, t17f);
+
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 7: the samplers those textures were seen
+	// through. The facade has kept every D3DSAMP_* write since wedge 1, in the same D3D8 ordinals the
+	// census reported, so this is a pass-through of six reads into the layer's sampler LUT - which keys on
+	// the tuple and hands the same VkSampler back for every batch that samples alike. A slot with no
+	// texture bound keeps nullptr and gets the layer's default, because its view is the built-in white
+	// and the tuple the game last set for it belongs to a texture that is not there.
+	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
+		if (!s.texture_views[t]) continue;
+		s.texture_samplers[t] = VKDesc_Sampler(
+			VK_Read_Sampler(t, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP),
+			VK_Read_Sampler(t, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP),
+			VK_Read_Sampler(t, D3DSAMP_ADDRESSW, D3DTADDRESS_WRAP),
+			VK_Read_Sampler(t, D3DSAMP_MINFILTER, D3DTEXF_LINEAR),
+			VK_Read_Sampler(t, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR),
+			VK_Read_Sampler(t, D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+			VK_Read_Sampler(t, D3DSAMP_MAXANISOTROPY, 1u));
+	}
+	vkf17::add(vkf17::F_SAMP, t17f);
 
 	s.vertex_constants = (const float*)&Vertex_Shader_Constants[0];
 	s.pixel_constants  = (const float*)&Pixel_Shader_Constants[0];
@@ -3950,11 +4760,11 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 	// batch, not only the ones the vertex stage is switched on for. Packing it unconditionally is what
 	// makes the gate a shader choice rather than a state choice - the same submit either way, so flipping
 	// GENERALSX_VKFFVERT cannot silently change what the pipeline was told to draw.
-	VKDraw_FF_State ffState;
 	VK_FF_Pack(&ffState, info);
 	s.ff = &ffState;
 	s.vertex_constant_vec4s = MAX_VERTEX_SHADER_CONSTANTS;
 	s.pixel_constant_vec4s  = MAX_PIXEL_SHADER_CONSTANTS;
+	vkf17::add(vkf17::F_PACK, t17f);
 
 	unsigned tw = 0, th = 0;
 	void* ck = nullptr; void* dk = nullptr;
@@ -3969,7 +4779,573 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 		s.scissor[2] = tw; s.scissor[3] = th;
 	}
 
-	if (!VK_Draw_Submit(&s)) { ++VKF.refused; return false; }
+	// GeneralsX @feature Qoder 19/10/2026 wedge 11 forensics: the occluder side of the sun shadow map. The
+	// RT mirror probe proved the far fill lands (R=1 everywhere) but caster texels carry R around 984,
+	// which the sink's CPU-side 0.5*clipZ+0.5 cannot produce for an ortho slab. The FF block below is
+	// exactly what the vertex stage will read, so name stage0's generator fields, its texture matrix and
+	// the viewport for the first shadow-map batches: the depth interpolant is legal input x texMat[0], and
+	// a stale transform there is the one mechanism that turns a [0,1] depth into hundreds.
+	if (psTag == 240u || psTag == 241u) {
+		static unsigned s_smapFfDumps = 0;
+		if (s_smapFfDumps < 8u) {
+			++s_smapFfDumps;
+			const VKDraw_FF_Stage& st0 = ffState.stage[0];
+			fprintf(stderr, "[VKSMAPFF] tag=%u #%u fvf=%08X stage0 tci=%u ttff=%u set=%u comp=%u rhw=%d vp=[%u,%u,%u,%u]\n",
+				psTag, s_smapFfDumps, s.key.fvf, st0.tci, st0.ttff, st0.set, st0.components,
+				(ffState.flags[0] & (1u << 8)) ? 1 : 0,
+				s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
+			for (unsigned m = 0; m < 4; ++m) {
+				fprintf(stderr, "[VKSMAPFF]  texMat0[%u] %.5f %.5f %.5f %.5f\n", m,
+					ffState.tex_mat[0][m * 4 + 0], ffState.tex_mat[0][m * 4 + 1],
+					ffState.tex_mat[0][m * 4 + 2], ffState.tex_mat[0][m * 4 + 3]);
+			}
+			fflush(stderr);
+		}
+	}
+
+	// GeneralsX @debug Qoder 19/10/2026 task 25 forensics: name what the sun shadow map's consumers bind
+	// in-frame. The census proves the mirror holds the depth at the fence; the receiver's multiplicative
+	// draw now paints black, which means its PS reads 0 from whatever t0 resolved to. This line decides
+	// between wrong view (vkTex mirror shadowing the RT), wrong layout, untranslated program (tag=0) and
+	// wrong constants - the four places the 0 can be minted.
+	if (Textures[0]) {
+		VKRT_Info mi;
+		if (VKRT_Query((void*)Textures[0], &mi) && mi.width == 1024u && !mi.is_depth) {
+			static unsigned s_smapRecvDumps = 0;
+			if (s_smapRecvDumps < 8u) {
+				++s_smapRecvDumps;
+				VKTex_Info ti;
+				const bool texHit = VKTex_Query((void*)Textures[0], &ti);
+				const float* pc = s.pixel_constants;
+				fprintf(stderr,
+					"[SMAPRECV] #%u key=%p vs=%u ps=%u bound=%p vkTex=%p vkRt=%p fmt=%u layout=%d "
+					"blend=%u src=%u dst=%u c0=%.5f,%.5f,%.5f,%.5f\n",
+					s_smapRecvDumps, (void*)Textures[0], vsTag, psTag,
+					vk_texture_view((void*)Textures[0]),
+					texHit ? ti.view : nullptr, mi.view, mi.format, mi.layout,
+					s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+					pc ? pc[0] : -99.f, pc ? pc[1] : -99.f, pc ? pc[2] : -99.f, pc ? pc[3] : -99.f);
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @feature Qoder 19/10/2026 BUG-01 forensics: the alpha bytes are PROVEN in the mirrored
+	// surface (tex alpha probe: the 1024x256 command-bar mirror carries 52% a=0 texels, matching its TGA),
+	// so the bottom-strip black must be minted at submit or later. Name the resolved state of the exact
+	// batches that sample that mirror - blend pair, alpha-test block, and the stage-0/1 alpha combiner -
+	// without changing anything. The black bar can only survive one of these lines disagreeing with the
+	// review's "chain is correct" claim.
+	{
+		static unsigned long s_cbar_probe = 0;
+		if (s_cbar_probe < 8 && Textures[0]) {
+			VKTex_Info ti;
+			if (VKTex_Query((void*)Textures[0], &ti) && ti.width == 1024u && ti.height == 256u) {
+				++s_cbar_probe;
+				fprintf(stderr,
+					"[VKWP1] cbar draw #%lu blend=%u src=%u dst=%u atest=%u aref=%u afunc=%u "
+					"col0=%u alp0=%u alpA0=%u alpA1=%u alpA2=%u alp1=%u shader=%llX "
+					"tgt color=%p depth=%p %ux%u vp=%d,%d %dx%d\n",
+					s_cbar_probe, s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+					s.key.alpha_test_enable, s.key.alpha_ref, s.key.alpha_cmp,
+					ffState.tss[0].col[0], ffState.tss[0].alp[0], ffState.tss[0].alp[1],
+					ffState.tss[0].alp[2], ffState.tss[0].alp[3], ffState.tss[1].alp[0],
+					(unsigned long long)s.key.shader_bits, ck, dk, tw, th,
+					VK_VP.valid ? VK_VP.x : -1, VK_VP.valid ? VK_VP.y : -1,
+					VK_VP.valid ? VK_VP.w : 0, VK_VP.valid ? VK_VP.h : 0);
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @debug Qoder 19/10/2026 BUG-02 forensics: the glyph atlas carries no texture name, so
+	// the [VKFFBIND] census (which skips empty names) has never printed one of its batches - every
+	// "state is correct" line measured so far belongs to a named disk texture. The menu black boxes are
+	// drawn from the 4-bit atlas, so name BOTH sides of its binding here: the CPU words the mirror was
+	// fed (alpha-nibble histogram read straight off the texture's own level 0), the view the query
+	// returns, the view the submit actually bound, and the stage-0 combiner the interpreter will replay.
+	// One session then decides between wrong bytes, wrong image and wrong arithmetic without another run.
+	{
+		static unsigned s_atlas_probe = 0;
+		// BUG-02 second pass: the first six slots all carried the healthy modulate state, and the VKFFBIND
+		// census has seen atlas-shaped batches under OTHER recipes (blend-off, and ZERO/SRCCOLOR multiply
+		// which paints every texel-black pixel straight onto the destination). Dedup on the resolved
+		// recipe so one session catches each distinct state once instead of six copies of the first page.
+		// BUG-02 third pass: recipe-only dedup printed the loading-screen page and then swallowed every
+		// later atlas instance that shares that recipe, so "the menu pages are healthy" was never measured.
+		// The census key now carries the texture instance too, and the line carries the render target and
+		// viewport, so a batch can be matched to a black square's screen position without another run.
+		static unsigned long long s_atlas_seen[96];
+		static unsigned s_atlas_keys = 0;
+		unsigned long long atlas_keyptr = 0;
+		// The global Textures[] shadow only tracks DX8Wrapper::_Set_DX8_Texture calls; a batch that binds
+		// through render_state alone (the census's atlas-multiply line) was invisible to the first probe.
+		// Key everything off render_state instead so both binding paths land in one census.
+		if (s_atlas_probe < 96u && render_state.Textures[0]) {
+			atlas_keyptr = (unsigned long long)(uintptr_t)(void*)render_state.Textures[0]->Peek_D3D_Base_Texture();
+			TextureClass* tc0 = render_state.Textures[0]->As_TextureClass();
+			if (tc0 && tc0->Get_Texture_Format() == WW3D_FORMAT_A4R4G4B4
+				&& tc0->Get_Width() <= 256 && tc0->Get_Height() <= 256) {
+			unsigned long long recipe =
+				atlas_keyptr ^
+				((unsigned long long)s.key.blend_enable << 60) | ((unsigned long long)s.key.src_blend << 56)
+				| ((unsigned long long)s.key.dst_blend << 52) | ((unsigned long long)s.key.alpha_test_enable << 51)
+				| ((unsigned long long)ffState.tss[0].col[0] << 44) | ((unsigned long long)ffState.tss[1].col[0] << 40)
+				| ((unsigned long long)ffState.tss[0].alp[0] << 36) | ((unsigned long long)ffState.tss[1].alp[0] << 32)
+				| (unsigned long long)s.key.shader_bits;
+				bool fresh = true;
+				for (unsigned k = 0; k < s_atlas_keys; ++k) if (s_atlas_seen[k] == recipe) { fresh = false; break; }
+				if (!fresh && s_atlas_probe >= 6u) { /* skip duplicates once the six originals are covered */ }
+				else if (!fresh) { }
+				else if (s_atlas_keys < 96u) { s_atlas_seen[s_atlas_keys++] = recipe; }
+				if (fresh) {
+					++s_atlas_probe;
+				unsigned long long aNz = 0, rgbNz = 0, tot = 0, wordHist[4] = { 0, 0, 0, 0 };
+				unsigned firstWords[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+				IDirect3DTexture9* dt = tc0->Peek_D3D_Texture();
+				if (dt) {
+					D3DLOCKED_RECT lr;
+					if (SUCCEEDED(dt->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) {
+						const unsigned short* w16 = (const unsigned short*)lr.pBits;
+						const unsigned pitchWords = (unsigned)lr.Pitch / 2u;
+						for (unsigned y = 0; y < (unsigned)tc0->Get_Height(); ++y) {
+							for (unsigned x = 0; x < (unsigned)tc0->Get_Width(); ++x) {
+								const unsigned v = w16[y * pitchWords + x];
+								++tot;
+								if ((v >> 12) != 0u) ++aNz;                    // stored alpha nibble (D3D order)
+								if ((v & 0x0FFFu) != 0u) ++rgbNz;             // stored rgb nibbles
+								const unsigned bucket = ((v >> 12) != 0u ? 1u : 0u) | ((v & 0x0FFFu) != 0u ? 2u : 0u);
+								++wordHist[bucket];
+								if (tot <= 8u) firstWords[tot - 1u] = v;
+							}
+						}
+						dt->UnlockRect(0);
+					}
+				}
+				VKTex_Info ti;
+				const bool hit = VKTex_Query((void*)tc0->Peek_D3D_Texture(), &ti);
+				fprintf(stderr,
+					"[VKATLAS] #%u f=%llu key=%p %ux%u mirror=%d mview=%p bound=%p bound1=%p "
+					"cpu: px=%llu aNz=%llu rgbNz=%llu hist0(both0)=%llu hist1(a)=%llu hist2(rgb)=%llu hist3=%llu w0=[%04X %04X %04X %04X] "
+					"blend=%u/%u/%u atest=%u col0=%u/%u/%u/%u alp0=%u/%u/%u/%u col1=%u/%u/%u alp1=%u res0=%u max=%u fvf=%08X set0=%u shader=%llX "
+					"tgt=%p/%p %ux%u vp=%d,%d %dx%d\n",
+					s_atlas_probe, VKCore_Frame_No(), (void*)tc0->Peek_D3D_Texture(),
+					(unsigned)tc0->Get_Width(), (unsigned)tc0->Get_Height(), hit ? 1 : 0,
+					hit ? ti.view : nullptr, s.texture_views[0], s.texture_views[1],
+					tot, aNz, rgbNz, wordHist[0], wordHist[1], wordHist[2], wordHist[3],
+					firstWords[0], firstWords[1], firstWords[2], firstWords[3],
+					s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+					s.key.alpha_test_enable,
+					ffState.tss[0].col[0], ffState.tss[0].col[1], ffState.tss[0].col[2], ffState.tss[0].col[3],
+					ffState.tss[0].alp[0], ffState.tss[0].alp[1], ffState.tss[0].alp[2], ffState.tss[0].alp[3],
+					ffState.tss[1].col[0], ffState.tss[1].col[2], ffState.tss[1].col[3],
+					ffState.tss[1].alp[0], ffState.tss[0].res[0], ffState.flags[3], fvf,
+					ffState.stage[0].set,
+					(unsigned long long)s.key.shader_bits, ck, dk, tw, th,
+					VK_VP.valid ? VK_VP.x : -1, VK_VP.valid ? VK_VP.y : -1,
+					VK_VP.valid ? VK_VP.w : 0, VK_VP.valid ? VK_VP.h : 0);
+				fflush(stderr);
+				}
+			}
+		}
+	}
+}
+
+// GeneralsX @bugfix Qoder 19/10/2026 R-02 untextured ff census, second form: the fill-site census could
+// not close attribution - it printed polys/index as 0 (the caller sets those fields after the fill) and
+// it never saw the batch's own vertex colours. The k-run's VKVCOL probe made the vertex diffuse the
+// decisive field: the white silhouettes paint vColor verbatim, so the emitter is an ff submit with no
+// texture whose stage-0 combiner or material source routes the vertex diffuse to the output. Run from
+// the draw sites after the streams bind, this prints the real counts, the resolved material sources,
+// the alpha-test block, and the first DIFFUSE dwords of the batch's own bytes.
+void DX8Wrapper::VK_FF_NTX_Census(VKDraw_Submit& s, const FVFInfoClass& info,
+	unsigned primitive_type, unsigned ps_tag, void* vertex_buffer, const void* vertex_data)
+{
+	if (ps_tag != 0u || Textures[0]) return;
+	static unsigned s_ntxKeys[32];
+	static unsigned s_ntxN = 0;
+	static unsigned s_ntxTotal = 0;
+	static bool s_ntx2 = false;
+	if (!s_ntx2 && VKCore_Frame_No() >= 226ull) {
+		s_ntx2 = true;   // the menu plateau gets its own dedup table, as in the j-run
+		s_ntxN = 0;
+		s_ntxTotal = 0;
+	}
+	++s_ntxTotal;
+	const unsigned fvf = info.Get_FVF();
+	const unsigned k4 = fvf ^ (primitive_type << 24) ^ (s.key.write_mask << 8)
+		^ (s.key.blend_enable << 4) ^ ((VK_Read_RS(D3DRS_LIGHTING) ? 1u : 0u) << 16);
+	for (unsigned i4 = 0; i4 < s_ntxN; ++i4) if (s_ntxKeys[i4] == k4) return;
+	if (s_ntxN >= 32u) return;
+	s_ntxKeys[s_ntxN++] = k4;
+	const D3DMATERIAL9& m4 = Peek_DX8_Material();
+	fprintf(stderr, "[VKFFNTX] #%u f=%llu fvf=%08x prim=%u vb=%p wm=%u bl=%u/%u/%u z=%u/%u/%u "
+		"alpha=%u/%u/%u light=%u cv=%u dms=%u ams=%u sms=%u ems=%u sten=%u st0=%u/%u/%u "
+		"matD=(%.2f,%.2f,%.2f,%.2f) matA=(%.2f,%.2f,%.2f) matE=(%.2f,%.2f,%.2f) polys=%u idx=%u verts=%u",
+		s_ntxTotal, VKCore_Frame_No(), fvf, primitive_type, vertex_buffer, s.key.write_mask,
+		s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+		s.key.depth_test, s.key.depth_write, s.key.depth_cmp,
+		s.key.alpha_test_enable, s.key.alpha_ref, s.key.alpha_cmp,
+		VK_Read_RS(D3DRS_LIGHTING) ? 1u : 0u, VK_Read_RS(D3DRS_COLORVERTEX) ? 1u : 0u,
+		VK_Read_RS(D3DRS_DIFFUSEMATERIALSOURCE), VK_Read_RS(D3DRS_AMBIENTMATERIALSOURCE),
+		VK_Read_RS(D3DRS_SPECULARMATERIALSOURCE), VK_Read_RS(D3DRS_EMISSIVEMATERIALSOURCE),
+		VK_Read_RS(D3DRS_SPECULARENABLE),
+		VK_Read_TSS(0, D3DTSS_COLOROP, D3DTOP_MODULATE),
+		VK_Read_TSS(0, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+		VK_Read_TSS(0, D3DTSS_COLORARG2, D3DTA_CURRENT),
+		m4.Diffuse.r, m4.Diffuse.g, m4.Diffuse.b, m4.Diffuse.a,
+		m4.Ambient.r, m4.Ambient.g, m4.Ambient.b,
+		m4.Emissive.r, m4.Emissive.g, m4.Emissive.b,
+		s.polygon_count, s.index_count, s.streams[0].vertex_count);
+
+	// The batch's own vertex bytes: the D3D9 resource read LOCK_READONLY exactly like the materialise
+	// bridge, or the caller's user-memory pointer. Three DIFFUSE dwords tell a white-prelit tint pass
+	// (FFFFFFFF) from a house-coloured or black one, which is the field the attribution turns on.
+	const unsigned char* bytes = (const unsigned char*)vertex_data;
+	IDirect3DVertexBuffer9* d3d = nullptr;
+	if (!bytes && vertex_buffer) {
+		d3d = static_cast<DX8VertexBufferClass*>(static_cast<VertexBufferClass*>(vertex_buffer))
+			->Get_DX8_Vertex_Buffer();
+		void* src = nullptr;
+		if (d3d && SUCCEEDED(d3d->Lock(0, 0, &src, D3DLOCK_READONLY)) && src) bytes = (const unsigned char*)src;
+		else d3d = nullptr;
+	}
+	const unsigned stride = info.Get_FVF_Size();
+	const bool hasDif = (fvf & D3DFVF_DIFFUSE) != 0u;
+	if (!hasDif) fprintf(stderr, " dif=(no-field)");
+	else if (!bytes || !stride || s.streams[0].vertex_count < 3u) fprintf(stderr, " dif=(n/a)");
+	else {
+		const unsigned off = info.Get_Diffuse_Offset();
+		for (unsigned v = 0; v < 3u; ++v) {
+			unsigned col;
+			memcpy(&col, bytes + off + v * stride, 4u);
+			fprintf(stderr, " dif%u=%08X", v, col);
+		}
+	}
+	if (d3d) d3d->Unlock();
+	fprintf(stderr, "\n");
+	fflush(stderr);
+
+	// GeneralsX @debug Qoder 19/10/2026 BUG-03 red-shadow attribution: the census proved the red blocks
+	// arrive as no-texture FF batches whose DX8 material is pure red, and no shadow source ever sets
+	// red, so the pass can only be named by its call stack. Four dumps, twelve frames, RVAs against the
+	// image base so GeneralRefresh.map resolves them.
+	{
+		static unsigned s_redStacks = 0;
+		if (s_redStacks < 4u && m4.Diffuse.r > 0.9f && m4.Diffuse.g < 0.15f && m4.Diffuse.b < 0.15f) {
+			++s_redStacks;
+			void* frames[12];
+			const unsigned n4 = RtlCaptureStackBackTrace(0, 12, frames, nullptr);
+			const char* base4 = (const char*)GetModuleHandleA(nullptr);
+			fprintf(stderr, "[VKFFRED] #%u f=%llu fvf=%08x polys=%u frames=%u",
+				s_redStacks, VKCore_Frame_No(), fvf, s.polygon_count, n4);
+			for (unsigned i4 = 0; i4 < n4; ++i4) {
+				const long long rva4 = (const char*)frames[i4] - base4;
+				fprintf(stderr, " %d=0x%llX", (int)i4, (unsigned long long)(rva4 > 0 ? rva4 : 0));
+			}
+			fprintf(stderr, "\n");
+
+			// Which surface this batch lands on (back buffer or an offscreen RT) and the recent
+			// blend/mask/stencil writes with their call sites: the pass that owns the red batches is
+			// whichever set of RVAs sits between its enable and disable writes.
+			void* ck4 = nullptr; void* dk4 = nullptr; unsigned tw4 = 0, th4 = 0;
+			VKDraw_Get_Targets(&ck4, &dk4, &tw4, &th4);
+			fprintf(stderr, "[VKFFRED] #%u tgt=%p/%p %ux%u ab=%u cw=%u st=%u\n",
+				s_redStacks, ck4, dk4, tw4, th4,
+				VK_Read_RS(D3DRS_ALPHABLENDENABLE), VK_Read_RS(D3DRS_COLORWRITEENABLE),
+				VK_Read_RS(D3DRS_STENCILENABLE));
+			const unsigned ring4 = VK_RS_Watch_N;
+			const unsigned start4 = ring4 > 14u ? ring4 - 14u : 0u;
+			for (unsigned i4 = start4; i4 < ring4; ++i4) {
+				const VK_RS_Watch_Entry& e4 = VK_RS_Watch[i4 & 63u];
+				const long long r4 = (const char*)e4.ret - base4;
+				fprintf(stderr, "[VKFFRED]   rs f=%llu %s=%u ret=0x%llX\n", e4.frame,
+					e4.state == (unsigned)D3DRS_ALPHABLENDENABLE ? "ab"
+						: e4.state == (unsigned)D3DRS_COLORWRITEENABLE ? "cw" : "st",
+					e4.value, (unsigned long long)(r4 > 0 ? r4 : 0));
+			}
+			fflush(stderr);
+		}
+	}
+}
+
+// GeneralsX @debug Qoder 19/10/2026 BUG-02 screen-stack census: every static review of the glyph chain
+// (CPU atlas bytes, rot4 upload, verify readback, combiner registers, blend PSO) came back clean, so the
+// black strip behind the menu text must be named by its pixels rather than by its recipe. GENERALSX_VKBAR
+// dumps the screen-space (XYZRHW) batch stack in draw order - bounding box, bound texture, blend recipe
+// and the batch's own first DIFFUSE dwords - for the first two frames after the loading plateau plus one
+// frame every 1000 after that. Value "1" dumps every RHW batch; value "x,y" prints only the batches whose
+// box covers that pixel, each with an eight-frame call stack, so one session names the emitter of a black
+// rectangle directly: the LAST covering line is the batch that painted it.
+void DX8Wrapper::VK_BAR_Census(VKDraw_Submit& s, const FVFInfoClass& info,
+	unsigned primitive_type, void* vertex_buffer, const void* vertex_data, unsigned vertex_count)
+{
+	static bool checked = false;
+	static bool on = false;
+	static float pickX = -1.f, pickY = -1.f;
+	if (!checked) {
+		checked = true;
+		char e[32] = {};
+		if (GetEnvironmentVariableA("GENERALSX_VKBAR", e, (DWORD)sizeof(e)) != 0 && e[0] != '0') {
+			on = true;
+			char* comma = nullptr;
+			if ((comma = strchr(e, ',')) != nullptr) {
+				*comma = 0;
+				pickX = (float)atof(e);
+				pickY = (float)atof(comma + 1);
+			}
+		}
+	}
+	if (!on) return;
+	const unsigned fvf = info.Get_FVF();
+	const bool isRHW = (fvf & D3DFVF_XYZRHW) != 0u;
+	// GeneralsX @bugfix Qoder 19/10/2026 the glyph atlas batches are not RHW: VKATLAS proved they arrive
+	// as fvf=0x252 (XYZ+NORMAL+DIFFUSE+TEX2) under a custom shader family, so an RHW-only filter missed
+	// every text batch in the first evidence run. Small bound textures (the atlas family, <=256px) are
+	// captured even when untransformed; their box is object-space but the recipe is the point.
+	TextureBaseClass* t0 = render_state.Textures[0];
+	TextureClass* tc0 = t0 ? t0->As_TextureClass() : nullptr;
+	const bool atlasish = tc0 && tc0->Get_Width() <= 256u && tc0->Get_Height() <= 256u;
+	if (!isRHW && !atlasish) return;
+	const unsigned long long frame = VKCore_Frame_No();
+	if (frame < 226ull) return;
+	static unsigned long long seen = 0;
+	static unsigned framesLeft = 2;
+	static unsigned lines = 0;
+	if (frame != seen) {
+		if (framesLeft == 0u && (frame % 1000ull) != 0ull) return;
+		if (framesLeft > 0u) --framesLeft;
+		seen = frame;
+		lines = 0;
+	}
+	if (lines >= 2000u) return;
+
+	const unsigned stride = info.Get_FVF_Size();
+	// GeneralsX @bugfix Qoder 19/10/2026 the user-memory emitters fill vertex_count on their local submit
+	// copy, so the streams field is zero when this runs from those sites - the caller's count is passed in.
+	const unsigned vertN = vertex_count ? vertex_count : s.streams[0].vertex_count;
+	if (!stride || vertN < 3u) return;
+
+	const unsigned char* bytes = (const unsigned char*)vertex_data;
+	IDirect3DVertexBuffer9* d3d = nullptr;
+	if (!bytes && vertex_buffer) {
+		d3d = static_cast<DX8VertexBufferClass*>(static_cast<VertexBufferClass*>(vertex_buffer))
+			->Get_DX8_Vertex_Buffer();
+		void* src = nullptr;
+		if (d3d && SUCCEEDED(d3d->Lock(0, 0, &src, D3DLOCK_READONLY)) && src) bytes = (const unsigned char*)src;
+		else d3d = nullptr;
+	}
+	if (!bytes) return;
+
+	const unsigned posOff = info.Get_Location_Offset();
+	float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+	for (unsigned v = 0; v < vertN; ++v) {
+		const float* p = (const float*)(bytes + (size_t)v * stride + posOff);
+		if (!(p[0] >= -1e20f && p[0] <= 1e20f) || !(p[1] >= -1e20f && p[1] <= 1e20f)) continue;
+		if (p[0] < x0) x0 = p[0];
+		if (p[0] > x1) x1 = p[0];
+		if (p[1] < y0) y0 = p[1];
+		if (p[1] > y1) y1 = p[1];
+	}
+	if (x1 < x0 || y1 < y0) return;
+	// The box filter is a screen-space test; an atlas (untransformed) batch carries an object-space box,
+	// so point mode prints it unconditionally - its recipe is the evidence, not its rectangle.
+	if (pickX >= 0.f && isRHW && (pickX < x0 || pickX > x1 || pickY < y0 || pickY > y1)) return;
+	++lines;
+
+	const bool hasDif = (fvf & D3DFVF_DIFFUSE) != 0u;
+	const unsigned difOff = hasDif ? info.Get_Diffuse_Offset() : 0u;
+	unsigned dif0 = 0, dif1 = 0, dif2 = 0;
+	if (hasDif) {
+		memcpy(&dif0, bytes + difOff, 4u);
+		if (vertN > 1u) memcpy(&dif1, bytes + difOff + stride, 4u);
+		if (vertN > 2u) memcpy(&dif2, bytes + difOff + 2u * stride, 4u);
+	}
+	const char* tname = t0 ? t0->Get_Texture_Name().str() : "";
+	const VKDraw_FF_State* fb = s.ff;
+	fprintf(stderr, "[VKBAR] f=%llu #%u tex='%s' key=%p fmt=%d %ux%u blend=%u/%u/%u wm=%u "
+		"atest=%u/%u/%u col0=%u/%u/%u/%u alp0=%u/%u/%u/%u fvf=%08X prim=%u polys=%u verts=%u "
+		"box=%.0f,%.0f-%.0f,%.0f dif=%08X/%08X/%08X vs=%u ps=%u\n",
+		frame, lines, tname, t0 ? (void*)t0->Peek_D3D_Base_Texture() : nullptr,
+		tc0 ? (int)tc0->Get_Texture_Format() : -1,
+		tc0 ? (unsigned)tc0->Get_Width() : 0u, tc0 ? (unsigned)tc0->Get_Height() : 0u,
+		s.key.blend_enable, s.key.src_blend, s.key.dst_blend, s.key.write_mask,
+		s.key.alpha_test_enable, s.key.alpha_ref, s.key.alpha_cmp,
+		fb ? fb->tss[0].col[0] : 0u, fb ? fb->tss[0].col[1] : 0u,
+		fb ? fb->tss[0].col[2] : 0u, fb ? fb->tss[0].col[3] : 0u,
+		fb ? fb->tss[0].alp[0] : 0u, fb ? fb->tss[0].alp[1] : 0u,
+		fb ? fb->tss[0].alp[2] : 0u, fb ? fb->tss[0].alp[3] : 0u,
+		fvf, primitive_type, s.polygon_count, vertN,
+		x0, y0, x1, y1, dif0, dif1, dif2, s.key.vs_tag, s.key.ps_tag);
+	fflush(stderr);
+
+	if (pickX >= 0.f && isRHW) {
+		void* fr[8];
+		const unsigned n = RtlCaptureStackBackTrace(0, 8, fr, nullptr);
+		const char* base = (const char*)GetModuleHandleA(nullptr);
+		fprintf(stderr, "[VKBARSTK] f=%llu #%u frames=%u", frame, lines, n);
+		for (unsigned i = 0; i < n; ++i) {
+			const long long r = (const char*)fr[i] - base;
+			fprintf(stderr, " %d=0x%llX", (int)i, (unsigned long long)(r > 0 ? r : 0));
+		}
+		fprintf(stderr, "\n");
+		fflush(stderr);
+	}
+	if (d3d) d3d->Unlock();
+}
+
+bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_type,
+	unsigned short first_index, unsigned short polygon_count,
+	unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex)
+{
+	(void)min_vertex_index;	// a range hint for D3D9, not something Vulkan binds against
+	long long t17 = vkf17::on() ? vkf17::now() : 0;
+	if (!VKDraw_Ready()) { ++VKF.notReady; return false; }
+
+	VertexBufferClass* vb = static_cast<VertexBufferClass*>(vb_);
+	IndexBufferClass*  ib = static_cast<IndexBufferClass*>(ib_);
+	if (!vb || !ib || !polygon_count) return false;
+
+	// Wedge 9.G: the same target rule every other draw entry point uses. Without it a family that
+	// bound a target the recorder does not follow would draw its indexed batches into the scene.
+	if (!VK_RT.owned) { ++VKF.refused; vk_note_rt_refusal(); return false; }
+
+	// A batch with a custom shader is a wedge-8 pipeline variant. Only a program the registry has actually
+	// matched can be drawn here: its tag selects the SPIR-V twin and travels in the pipeline key. A handle
+	// with no tag is still refused, and the D3D9 call runs, which is what keeps every intermediate state of
+	// this port playable while the 51 inline shaders are translated family by family.
+	unsigned vsTag = 0u, psTag = 0u;
+	if (Vertex_Shader || Pixel_Shader) {
+		if (Vertex_Shader) vsTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Vertex_Shader, 0);
+		if (Pixel_Shader)  psTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Pixel_Shader, 1);
+		if ((Vertex_Shader && !vsTag) || (Pixel_Shader && !psTag)) { ++VKF.programmable; return false; }
+	}
+
+	vkf17::add(vkf17::E_TAGS, t17);
+
+	void* vbBuf = nullptr; void* ibBuf = nullptr;
+	unsigned long long vbOff = 0, ibOff = 0;
+	unsigned vbBytes = 0, ibBytes = 0;
+	if (!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
+		if (!vk_materialize_vertex_backing(vb) ||
+			!VKGeo_Back_Bind(vb, &vbBuf, &vbOff, nullptr, &vbBytes) || !vbBuf) {
+			++VKF.noVertexBacking;
+			vk_report_missing_vb(vb);
+			return false;
+		}
+		++VKF.materialized;
+	}
+	if (!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
+		if (!vk_materialize_index_backing(ib) ||
+			!VKGeo_Back_Bind(ib, &ibBuf, &ibOff, nullptr, &ibBytes) || !ibBuf) {
+			++VKF.noIndexBacking;
+			return false;
+		}
+		++VKF.materialized;
+	}
+
+	vkf17::add(vkf17::E_BIND, t17);
+
+	// The vertex layout comes from the buffer, exactly like the D3D9 path takes it from the buffer:
+	// Apply_Render_State_Changes re-asserts SetFVF(vb->FVF_Info().Get_FVF()) on every buffer change, so
+	// this is the format the batch was drawn with, not merely the last one the game named.
+	const FVFInfoClass& info = vb->FVF_Info();
+	const unsigned fvf = info.Get_FVF();
+	const unsigned stride = info.Get_FVF_Size();
+	if (!fvf || !stride) { ++VKF.refused; return false; }
+
+	VKDraw_Submit s = {};
+	VKDraw_FF_State ffState;
+	VK_Fill_Submit_State(s, ffState, info, vsTag, psTag, primitive_type);
+	if (!s.attr_count) { ++VKF.refused; return false; }
+
+	vkf17::add(vkf17::E_FILL, t17);
+
+	s.stream_count = 1;
+	s.streams[0].vk_buffer   = vbBuf;
+	s.streams[0].offset      = vbOff;
+	s.streams[0].stride      = stride;
+	s.streams[0].vertex_count = vb->Get_Vertex_Count();
+
+	s.vk_index_buffer = ibBuf;
+	s.index_offset    = ibOff;
+	s.start_index     = first_index;
+	// How many indices the backing actually holds from here: D3D9 guarded the same read, and the layer
+	// refuses a batch that would run past it instead of reading another object's geometry.
+	s.index_count     = (ib->Get_Index_Count() > (unsigned)first_index)
+		? ib->Get_Index_Count() - (unsigned)first_index : 0u;
+	s.polygon_count   = polygon_count;
+	s.base_vertex     = (unsigned)base_vertex;
+	vkf17::add(vkf17::E_SETUP, t17);
+	VK_FF_NTX_Census(s, info, primitive_type, psTag, vb, nullptr);
+	VK_BAR_Census(s, info, primitive_type, vb, nullptr, 0u);
+	vkf17::add(vkf17::E_NTX, t17);
+
+	// GeneralsX @feature Qoder 18/10/2026 P3 diagnostics: GN-family submit probe. "Textures vanish when
+	// per-pixel lighting is on" has two mechanical candidates on this side of the facade - the batch
+	// samples the built-in white because its D3D texture never mirrored, or the GN constants (WVP / light
+	// block) reach the shader as NaN. Both are visible from here, so log the first 48 GN submits in detail
+	// and a 4096-batch white-slot rate; this never alters state and costs nothing when the family is off.
+	if (vkf17::diag() && (psTag == 8u || psTag == 10u || psTag == 203u || psTag == 211u)) {
+		static unsigned s_gnSubmitProbe = 0u;
+		static unsigned long long s_gnSubmitSeen = 0ull, s_gnSubmitWhite = 0ull;
+		++s_gnSubmitSeen;
+		if (!s.texture_views[0]) ++s_gnSubmitWhite;
+		unsigned slots = 0u;
+		for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) if (s.texture_views[t]) slots |= (1u << t);
+		if (s_gnSubmitProbe < 48u) {
+			++s_gnSubmitProbe;
+			const char* t0 = "(none)";
+			if (render_state.Textures[0]) t0 = (const char*)render_state.Textures[0]->Get_Texture_Name();
+			const float* pc = (const float*)&Pixel_Shader_Constants[0];
+			const float* vc = (const float*)&Vertex_Shader_Constants[0];
+			fprintf(stderr, "[GNSUBMIT] #%u vs=%u ps=%u fvf=0x%08X verts=%u polys=%u idx=%u slot0='%s' views=0x%02X c0=(%.3f %.3f %.3f %.3f) c5=(%.3f %.3f %.3f) c9=(%.3f %.3f %.3f) c13=(%.3f %.3f %.3f %.3f)\n",
+				s_gnSubmitProbe, vsTag, psTag, fvf, vb->Get_Vertex_Count(), polygon_count, s.index_count,
+				t0, slots,
+				vc[0], vc[1], vc[2], vc[3],
+				pc[5 * 4 + 0], pc[5 * 4 + 1], pc[5 * 4 + 2],
+				pc[9 * 4 + 0], pc[9 * 4 + 1], pc[9 * 4 + 2],
+				pc[13 * 4 + 0], pc[13 * 4 + 1], pc[13 * 4 + 2], pc[13 * 4 + 3]);
+			fflush(stderr);
+		}
+		if ((s_gnSubmitSeen & 4095ull) == 0ull) {
+			fprintf(stderr, "[GNSUBMIT] total=%llu slot0White=%llu\n", s_gnSubmitSeen, s_gnSubmitWhite);
+			fflush(stderr);
+		}
+	}
+
+	// GeneralsX @bugfix Qoder 18/10/2026 Radar minimap probe: the three CPU-painted radar textures
+	// mirror correctly (pixel statistics prove it) yet the panel draws solid black, so this records what
+	// the emitter is actually handed for their quads - view resolution, blend pair and stage-0 combiner.
+	if (vkf17::diag() && render_state.Textures[0]) {
+		const char* rn = render_state.Textures[0]->Get_Texture_Name().str();
+		if (rn && strncmp(rn, "RADAR_", 6) == 0) {
+			static unsigned s_radarProbe = 0u;
+			if (s_radarProbe < 24u || (s_radarProbe % 512u) == 0u) {
+				VKTex_Info rti;
+				const bool rq = VKTex_Query((void*)Textures[0], &rti) && rti.view;
+				fprintf(stderr, "[RADARDRAW] #%u name='%s' key=%p view=%p wh=%ux%u fvf=%08X blend=%u src=%u dst=%u c0=(%u,%u,%u) a0=(%u,%u,%u) vp=%d,%d,%d,%d sc=%d,%d,%d,%d\n",
+					s_radarProbe, rn, (void*)Textures[0], rq ? rti.view : nullptr,
+					rq ? rti.width : 0u, rq ? rti.height : 0u, fvf,
+					s.key.blend_enable, s.key.src_blend, s.key.dst_blend,
+					VK_Read_TSS(0, D3DTSS_COLOROP, D3DTOP_MODULATE),
+					VK_Read_TSS(0, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+					VK_Read_TSS(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+					VK_Read_TSS(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE),
+					VK_Read_TSS(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+					VK_Read_TSS(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE),
+					s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3],
+					s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]);
+				fflush(stderr);
+			}
+			++s_radarProbe;
+		}
+	}
+
+	if (!VK_Draw_Submit(&s)) { ++VKF.refused; vkf17::add(vkf17::E_SUBMIT, t17); return false; }
+	vkf17::add(vkf17::E_PROBE, t17);
+	vkf17::add(vkf17::E_SUBMIT, t17);
+	vkf17::tick();
 	++VKF.emitted;
 	if ((VKF.emitted & 8191ull) == 0ull) {
 		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.A: the plan's hard gate for this wedge is
@@ -3977,13 +5353,144 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 		// before DX8_RECORD_DRAW_CALLS(), so this frame's counter is the number the Vulkan path did NOT
 		// describe. dx8_calls is the same story one level up: the raw device calls the facade still makes.
 		// Both are per-frame (reset in Begin_Pass), so they read as the steady-state frame, not a total.
-		fprintf(stderr, "[VKDRAW] facade submits=%llu noVb=%llu noIb=%llu programmable=%llu refused=%llu materialized=%llu frameD3dDraws=%u frameDx8Calls=%u\n",
+		fprintf(stderr, "[VKDRAW] facade submits=%llu noVb=%llu noIb=%llu programmable=%llu refused=%llu materialized=%llu texBeyondSlots=%llu ffUnsupported=%llu frameD3dDraws=%u frameDx8Calls=%u\n",
 			VKF.emitted, VKF.noVertexBacking, VKF.noIndexBacking, VKF.programmable, VKF.refused, VKF.materialized,
-			FrameStatistics.draw_calls, FrameStatistics.dx8_calls);
+			VKF.texBeyondSlots, VKF.ffUnsupported, FrameStatistics.draw_calls, FrameStatistics.dx8_calls);
 		fflush(stderr);
 	}
 	return true;
 }
+
+bool DX8Wrapper::VK_Emit_User_Primitive(unsigned primitive_type, const void* vertex_data,
+	unsigned stride, unsigned polygon_count)
+{
+	if (!VKDraw_Ready()) { ++VKF.notReady; return false; }
+	if (!vertex_data || !stride || !polygon_count) { ++VKF.refused; return false; }
+	if (primitive_type < D3DPT_POINTLIST || primitive_type > D3DPT_TRIANGLEFAN) { ++VKF.refused; return false; }
+
+	// The recorder follows a target only when its family opted in (wedge 9.G). Any other target keeps
+	// this false while it is bound, which is what stops an unconverted pass from landing in the scene.
+	if (!VK_RT.owned) { ++VKF.refused; vk_note_rt_refusal(); return false; }
+	// Stencil is no longer a refusal: wedge 9 widened the pipeline key to the whole D3D9 stencil block
+	// (func/ref/masks/fail/zfail/pass) and the scene depth is now created with a stencil aspect.
+
+	unsigned vsTag = 0u, psTag = 0u;
+	if (Vertex_Shader || Pixel_Shader) {
+		if (Vertex_Shader) vsTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Vertex_Shader, 0);
+		if (Pixel_Shader)  psTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Pixel_Shader, 1);
+		if ((Vertex_Shader && !vsTag) || (Pixel_Shader && !psTag)) { ++VKF.programmable; return false; }
+	}
+
+	// A shadowed texture with no Vulkan view would silently become the layer's white texel, which is a
+	// different picture from the one the combiners draw. Bound but unmirrored is a refusal, not a default.
+	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
+		if (!Textures[t]) continue;
+		if (!vk_texture_view((void*)Textures[t])) { ++VKF.refused; return false; }
+	}
+
+	// DrawPrimitiveUP takes its layout from the FVF the facade last installed, exactly like the D3D9 call.
+	const FVFInfoClass info(Vertex_Format);
+	if (!info.Get_FVF() || info.Get_FVF_Size() != stride) { ++VKF.refused; return false; }
+
+	unsigned vertex_count = 0u;
+	switch (primitive_type) {
+	case D3DPT_POINTLIST:     vertex_count = polygon_count; break;
+	case D3DPT_LINELIST:      vertex_count = polygon_count * 2u; break;
+	case D3DPT_LINESTRIP:     vertex_count = polygon_count + 1u; break;
+	case D3DPT_TRIANGLELIST:  vertex_count = polygon_count * 3u; break;
+	default:                  vertex_count = polygon_count + 2u; break;	// TRIANGLESTRIP and TRIANGLEFAN
+	}
+
+	VKDraw_Submit s = {};
+	VKDraw_FF_State ffState;
+	VK_Fill_Submit_State(s, ffState, info, vsTag, psTag, primitive_type);
+	if (!s.attr_count) { ++VKF.refused; return false; }
+
+	if (!VK_Draw_User_Primitive_State(primitive_type, vertex_data, vertex_count, stride, polygon_count, &s)) {
+		++VKF.refused;
+		return false;
+	}
+	VK_FF_NTX_Census(s, info, primitive_type, psTag, nullptr, vertex_data);
+	VK_BAR_Census(s, info, primitive_type, nullptr, vertex_data, vertex_count);
+	++VKF.emitted;
+	return true;
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed counterpart of the reference above.
+// The gates are deliberately identical, because the D3D9 fallback is the same kind of call: an offscreen
+// target, an untranslated program or a texture without a Vulkan view all mean "let D3D9 draw it".
+bool DX8Wrapper::VK_Emit_Indexed_User_Primitive(unsigned primitive_type,
+	const void* vertex_data, unsigned vertex_count, unsigned stride, unsigned fvf,
+	const void* index_data, unsigned index_count, unsigned base_vertex)
+{
+	if (!VKDraw_Ready()) { ++VKF.notReady; return false; }
+	if (!vertex_data || !index_data || !vertex_count || !stride || !index_count) { ++VKF.refused; return false; }
+	if (primitive_type < D3DPT_POINTLIST || primitive_type > D3DPT_TRIANGLEFAN) { ++VKF.refused; return false; }
+
+	if (!VK_RT.owned) { ++VKF.refused; vk_note_rt_refusal(); return false; }
+
+	unsigned vsTag = 0u, psTag = 0u;
+	if (Vertex_Shader || Pixel_Shader) {
+		if (Vertex_Shader) vsTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Vertex_Shader, 0);
+		if (Pixel_Shader)  psTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Pixel_Shader, 1);
+		if ((Vertex_Shader && !vsTag) || (Pixel_Shader && !psTag)) { ++VKF.programmable; return false; }
+	}
+
+	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
+		if (!Textures[t]) continue;
+		if (!vk_texture_view((void*)Textures[t])) { ++VKF.refused; return false; }
+	}
+
+	const FVFInfoClass info(fvf);
+	if (!info.Get_FVF() || info.Get_FVF_Size() != stride) { ++VKF.refused; return false; }
+
+	VKDraw_Submit s = {};
+	VKDraw_FF_State ffState;
+	VK_Fill_Submit_State(s, ffState, info, vsTag, psTag, primitive_type);
+	if (!s.attr_count) { ++VKF.refused; return false; }
+
+	if (!VK_Draw_Indexed_User_Primitive_State(primitive_type, vertex_data, vertex_count, stride,
+			index_data, index_count, base_vertex, &s)) {
+		++VKF.refused;
+		return false;
+	}
+	VK_FF_NTX_Census(s, info, primitive_type, psTag, nullptr, vertex_data);
+	VK_BAR_Census(s, info, primitive_type, nullptr, vertex_data, vertex_count);
+	++VKF.emitted;
+	return true;
+}
+
+bool DX8Wrapper::VK_Publish_Render_Target(void* color_surface, void* depth_surface)
+{
+	return vk_publish_render_target((IDirect3DSurface9*)color_surface, (IDirect3DSurface9*)depth_surface);
+}
+
+void DX8Wrapper::VK_Publish_Scene_Target()
+{
+	vk_publish_render_target(nullptr, nullptr);
+}
+
+void DX8Wrapper::VK_RT_Probe(void* texture_key)
+{
+	VKDraw_RTProbe(texture_key);
+}
+
+void DX8Wrapper::VK_Suspend_Scene_Target()
+{
+	// The recorder keeps its scene target bindings; only ownership is cleared, which is the same state
+	// a raw SetRenderTarget leaves behind. Every draw entry point refuses on it and runs the D3D9 call.
+	VK_RT.owned = false;
+}
+
+#else
+
+// The recorder does not exist outside the Vulkan facade, so publishing is a no-op there. The
+// declarations stay unconditional because the device-layer callers are compiled without the backend
+// define (see VulkanTexMirror.h for the same contract).
+bool DX8Wrapper::VK_Publish_Render_Target(void*, void*) { return false; }
+void DX8Wrapper::VK_Publish_Scene_Target() {}
+void DX8Wrapper::VK_RT_Probe(void*) {}
+void DX8Wrapper::VK_Suspend_Scene_Target() {}
 
 #endif // _WIN32 && SAGE_USE_VULKAN_CORE
 
@@ -4103,8 +5610,38 @@ void DX8Wrapper::Draw(
 	unsigned short start_index,
 	unsigned short polygon_count,
 	unsigned short min_vertex_index,
-	unsigned short vertex_count)
-{
+	unsigned short vertex_count){
+	// GeneralsX @performance Qoder 19/10/2026 R-05 L14 (V16): split the per-draw budget of the
+	// facade draw path. head = thread assert, apply = Apply_Render_State_Changes, mid = census +
+	// early-outs + vertex fixup + record macros, emit = VK_Emit_Indexed_Draw, d3d9 = the DX8CALL
+	// fallback when the Vulkan pipeline refuses the batch. emitcalls/took count the takeover rate.
+	// Temporary forensic instrumentation, retire with the other probes.
+	static const bool s16On = [] {
+		const char* e = getenv("GENERALSX_VKFPS_PHASES");
+		return e != nullptr && atoi(e) != 0;
+	}();
+	static long long s16Calls = 0, s16Head = 0, s16Apply = 0, s16Mid = 0, s16Emit = 0, s16D3d9 = 0;
+	static long long s16EmitCalls = 0, s16Took = 0;
+	auto s16Now = [] {
+		return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	};
+	const bool vk16 = s16On;
+	if (vk16) {
+		if ((++s16Calls % 3000) == 0) {
+			FILE* out16 = fopen("vkfps_phase16.log", "a");
+			if (out16) {
+				fprintf(out16, "[V16] win=3000 head=%.2f apply=%.2f mid=%.2f emit=%.2f d3d9=%.2f emitcalls=%lld took=%lld\n",
+					s16Head / 3000.0, s16Apply / 3000.0, s16Mid / 3000.0, s16Emit / 3000.0,
+					s16D3d9 / 3000.0, s16EmitCalls, s16Took);
+				fclose(out16);
+			}
+			s16Head = s16Apply = s16Mid = s16Emit = s16D3d9 = 0;
+			s16EmitCalls = s16Took = 0;
+		}
+	}
+	long long t16 = vk16 ? s16Now() : 0;
+
 	// GeneralsX @refactor PS3.0-P3-33 14/10/2026 the DrawPolygonLowBoundLimit cull was removed:
 	// its only setter had no caller in either game tree, so the counter was permanently 0 and the
 	// early-out dead code.
@@ -4112,14 +5649,16 @@ void DX8Wrapper::Draw(
 	DX8_THREAD_ASSERT();
 	SNAPSHOT_SAY(("DX8 - draw"));
 
+	if (vk16) { s16Head += s16Now() - t16; t16 = s16Now(); }
 	Apply_Render_State_Changes();
+	if (vk16) { s16Apply += s16Now() - t16; t16 = s16Now(); }
 
 	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 0: measure the state tuple this draw is about to
 	// commit to, before any early-out, because the early-out still costs a state apply.
 	VK_Census_Draw(primitive_type, polygon_count, vertex_count);
 
 	// Debug feature to disable triangle drawing...
-	if (!_Is_Triangle_Draw_Enabled()) return;
+	if (!_Is_Triangle_Draw_Enabled()) { if (vk16) s16Mid += s16Now() - t16; return; }
 
 #ifdef DEBUG_LOGGING
 	if (WW3D::Is_Snapshot_Activated()) {
@@ -4200,22 +5739,26 @@ void DX8Wrapper::Draw(
 					break;
 				}*/
 				DX8_RECORD_RENDER(polygon_count,vertex_count,render_state.shader);
+				if (vk16) { s16Mid += s16Now() - t16; t16 = s16Now(); }
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 				// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.C: the primary draw site. The
 				// filler describes the shadow state as a Vulkan batch and returns true when the pipeline
 				// layer took it, in which case no D3D9 draw is recorded and none is issued. Whatever it
 				// cannot describe - no backing, a custom shader, a refused submit - still runs the D3D9
 				// call below, which is what keeps the intermediate states of this port playable.
-				if (VK_Emit_Indexed_Draw(render_state.vertex_buffers[0],render_state.index_buffer,
+				const bool vkTook16 = VK_Emit_Indexed_Draw(render_state.vertex_buffers[0],render_state.index_buffer,
 					primitive_type,
 					(unsigned short)(start_index+render_state.iba_offset),
 					polygon_count,
 					min_vertex_index,
 					vertex_count,
-					(unsigned long long)(render_state.index_base_offset+render_state.vba_offset))) {
+					(unsigned long long)(render_state.index_base_offset+render_state.vba_offset));
+				if (vk16) { s16Emit += s16Now() - t16; s16EmitCalls++; if (vkTook16) s16Took++; }
+				if (vkTook16) {
 					break;
 				}
 #endif
+				if (vk16) t16 = s16Now();
 				DX8_RECORD_DRAW_CALLS();
 				DX8CALL(DrawIndexedPrimitive(
 					(D3DPRIMITIVETYPE)primitive_type,
@@ -4225,6 +5768,7 @@ void DX8Wrapper::Draw(
 					vertex_count,
 					start_index+render_state.iba_offset,
 					polygon_count));
+					if (vk16) s16D3d9 += s16Now() - t16;
 			}
 			break;
 		case BUFFER_TYPE_SORTING:
@@ -4307,6 +5851,64 @@ void DX8Wrapper::Draw_Strip(
 	unsigned short vertex_count)
 {
 	Draw(D3DPT_TRIANGLESTRIP,start_index,polygon_count,min_vertex_index,vertex_count);
+}
+
+// ----------------------------------------------------------------------------
+//
+//
+//
+// ----------------------------------------------------------------------------
+
+bool DX8Wrapper::Draw_User_Primitive(unsigned primitive_type, unsigned primitive_count,
+	const void* vertex_data, unsigned stride)
+{
+	DX8_THREAD_ASSERT();
+	Apply_Render_State_Changes();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: with the recorder up, a user-memory batch
+	// takes the same pipeline path as an indexed one and stops here. Every refusal above leaves the D3D9
+	// call below in place, so an unmirrored texture or an offscreen target still draws where it used to.
+	if (VK_Emit_User_Primitive(primitive_type, vertex_data, stride, primitive_count)) return true;
+#endif
+	DX8_RECORD_DRAW_CALLS();
+	DX8CALL(DrawPrimitiveUP((D3DPRIMITIVETYPE)primitive_type, primitive_count, vertex_data, stride));
+	return false;
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed raw-buffer families. Unlike
+// Draw_User_Primitive this returns a verdict instead of drawing on refusal, because the caller still owns
+// the D3D9 buffer pair and is the only one that can issue the fallback exactly as it did before.
+bool DX8Wrapper::Draw_Indexed_User_Primitive(unsigned primitive_type,
+	const void* vertex_data, unsigned vertex_count, unsigned stride, unsigned fvf,
+	const void* index_data, unsigned index_count, unsigned base_vertex)
+{
+	DX8_THREAD_ASSERT();
+	Apply_Render_State_Changes();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (VK_Emit_Indexed_User_Primitive(primitive_type, vertex_data, vertex_count, stride, fvf,
+			index_data, index_count, base_vertex)) return true;
+#endif
+	return false;
+}
+
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: indexed draw over an engine buffer pair
+// that the caller bound with raw device calls. The recorder binds the mirrored backings at the same
+// ranges D3D9 was given, so no CPU copy is involved. The counts are narrowed to the short interface
+// VK_Emit_Indexed_Draw uses; a batch that does not fit stays on D3D9 rather than being truncated.
+bool DX8Wrapper::Draw_Indexed_Primitive_From_Buffers(void* vertex_buffer, void* index_buffer,
+	unsigned primitive_type, unsigned first_index, unsigned polygon_count,
+	unsigned min_vertex_index, unsigned vertex_count, unsigned base_vertex)
+{
+	DX8_THREAD_ASSERT();
+	Apply_Render_State_Changes();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	if (first_index > 0xFFFFu || polygon_count > 0xFFFFu ||
+			min_vertex_index > 0xFFFFu || vertex_count > 0xFFFFu) return false;
+	if (VK_Emit_Indexed_Draw(vertex_buffer, index_buffer, primitive_type,
+			(unsigned short)first_index, (unsigned short)polygon_count,
+			(unsigned short)min_vertex_index, (unsigned short)vertex_count, base_vertex)) return true;
+#endif
+	return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -4688,6 +6290,14 @@ IDirect3DTexture9 * DX8Wrapper::_Create_DX8_Texture
 	if (mip_level_count!=MIP_LEVELS_1)
 	{
 		DX8_ErrorCode(D3DXFilterTexture(texture, nullptr, 0, D3DX_FILTER_BOX));
+	}
+
+	// GeneralsX @bugfix Qoder 18/10/2026 A texture built from a CPU surface never passes through the
+	// disk loader's convergence point, so the Vulkan draw layer had no keyed image for it and sampled
+	// the built-in white. This is the single choke point for every surface-backed texture, which is how
+	// the faction-colour remaps (W3DAssetManager Remap_Palette / Recolor_Texture) reach the mirror.
+	if (texture) {
+		VKTex_Mirror_D3D_Texture(texture);
 	}
 
 	return texture;
@@ -5716,6 +7326,12 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface9 *render_target, bool use_default
 			CurrentDepthBuffer=nullptr;
 		}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: "default" is the scene mirror the
+		// present chain reads, not the swapchain image, so the recorder returns to its own target here.
+		vk_publish_render_target(nullptr, nullptr);
+#endif
+
 	}
 	else if (render_target != CurrentRenderTarget)
 	{
@@ -5776,6 +7392,12 @@ DX8Wrapper::Set_Render_Target(IDirect3DSurface9 *render_target, bool use_default
 			DX8CALL(SetDepthStencilSurface(nullptr));
 			}
 		}
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: a target switch is only followed by
+		// the recorder when the family opted in; every other target leaves facade draws refused.
+		vk_publish_render_target(render_target, use_default_depth_buffer ? DefaultDepthBuffer : nullptr);
+#endif
 	}
 
 	//
@@ -5844,6 +7466,10 @@ void DX8Wrapper::Set_Render_Target
 			CurrentDepthBuffer->Release();
 			CurrentDepthBuffer=nullptr;
 		}
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		vk_publish_render_target(nullptr, nullptr);
+#endif
 	}
 	else if (render_target != CurrentRenderTarget)
 	{
@@ -5898,6 +7524,10 @@ void DX8Wrapper::Set_Render_Target
 			DX8CALL(SetRenderTarget (0, CurrentRenderTarget));
 			DX8CALL(SetDepthStencilSurface(CurrentDepthBuffer));
 		}
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		vk_publish_render_target(render_target, depth_buffer);
+#endif
 	}
 
 	IsRenderToTexture=true;

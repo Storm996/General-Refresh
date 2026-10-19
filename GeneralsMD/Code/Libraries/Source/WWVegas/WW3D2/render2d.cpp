@@ -60,6 +60,64 @@
 
 RectClass							Render2DClass::ScreenResolution( 0,0,0,0 );
 
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 4: level-7 probe splitting
+// Render2DClass::Render into setup / dynamic VB / dynamic IB / submit segments.
+// Env-gated with GENERALSX_VKFPS_PHASES=1; per 3000 calls dumps averages to
+// vkfps_phase7.log.
+#include <chrono>
+namespace {
+	struct R2Probe
+	{
+		bool enabled;
+		bool checked;
+		long long calls;
+		long long setup, vb, ib, tail;
+		long long verts, idxs, maxVerts;
+	};
+	R2Probe g_r2;
+
+	inline long long r2NowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool r2ProbeOn()
+	{
+		if (!g_r2.checked)
+		{
+			g_r2.checked = true;
+			g_r2.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_r2.enabled;
+	}
+
+	inline void r2Note(long long s, long long v, long long i, long long t, int verts, int idxs)
+	{
+		g_r2.setup += s;
+		g_r2.vb += v;
+		g_r2.ib += i;
+		g_r2.tail += t;
+		g_r2.verts += verts;
+		g_r2.idxs += idxs;
+		if (verts > g_r2.maxVerts) g_r2.maxVerts = verts;
+		++g_r2.calls;
+		if ((g_r2.calls % 3000) != 0)
+			return;
+		FILE* f = fopen("vkfps_phase7.log", "a");
+		if (!f)
+			return;
+		fprintf(f, "[R2_7] per3000calls avg_us total=%.2f setup=%.2f dynvb=%.2f dynib=%.2f submit=%.2f | verts/call=%.1f idx/call=%.1f maxVerts=%lld\n",
+			(g_r2.setup + g_r2.vb + g_r2.ib + g_r2.tail) / 3000.0,
+			g_r2.setup / 3000.0, g_r2.vb / 3000.0, g_r2.ib / 3000.0, g_r2.tail / 3000.0,
+			g_r2.verts / 3000.0, g_r2.idxs / 3000.0, g_r2.maxVerts);
+		fflush(f);
+		fclose(f);
+		g_r2.setup = g_r2.vb = g_r2.ib = g_r2.tail = 0;
+		g_r2.verts = g_r2.idxs = g_r2.maxVerts = 0;
+	}
+}
+
 
 /*
 ** Render2DClass
@@ -604,6 +662,10 @@ void Render2DClass::Render()
 		return;
 	}
 
+	const bool r7 = r2ProbeOn();
+	long long r7t0 = r7 ? r2NowUs() : 0;
+	long long r7t1 = 0, r7t2 = 0, r7t3 = 0;
+
 	// save the view and projection matrices since we're nuking them
 	Matrix4x4 view,proj;
 	Matrix4x4 identity(true);
@@ -635,6 +697,7 @@ void Render2DClass::Render()
 	DX8Wrapper::Set_View_Identity();
 	DX8Wrapper::Set_Transform(D3DTS_PROJECTION,identity);
 
+	if (r7) r7t1 = r2NowUs();
 	DynamicVBAccessClass vb(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,Vertices.Count());
 	{
 		DynamicVBAccessClass::WriteLockClass Lock(&vb);
@@ -652,6 +715,7 @@ void Render2DClass::Render()
 		}
 	}
 
+	if (r7) r7t2 = r2NowUs();
 	DynamicIBAccessClass ib(BUFFER_TYPE_DYNAMIC_DX8,Indices.Count());
 	{
 		DynamicIBAccessClass::WriteLockClass Lock(&ib);
@@ -660,6 +724,7 @@ void Render2DClass::Render()
 			mem[i]=Indices[i];
 	}
 
+	if (r7) r7t3 = r2NowUs();
 	DX8Wrapper::Set_Vertex_Buffer(vb);
 	DX8Wrapper::Set_Index_Buffer(ib,0);
 
@@ -701,6 +766,12 @@ void Render2DClass::Render()
 	DX8Wrapper::Set_Transform(D3DTS_PROJECTION,proj);
 	if (IsGrayScale)
 		ShaderClass::Invalidate();	//force both stages to be reset.
+
+	if (r7)
+	{
+		long long r7t4 = r2NowUs();
+		r2Note(r7t1 - r7t0, r7t2 - r7t1, r7t3 - r7t2, r7t4 - r7t3, Vertices.Count(), Indices.Count());
+	}
 
 }
 

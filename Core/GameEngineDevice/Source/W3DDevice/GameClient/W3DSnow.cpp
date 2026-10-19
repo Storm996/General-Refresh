@@ -457,12 +457,34 @@ void W3DSnowManager::renderSubBox(RenderInfoClass &rinfo, Int originX, Int origi
 		}
 
 flush_particles:
+		// GeneralsX @feature Qoder 18/10/2026 step 9.I: hand the batch to the Vulkan facade while the
+		// lock still names the memory it wrote. The facade copies the vertices into its scratch ring
+		// (VK_Draw_User_Primitive_State), so nothing here depends on a mirrored D3D9 vertex buffer: the
+		// bare SetStreamSource only exists for the refusal path below.
+		bool vkSubmitted = false;
+		if (numberInBatch)
+		{
+			vkSubmitted = DX8Wrapper::Draw_User_Primitive(D3DPT_POINTLIST, (unsigned)numberInBatch,
+				verts - numberInBatch, sizeof(POINTVERTEX));
+		}
 		m_VertexBufferD3D->Unlock();
 		//Render any particles that may be queued up.
 		if (numberInBatch)
 		{
+			{
+				static unsigned s_snowProbe = 0;
+				if (s_snowProbe < 8) {
+					fprintf(stderr, "[SNOWPROBE] points vk=%d n=%d\n", (int)vkSubmitted, (int)numberInBatch);
+					fflush(stderr);
+					++s_snowProbe;
+				}
+			}
 			Debug_Statistics::Record_DX8_Polys_And_Vertices(numberInBatch*2,numberInBatch*4,ShaderClass::_PresetOpaqueShader);
-			DX8Wrapper::_Get_D3D_Device8()->DrawPrimitive( D3DPT_POINTLIST, m_dwBase, numberInBatch);
+			if (!vkSubmitted)
+			{
+				DX8Wrapper::_Get_D3D_Device8()->SetStreamSource( 0, m_VertexBufferD3D, 0, sizeof(POINTVERTEX) );
+				DX8Wrapper::_Get_D3D_Device8()->DrawPrimitive( D3DPT_POINTLIST, m_dwBase, numberInBatch);
+			}
 			totalPart -= numberInBatch;
 			m_dwBase += numberInBatch;
 		}
@@ -597,8 +619,9 @@ void W3DSnowManager::render(RenderInfoClass &rinfo)
     DX8Wrapper::Set_DX8_Render_State( D3DRS_POINTSCALE_B,  FtoDW(0.00f) );
     DX8Wrapper::Set_DX8_Render_State( D3DRS_POINTSCALE_C,  FtoDW(1.00f) );
 
-	DX8Wrapper::_Get_D3D_Device8()->SetStreamSource( 0, m_VertexBufferD3D, 0, sizeof(POINTVERTEX) );
-    DX8Wrapper::_Get_D3D_Device8()->SetFVF( D3DFVF_POINTVERTEX );
+	// GeneralsX @feature Qoder 18/10/2026 step 9.I: the stream source moved into flush_particles' refusal
+	// path. A batch the facade consumes never binds the D3D9 vertex buffer at all.
+    DX8Wrapper::Set_Vertex_FVF( D3DFVF_POINTVERTEX );
 	m_dwBase = SNOW_BUFFER_SIZE;	//start with a new vertex buffer each frame.
 
 	m_leafDim = 45;	//cull boxes that are 20x20 emitters in size. Making them much smaller will result in too many draw calls.

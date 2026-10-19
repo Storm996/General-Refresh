@@ -19,4 +19,9 @@
 // DX8Wrapper::_Create_DX8_Texture result). Returns false (no-op) when the Vulkan mirror is off.
 bool VKTex_Mirror_D3D_Texture(void* d3d_texture);
 
+// Same convergence, but the texels are read from a second texture (the D3D9 staging copy) and
+// uploaded under 'key'. D3DPOOL_DEFAULT destinations cannot be re-locked, so the rect-copy path
+// hands over its staging texture instead of the destination pointer.
+bool VKTex_Mirror_Texture_As(void* key, void* source_texture, unsigned levels);
+
 #endif // GENERALSX_VULKANTEXMIRROR_H

@@ -66,6 +66,64 @@
 
 // PRIVATE PROTOTYPES /////////////////////////////////////////////////////////
 
+// GeneralsX @performance Qoder 19/10/2026 R-05 wave 4: level-6 probe splitting
+// W3DDisplayString::draw into build / polys / flush / render segments. Env-gated
+// with GENERALSX_VKFPS_PHASES=1, averages per 2000 draws to vkfps_phase6.log.
+#include <chrono>
+#include <cstdlib>
+namespace {
+	struct DsProbe
+	{
+		bool enabled;
+		bool checked;
+		long long draws;
+		long long total, build, polys, flush, render, rebuilds;
+	};
+	DsProbe g_ds;
+
+	inline long long dsNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool dsProbeOn()
+	{
+		if (!g_ds.checked)
+		{
+			g_ds.checked = true;
+			g_ds.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_ds.enabled;
+	}
+
+	struct DsScope
+	{
+		long long* out;
+		long long t0;
+		DsScope(long long* o) : out(o), t0(o ? dsNowUs() : 0) { }
+		~DsScope() { if (out) *out += dsNowUs() - t0; }
+	};
+
+	inline void dsTickDump()
+	{
+		if (!g_ds.enabled)
+			return;
+		++g_ds.draws;
+		if ((g_ds.draws % 2000) != 0)
+			return;
+		FILE* f = fopen("vkfps_phase6.log", "a");
+		if (!f)
+			return;
+		fprintf(f, "[DS6] per2000draws avg_us total=%.2f build=%.2f polys=%.2f flush=%.2f render=%.2f rebuilds/draw=%.2f\n",
+			g_ds.total / 2000.0, g_ds.build / 2000.0, g_ds.polys / 2000.0,
+			g_ds.flush / 2000.0, g_ds.render / 2000.0, g_ds.rebuilds / 2000.0);
+		fflush(f);
+		fclose(f);
+		g_ds.total = g_ds.build = g_ds.polys = g_ds.flush = g_ds.render = g_ds.rebuilds = 0;
+	}
+}
+
 // PRIVATE FUNCTIONS //////////////////////////////////////////////////////////
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -165,9 +223,15 @@ void W3DDisplayString::draw( Int x, Int y, Color color, Color dropColor, Int xDr
 	if( getTextLength() == 0 )
 		return;  // nothing to draw
 
+	const bool dsP = dsProbeOn();
+	if (dsP) dsTickDump();
+	DsScope sTotal(dsP ? &g_ds.total : nullptr);
+
 	// if our font or text has changed we need to build a new sentence
 	if( m_fontChanged || m_textChanged )
 	{
+		DsScope sBuild(dsP ? &g_ds.build : nullptr);
+		if (dsP) ++g_ds.rebuilds;
 		if(m_useHotKey)
 		{
 			m_textRenderer.Set_Hot_Key_Parse(TRUE);
@@ -199,6 +263,7 @@ void W3DDisplayString::draw( Int x, Int y, Color color, Color dropColor, Int xDr
 			color != m_currTextColor ||
 			dropColor != m_currDropColor )
 	{
+		DsScope sPolys(dsP ? &g_ds.polys : nullptr);
 
 		// save the new attributes of the text position and color
 		m_textPos.x = x;
@@ -226,14 +291,21 @@ void W3DDisplayString::draw( Int x, Int y, Color color, Color dropColor, Int xDr
 
 	}
 
-	TheDisplay->flush();
+	{
+		DsScope sFlush(dsP ? &g_ds.flush : nullptr);
+		TheDisplay->flush();
+	}
 
 	if (m_useHotKey)
 	{
+		DsScope sRender(dsP ? &g_ds.render : nullptr);
 		m_textRendererHotKey.Render();
 	}
 
-	m_textRenderer.Render();
+	{
+		DsScope sRender(dsP ? &g_ds.render : nullptr);
+		m_textRenderer.Render();
+	}
 
 	// we are for sure using display resources now
 	if( TheGameClient )

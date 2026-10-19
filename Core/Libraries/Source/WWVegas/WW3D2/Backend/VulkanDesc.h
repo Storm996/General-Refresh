@@ -73,9 +73,9 @@ void* VKDesc_Sampler(unsigned int addrU, unsigned int addrV, unsigned int addrW,
                      unsigned int minFilter, unsigned int magFilter, unsigned int mipFilter,
                      unsigned int maxAnisotropy);
 
-// Allocate one descriptor set and fill all four bindings: four texture slots (a null view binds the
+// Allocate one descriptor set and fill all four bindings: eight texture slots (a null view binds the
 // built-in 1x1 white fallback) plus the three constant regions. *set receives the VkDescriptorSet.
-bool VKDesc_Build_Set(void** set, void* const views[4], void* const samplers[4],
+bool VKDesc_Build_Set(void** set, void* const views[8], void* const samplers[8],
                       const VKDesc_Region* vtx, const VKDesc_Region* pix, const VKDesc_Region* lights);
 
 // The ring buffer handles a caller needs when it writes VkDescriptorBufferInfo itself (wedge 5's PSO

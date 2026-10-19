@@ -48,6 +48,12 @@
 #include "WWMath/sphere.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwmemlog.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.J2d: the no-d3d9 vptr write watch lives in
+// Backend/VKD3DStubImpl.cpp; declared here rather than included, because that header carries the whole D3D9
+// stub class set and this TU does not want it.
+void VK_NOD3D_Watch_Check(const char* where);
+#endif
 
 #define DEFAULT_IB_SIZE 5000
 
@@ -228,6 +234,9 @@ IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_
 				}
 			}
 		}
+#endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine IB writelock");
 #endif
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(index_buffer)->Get_DX8_Index_Buffer()->Lock(
 			0,
@@ -511,6 +520,9 @@ DynamicIBAccessClass::WriteLockClass::WriteLockClass(DynamicIBAccessClass* ib_ac
 			}
 		}
 #endif
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine dyn IB lock");
+#endif
 		DX8_ErrorCode(
 			static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Lock(
 			DynamicIBAccess->IndexBufferOffset*sizeof(WORD),
@@ -537,6 +549,9 @@ DynamicIBAccessClass::WriteLockClass::~WriteLockClass()
 		if (vk_mirrored) break;	// wedge 5.A: wrote the backing, the D3D9 pool was never locked
 #endif
 		DX8_Assert();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		VK_NOD3D_Watch_Check("engine dyn IB unlock");
+#endif
 		DX8_ErrorCode(static_cast<DX8IndexBufferClass*>(DynamicIBAccess->IndexBuffer)->Get_DX8_Index_Buffer()->Unlock());
 		break;
 	case BUFFER_TYPE_DYNAMIC_SORTING:

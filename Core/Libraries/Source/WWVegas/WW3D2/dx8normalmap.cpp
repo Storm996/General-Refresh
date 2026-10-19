@@ -28,6 +28,45 @@
 #include <cstring>
 #include <cmath>
 
+// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 8: mount capability probe. While the Vulkan
+// swapchain owns presentation, a batch that names a custom VS/PS the registry has not translated is
+// refused by the draw facade and falls back to a D3D9 call that is never presented - the whole batch
+// disappears. The mounters therefore have to decline such a pair up front and leave the batch on the
+// fixed pipeline (which the Vulkan FF stages do draw). This is not a feature switch: every translated
+// pair still mounts, and the decline lifts automatically as each family's translation lands.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanCore.h"
+#include "Backend/VulkanPgm.h"
+#endif
+
+namespace
+{
+	bool vkPresentOwnsFrame()
+	{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		return VKPgm_On() && VulkanCore_Present_Enabled();
+#else
+		return false;
+#endif
+	}
+
+	bool vkPairTranslated(UINT_PTR vs, UINT_PTR ps, const char* family)
+	{
+		if (!vkPresentOwnsFrame()) return true;
+		const unsigned vsTag = VKPgm_Tag_For_Handle((void*)vs, 0);
+		const unsigned psTag = VKPgm_Tag_For_Handle((void*)ps, 1);
+		if ((vs == 0 || vsTag != 0u) && (ps == 0 || psTag != 0u)) return true;
+
+		static unsigned s_declined = 0;
+		if ((s_declined++ & 0x3FFu) == 0u) {
+			fprintf(stderr, "[VKPGM] mount declined (%s): vs tag=%u ps tag=%u - batch stays on the fixed pipeline\n",
+				family != nullptr ? family : "?", vsTag, psTag);
+			fflush(stderr);
+		}
+		return false;
+	}
+}
+
 // GeneralsX @feature PS3.0-P3-12 14/10/2026: hemispherical ambient strength (master report L5).
 // The engine's ambient is a flat constant; multiplying an ambient*hemiscale tint by the WORLD-up
 // component of the pixel normal (W3D is Z-up - see DX8NormalMap's g_FallbackDir) lifts sky-facing
@@ -848,6 +887,11 @@ namespace DX8NormalMap
 				// (which used to swallow the PBR look whenever any lamp/explosion touched the mesh).
 				// c11 = (mode, LI, ENV, wetness) mirrors the single-light PBR c8 contract in a free register.
 				const bool pbrml = (PBR_Mode() == 2 && PBRML_Enabled() && rp != nullptr);
+				// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 8: same capability gate as the
+				// GN mounter. The constants above are inert to the fixed pipeline; the textures and
+				// shader handles below are not, so decline before touching them.
+				if (!vkPairTranslated(g_VS_ML, pbrml ? g_PS_PBRML : g_PS_ML,
+						pbrml ? "PBRML" : "ML")) return false;
 				if (pbrml)
 				{
 					static int s_pbrmlMounted = 0;
@@ -1183,6 +1227,11 @@ namespace DX8GeomNormal
 				useShadow = true;
 			}
 		}
+
+		// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 8: decline the mount when this exact
+		// pair has no translated twin. Reached before any constant/texture upload, so returning false
+		// leaves the batch untouched for the fixed pipeline.
+		if (!vkPairTranslated(vs, psSel, merged ? "GNMerged" : (skinBatch ? "GNSkin" : "GN"))) return false;
 
 		// Same WVP convention as DX8NormalMap::Apply (raw DX8 transforms, transpose once);
 		// see the water-shader precedent comment there.
