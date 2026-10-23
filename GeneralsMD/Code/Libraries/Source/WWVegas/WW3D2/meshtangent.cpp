@@ -206,7 +206,7 @@ bool Compute_Mesh_Tangents(MeshModelClass* mesh, Vector3** out_tangent, Vector3*
 		// diffuse with the mesh placement angle, and it cannot affect roughness-only batches at all
 		// (nm == nullptr runs with a flat (0,0,1) tangent normal, so the B row is never read). The
 		// rotating-light symptom - reproduced by both normal maps and roughness - was the world ->
-		// model rotate in DX8NormalMap::Apply; see @bugfix PS3.0-#76b in Core/.../dx8normalmap.cpp.
+		// model rotate in the old dot3 path; see @bugfix PS3.0-#76b in Core/.../dx8normalmap.cpp.
 		// The earlier draft of this comment quoted mirror_chart_probe.py negative-triangle counts and
 		// a lighting-preview-studio A/B as evidence for the rotating-light symptom. Neither was
 		// reproduced here, so both citations are dropped; the handedness fix stands on the derivation

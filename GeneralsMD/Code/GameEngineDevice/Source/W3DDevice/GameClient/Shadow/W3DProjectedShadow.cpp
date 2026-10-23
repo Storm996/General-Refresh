@@ -50,7 +50,7 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "d3dx9math.h"
 #include "Common/GlobalData.h"
-#include "Common/OptionPreferences.h"	// GeneralsX @feature 10/10/2026 shadow S1/S2 knobs (Options.ini, outside m_iniCRC)
+#include "Common/OptionPreferences.h"	// GeneralsX @feature 10/10/2026 shadow S2: retail atlas resolution (Options.ini, outside m_iniCRC)
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
 #include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @feature PS3.0 T6: share the device-reset lifecycle
 #include "WW3D2/statistics.h"
@@ -64,8 +64,7 @@
 // GeneralsX @feature Qoder 18/10/2026 wedge 9.G: surface rect copies do not touch the Vulkan mirror,
 // so the per-object shadow blob needs an explicit re-upload after Copy (no-op outside win64vk).
 #include "WW3D2/Backend/VulkanTexMirror.h"
-// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: compileShaderAtBestProfile for the blur PS.
-#include "W3DDevice/GameClient/W3DShaderManager.h"
+#include "WW3D2/Backend/VulkanGeo.h"
 
 
 /** @todo: We're going to have a pool of a couple rendertargets to use
@@ -135,29 +134,6 @@ static void vk_shadow_mirror_reserve()
 	if (s_vkShadowDecalIndices.size() < (size_t)SHADOW_DECAL_INDEX_SIZE) s_vkShadowDecalIndices.resize((size_t)SHADOW_DECAL_INDEX_SIZE);
 }
 #endif
-
-// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: a separable 5-tap gaussian (the two
-// "wide" weights 0.270659/0.060002 folded into offsets 1.3846/3.2308, classic linear-sampling
-// trick) run once horizontally and once vertically over the shadow atlas.  It is drawn as a
-// full-screen pre-transformed quad so it needs no world vertex buffer.
-#define SHADOW_BLUR_FVF	(D3DFVF_XYZRHW | D3DFVF_TEX1)
-
-struct SHADOW_BLUR_VERTEX	//clip-space quad vertex for the blur pass
-{
-		float x,y,z,rhw;
-		float u,v;
-};
-
-static const char* kShadowBlurShader =
-	"sampler s0 : register(s0);\n"
-	"float4 c0 : register(c0);\n"
-	"float4 main(float2 uv : TEXCOORD0) : COLOR\n"
-	"{\n"
-	"    float4 sum = tex2D(s0, uv) * 0.2270270;\n"
-	"    sum += (tex2D(s0, uv + c0.xy * 1.3846153) + tex2D(s0, uv - c0.xy * 1.3846153)) * 0.3162162;\n"
-	"    sum += (tex2D(s0, uv + c0.xy * 3.2307692) + tex2D(s0, uv - c0.xy * 3.2307692)) * 0.0702702;\n"
-	"    return sum;\n"
-	"}\n";
 
 LPDIRECT3DVERTEXBUFFER9 shadowDecalVertexBufferD3D=nullptr;		///<D3D vertex buffer
 LPDIRECT3DINDEXBUFFER9	shadowDecalIndexBufferD3D=nullptr;	///<D3D index buffer
@@ -275,15 +251,6 @@ W3DProjectedShadowManager::W3DProjectedShadowManager()
 	m_drawStartX = 0;
 	m_drawStartY = 0;
 	m_renderTargetSize = DEFAULT_RENDER_TARGET_WIDTH;	//GeneralsX @feature 10/10/2026 shadow S2: default step, ReAcquireResources overrides it from the option
-	// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: blur resources stay inert until
-	// ReAcquireResources builds them (they are device-dependent).
-	m_blurRT[0] = nullptr;
-	m_blurRT[1] = nullptr;
-	m_blurShader = nullptr;
-	m_blurVB = nullptr;
-	m_blurIB = nullptr;
-	m_blurReady = FALSE;
-	m_blurRadius = 0;
 }
 
 W3DProjectedShadowManager::~W3DProjectedShadowManager()
@@ -401,17 +368,12 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 			return FALSE;
 	}
 
-	// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: build the blur detour on top of the
-	// atlas that was just created.  Failure is non-fatal - it only leaves shadows sharp.
-	initBlurResources();
-
 	return TRUE;
 }
 
 void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
-	releaseBlurResources();	//GeneralsX @feature PS3.0 T2 13/10/2026: blur RTs/buffers are device-dependent too.
 	W3DSunShadowMap::releaseResources();	//GeneralsX @feature PS3.0 T6: depth map + shaders are POOL_DEFAULT.
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
 	if (shadowDecalIndexBufferD3D)
@@ -420,272 +382,6 @@ void W3DProjectedShadowManager::ReleaseResources()
 		shadowDecalVertexBufferD3D->Release();
 	shadowDecalIndexBufferD3D=nullptr;
 	shadowDecalVertexBufferD3D=nullptr;
-}
-
-// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening.  Retail projected shadows are a hard
-// silhouette: updateTexture copies the shadow atlas straight into each object's private texture and
-// flushDecals stamps that onto the terrain with zero filtering of the shape itself.  Softening is
-// done at the atlas level, BEFORE the per-object Copy, because the atlas packing of shadows shifts
-// from frame to frame - blurring a private copy later would sample stale neighbours.  The cost is
-// two full-atlas blur passes per shadow that actually re-renders its texture, and shadows only
-// re-render when their light angle moves, so steady-state cost is ~zero.
-//
-// Level comes from Options.ini ShadowSoftening (S-family, outside m_iniCRC); the environment
-// variable GENERALSX_SHADOWBLUR overrides it so A/B runs never need to touch the user's Options.ini.
-void W3DProjectedShadowManager::initBlurResources()
-{
-#ifdef _WIN32
-	Int level = OptionPreferences().getShadowSoftening();
-	const char* env = getenv("GENERALSX_SHADOWBLUR");
-	if (env)
-		level = atoi(env);
-	if (level < 1)
-		return;	//softening off: the original sharp atlas path stays untouched.
-	if (level > 3)
-		level = 3;
-	m_blurRadius = level;
-
-	if (m_dynamicRenderTarget == nullptr)
-		return;	//no atlas to blur behind.
-
-	const char* profile = nullptr;
-	void* handle = nullptr;
-	// compileShaderAtBestProfile reports HRESULT and the compiler reason on stderr itself; ps_3_0
-	// first with a ps_2_0 step-down, same ladder the water and dot3 shaders use.
-	HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kShadowBlurShader, false, "[SHADOWBLUR]", &profile, &handle);
-	if (FAILED(hr) || handle == nullptr)
-		return;
-	m_blurShader = handle;
-
-	m_blurRT[0] = DX8Wrapper::Create_Render_Target(m_renderTargetSize, m_renderTargetSize, WW3D_FORMAT_A8R8G8B8);
-	m_blurRT[1] = DX8Wrapper::Create_Render_Target(m_renderTargetSize, m_renderTargetSize, WW3D_FORMAT_A8R8G8B8);
-	if (m_blurRT[0] == nullptr || m_blurRT[1] == nullptr)
-	{
-		releaseBlurResources();
-		return;
-	}
-
-	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
-	if (dev == nullptr ||
-		FAILED(dev->CreateVertexBuffer(4*sizeof(SHADOW_BLUR_VERTEX), D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, (LPDIRECT3DVERTEXBUFFER9*)&m_blurVB, nullptr)) ||
-		FAILED(dev->CreateIndexBuffer(6*sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, (LPDIRECT3DINDEXBUFFER9*)&m_blurIB, nullptr)))
-	{
-		releaseBlurResources();
-		return;
-	}
-
-	//Clip-space quad covering the whole atlas; texture row 0 maps to NDC y=-1 (top of the RT).
-	SHADOW_BLUR_VERTEX quad[4] =
-	{
-		{ -1.0f, -1.0f, 0.5f, 1.0f, 0.0f, 0.0f },
-		{ -1.0f,  1.0f, 0.5f, 1.0f, 0.0f, 1.0f },
-		{  1.0f, -1.0f, 0.5f, 1.0f, 1.0f, 0.0f },
-		{  1.0f,  1.0f, 0.5f, 1.0f, 1.0f, 1.0f },
-	};
-	VOID* vbBits = nullptr;
-	if (SUCCEEDED(((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Lock(0, sizeof(quad), &vbBits, 0)))
-	{
-		memcpy(vbBits, quad, sizeof(quad));
-		((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Unlock();
-	}
-
-	WORD ibIndices[6] = {0, 1, 2, 1, 3, 2};
-	VOID* ibBits = nullptr;
-	if (SUCCEEDED(((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Lock(0, sizeof(ibIndices), &ibBits, 0)))
-	{
-		memcpy(ibBits, ibIndices, sizeof(ibIndices));
-		((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Unlock();
-	}
-
-#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the two ping-pong targets and the atlas
-	// they read are written exclusively by facade draws (decal pool, projector quad, blur quad), so the
-	// recorder can follow them. Every other render target stays on D3D9 until its own family is converted.
-	DX8Wrapper::VK_Allow_Render_Target((void*)m_blurRT[0]->Peek_D3D_Texture());
-	DX8Wrapper::VK_Allow_Render_Target((void*)m_blurRT[1]->Peek_D3D_Texture());
-	DX8Wrapper::VK_Allow_Render_Target((void*)m_dynamicRenderTarget->Peek_D3D_Texture());
-#endif
-
-	m_blurReady = TRUE;
-	fprintf(stderr, "[SHADOWBLUR] enabled radius=%d profile=%s atlas=%d\n", m_blurRadius, profile, m_renderTargetSize);
-	fflush(stderr);
-#else
-	// Runtime HLSL compilation is Windows-only (the CompatLib shim drives d3dcompiler), same
-	// boundary as compileShaderAtBestProfile itself.  On other platforms shadow softening stays
-	// off until the blur program ships as a build-time asset; the sharp path is unaffected.
-#endif
-}
-
-void W3DProjectedShadowManager::releaseBlurResources()
-{
-	REF_PTR_RELEASE(m_blurRT[0]);
-	REF_PTR_RELEASE(m_blurRT[1]);
-	if (m_blurShader)
-	{
-		((IDirect3DPixelShader9*)m_blurShader)->Release();
-		m_blurShader = nullptr;
-	}
-	if (m_blurVB)
-	{
-		((LPDIRECT3DVERTEXBUFFER9)m_blurVB)->Release();
-		m_blurVB = nullptr;
-	}
-	if (m_blurIB)
-	{
-		((LPDIRECT3DINDEXBUFFER9)m_blurIB)->Release();
-		m_blurIB = nullptr;
-	}
-	m_blurReady = FALSE;
-	m_blurRadius = 0;
-}
-
-void W3DProjectedShadowManager::runBlurPass(void* srcTexture, void* dstSurface, float texelOffsetX, float texelOffsetY)
-{
-	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
-	if (dev == nullptr || srcTexture == nullptr || dstSurface == nullptr || m_blurShader == nullptr)
-		return;
-
-	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: publish the ping-pong target through the
-	// facade. The quad below is the only thing drawn here, and the target was opted in at creation, so
-	// the recorder stays on it for the whole pass instead of dropping these batches into the scene.
-	// No depth attachment: the quad tests nothing, and the surface overload would AddRef a null depth.
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)dstSurface, false);
-
-	D3DVIEWPORT9 vp;
-	vp.X = 0;
-	vp.Y = 0;
-	vp.Width = m_renderTargetSize;
-	vp.Height = m_renderTargetSize;
-	vp.MinZ = 0.0f;
-	vp.MaxZ = 1.0f;
-	DX8Wrapper::Set_Viewport(&vp);
-
-	DX8Wrapper::Set_DX8_Texture(0, (IDirect3DBaseTexture9*)srcTexture);
-	//Linear filtering is part of the gaussian: the 3-tap weights rely on sampling between texels.
-	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-
-	float c0v[4] = { texelOffsetX, texelOffsetY, 0.0f, 0.0f };
-	DX8Wrapper::Set_Pixel_Shader_Constant(0, c0v, 1);
-
-	//D18 lesson: SetFVF does not unbind a custom vertex shader left behind by another pass, so
-	//the null binding must be explicit or the quad could be drawn through a stale world VS.
-	DX8Wrapper::Set_Vertex_Shader(0);
-	DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(m_blurShader));
-
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
-
-#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-	// Same quad the init path uploaded; the facade needs it in CPU memory to describe the batch.
-	static const SHADOW_BLUR_VERTEX kQuad[4] =
-	{
-		{ -1.0f, -1.0f, 0.5f, 1.0f, 0.0f, 0.0f },
-		{ -1.0f,  1.0f, 0.5f, 1.0f, 0.0f, 1.0f },
-		{  1.0f, -1.0f, 0.5f, 1.0f, 1.0f, 0.0f },
-		{  1.0f,  1.0f, 0.5f, 1.0f, 1.0f, 1.0f },
-	};
-	static const WORD kIndices[6] = {0, 1, 2, 1, 3, 2};
-	DX8Wrapper::Set_Vertex_FVF(SHADOW_BLUR_FVF);
-	const Bool vkOwned = DX8Wrapper::Draw_Indexed_User_Primitive(D3DPT_TRIANGLELIST,
-			kQuad, 4, sizeof(SHADOW_BLUR_VERTEX), SHADOW_BLUR_FVF, kIndices, 6, 0);
-	{
-		// Bounded evidence that the blur pass itself is recorded, not just the pass that fills the atlas.
-		static Int vkProbe = 0;
-		if (vkProbe < 8) {
-			++vkProbe;
-			fprintf(stderr, "[SHADOWPROBE] blur vk=%d\n", vkOwned ? 1 : 0);
-			fflush(stderr);
-		}
-	}
-#endif
-	{
-		// The blurred result is still consumed by a D3D9 surface Copy (updateTexture), which the
-		// recorder cannot fill, so the device gets the same quad as well. Both writes are therefore
-		// intentional: the Vulkan mirror for the recorder, the D3D9 target for the copy below.
-		dev->SetStreamSource(0, (LPDIRECT3DVERTEXBUFFER9)m_blurVB, 0, sizeof(SHADOW_BLUR_VERTEX));
-		dev->SetIndices((LPDIRECT3DINDEXBUFFER9)m_blurIB);
-		DX8Wrapper::Set_Vertex_FVF(SHADOW_BLUR_FVF);
-		dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
-	}
-
-	DX8Wrapper::Set_Pixel_Shader(0);
-}
-
-TextureClass *W3DProjectedShadowManager::acquireBlurredAtlas()
-{
-	if (!m_blurReady || m_dynamicRenderTarget == nullptr)
-		return m_dynamicRenderTarget;
-
-	LPDIRECT3DDEVICE9 dev = DX8Wrapper::_Get_D3D_Device8();
-	if (dev == nullptr)
-		return m_dynamicRenderTarget;
-
-	//Remember the shadow-render state we interrupt, so the caller's own device stays usable.
-	IDirect3DSurface9* prevRT = nullptr;
-	IDirect3DSurface9* prevDS = nullptr;
-	D3DVIEWPORT9 prevVP;
-	dev->GetRenderTarget(0, &prevRT);
-	dev->GetDepthStencilSurface(&prevDS);
-	dev->GetViewport(&prevVP);
-
-	//Radius is in texels per pass; the shader multiplies by 1.38/3.23 for the wide taps.
-	float step = (float)m_blurRadius / (float)m_renderTargetSize;
-
-	TextureClass* result = m_dynamicRenderTarget;
-
-	SurfaceClass* hSurface = m_blurRT[0] ? m_blurRT[0]->Get_Surface_Level() : nullptr;
-	if (hSurface)
-	{
-		runBlurPass((void*)m_dynamicRenderTarget->Peek_D3D_Texture(), (void*)hSurface->Peek_D3D_Surface(), step, 0.0f);
-		hSurface->Release_Ref();
-
-		// The wrapper only supports one custom target at a time (it parks the interrupted default on
-		// the side), so hand the device back before the second ping-pong pass binds the other texture.
-		DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)nullptr);
-
-		SurfaceClass* vSurface = m_blurRT[1] ? m_blurRT[1]->Get_Surface_Level() : nullptr;
-		if (vSurface)
-		{
-			runBlurPass((void*)m_blurRT[0]->Peek_D3D_Texture(), (void*)vSurface->Peek_D3D_Surface(), 0.0f, step);
-			vSurface->Release_Ref();
-			result = m_blurRT[1];
-		}
-	}
-
-	// Restore through the facade, not raw D3D: the wrapper has to release the device pointers it
-	// parked when the first blur pass switched away from this target, and publish the scene/owning
-	// target back to the Vulkan recorder at the same time.
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface9*)nullptr);
-	if (prevRT)
-		prevRT->Release();
-	if (prevDS)
-		prevDS->Release();
-	DX8Wrapper::Set_Viewport(&prevVP);
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	//The detour wrote raw D3D state over everything DX8Wrapper caches (viewport, shaders, states).
-	DX8Wrapper::Invalidate_Cached_Render_States();
-
-	// GeneralsX @feature PS3.0 T2 13/10/2026: one-shot proof the softening detour actually runs on a
-	// re-rendered atlas (not just that initBlurResources compiled the PS). Static projected shadows
-	// never re-render between screenshots, so a zero A/B delta is expected unless this fires.
-	{
-		static Int s_blurApplied = 0;
-		if (result != m_dynamicRenderTarget && s_blurApplied < 5)
-		{
-			++s_blurApplied;
-			fprintf(stderr, "[SHADOWBLUR] applied pass #%d radius=%d atlas=%d\n",
-				s_blurApplied, m_blurRadius, m_renderTargetSize);
-			fflush(stderr);
-		}
-	}
-
-	return result;
 }
 
 void W3DProjectedShadowManager::invalidateCachedLightPositions()
@@ -1141,6 +837,27 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 	REF_PTR_RELEASE(vmat);
 	DX8Wrapper::Set_Texture(0,texture->getTexture());
 
+	// GeneralsX @bugfix Qoder 22/10/2026 effect stage-combiner leak: the stencil-volume shadow pass
+	// leaves stage0 at SELECTARG2/DISABLE (no texture, no alpha). ShaderClass::Apply restores blend
+	// and alpha-test but not the combiners, so a decal flushed after it sampled no texture and its
+	// alpha decal became a hard black square around damaged buildings. Restore the decal contract:
+	// colour and alpha both MODULATE(TEXTURE, DIFFUSE), all higher stages off.
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+	if (DX8Wrapper::Get_Current_Caps())
+	{
+		const int maxStages = DX8Wrapper::Get_Current_Caps()->Get_Max_Textures_Per_Pass();
+		for (int s = 1; s < maxStages; ++s)
+		{
+			DX8Wrapper::Set_DX8_Texture_Stage_State(s, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(s, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+		}
+	}
+
 //	DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);	//good for debugging, draws without alpha
 	switch (type)
 	{
@@ -1160,6 +877,28 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 	//_PresetAlphaSpriteShader
 
 	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @debug Qoder 20/10/2026 R-07 decal identity: the shadow quad is the batch the
+	// flat-unit-texture-on-terrain report points at, and the FF census only lists names it is asked
+	// about. Ask the device slot itself at the point the decal draws: want is the shadow texture the
+	// flush requested (ShadowI.tga for infantry, shadow.tga for vehicles), bound is the key the
+	// recorder will sample. A mismatch is the bug; equality moves the search into the mirror or the
+	// texture's own pixels.
+	{
+		static Int s_vkDecalProbe = 0;
+		if (s_vkDecalProbe < 320) {
+			++s_vkDecalProbe;
+			TextureClass *want = texture ? texture->getTexture() : nullptr;
+			const void *wantKey = want ? (const void*)want->Peek_D3D_Base_Texture() : nullptr;
+			const void *boundKey = DX8Wrapper::VK_Read_Texture(0);
+			fprintf(stderr, "[VKDECAL] #%d type=0x%02x verts=%d polys=%d want='%s' wantKey=%p boundKey=%p match=%d\n",
+				(int)s_vkDecalProbe, (unsigned)type, nShadowDecalVertsInBatch, nShadowDecalPolysInBatch,
+				want ? want->Get_Texture_Name().str() : "?", wantKey, boundKey, (wantKey == boundKey) ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+#endif
 
 	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: the maroon footprint patches under buildings
 	// and units are drawn by exactly this call with the multiplicative preset (dst * pixel). A maroon
@@ -2733,18 +2472,9 @@ void W3DProjectedShadow::init()
 
 	DEBUG_ASSERTCRASH(m_shadowProjector == nullptr, ("Init of existing shadow projector"));
 
-	// GeneralsX @feature 10/10/2026 Shadow S1: density and tint now come from Options.ini (read once
-	// and cached in the manager).  If the manager is absent we keep the original numbers, so the old
-	// behavior can never change by accident.
-	Real projectedIntensity = 0.4f;
-	Real tint[3] = { 1.0f, 1.0f, 1.0f };
-	if (TheW3DShadowManager)
-	{
-		projectedIntensity = TheW3DShadowManager->getShadowProjectedIntensity();
-		for (Int i=0; i<3; i++)
-			tint[i] = TheW3DShadowManager->getShadowTint(i);
-	}
-
+	// GeneralsX @refactor Qoder 20/10/2026: back to the retail constant. The options-page density row now
+	// drives the native sun shadow instead; VK_Set_Retail_Shadow_Off mutes this manager while that row is
+	// on, so there is nothing left here to tune.
 	// GeneralsX @bugfix Qoder 11/10/2026 T3-0 shadow-bug: the decal vertex color must stay pure
 	// white.  flushDecals draws decals with a multiplicative shader where m_diffuse multiplies into
 	// the destination and the texture alpha is ignored, so a tinted m_diffuse (the first S1 pass
@@ -2757,10 +2487,7 @@ void W3DProjectedShadow::init()
 	if (m_type & SHADOW_PROJECTION)
 	{
 		m_shadowProjector = NEW_REF(TexProjectClass,());
-		m_shadowProjector->Set_Intensity(projectedIntensity,true);
-		// The original code could only crush covered pixels to plain gray; now they carry an ambient
-		// (cold) cast.  See TexProjectClass::Set_Projection_Color.
-		m_shadowProjector->Set_Projection_Color(tint[0],tint[1],tint[2]);
+		m_shadowProjector->Set_Intensity(0.4f,true);
 		m_shadowProjector->Set_Texture(m_shadowTexture[0]->getTexture());
 	}
 }
@@ -2799,13 +2526,47 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		m_shadowProjector->Compute_Texture(m_robj,context);
 
 		//Need to copy generated texture into permanent texture.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @bugfix Qoder 21/10/2026 SHADOWRT: a D3D9 Surface::Copy/GetRenderTargetData
+		// readback returns the stub's empty CPU store under the pure facade, so the permanent shadow
+		// texture used to mirror all-zero and every multiplicative decal painted a black quad.
+		// The baked pixels live in the shared RT's VkImage; move them image-to-image instead.
+		{
+			TextureClass* dstTex = m_shadowTexture[0]->getTexture();
+			TextureClass* srcTex = TheW3DProjectedShadowManager->getRenderTarget();
+			// The image-to-image copy needs the destination mirror to exist. First bake only:
+			// create it from the (empty) D3D level, then overwrite it with the real RT pixels.
+			VKTex_Info dstInfo;
+			const Bool hadMirror = dstTex && VKTex_Query((void*)dstTex->Peek_D3D_Texture(), &dstInfo);
+			if (dstTex && !hadMirror)
+				VKTex_Mirror_D3D_Texture(dstTex->Peek_D3D_Texture());
+			const Bool gpuCopied = VKTex_Copy_RT_To_Texture(
+				dstTex ? (void*)dstTex->Peek_D3D_Texture() : nullptr,
+				srcTex ? (void*)srcTex->Peek_D3D_Texture() : nullptr,
+				dstTex ? (unsigned)dstTex->Get_Width() : 0u,
+				dstTex ? (unsigned)dstTex->Get_Height() : 0u);
+			if (!gpuCopied && !hadMirror && dstTex) {
+				// The mirror created just above holds the empty D3D9 store; drop it so the receiver
+				// resolves to white instead of sampling zeros as a black shadow.
+				VKTex_Drop(dstTex->Peek_D3D_Texture());
+			}
+			if (!gpuCopied) {
+				// GeneralsX @bugfix Qoder 23/10/2026: the old D3D9 convergence copied an empty CPU store
+				// under the pure facade and then mirrored those zeros into the shadow texture, which the
+				// multiplicative receiver painted as a hard black quad. Keep the last valid sprite instead:
+				// an unmirrored texture resolves to white (no darkening), never to a black square.
+				static Bool s_copyFailedLogged = FALSE;
+				if (!s_copyFailedLogged) {
+					s_copyFailedLogged = TRUE;
+					fprintf(stderr, "[SHADOWRT] GPU copy unavailable for '%s'; keeping the previous shadow texture\n",
+						dstTex ? dstTex->Get_Texture_Name().str() : "?");
+					fflush(stderr);
+				}
+			}
+		}
+#else
 		SurfaceClass *oldSurface=m_shadowTexture[0]->getTexture()->Get_Surface_Level();
-		// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: copy from the blurred atlas when
-		// ShadowSoftening is on (acquireBlurredAtlas returns the sharp atlas itself when it isn't,
-		// so the original path is bit-identical).  The blur has to happen here, before the Copy:
-		// the projector repacks the atlas every re-render, so blurring a private copy afterwards
-		// would mix in stale neighbour shadows.
-		SurfaceClass *newSurface=TheW3DProjectedShadowManager->acquireBlurredAtlas()->Get_Surface_Level();
+		SurfaceClass *newSurface=TheW3DProjectedShadowManager->getRenderTarget()->Get_Surface_Level();
 
 		//Copy shadow from temporary video-memory surface into a permanent texture
 		// GeneralsX @feature 10/10/2026 Shadow S2: must use the real dimensions, not the macros, or a
@@ -2813,10 +2574,6 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		oldSurface->Copy(0,0,0,0,m_shadowTexture[0]->getTexture()->Get_Width(),m_shadowTexture[0]->getTexture()->Get_Height(),newSurface);
 		REF_PTR_RELEASE(newSurface);
 		REF_PTR_RELEASE(oldSurface);
-#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-		// flushDecals samples the private texture through its Vulkan view; the rect copy above only
-		// wrote the D3D9 managed level, so push those bytes into the mirror now (blurred or sharp).
-		VKTex_Mirror_D3D_Texture(m_shadowTexture[0]->getTexture()->Peek_D3D_Texture());
 #endif
 		m_shadowTexture[0]->updateBounds(TheW3DShadowManager->getLightPosWorld(0),m_robj);	//update local shadow bounds
 	}

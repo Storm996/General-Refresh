@@ -74,7 +74,7 @@ extern VkInstance g_impInst;
     VKFN(vkCreateGraphicsPipelines) VKFN(vkDestroyPipeline) \
     VKFN(vkCmdBindPipeline) VKFN(vkCmdDraw) VKFN(vkCmdSetViewport) VKFN(vkCmdSetScissor) \
     VKFN(vkCmdBindVertexBuffers) VKFN(vkCmdBindIndexBuffer) VKFN(vkCmdDrawIndexed) \
-    VKFN(vkCmdClearAttachments) VKFN(vkCmdBlitImage) \
+    VKFN(vkCmdClearAttachments) VKFN(vkCmdBlitImage) VKFN(vkCmdPushConstants) \
     VKFN(vkFreeCommandBuffers) \
     VKFN(vkCreateSampler) VKFN(vkDestroySampler) \
     VKFN(vkCreateDescriptorSetLayout) VKFN(vkDestroyDescriptorSetLayout) \

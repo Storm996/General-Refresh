@@ -127,6 +127,8 @@ typedef struct {
 	MeshClass * m_mesh;			///< Mesh for this kind of tree.
 	SphereClass m_bounds;		///< Bounding boxes for the base tree models.
 	const W3DTreeDrawModuleData *m_data;
+	AsciiString m_modelName;	///< GeneralsX @feature T10 21/10/2026: resolved model name (original or GX override).
+	AsciiString m_textureName;	///< GeneralsX @feature T10 21/10/2026: resolved tree atlas name (original or GX override).
 	ICoord2D		m_textureOrigin; ///< Texture origin in the mega texture.
 	Int					m_numTiles;	///< Number of tex tiles.
 	Int					m_firstTile;///< First texture tile.
@@ -210,14 +212,18 @@ public:
 	void freeTreeBuffers();									 ///< Frees the index and vertex buffers.
 
 private:
-	enum { MAX_TREE_VERTEX=30000,
-					MAX_TREE_INDEX=60000,
+	enum { MAX_TREE_VERTEX=60000,
+					MAX_TREE_INDEX=120000,
 					MAX_TREES=4000};
 	enum {MAX_TYPES = 64,
 				MAX_TILES = 512,
 				NUM_SWAY_ENTRIES = 100,
 				MAX_SWAY_TYPES = 10,
-				MAX_BUFFERS = 1,
+				// GeneralsX @feature T10 21/10/2026: the old 30k vertex / 1 buffer
+				// path could hold only a handful of RTS-detail trees. The loader and
+				// draw loops already iterate MAX_BUFFERS; raising it (and the 16-bit
+				// vertex ceiling) lets a whole map hold the new trees without instancing.
+				MAX_BUFFERS = 8,
 				SORT_ITERATIONS_PER_FRAME=10};
 	enum {PARTITION_WIDTH_HEIGHT = 100};
 	DX8VertexBufferClass	*m_vertexTree[MAX_BUFFERS];	///<Tree vertex buffer.

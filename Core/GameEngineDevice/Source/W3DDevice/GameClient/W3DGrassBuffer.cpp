@@ -34,9 +34,25 @@
 #include "WW3D2/vertmaterial.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/assetmgr.h"
+#include "WWMath/matrix4.h"
 
 #include "d3d9.h"
 #include <cstdio>
+#include <cstdlib>
+
+// GeneralsX @feature Qoder 21/10/2026 QA leg: GENERALSX_VEG_FORCE=1 treats every terrain cell as
+// grassy while leaving the shipping class table untouched. It exists so a replay on a sand map can
+// exercise the Vulkan vegetation pipeline end to end without editing a map.
+static Bool grassForceAllTerrain()
+{
+	static Int s_on = -1;
+	if (s_on < 0)
+	{
+		const char *e = getenv("GENERALSX_VEG_FORCE");
+		s_on = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return s_on != 0;
+}
 
 // Singleton owned by the W3D device layer (created lazily, never by game logic).
 W3DGrassBuffer *TheGrassBuffer = nullptr;
@@ -44,10 +60,13 @@ W3DGrassBuffer *TheGrassBuffer = nullptr;
 // --- Distribution tuning ---------------------------------------------------
 #define GRASS_STEP				5.0f			// world units between candidate cells
 #define GRASS_NEAR_RADIUS		250.0f		// view cull radius at zoom 1 (grows with camera zoom)
-#define GRASS_MAX_CLUMPS		1000			// per-frame draw budget (index buffer is sized for this)
+#define GRASS_MAX_CLUMPS		1800			// per-frame draw budget (index buffer is sized for this)
 #define GRASS_MAX_QUADS			(GRASS_MAX_CLUMPS * 2)	// two crossed quads per clump
-#define GRASS_DEFAULT_DENSITY	40			// percent of qualifying cells kept by the per-frame filter
+#define GRASS_DEFAULT_DENSITY	55			// percent of qualifying cells kept by the per-frame filter
 #define GRASS_STRUCTURE_MARGIN	5.0f			// extra keep-out ring around building footprints
+// GeneralsX @feature Qoder 21/10/2026: Vulkan instanced path knobs.
+#define GRASS_BLADES_PER_CLUMP	18
+#define GRASS_MAX_ROCKS			600
 
 // --- Per-clump geometry tuning --------------------------------------------
 #define GRASS_HEIGHT_MIN		6.0f
@@ -109,6 +128,10 @@ W3DGrassBuffer::W3DGrassBuffer()
 	m_hasResources = false;
 	m_densityPercent = GRASS_DEFAULT_DENSITY;
 	m_clumps.reserve(GRASS_MAX_CLUMPS);
+	m_allRocks.reserve(GRASS_MAX_ROCKS);
+	m_rocks.reserve(GRASS_MAX_ROCKS);
+	m_grassInst.reserve(GRASS_MAX_CLUMPS * GRASS_BLADES_PER_CLUMP * 12);
+	m_rockInst.reserve(GRASS_MAX_ROCKS * 12);
 }
 
 W3DGrassBuffer::~W3DGrassBuffer()
@@ -125,6 +148,10 @@ void W3DGrassBuffer::reset()
 {
 	m_clumps.clear();
 	m_allClumps.clear();
+	m_rocks.clear();
+	m_allRocks.clear();
+	m_grassInst.clear();
+	m_rockInst.clear();
 	m_builtSig = -1;	// force a full-map rescan on the next render
 	m_quadCount = 0;
 }
@@ -202,12 +229,11 @@ void W3DGrassBuffer::update()
 
 void W3DGrassBuffer::updateIniSettings()
 {
-	// Reflect the GrassEnabled / GrassDensity weather INI toggles (Options fallback).
-	if (!TheWeatherSetting)
-		return;	// weather INI not loaded yet - keep the constructor defaults.
-
-	Bool enabled = TheWeatherSetting->m_grassEnabled;
-	Int density = (Int)(TheWeatherSetting->m_grassDensity + 0.5f);
+	// GeneralsX @feature Qoder 21/10/2026: the graphics options page owns these knobs now (the old
+	// weather INI GrassEnabled/GrassDensity keys remain as the seed for Options.ini defaults, but the
+	// live values come from the shared record the page's apply hooks write).
+	Bool enabled = g_vegetationRenderOptions.enabled && g_vegetationRenderOptions.grassEnabled;
+	Int density = (Int)(g_vegetationRenderOptions.grassDensity + 0.5f);
 	if (density < 0) density = 0;
 	if (density > 100) density = 100;
 
@@ -242,6 +268,28 @@ static bool isGrassyTerrainClass(TerrainClass c)
 	}
 }
 
+// GeneralsX @bugfix Qoder 21/10/2026: many maps paint grass with terrain classes that are NOT the
+// grass enum - "SandLargeType3Grassy" is ACCENT_SAND, "SandMediumType12Grassy" is DESERT_1. The class
+// table alone therefore left a visually grassy map with zero bush candidates. The tile's authored name
+// is the ground truth the artist actually picked, so match a case-insensitive "grass" substring too.
+static bool isGrassyTerrainName(const AsciiString &name)
+{
+	const char *s = name.str();
+	for (; s && *s; ++s)
+	{
+		const char c0 = (char)((*s >= 'A' && *s <= 'Z') ? *s + 32 : *s);
+		if (c0 != 'g') continue;
+		const char *t = s + 1;
+		if (t[0] == 'r' || t[0] == 'R')
+		{
+			const char c2 = (char)((t[1] >= 'A' && t[1] <= 'Z') ? t[1] + 32 : t[1]);
+			if (c2 == 'a' && (t[2] == 's' || t[2] == 'S') && (t[3] == 's' || t[3] == 'S'))
+				return true;
+		}
+	}
+	return false;
+}
+
 // Stable per-map signature from the loaded map filename: changes exactly when a new map
 // loads (TerrainLogic exposes no public width getter we could key off instead).
 static Int grassMapSignature()
@@ -260,6 +308,7 @@ static Int grassMapSignature()
 void W3DGrassBuffer::rebuildFullField()
 {
 	m_allClumps.clear();
+	m_allRocks.clear();
 	m_builtSig = -1;
 
 	// Defensive: only scan once the terrain subsystems exist (mid-game).
@@ -310,8 +359,33 @@ void W3DGrassBuffer::rebuildFullField()
 			}
 			vocab[vi].cells++;
 
+			// GeneralsX @feature Qoder 21/10/2026 stones: a low-density scatter over every terrain
+			// class, biased to the non-grass cells the ground shader already paints as dirt/rock.
+			const unsigned rh = grassHash(ci + 7919, cj - 104729);
+			const Bool grassy = grassForceAllTerrain() || isGrassyTerrainClass(tile->getClass())
+				|| isGrassyTerrainName(tile->getName());
+			const unsigned rockPermille = grassy ? 20u : 55u;
+			if ((rh % 1000u) < rockPermille && (Int)m_allRocks.size() < GRASS_MAX_ROCKS * 40)
+			{
+				GrassRock rk;
+				rk.x = jx;
+				rk.y = jy;
+				const Real s = 1.5f + ((Real)((rh >> 8) & 0xff) / 255.0f) * 4.2f;
+				rk.scale = s;
+				rk.z = TheTerrainLogic->getGroundHeight(jx, jy) - s * 0.28f;
+				rk.rotX = ((Real)((rh >> 16) & 0xff) / 255.0f) * 1.2f;
+				rk.rotY = ((Real)((rh >> 20) & 0xff) / 255.0f) * 6.2831853f;
+				rk.rotZ = ((Real)((rh >> 24) & 0xff) / 255.0f) * 1.4f;
+				rk.variant = ((Real)((rh >> 4) & 0xff) / 255.0f);
+				const Real shade = 0.85f + ((Real)((rh >> 2) & 0x3f) / 63.0f) * 0.30f;
+				rk.r = 0.46f * shade;
+				rk.g = 0.45f * shade;
+				rk.b = 0.41f * shade;
+				m_allRocks.push_back(rk);
+			}
+
 			// Only grow grass on genuine grass cells (roads/dirt/snow stay bare).
-			if (!isGrassyTerrainClass(tile->getClass())) { ++notGrass; continue; }
+			if (!grassy) { ++notGrass; continue; }
 
 			GrassClump c;
 			c.x = jx;
@@ -340,13 +414,13 @@ void W3DGrassBuffer::rebuildFullField()
 
 	// One census printout per scan: the full terrain vocabulary this map actually uses.
 	AsciiString mapName = TheTerrainLogic->getSourceFilename();
-	fprintf(stderr, "[GRASS] scan '%s': cells=%d tileNull=%d notGrass=%d candidates=%d\n",
-		mapName.str(), cellsScanned, tileNull, notGrass, (Int)m_allClumps.size());
+	fprintf(stderr, "[GRASS] scan '%s': cells=%d tileNull=%d notGrass=%d candidates=%d stones=%d\n",
+		mapName.str(), cellsScanned, tileNull, notGrass, (Int)m_allClumps.size(), (Int)m_allRocks.size());
 	for (Int v = 0; v < (Int)vocab.size(); ++v)
 	{
 		fprintf(stderr, "[GRASS] vocab: '%s' class=%d grassy=%d cells=%d\n",
 			vocab[v].name.str(), vocab[v].cls,
-			isGrassyTerrainClass((TerrainClass)vocab[v].cls) ? 1 : 0, vocab[v].cells);
+			(isGrassyTerrainClass((TerrainClass)vocab[v].cls) || isGrassyTerrainName(vocab[v].name)) ? 1 : 0, vocab[v].cells);
 	}
 	fflush(stderr);
 }
@@ -360,7 +434,7 @@ void W3DGrassBuffer::filterVisible()
 	m_clumps.clear();
 	m_quadCount = 0;
 
-	if (!TheTacticalView || m_allClumps.empty())
+	if (!TheTacticalView || (m_allClumps.empty() && m_allRocks.empty()))
 		return;
 
 	// Center on the look-at pivot (ground center of view), never the eye position.
@@ -451,6 +525,31 @@ void W3DGrassBuffer::filterVisible()
 
 	m_quadCount = (Int)m_clumps.size() * 2;
 
+	// GeneralsX @feature Qoder 21/10/2026: stones share the same view slice and keep-out rules.
+	m_rocks.clear();
+	if (g_vegetationRenderOptions.enabled && g_vegetationRenderOptions.rocksEnabled)
+	{
+		Int rockDensity = (Int)(g_vegetationRenderOptions.rockDensity + 0.5f);
+		if (rockDensity > 100) rockDensity = 100;
+		for (size_t i = 0; i < m_allRocks.size() && (Int)m_rocks.size() < GRASS_MAX_ROCKS; ++i)
+		{
+			const GrassRock &r = m_allRocks[i];
+			const Real dx = r.x - cam.x, dy = r.y - cam.y;
+			if (dx * dx + dy * dy > rr) continue;
+			if (rockDensity <= 0) continue;
+			const unsigned int rh = grassHash((Int)r.x, (Int)r.y);
+			if ((Int)(rh % 100u) >= rockDensity) continue;
+			Bool hidden = false;
+			for (Int k = 0; k < (Int)occX.size(); ++k)
+			{
+				const Real sx = r.x - occX[k], sy = r.y - occY[k];
+				if (sx * sx + sy * sy < occR[k] * occR[k]) { hidden = true; break; }
+			}
+			if (!hidden)
+				m_rocks.push_back(r);
+		}
+	}
+
 	// Throttled trace so coverage/budget behavior is checkable from the log.
 	static Int s_filterCount = 0;
 	if ((++s_filterCount % 60) == 0)
@@ -458,6 +557,78 @@ void W3DGrassBuffer::filterVisible()
 		fprintf(stderr, "[GRASS] filter cam(%.0f,%.0f) zoom %.2f r=%.0f stride=%d drawn=%d/%d\n",
 			cam.x, cam.y, zoom, radius, stride, (Int)m_clumps.size(), (Int)m_allClumps.size());
 		fflush(stderr);
+	}
+}
+
+// GeneralsX @feature Qoder 21/10/2026: expand the visible clumps into the 12-float instance stream the
+// Vulkan vegetation pass consumes. Every blade is derived from a per-cell hash, so the same map and the
+// same cell always grow the same blades and nothing here reaches the simulation.
+void W3DGrassBuffer::buildVkInstances()
+{
+	m_grassInst.clear();
+	m_rockInst.clear();
+
+	const Real heightScale = g_vegetationRenderOptions.grassHeightScale * 0.01f;
+	if (g_vegetationRenderOptions.grassEnabled)
+	{
+		m_grassInst.reserve(m_clumps.size() * GRASS_BLADES_PER_CLUMP * 12);
+		for (size_t ci = 0; ci < m_clumps.size(); ++ci)
+		{
+			const GrassClump &c = m_clumps[ci];
+			for (Int b = 0; b < GRASS_BLADES_PER_CLUMP; ++b)
+			{
+				const unsigned int h = grassHash(c.cellX + b * 101, c.cellY - b * 67);
+				const Real rx = ((Real)(h & 0xff) / 255.0f - 0.5f) * c.halfWidth * 1.4f;
+				const Real rz = ((Real)((h >> 8) & 0xff) / 255.0f - 0.5f) * c.halfWidth * 1.4f;
+				const Real width = c.halfWidth * (0.10f + 0.12f * ((Real)((h >> 16) & 0xff) / 255.0f));
+				const Real height = c.height * (0.55f + 0.60f * ((Real)((h >> 24) & 0x0f) / 15.0f)) * heightScale;
+				const Real leanAng = ((Real)((h >> 4) & 0xff) / 255.0f) * 6.2831853f;
+				const Real lean = 0.15f + 0.55f * ((Real)((h >> 12) & 0xff) / 255.0f);
+				const Real phase = ((Real)((h >> 20) & 0xff) / 255.0f) * 6.2831853f;
+				const Real dry = ((Real)((h >> 9) & 0xff) / 255.0f);
+
+				const Real v = 0.86f + 0.28f * ((Real)((h >> 2) & 0x3f) / 63.0f);
+				const Real tr = v * (0.94f + 0.12f * ((Real)((h >> 6) & 0x1f) / 31.0f));
+				const Real tg = v * (0.96f + 0.10f * ((Real)((h >> 11) & 0x1f) / 31.0f));
+				const Real tb = v * (0.86f + 0.18f * ((Real)((h >> 15) & 0x1f) / 31.0f));
+
+				m_grassInst.push_back(c.x + rx);
+				m_grassInst.push_back(c.y + rz);
+				m_grassInst.push_back(c.z);
+				m_grassInst.push_back(width);
+
+				m_grassInst.push_back(height);
+				m_grassInst.push_back(leanAng);
+				m_grassInst.push_back(lean);
+				m_grassInst.push_back(phase);
+
+				m_grassInst.push_back(tr);
+				m_grassInst.push_back(tg);
+				m_grassInst.push_back(tb);
+				m_grassInst.push_back(dry);
+			}
+		}
+	}
+
+	if (g_vegetationRenderOptions.rocksEnabled)
+	{
+		m_rockInst.reserve(m_rocks.size() * 12);
+		for (size_t i = 0; i < m_rocks.size(); ++i)
+		{
+			const GrassRock &r = m_rocks[i];
+			m_rockInst.push_back(r.x);
+			m_rockInst.push_back(r.y);
+			m_rockInst.push_back(r.z);
+			m_rockInst.push_back(r.scale);
+			m_rockInst.push_back(r.rotX);
+			m_rockInst.push_back(r.rotY);
+			m_rockInst.push_back(r.rotZ);
+			m_rockInst.push_back(r.variant);
+			m_rockInst.push_back(r.r);
+			m_rockInst.push_back(r.g);
+			m_rockInst.push_back(r.b);
+			m_rockInst.push_back(0.0f);
+		}
 	}
 }
 
@@ -506,9 +677,11 @@ void W3DGrassBuffer::emitClumpQuads(VertexFormatXYZNDUV2 *&verts, const Matrix3D
 
 void W3DGrassBuffer::render(RenderInfoClass &rinfo)
 {
-	updateIniSettings();	// re-read GrassEnabled / GrassDensity before deciding to draw.
+	updateIniSettings();	// re-read the graphics-page knobs before deciding to draw.
 
-	if (!m_enabled)
+	// GeneralsX @feature Qoder 21/10/2026 master switch: off means the whole channel is untouched -
+	// no map scan, no placement filter, no instance build and no draw.
+	if (!g_vegetationRenderOptions.enabled)
 		return;
 
 	// Only meaningful once the terrain and camera subsystems exist (mid-game).
@@ -526,11 +699,6 @@ void W3DGrassBuffer::render(RenderInfoClass &rinfo)
 		return;
 	}
 
-	if (!m_hasResources)
-		ReAcquireResources();
-	if (!m_indexBuffer)
-		return;	// device object unavailable - skip this frame.
-
 	// Scan the full map once per map load; placement no longer depends on camera position,
 	// so there is nothing else to rebuild while playing.
 	const Int mapSig = grassMapSignature();
@@ -540,6 +708,79 @@ void W3DGrassBuffer::render(RenderInfoClass &rinfo)
 	// Per-frame visibility slice: cull to the actual view footprint (radius scales with
 	// zoom), thin far cells with the LOD stride, apply density + keep-out, cap the budget.
 	filterVisible();
+
+	// GeneralsX @feature Qoder 21/10/2026: Vulkan instanced path. The device-side grass buffer builds
+	// the blade/stone streams and the backend records them into the scene pass that is open right now.
+	if (DX8Wrapper::VK_Vegetation_Ready())
+	{
+		buildVkInstances();
+		const unsigned grassCount = (unsigned)(m_grassInst.size() / 12);
+		const unsigned rockCount = (unsigned)(m_rockInst.size() / 12);
+		if (!grassCount && !rockCount)
+			return;
+
+		Matrix3D view;
+		Matrix4x4 proj;
+		rinfo.Camera.Get_View_Matrix(&view);
+		rinfo.Camera.Get_Projection_Matrix(&proj);
+		Matrix4x4 view4(view);
+		Matrix4x4 vp;
+		// GeneralsX @bugfix Qoder 21/10/2026: WW3D's projection consumes a COLUMN vector
+		// (ProjectionTransform * cam_point in camera.cpp), so the combined transform is P * V.
+		// The old row-vector V * P put every blade behind the camera (w=-18057 in the clip probe),
+		// which is why the layer drew 17k instances but nothing appeared on screen.
+		Matrix4x4::Multiply(proj, view4, &vp);
+		float vpf[16];
+		for (Int r = 0; r < 4; ++r)
+			for (Int c = 0; c < 4; ++c)
+				vpf[r * 4 + c] = vp[r][c];
+
+		const Coord3D eye = TheTacticalView->get3DCameraPosition();
+		float cam[3] = { eye.x, eye.y, eye.z };
+
+		Real zoom = TheTacticalView->getZoom();
+		if (zoom < 1.0f) zoom = 1.0f;
+		Real radius = GRASS_NEAR_RADIUS * zoom * (g_vegetationRenderOptions.grassDistanceScale * 0.01f);
+		if (radius < 60.0f) radius = 60.0f;
+
+		// Match the scene's fog colour so blades melt into the view distance instead of popping out.
+		const D3DCOLOR fogColor = DX8Wrapper::Get_Fog_Color();
+		const float fogCol[3] = {
+			(float)((fogColor >> 16) & 0xff) / 255.0f,
+			(float)((fogColor >> 8) & 0xff) / 255.0f,
+			(float)(fogColor & 0xff) / 255.0f
+		};
+		const float sunLen = sqrtf(0.35f * 0.35f + 0.45f * 0.45f + 0.75f * 0.75f);
+		const float sun[3] = { 0.35f / sunLen, 0.45f / sunLen, 0.75f / sunLen };
+		const float timeSec = (float)TheGameLogic->getFrame() * (1.0f / 30.0f);
+
+		if (DX8Wrapper::VK_Vegetation_Draw(
+				m_grassInst.empty() ? nullptr : &m_grassInst[0], grassCount,
+				m_rockInst.empty() ? nullptr : &m_rockInst[0], rockCount,
+				vpf, cam, timeSec, sun, fogCol,
+				radius * 0.55f, radius * 1.10f, radius * 1.15f))
+		{
+			static Int s_vkLogTick = 0;
+			if ((++s_vkLogTick % 600) == 0)
+			{
+				fprintf(stderr, "[VEG] draw blades=%u stones=%u radius=%.0f density=%.0f height=%.0f%%\n",
+					grassCount, rockCount, radius, g_vegetationRenderOptions.grassDensity,
+					g_vegetationRenderOptions.grassHeightScale);
+				fflush(stderr);
+			}
+			return;
+		}
+		// Backend refused this frame (no open pass, instance cap, device issue): fall through to the
+		// retail billboard path instead of dropping the field entirely.
+	}
+
+	if (!m_enabled)
+		return;
+
+	if (!m_hasResources)
+		ReAcquireResources();
+	if (!m_indexBuffer)
+		return;	// device object unavailable - skip this frame.
 
 	if (m_clumps.empty())
 		return;	// no grass in this window (all roads/dirt/snow) - draw nothing.

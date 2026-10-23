@@ -31,6 +31,7 @@
 #include "WW3D2/camera.h"
 #include "WWLib/simplevec.h"
 #include "WW3D2/dx8wrapper.h"
+#include "WW3D2/formconv.h"
 #include "Common/MapObject.h"
 #include "Common/PerfTimer.h"
 #include "W3DDevice/GameClient/HeightMap.h"
@@ -41,6 +42,9 @@
 #include "WW3D2/textureloader.h"
 #include "Common/GlobalData.h"
 #include "GameLogic/PartitionManager.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanGeo.h"
+#endif
 
 
 //-----------------------------------------------------------------------------
@@ -117,6 +121,9 @@ W3DShroud::W3DShroud()
 	m_rawLevelField=nullptr;	//GeneralsX @feature PS3.0-P3-11 14/10/2026
 	m_pSrcTexture=nullptr;
 	m_pDstTexture=nullptr;
+	m_dstShadow=nullptr;
+	m_dstShadowW=m_dstShadowH=0;
+	m_dstValid=FALSE;
 	m_srcTextureData=nullptr;
 	m_srcTexturePitch=0;
 	m_dstTextureWidth=m_numMaxVisibleCellsX=0;
@@ -143,6 +150,8 @@ W3DShroud::~W3DShroud()
 	delete [] m_currentFogData;
 	delete [] m_rawLevelField;	//GeneralsX @feature PS3.0-P3-11 14/10/2026
 	m_rawLevelField=nullptr;
+	delete [] m_dstShadow;
+	m_dstShadow=nullptr;
 
 	m_drawFogOfWar=FALSE;
 }
@@ -285,6 +294,7 @@ void W3DShroud::reset()
 void W3DShroud::ReleaseResources()
 {
 	REF_PTR_RELEASE (m_pDstTexture);
+	m_dstValid = FALSE;
 }
 
 //-----------------------------------------------------------------------------
@@ -810,7 +820,60 @@ void W3DShroud::render(CameraClass *cam)
 				&dstPoint);
 	}
 
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @bugfix Qoder 21/10/2026 SHROUDMIRROR: the destination is D3DPOOL_DEFAULT, so the
+	// Vulkan mirror cannot lock it, and the per-rect UpdateSurface path above never fed the keyed
+	// VkImage. The tree shader's stage-1 shroud modulation therefore sampled black/white and turned
+	// every tree black. Rebuild the destination in CPU memory from the same source rect + border and
+	// upload it under the destination texture key. One 128x128 upload per shroud update.
+	{
+		const Int dw = m_dstTextureWidth, dh = m_dstTextureHeight;
+		if (dw > 0 && dh > 0 && m_srcTextureData && m_pDstTexture) {
+			if (!m_dstShadow || m_dstShadowW != dw || m_dstShadowH != dh) {
+				delete [] m_dstShadow;
+				m_dstShadow = new UnsignedByte[(size_t)dw * (size_t)dh * 2u];
+				m_dstShadowW = dw; m_dstShadowH = dh;
+			}
+			UnsignedShort border = 0;
+			if (m_numCellsY > 0 && m_srcTextureData)
+				border = *(const UnsignedShort*)((const UnsignedByte*)m_srcTextureData
+					+ (size_t)m_numCellsY * m_srcTexturePitch);
+			UnsignedShort* out = (UnsignedShort*)m_dstShadow;
+			for (Int i = 0; i < dw * dh; ++i) out[i] = border;
+			const Int sx = srcRect.left, sy = srcRect.top;
+			const Int w = srcRect.right - srcRect.left, h = srcRect.bottom - srcRect.top;
+			const Int dx = dstPoint.x, dy = dstPoint.y;
+			for (Int y = 0; y < h && (dy + y) < dh; ++y) {
+				const UnsignedByte* srcRow = (const UnsignedByte*)m_srcTextureData
+					+ (size_t)(sy + y) * m_srcTexturePitch + (size_t)sx * 2u;
+				UnsignedShort* dstRow = out + (size_t)(dy + y) * dw + dx;
+				const Int copyW = (dx + w <= dw) ? w : (dw - dx);
+				if (copyW > 0) memcpy(dstRow, srcRow, (size_t)copyW * 2u);
+			}
+			VKTex_Mip_Source mip;
+			mip.bits = m_dstShadow;
+			mip.pitch = (unsigned int)dw * 2u;
+			D3DSURFACE_DESC dd;
+			ZeroMemory(&dd, sizeof(dd));
+			int dstFmt = (int)WW3D_FORMAT_R5G6B5;
+			if (m_pDstTexture->Peek_D3D_Texture()
+				&& SUCCEEDED(m_pDstTexture->Peek_D3D_Texture()->GetLevelDesc(0, &dd)))
+				dstFmt = (int)D3DFormat_To_WW3DFormat(dd.Format);
+			VKTex_Upload_2D(m_pDstTexture->Peek_D3D_Texture(), (unsigned)dw, (unsigned)dh, 1,
+				dstFmt, &mip);
+			static int s_mirrorLog = 0;
+			if (s_mirrorLog < 3) {
+				++s_mirrorLog;
+				fprintf(stderr, "[SHROUDMIRROR] %dx%d fmt=%d rect=%d,%d %dx%d border=%04X\n",
+					(int)dw, (int)dh, dstFmt, (int)sx, (int)sy, (int)w, (int)h, (unsigned)border);
+				fflush(stderr);
+			}
+		}
+	}
+#endif
+
 	REF_PTR_RELEASE (pDestSurface);
+	m_dstValid = TRUE;
 }
 
 #define FOG_INTERPOLATION_RATE	(255.0f/1000.0f)	//take one second to go from black to fully lit.

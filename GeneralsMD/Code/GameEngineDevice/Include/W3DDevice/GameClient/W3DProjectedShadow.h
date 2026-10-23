@@ -68,11 +68,6 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		void removeShadow (W3DProjectedShadow *shadow);
 		void removeAllShadows(); ///< Remove all shadows.
 		TextureClass *getRenderTarget()	{ return m_dynamicRenderTarget;}
-		// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: returns the separable-Gaussian
-		// blurred copy of the atlas when the "ShadowSoftening" option is active and the blur
-		// resources survived creation; the raw atlas otherwise. Callers (updateTexture's Copy)
-		// treat the result exactly like getRenderTarget().
-		TextureClass *acquireBlurredAtlas();
 		SpecialRenderInfoClass *getRenderContext()	{ return m_shadowContext;}
 		void updateRenderTargetTextures();	///<render into any textures that need updating.
 		void queueDecal(W3DProjectedShadow *shadow);	///<add shadow decal to render list - decal conforms to terrain.
@@ -89,15 +84,6 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		Int renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box);	///<render shadow on map terrain.
 		void updateShadowNumbers(ShadowType shadowType, Int addNum);
 
-		// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening (separable Gaussian blur pass).
-		// Created with the atlas in ReAcquireResources, released in ReleaseResources; all device
-		// dependent so they never survive a reset. m_blurShader is a compiled ps_3_0/ps_2_0 handle
-		// (void* so this header stays d3d-free); it is owned by the CompatLib shader path.
-		void initBlurResources();
-		void releaseBlurResources();
-		// src is an IDirect3DBaseTexture9*, dst an IDirect3DSurface9* (void* keeps this header d3d-free).
-		void runBlurPass(void* srcTexture, void* dstSurface, float texelOffsetX, float texelOffsetY);
-
 	private:
 		W3DProjectedShadow *m_shadowList;
 		W3DProjectedShadow *m_decalList;
@@ -110,18 +96,6 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		W3DShadowTextureManager *m_W3DShadowTextureManager;
 		Int m_numDecalShadows;							///< number of decal shadows in the system.
 		Int m_numProjectionShadows;						///< number of projected shadows in the system.
-
-		// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening state. The two ping-pong targets
-		// hold the horizontal and vertical Gaussian passes at atlas size; m_blurShader/m_blurVB/
-		// m_blurIB are the fullscreen-quad machinery (IDirect3DPixelShader9*, LPDIRECT3DVERTEXBUFFER9,
-		// LPDIRECT3DINDEXBUFFER9 - void* here so the header does not pull d3d9.h).
-		// m_blurRadius 1..3 = kernel texel spread multiplier; m_blurReady gates the whole path.
-		TextureClass	*m_blurRT[2];
-		void			*m_blurShader;
-		void			*m_blurVB;
-		void			*m_blurIB;
-		Bool			 m_blurReady;
-		Int				 m_blurRadius;
 
 		//Bounding rectangle around rendered portion of terrain.
 		Int m_drawEdgeX;

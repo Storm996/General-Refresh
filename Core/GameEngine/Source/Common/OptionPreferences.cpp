@@ -993,23 +993,12 @@ Int OptionPreferences::getSkirmishTickRate() const
 // old replays and room CRC checks).                                                   //
 ///////////////////////////////////////////////////////////////////////////////////////
 
-// Reference points for these numbers: the original code used 0.4f for projected shadows (hard-coded
-// in W3DProjectedShadow::init()) and the 0xa0 multiplier for volumetric ones (160/255 = about 62.7%
-// of the brightness kept, i.e. 37.3% darkening).  The defaults below are deliberately below those
-// reference values: a first landing used 35/30 and was rejected on screen as indistinguishable from
-// vanilla (a covered pixel only moved from a 0.600 to a 0.650 multiplier, a handful of 8-bit steps),
-// so the density is pushed far enough to be judged by eye.
+// The retail path uses its shipped constants again (0.4f intensity, 0x7fa0a0a0 volume color), so these
+// two values only anchor the options page's mapping onto the native sun shadow: 25 -> strength 0.58
+// and 22 -> penumbra 1.0, the receiver's previous defaults. An untouched Options.ini keeps that look.
 static const Real SHADOW_PROJECTED_INTENSITY_DEFAULT	= 25.0f;
 static const Real SHADOW_VOLUMETRIC_INTENSITY_DEFAULT	= 22.0f;
-// Tint in permille, 1000 means no color shift.  Cutting red and lifting blue gives the cold ambient
-// cast; anything above 1000 has to survive 8-bit packing too, see the normalization in
-// W3DProjectedShadow::init() for the decal vertex color.
-static const Real SHADOW_TINT_DEFAULT[3]						= { 880.0f, 1000.0f, 1150.0f };
 static const Int SHADOW_MAP_RESOLUTION_DEFAULT				= 768;
-// GeneralsX @feature PS3.0 T2 13/10/2026 shadow softening: 0 keeps retail sharp silhouettes; 1-3
-// blur the projected-shadow atlas by that many texels per gaussian pass.  Off by default so a
-// first launch never changes someone's shadows without asking.
-static const Int SHADOW_SOFTENING_DEFAULT						= 0;
 
 Real OptionPreferences::getShadowProjectedIntensity() const
 {
@@ -1039,38 +1028,6 @@ Real OptionPreferences::getShadowVolumetricIntensity() const
 	return val;
 }
 
-void OptionPreferences::getShadowTint(Real *r, Real *g, Real *b) const
-{
-	Real tint[3] = { SHADOW_TINT_DEFAULT[0], SHADOW_TINT_DEFAULT[1], SHADOW_TINT_DEFAULT[2] };
-
-	OptionPreferences::const_iterator it = find("ShadowTint");
-	if (it != end())
-	{
-		// Format is "R G B" in permille (1000 = 1.0).  Channels left out of the value keep the default.
-		AsciiString tokenizer = it->second;
-		AsciiString token;
-		for (Int i = 0; i < 3; ++i)
-		{
-			if (!tokenizer.nextToken(&token, " "))
-				break;
-
-			Real val = (Real)atof(token.str());
-			if (val < 100.0f)
-				val = 100.0f;
-			if (val > 4000.0f)
-				val = 4000.0f;
-			tint[i] = val;
-		}
-	}
-
-	if (r != nullptr)
-		*r = tint[0] * 0.001f;
-	if (g != nullptr)
-		*g = tint[1] * 0.001f;
-	if (b != nullptr)
-		*b = tint[2] * 0.001f;
-}
-
 Int OptionPreferences::getShadowMapResolution() const
 {
 	OptionPreferences::const_iterator it = find("ShadowMapResolution");
@@ -1091,20 +1048,6 @@ Int OptionPreferences::getShadowMapResolution() const
 			return allowed[i];
 	}
 	return allowed[allowedCount - 1];
-}
-
-Int OptionPreferences::getShadowSoftening() const
-{
-	OptionPreferences::const_iterator it = find("ShadowSoftening");
-	if (it == end())
-		return SHADOW_SOFTENING_DEFAULT;
-
-	Int val = atoi(it->second.str());
-	if (val < 0)
-		val = 0;
-	if (val > 3)
-		val = 3;
-	return val;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1161,20 +1104,22 @@ Real OptionPreferences::getBloomIntensity() const
 	return (Real)tick / 100.0f;
 }
 
-Bool OptionPreferences::getMultiLightEnabled() const
+Int OptionPreferences::getForwardPlusMode() const
 {
-	// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): the multi-light family is
-	// no longer a user preference. It is a permanently-on layer of the merged per-pixel base, and its
-	// menu row carried apply = nullptr, so flipping it never did anything to a running client anyway.
-	// The ini key is therefore NOT read any more (a stale MultiLightEffect=0 from an older Options.ini
-	// must not silently kill the lamp/GGX path), and the menu widget has left GraphicsOptions.wnd with
-	// it. GENERALSX_MULTILIGHT=0 stays as the scripted A/B back door - that is the one supported way
-	// down, and it keeps working for the forensics harness.
-	const char* env = getenv("GENERALSX_MULTILIGHT");
-	if (env != nullptr && strcmp(env, "0") == 0)
-		return FALSE;
+	const char* env = getenv("GENERALSX_VK_FORWARDPLUS_MODE");
+	Int mode = (env != nullptr && *env != 0) ? atoi(env) : getInt("ForwardPlusMode", 1);
+	if (mode < 0) mode = 0;
+	if (mode > 2) mode = 2;
+	return mode;
+}
 
-	return TRUE;
+Int OptionPreferences::getForwardLightBudget() const
+{
+	const char* env = getenv("GENERALSX_VK_FP_BUDGET");
+	Int budget = (env != nullptr && *env != 0) ? atoi(env) : getInt("ForwardLightBudget", 256);
+	if (budget < 32) budget = 32;
+	if (budget > 256) budget = 256;
+	return budget;
 }
 
 Bool OptionPreferences::getShadowMapEnabled() const
@@ -1277,17 +1222,6 @@ Int OptionPreferences::getLampLightIntensity() const
 	return tick;
 }
 
-Bool OptionPreferences::getPBRMLEnabled() const
-{
-	// Same env contract as the WW3D2 library gate: only the literal "0" forces OFF, any other
-	// value forces ON, unset falls through to the ini key (default ON, retail-stage-4 shipped state).
-	const char* env = getenv("GENERALSX_PBRML");
-	if (env != nullptr && *env != 0)
-		return (strcmp(env, "0") == 0) ? FALSE : TRUE;
-
-	return (getInt("PBRMultiLight", 1) != 0) ? TRUE : FALSE;
-}
-
 // GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the P3-14 distance haze as two
 // Graphics Options rows. ini keys DistanceHaze (0/1, default ON = the shipped look) and
 // DistanceHazeIntensity (ticks 0-100, i.e. 0.0-1.0 blend strength, default 60). GENERALSX_GNFOG stays
@@ -1366,11 +1300,11 @@ Bool OptionPreferences::getTerrain30Shading() const
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal child switch. Env
-// GENERALSX_TERRAIN_PPL wins for QA legs; otherwise the ini key decides, factory default OFF. This is
-// strictly a CHILD of Terrain30Shading (the batch22 retail-parity red line): the consumer only reaches
-// it after the HLSL trio gate has already passed, so turning this on can never flip the terrain default.
-// Read at terrain shader init, so toggling takes effect on restart - same convention as the parent.
+// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal switch, the single
+// terrain row since the 20/10/2026 merge. Env GENERALSX_TERRAIN_PPL wins for QA legs; otherwise the ini
+// key decides, factory default OFF. Turning it on arms the ps_3_0/NM leg itself, so the retired
+// "现代地形光影" parent row is no longer needed to reach it (batch22 retail-parity default untouched).
+// Read at terrain shader init, so toggling takes effect on restart.
 //-------------------------------------------------------------------------------------------------
 Bool OptionPreferences::getTerrainPerPixel() const
 {

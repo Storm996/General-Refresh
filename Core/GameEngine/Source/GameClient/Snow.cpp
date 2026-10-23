@@ -38,9 +38,46 @@
 #include "GameClient/Display.h"
 // GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1/W4: render-side weather state owner.
 #include "GameClient/WeatherFX.h"
+// GeneralsX @feature Qoder 21/10/2026: weather preset + vegetation knobs persist in Options.ini.
+#include "Common/OptionPreferences.h"
 
 
 SnowManager *TheSnowManager=nullptr;
+
+// GeneralsX @feature Qoder 21/10/2026: default vegetation recipe. The master switch ships ON so the
+// user can evaluate the layer immediately, and turning it off skips the entire channel (scan, instance
+// build and draw). Values outside the documented ranges are clamped by refreshVegetationRenderOptions.
+VegetationRenderOptions g_vegetationRenderOptions =
+{
+	TRUE,		// enabled
+	TRUE,		// grassEnabled
+	TRUE,		// rocksEnabled
+	55.0f,		// grassDensity (%)
+	100.0f,		// grassHeightScale (%)
+	100.0f,		// grassDistanceScale (%)
+	100.0f		// rockDensity (%)
+};
+
+void refreshVegetationRenderOptions()
+{
+	OptionPreferences prefs;
+	g_vegetationRenderOptions.enabled = prefs.getInt("VegetationEnabled", 1) != 0;
+	g_vegetationRenderOptions.grassEnabled = prefs.getInt("GrassEnabled", 1) != 0;
+	g_vegetationRenderOptions.rocksEnabled = prefs.getInt("RocksEnabled", 1) != 0;
+	g_vegetationRenderOptions.grassDensity = (Real)prefs.getInt("GrassDensity", 55);
+	g_vegetationRenderOptions.grassHeightScale = (Real)prefs.getInt("GrassHeight", 100);
+	g_vegetationRenderOptions.grassDistanceScale = (Real)prefs.getInt("GrassDistance", 100);
+	g_vegetationRenderOptions.rockDensity = (Real)prefs.getInt("RockDensity", 100);
+
+	if (g_vegetationRenderOptions.grassDensity < 0.0f) g_vegetationRenderOptions.grassDensity = 0.0f;
+	if (g_vegetationRenderOptions.grassDensity > 100.0f) g_vegetationRenderOptions.grassDensity = 100.0f;
+	if (g_vegetationRenderOptions.grassHeightScale < 50.0f) g_vegetationRenderOptions.grassHeightScale = 50.0f;
+	if (g_vegetationRenderOptions.grassHeightScale > 200.0f) g_vegetationRenderOptions.grassHeightScale = 200.0f;
+	if (g_vegetationRenderOptions.grassDistanceScale < 50.0f) g_vegetationRenderOptions.grassDistanceScale = 50.0f;
+	if (g_vegetationRenderOptions.grassDistanceScale > 200.0f) g_vegetationRenderOptions.grassDistanceScale = 200.0f;
+	if (g_vegetationRenderOptions.rockDensity < 0.0f) g_vegetationRenderOptions.rockDensity = 0.0f;
+	if (g_vegetationRenderOptions.rockDensity > 200.0f) g_vegetationRenderOptions.rockDensity = 200.0f;
+}
 
 // GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: one profile per weather type. Index is the
 // Weather enum value. Slot WEATHER_SNOWY is the retail "Weather" INI block (and every override of it);
@@ -302,6 +339,7 @@ SnowManager::SnowManager()
 	m_velocity = 1;
 	m_isVisible = TRUE;	//default to showing if it's enabled via INI.
 	m_weatherType = WEATHER_SNOWY;	//GeneralsX @feature PS3.0 Weather W1: retail only ever had snow.
+	m_userWeatherType = -1;			//GeneralsX @feature Qoder 21/10/2026: follow the map until the player picks one.
 }
 
 void SnowManager::init()
@@ -325,6 +363,42 @@ void SnowManager::init()
 		TheWeatherFX = NEW WeatherFX;
 	}
 	TheWeatherFX->reset();
+
+	// GeneralsX @feature Qoder 21/10/2026: seed the user preset and the vegetation knobs from Options.ini
+	// once per client init, so the graphics page shows the same values the renderer will consume.
+	loadWeatherUserOverride();
+	refreshVegetationRenderOptions();
+}
+
+// GeneralsX @feature Qoder 21/10/2026: the options page forces a weather type for preview and the
+// manager honours it until the player goes back to "follow map". Env GENERALSX_WEATHER_TYPE still wins
+// in update(), so scripted A/B runs keep their authority.
+void SnowManager::setUserWeatherOverride(Int type)
+{
+	if (type >= (Int)WEATHER_COUNT)
+		type = (Int)WEATHER_COUNT - 1;
+	if (type < -1)
+		type = -1;
+	m_userWeatherType = type;
+	if (type >= 0)
+	{
+		m_isVisible = TRUE;
+		// Publish immediately: setWeatherType() refreshes the recipe, particles, screen filter and
+		// lighting on this same frame, which is what makes the combo feel like a live switch.
+		setWeatherType(Weather_ClampToKnown(type));
+	}
+}
+
+void SnowManager::loadWeatherUserOverride()
+{
+	Int saved = -1;
+	{
+		OptionPreferences prefs;
+		saved = prefs.getInt("WeatherPreview", -1);
+	}
+	if (saved < -1 || saved >= (Int)WEATHER_COUNT)
+		saved = -1;
+	m_userWeatherType = saved;
 }
 
 void SnowManager::setWeatherType(Weather type)
@@ -373,7 +447,9 @@ void SnowManager::update()
 	const Weather forced = readMapWeatherOverride();
 	const Weather wanted = hasWeatherTypeOverride()
 		? forced
-		: TheGlobalData != nullptr ? TheGlobalData->m_weather : WEATHER_NORMAL;
+		: (m_userWeatherType >= 0 && m_userWeatherType < (Int)WEATHER_COUNT)
+			? (Weather)m_userWeatherType
+			: TheGlobalData != nullptr ? TheGlobalData->m_weather : WEATHER_NORMAL;
 
 	if (wanted != m_weatherType)
 	{

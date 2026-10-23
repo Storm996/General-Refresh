@@ -819,11 +819,19 @@ D3DXFilterTexture(
 
 			while (tex->GetSurfaceLevel(Level, &mipsurf) == D3D_OK)
 			{
-				// Copy the data
-				D3DXLoadSurfaceFromSurface(mipsurf, NULL, NULL, topsurf, NULL, NULL, Filter, 0);
-
-				// Release the surface
-				mipsurf->Release();
+				// GeneralsX @bugfix Qoder 21/10/2026: the source level must stay alive until the
+				// downsample has read it. Releasing mipsurf before topsurf = mipsurf left topsurf
+				// dangling; the next GetSurfaceLevel recycled the same address, so every level past
+				// the first filtered itself and stayed uninitialised (zero/black). The terrain atlas
+				// samples those levels at cell-tile UV jumps, which drew black grid lines under
+				// pure Vulkan while the real D3DX mip chain on DX9 stayed valid.
+				HRESULT loadHr = D3DXLoadSurfaceFromSurface(mipsurf, NULL, NULL, topsurf, NULL, NULL, Filter, 0);
+				topsurf->Release();
+				if (FAILED(loadHr))
+				{
+					mipsurf->Release();
+					return loadHr;
+				}
 				topsurf = mipsurf;
 
 				Level++;

@@ -44,6 +44,7 @@
 //-----------------------------------------------------------------------------
 
 #include "W3DDevice/GameClient/W3DTerrainTracks.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/PerfTimer.h"
 #include "Common/GlobalData.h"
@@ -875,7 +876,7 @@ Try improving the fit to vertical surfaces like cliffs.
 	const bool slopeOn = Track_Slope_On() && TheGlobalData != nullptr;
 	if (slopeOn)
 	{
-		const GlobalData::TerrainLighting* sl = &TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+		const GlobalData::TerrainLighting* sl = &TheGlobalData->m_terrainObjectsLighting[W3DDisplay::getRenderTimeOfDay()][0];
 		Vector3 L(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z);   // toward the light (L1 sign convention)
 		float llen = L.Length();
 		if (llen > 0.001f) { sunLx = L.X/llen; sunLy = L.Y/llen; sunLz = L.Z/llen; }

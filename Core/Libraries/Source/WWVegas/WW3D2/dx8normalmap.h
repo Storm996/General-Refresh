@@ -26,11 +26,6 @@ namespace DX8NormalMap
 	// GeneralsX @build d3d9 port 11/10/2026 - handles are D3D9 interface pointers carried as UINT_PTR.
 	void Install(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
-	// GeneralsX @feature PS3.0 T5 13/10/2026 optional per-pixel multi-light pair (world TBN + up to
-	// 4 point lights from the mesh's LightEnvironment).  Mounted by Apply only when the mesh
-	// actually collects at least one point light; without it the single-light path above is used.
-	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle);
-
 	// GeneralsX @feature PS3.0-P4-1 15/10/2026 roughness/metalness (PBR) variant pair for the dot3
 	// single-light path.  #70 15/10/2026: the pair compiles unconditionally at shader install and
 	// mounts whenever Set_PBR_Mode(1/2) is armed and the diffuse carries a "<stem>_rp" companion
@@ -39,22 +34,7 @@ namespace DX8NormalMap
 	// bit-for-bit - zero regression.
 	void Install_PBR(UINT_PTR vs_handle, UINT_PTR ps_handle);
 
-	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pair (光影四阶段/调研/03): the ML world-TBN
-	// VS reused with a PS that keeps the point-light loop but shades every light (sun + up to 8 point
-	// lights) with the M2 GGX lobe and samples the "_rp" companion.  Mounted only inside the ML branch
-	// when PBR mode == 2, the mesh carries an _rp texture and the toggle is ON (GENERALSX_PBRML=0
-	// forces OFF, otherwise Set_PBRML_Enabled below decides); otherwise the plain ML pair runs
-	// bit-for-bit as before.  PS-only install: the VS handle comes from Install_ML.
-	void Install_PBRML(UINT_PTR ps_handle);
-
-	// GeneralsX @feature PS3.0 4E 17/10/2026: user toggle fed by the Graphics Options page
-	// (Options.ini PBRMultiLight) through the device layer; default ON = the 4C shipped state.
-	// GENERALSX_PBRML still wins inside the mount decision; the options menu re-arms this live
-	// through gameOptionApply_PBRML.
-	void Set_PBRML_Enabled(int on);
-
-	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth distance haze shared by the GN and ML
-	// per-pixel families. colorStrength carries the haze rgb in xyz and the blend strength in w
+	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth distance haze for the GN family. colorStrength carries the haze rgb in xyz and the blend strength in w
 	// (0 leaves every pixel numerically identical to the pre-fog shaders); startInvLen is
 	// (eye-depth fog start, 1/ramp length, -, -). Injected once by the device layer from camera
 	// settings - WW3D2 must not read game-side GlobalData itself. Default state is strength 0.
@@ -97,18 +77,6 @@ namespace DX8NormalMap
 	void Set_Strength(float s);
 	float Get_Strength();
 
-	// Mount before drawing a POINT-LIGHT-lit tangent batch: inject WVP / model-space key light /
-	// ambient constants, bind the companion normal texture to stage1, switch to the ML (or PBRML)
-	// pair. fvf is the fixed-pipeline FVF (DX8_FVF_XYZNDUV1TG3). Returns true on success; if any
-	// precondition fails (missing handle / no normal-map companion / no point lights collected)
-	// returns false and leaves state untouched.
-	// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): this call is now ML-ONLY - the 兼容层 of
-	// the master-switch architecture keeps the point-light family (including the 4C PBRML GGX upgrade)
-	// bit-for-bit, while the legacy single-light DOT3/PBR mounts are gone: bump/roughness meshes
-	// without point lights fall through to DX8GeomNormal::Apply's merged base pair. lenv==null means
-	// "no point lights by definition" and declines the mount (the merged path handles those batches).
-	bool Apply(const Matrix3D& world, LightEnvironmentClass* lenv, TextureClass* diffuse);
-
 	// GeneralsX @feature T3-0 P1: global sun fallback for meshes without a per-mesh light
 	// environment. Injected by the display layer on time-of-day changes. world_dir follows the
 	// LightEnvironmentClass sign convention (direction the light travels toward the surface is
@@ -121,8 +89,6 @@ namespace DX8NormalMap
 	// color (or a degenerate direction) keeps the single-key look bit-for-bit.
 	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color);
 
-	// Restore the fixed pipeline after drawing (FVF + no PS).
-	void Restore(UINT_PTR fvf);
 }
 
 //=============================================================================
@@ -184,7 +150,7 @@ namespace DX8GeomNormal
 	// Forensics (RECMODE 5/6 discriminator, 14/10): pixel-shader texture reads return 0 for ANY
 	// bound texture in the game layer's raw post-scene receiver draw (constant-PS draw fine,
 	// plain A8R8G8B8 dummy echo reads 0), while every sampling pass that uses a programmable VS
-	// (GN/ML/dot3/bloom) samples correctly. The shadow map therefore gets sampled here.
+	// (GN/dot3/bloom) samples correctly. The shadow map therefore gets sampled here.
 	//
 	// Device layer compiles the shadow-aware pair (two VS variants + one PS) and installs it;
 	// zero handles or an uninstalled pair keeps the plain GN shaders. The game layer then feeds

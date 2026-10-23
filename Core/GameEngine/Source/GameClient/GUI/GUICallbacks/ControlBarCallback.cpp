@@ -48,6 +48,7 @@
 #include "GameClient/GUICallbacks.h"
 #include "GameClient/InGameUI.h"
 #include "GameClient/ControlBar.h"
+#include "GameClient/RightSidebar.h"
 #include "GameClient/GameWindowManager.h"
 #include "GameClient/LanguageFilter.h"
 #include "GameClient/CommandXlat.h"
@@ -521,6 +522,9 @@ void ShowControlBar( Bool immediate )
 		window->winHide(FALSE);
 	}
 
+	// GeneralsX @feature Qoder 22/10/2026 Keep the optional RA3-style right sidebar with the bar.
+	RightSidebarSetVisible( TRUE );
+
 	// We want to get everything recalced since this is a major state change.
 	TheControlBar->markUIDirty();
 }
@@ -561,6 +565,9 @@ void HideControlBar( Bool immediate )
 
 	//Always get rid of the purchase science screen!
 	TheControlBar->hidePurchaseScience();
+
+	// GeneralsX @feature Qoder 22/10/2026 Hide the optional RA3-style right sidebar with the bar.
+	RightSidebarSetVisible( FALSE );
 }
 
 //-------------------------------------------------------------------------------------------------

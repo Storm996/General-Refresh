@@ -13,10 +13,8 @@
 //   byte-identical to the ZH blur (hash 0x13415A51DB2155DF for both), so the tag 244 row already serves
 //   any build that compiles the base copy.  The second #define is therefore not emitted here.
 // - tags 220/221 (single-light PBR pair) compile at startup but have not been MOUNTED since PS3.0-P3
-//   (DX8NormalMap::Apply falls through to the merged base); the rows exist so a re-mounted variant still
-//   hits instead of rejecting its batch.
-// - PBRML (tag 222) is live-paired with the B1 ML VS (tag 140), not with the B2 PBR VS - see the bundle
-//   report; both halves must hit for a batch, and the ML VS row lives in VkPgmB1.inc.
+//   (the merged GN base owns roughness now); the rows exist so a re-mounted variant still hits
+//   instead of rejecting its batch.
 #include "VkShadersPgmB2.h"
 
 // #define lines emitted verbatim by scripts/pgm_hash.py over the exported blocks (see byte counts on the
@@ -26,10 +24,9 @@
 #define VKPGM_HASH_KVERTEXSHADERGN_SKIN    0xCD81361114287784ULL   // kVertexShaderGN_SKIN.hlsl (750 bytes)
 #define VKPGM_HASH_KPIXELSHADERGNSKIN      0xA3FC8BF90AAF5B82ULL   // kPixelShaderGNSkin.hlsl (1738 bytes)
 #define VKPGM_HASH_KVERTEXSHADERGNMERGED_TG3 0x4A0F255C6914588DULL // kVertexShaderGNMerged_TG3.hlsl (1320 bytes)
-#define VKPGM_HASH_KPIXELSHADERGNMERGED    0x4A3BCAD7E1A5C6C4ULL   // kPixelShaderGNMerged.hlsl (6094 bytes)
+#define VKPGM_HASH_KPIXELSHADERGNMERGED    0xF4DB3998076F626EULL   // kPixelShaderGNMerged.hlsl (6150 bytes)
 #define VKPGM_HASH_KVERTEXSHADERPBR        0x897C5E5C552F0011ULL   // kVertexShaderPBR.hlsl (1370 bytes)
 #define VKPGM_HASH_KPIXELSHADERPBR         0xAE1074630B614065ULL   // kPixelShaderPBR.hlsl (2204 bytes)
-#define VKPGM_HASH_KPIXELSHADERPBRML       0x67891C3005291E77ULL   // kPixelShaderPBRML.hlsl (2864 bytes)
 #define VKPGM_HASH_KWAVEVERTEXSHADERHLSL   0x8F49BD71B7E1098DULL   // kWaveVertexShaderHLSL.hlsl (494 bytes)
 #define VKPGM_HASH_KWAVEPIXELSHADERHLSL    0xD6D796FBBF123DC2ULL   // kWavePixelShaderHLSL.hlsl (1705 bytes)
 #define VKPGM_HASH_COMPILEWATERPIXELSHADER_RIVER 0x692F748A361FDF35ULL // CompileWaterPixelShader_river.hlsl (520 bytes)
@@ -55,15 +52,13 @@ static const VKPgm_Program kPgmB2Programs[] = {
     { 210u, 0u, VKPGM_HASH_KVERTEXSHADERGNMERGED_TG3, VKPGMB2_GNM_VERT_SPV,
       VKPGM_COUNT(VKPGMB2_GNM_VERT_SPV), "b2.gnm.vert" },                        // 1320 B
     { 211u, 1u, VKPGM_HASH_KPIXELSHADERGNMERGED,      VKPGMB2_GNM_FRAG_SPV,
-      VKPGM_COUNT(VKPGMB2_GNM_FRAG_SPV),  "b2.gnm.frag" },                       // 6094 B
+      VKPGM_COUNT(VKPGMB2_GNM_FRAG_SPV),  "b2.gnm.frag" },                       // 6150 B
 
-    // legacy PBR trio (4676/4729/4803); 220/221 unmounted since P3, 222 rides the B1 ML VS (tag 140)
+    // legacy PBR pair (4676/4729); 220/221 unmounted since P3
     { 220u, 0u, VKPGM_HASH_KVERTEXSHADERPBR, VKPGMB2_PBR_VERT_SPV,
       VKPGM_COUNT(VKPGMB2_PBR_VERT_SPV), "b2.pbr.vert" },                        // 1370 B
     { 221u, 1u, VKPGM_HASH_KPIXELSHADERPBR,  VKPGMB2_PBR_FRAG_SPV,
       VKPGM_COUNT(VKPGMB2_PBR_FRAG_SPV),  "b2.pbr.frag" },                       // 2204 B
-    { 222u, 1u, VKPGM_HASH_KPIXELSHADERPBRML, VKPGMB2_PBRML_FRAG_SPV,
-      VKPGM_COUNT(VKPGMB2_PBRML_FRAG_SPV), "b2.pbrml.frag" },                    // 2864 B
 
     // water family (W3DWater.cpp:921/937/1121/1138); wave VS+PS pair, river/trap are pure-PS draws
     { 230u, 0u, VKPGM_HASH_KWAVEVERTEXSHADERHLSL, VKPGMB2_WAVE_VERT_SPV,

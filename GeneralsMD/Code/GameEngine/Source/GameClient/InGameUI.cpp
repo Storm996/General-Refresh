@@ -53,6 +53,7 @@
 
 #include "GameClient/Anim2D.h"
 #include "GameClient/ControlBar.h"
+#include "GameClient/RightSidebar.h"
 #include "GameClient/DisplayStringManager.h"
 #include "GameClient/Diplomacy.h"
 #include "GameClient/Eva.h"
@@ -1288,6 +1289,8 @@ InGameUI::InGameUI()
 //-------------------------------------------------------------------------------------------------
 InGameUI::~InGameUI()
 {
+	RightSidebarShutdown();
+
 	delete TheControlBar;
 	TheControlBar = nullptr;
 
@@ -4210,6 +4213,8 @@ void InGameUI::createControlBar()
 {
 
 	TheWindowManager->winCreateFromScript( "ControlBar.wnd" );
+	// GeneralsX @feature Qoder 22/10/2026 Additive RA3-style right sidebar (retail bar stays).
+	RightSidebarInit();
 	HideControlBar();
 /*
 	// hide all windows created from this layout
@@ -5991,6 +5996,8 @@ void InGameUI::resetIdleWorker()
 
 void InGameUI::recreateControlBar()
 {
+	RightSidebarShutdown();
+
 	GameWindow *win = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("ControlBar.wnd"));
 	deleteInstance(win);
 

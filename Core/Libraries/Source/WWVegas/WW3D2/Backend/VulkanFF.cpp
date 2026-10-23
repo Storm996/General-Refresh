@@ -119,7 +119,8 @@ enum {
     BB_TA_COMPLEMENT = 0x10, BB_TA_ALPHAREPLICATE = 0x20
 };
 
-// The D3DCMP_* ordinals the folded-in alpha test decodes out of flags[2]. d3d8types.h numbers them from 0.
+// The 0-based compare table the folded-in alpha test decodes out of flags[2]. d3d8types.h numbers
+// D3DCMP_NEVER as 1, so VKFF_PACK_ALPHA_TEST subtracts one before packing.
 enum {
     BB_CMP_NEVER = 0, BB_CMP_LESS, BB_CMP_EQUAL, BB_CMP_LESSEQUAL,
     BB_CMP_GREATER, BB_CMP_NOTEQUAL, BB_CMP_GREATEREQUAL, BB_CMP_ALWAYS

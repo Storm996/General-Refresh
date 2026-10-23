@@ -904,16 +904,43 @@ void DynamicVBAccessClass::Allocate_DX8_Dynamic_Buffer()
 
 	// If requesting more vertices than dynamic vertex buffer can fit, delete the vb
 	// and adjust the size to the new count.
+	bool keep_offset=false;
 	if (nm) {
+		// GeneralsX @bugfix Qoder 20/10/2026 R-08: append instead of wrapping while a 16-bit offset can
+		// still address the frame's total. Wrapping is legal only because D3D9 renames the pool on
+		// DISCARD; the Vulkan mirror has to spend a whole extra generation to reproduce that, so the
+		// common case (a skinned batch followed by UI this frame) must not wrap in the first place.
+		const unsigned need=(unsigned)VertexCount+_DynamicDX8VertexBufferNMOffset;
+		if (need>_DynamicDX8VertexBufferNMSize && need<=65535u) {
+			REF_PTR_RELEASE(_DynamicDX8VertexBufferNM);
+			unsigned grow=(unsigned)_DynamicDX8VertexBufferNMSize*2u;
+			if (grow<need) grow=need;
+			if (grow>65535u) grow=65535u;
+			_DynamicDX8VertexBufferNMSize=(unsigned short)grow;
+			keep_offset=true;
+		}
 		if (VertexCount>_DynamicDX8VertexBufferNMSize) {
 			REF_PTR_RELEASE(_DynamicDX8VertexBufferNM);
 			_DynamicDX8VertexBufferNMSize=VertexCount;
 			if (_DynamicDX8VertexBufferNMSize<DEFAULT_VB_SIZE) _DynamicDX8VertexBufferNMSize=DEFAULT_VB_SIZE;
+			keep_offset=false;
 		}
-	} else if (VertexCount>_DynamicDX8VertexBufferSize) {
-		REF_PTR_RELEASE(_DynamicDX8VertexBuffer);
-		_DynamicDX8VertexBufferSize=VertexCount;
-		if (_DynamicDX8VertexBufferSize<DEFAULT_VB_SIZE) _DynamicDX8VertexBufferSize=DEFAULT_VB_SIZE;
+	} else {
+		const unsigned need=(unsigned)VertexCount+_DynamicDX8VertexBufferOffset;
+		if (need>_DynamicDX8VertexBufferSize && need<=65535u) {
+			REF_PTR_RELEASE(_DynamicDX8VertexBuffer);
+			unsigned grow=(unsigned)_DynamicDX8VertexBufferSize*2u;
+			if (grow<need) grow=need;
+			if (grow>65535u) grow=65535u;
+			_DynamicDX8VertexBufferSize=(unsigned short)grow;
+			keep_offset=true;
+		}
+		if (VertexCount>_DynamicDX8VertexBufferSize) {
+			REF_PTR_RELEASE(_DynamicDX8VertexBuffer);
+			_DynamicDX8VertexBufferSize=VertexCount;
+			if (_DynamicDX8VertexBufferSize<DEFAULT_VB_SIZE) _DynamicDX8VertexBufferSize=DEFAULT_VB_SIZE;
+			keep_offset=false;
+		}
 	}
 
 	// Create a new vb if one doesn't exist currently
@@ -928,7 +955,7 @@ void DynamicVBAccessClass::Allocate_DX8_Dynamic_Buffer()
 				dynamic_fvf_type_nm,
 				_DynamicDX8VertexBufferNMSize,
 				(DX8VertexBufferClass::UsageType)usage));
-			_DynamicDX8VertexBufferNMOffset=0;
+			if (!keep_offset) _DynamicDX8VertexBufferNMOffset=0;
 		}
 	} else if (!_DynamicDX8VertexBuffer) {
 		unsigned usage=DX8VertexBufferClass::USAGE_DYNAMIC;
@@ -940,18 +967,42 @@ void DynamicVBAccessClass::Allocate_DX8_Dynamic_Buffer()
 			dynamic_fvf_type,
 			_DynamicDX8VertexBufferSize,
 			(DX8VertexBufferClass::UsageType)usage));
-		_DynamicDX8VertexBufferOffset=0;
+		if (!keep_offset) _DynamicDX8VertexBufferOffset=0;
 	}
 
 	// Any room at the end of the buffer?
 	if (nm) {
 		if (((unsigned)VertexCount+_DynamicDX8VertexBufferNMOffset)>_DynamicDX8VertexBufferNMSize) {
+			// GeneralsX @debug Qoder 20/10/2026 R-08: see the DISCARD trace in VulkanDraw.cpp. This is the
+			// engine half of the same event: the pool is full and the offset restarts at zero.
+			static int trace = -1;
+			if (trace < 0) { const char* e = getenv("GENERALSX_VK_VBTRACE"); trace = (e && atoi(e)) ? 1 : 0; }
+			if (trace) {
+				static unsigned long long wraps = 0;
+				if (++wraps <= 400) {
+					fprintf(stderr, "[VKVBWRAP] nm req=%u off=%u size=%u n=%llu\n",
+						(unsigned)VertexCount, (unsigned)_DynamicDX8VertexBufferNMOffset,
+						(unsigned)_DynamicDX8VertexBufferNMSize, wraps);
+					fflush(stderr);
+				}
+			}
 			_DynamicDX8VertexBufferNMOffset=0;
 		}
 		REF_PTR_SET(VertexBuffer,_DynamicDX8VertexBufferNM);
 		VertexBufferOffset=_DynamicDX8VertexBufferNMOffset;
 	} else {
 		if (((unsigned)VertexCount+_DynamicDX8VertexBufferOffset)>_DynamicDX8VertexBufferSize) {
+			static int trace = -1;
+			if (trace < 0) { const char* e = getenv("GENERALSX_VK_VBTRACE"); trace = (e && atoi(e)) ? 1 : 0; }
+			if (trace) {
+				static unsigned long long wraps = 0;
+				if (++wraps <= 400) {
+					fprintf(stderr, "[VKVBWRAP] req=%u off=%u size=%u n=%llu\n",
+						(unsigned)VertexCount, (unsigned)_DynamicDX8VertexBufferOffset,
+						(unsigned)_DynamicDX8VertexBufferSize, wraps);
+					fflush(stderr);
+				}
+			}
 			_DynamicDX8VertexBufferOffset=0;
 		}
 		REF_PTR_SET(VertexBuffer,_DynamicDX8VertexBuffer);

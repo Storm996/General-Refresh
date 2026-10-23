@@ -47,6 +47,7 @@
 //-----------------------------------------------------------------------------
 
 #include "W3DDevice/GameClient/W3DPropBuffer.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
 
 #include <WW3D2/assetmgr.h>
 #include "Common/GameUtility.h"
@@ -327,7 +328,7 @@ void W3DPropBuffer::drawProps(RenderInfoClass &rinfo)
 	if (m_doCull) {
 		cull(&rinfo.Camera);
 	}
-	const GlobalData::TerrainLighting *objectLighting = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay];
+	const GlobalData::TerrainLighting *objectLighting = TheGlobalData->m_terrainObjectsLighting[W3DDisplay::getRenderTimeOfDay()];
 
 	LightEnvironmentClass lightEnv;
 	Vector3 center(0,0,0); // arbitrary center point. [6/6/2003]

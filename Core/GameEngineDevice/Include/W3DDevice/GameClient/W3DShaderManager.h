@@ -202,6 +202,10 @@ public:
 	// frame, which is a static load, not an ini parse.
 	static void setBloomIntensity(Real intensity01);
 	static Real getBloomIntensity();					///< lazy seed from Options.ini / GENERALSX_BLOOM_INTENSITY
+	// GeneralsX @feature Qoder 20/10/2026: the pure-Vulkan present pass has no MSAA to enable (every
+	// attachment is 1 sample), so the anti-aliasing row drives its FXAA instead. Same live-knob route as
+	// bloom: the options page pushes through Display, the backend reads the DX8Wrapper mirror per frame.
+	static void setPostAntiAliasing(Bool enabled);
 	static void setShadowMapStrength(Real strength01);
 	static Real getShadowMapStrength();					///< lazy seed from Options.ini / GENERALSX_SHADOWMAP_INT
 

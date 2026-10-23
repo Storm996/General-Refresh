@@ -1284,7 +1284,6 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 
 	Campaign* currentCampaign = TheCampaignManager->getCurrentCampaign();
 	Bool isChallengeCampaign = m_gameMode == GAME_SINGLE_PLAYER && currentCampaign && currentCampaign->m_isChallengeCampaign;
-
 	// Fill in the game color and Factions before we do the Load Screen
 	TheGameInfo = nullptr;
 	if (TheNetwork)
@@ -1434,6 +1433,58 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 	// update the loadscreen
 	updateLoadProgress(LOAD_PROGRESS_POST_LOAD_MAP);
 
+	// GeneralsX @bugfix Qoder 21/10/2026 Campaign maps are not skirmish. The check MUST run
+	// AFTER TheTerrainLogic->loadMap(): before it, TheSidesList still holds the shell/default
+	// sides, so a "Player" probe would always be false. If the loaded map defines "Player"
+	// (campaign maps and our NX maps do; retail skirmish maps use Skirmish* instead), keep the
+	// map's own SidesList/scripts. Otherwise the skirmish path wipes them and rebuilds empty
+	// sides from GameInfo slots.
+	Bool mapHasPlayerSide = FALSE;
+	if (TheSidesList)
+	{
+		for (Int si = 0; si < TheSidesList->getNumSides(); ++si)
+		{
+			SidesInfo *sinfo = TheSidesList->getSideInfo(si);
+			if (sinfo && sinfo->getDict() &&
+				sinfo->getDict()->getAsciiString(TheKey_playerName) == "Player")
+			{
+				mapHasPlayerSide = TRUE;
+				break;
+			}
+		}
+	}
+	const Bool keepCampaignSides =
+		((currentCampaign != nullptr || mapHasPlayerSide) && !isChallengeCampaign);
+
+	{
+		FILE *nxlog = fopen("_nx_guard.log", "a");
+		if (nxlog)
+		{
+			fprintf(nxlog, "[NXGUARD] mode=%d campaign=%p challenge=%d player=%d keep=%d sides=%d\n",
+				(int)m_gameMode, (void*)currentCampaign, (int)isChallengeCampaign,
+				(int)mapHasPlayerSide, (int)keepCampaignSides,
+				TheSidesList ? TheSidesList->getNumSides() : -1);
+			if (TheSidesList)
+			{
+				for (Int si = 0; si < TheSidesList->getNumSides(); ++si)
+				{
+					SidesInfo *sinfo = TheSidesList->getSideInfo(si);
+					const char *nm = (sinfo && sinfo->getDict())
+						? sinfo->getDict()->getAsciiString(TheKey_playerName).str() : "<null>";
+					fprintf(nxlog, "  side[%d]=%s\n", si, nm);
+				}
+				SidesInfo *pinfo = TheSidesList->findSideInfo("Player");
+				ScriptList *psl = pinfo ? pinfo->getScriptList() : nullptr;
+				fprintf(nxlog, "  playerScripts=%p firstGroup=%p firstScript=%p\n",
+					(void*)psl,
+					psl ? (void*)psl->getScriptGroup() : nullptr,
+					psl ? (void*)psl->getScript() : nullptr);
+			}
+			fclose(nxlog);
+		}
+	}
+
+
 	#ifdef DUMP_PERF_STATS
 	GetPrecisionTimer(&endTime64);
 	char Buf[256];
@@ -1444,10 +1495,10 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 
 	Int localSlot = 0;
 	Int progressCount = LOAD_PROGRESS_SIDE_POPULATION;
-	if (TheGameInfo)
+	if (TheGameInfo && !keepCampaignSides)
 	{
 
-		if (TheGameEngine->isMultiplayerSession() || isSkirmishOrSkirmishReplay)
+		if (!keepCampaignSides && (TheGameEngine->isMultiplayerSession() || isSkirmishOrSkirmishReplay))
 		{
 			// Saves off any player, and resets the sides to 0 players so we can add the skirmish players.
 			TheSidesList->prepareForMP_or_Skirmish();
@@ -1627,6 +1678,7 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 		d.setBool(TheKey_teamIsSingleton, true);
 		TheSidesList->addTeam(&d);
 	//}
+
 	TheSidesList->validateSides();
 
 	// update the loadscreen

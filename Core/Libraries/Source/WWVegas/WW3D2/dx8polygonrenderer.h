@@ -141,6 +141,19 @@ inline void DX8PolygonRendererClass::Render_Sorted(/*const Matrix3D & tm,*/int b
 	SNAPSHOT_SAY(("Set_Index_Buffer_Index_Offset(%d)",base_vertex_offset));
 	SNAPSHOT_SAY(("Insert_Sorting_Triangles(%d,%d,%d,%d)",index_offset,index_count-2,min_vertex_index,vertex_index_range));
 
+	// GeneralsX @debug Qoder 21/10/2026 PROPSORTED: confirm the rotor blur reaches the sorting
+	// inserter at all (the flush lists were empty despite a sort=1 category).
+	{
+		static int s_propSorted = 0;
+		const char* mn = mmc ? mmc->Get_Name() : nullptr;
+		if (s_propSorted < 8 && mn && strstr(mn, "PROPS")) {
+			++s_propSorted;
+			fprintf(stderr, "[PROPSORTED] mesh='%s' polys=%u verts=%u sphereValid=%d\n",
+				mn, index_count / 3, vertex_index_range, bounding_sphere.Is_Valid() ? 1 : 0);
+			fflush(stderr);
+		}
+	}
+
 	DX8Wrapper::Set_Index_Buffer_Index_Offset(base_vertex_offset);
 	SortingRendererClass::Insert_Triangles(
 		bounding_sphere,

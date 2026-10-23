@@ -1078,7 +1078,7 @@ void W3DTerrainVisual::addProp(const ThingTemplate *tTemplate, const Coord3D *po
 	{
 		state.set(MODELCONDITION_SNOW);
 	}
-	if (TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT)
+	if (W3DDisplay::getRenderTimeOfDay() == TIME_OF_DAY_NIGHT)
 	{
 		state.set(MODELCONDITION_NIGHT);
 	}

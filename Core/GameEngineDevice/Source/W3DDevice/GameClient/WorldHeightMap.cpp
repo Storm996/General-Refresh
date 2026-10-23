@@ -1742,8 +1742,7 @@ Bool WorldHeightMap::readTiles(InputStream *pStr, TileData **tiles, Int numRows,
 
 
 /** updateTileTexturePositions - assigns each tile a location in the texture.
-*/
-Int WorldHeightMap::updateTileTexturePositions(Int *edgeHeight)
+*/Int WorldHeightMap::updateTileTexturePositions(Int *edgeHeight)
 {
 	Int i, j;
 	Int maxHeight = 0;

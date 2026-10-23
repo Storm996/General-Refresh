@@ -45,6 +45,7 @@
 
 #include <WWLib/always.h>
 #include "W3DDevice/GameClient/W3DAssetManager.h"
+#include "W3DDevice/GameClient/W3DTreeAlias.h"
 #include "WW3D2/proto.h"
 #include "WW3D2/rendobj.h"
 #include <WWMath/vector3.h>
@@ -261,6 +262,25 @@ TextureClass *W3DAssetManager::Get_Texture(
 //---------------------------------------------------------------------
 RenderObjClass * W3DAssetManager::Create_Render_Obj(const char* name)
 {
+	// GeneralsX @feature T10 21/10/2026: existing maps keep their original tree
+	// model names; resolve them to the GX RTS assets here, with original fallback.
+	const char *resolved = W3DTreeAliasResolve(name);
+	if (resolved != name) {
+		RenderObjClass *robj = WW3DAssetManager::Create_Render_Obj(resolved);
+		if (robj) {
+			static Int s_aliasLog = 0;
+			if (s_aliasLog++ < 48) {
+				fprintf(stderr, "[TREEALIAS] model %s -> %s\n", name, resolved);
+				fflush(stderr);
+			}
+			return robj;
+		}
+		static Int s_missingLog = 0;
+		if (s_missingLog++ < 24) {
+			fprintf(stderr, "[TREEALIAS] model MISSING %s, fallback %s\n", resolved, name);
+			fflush(stderr);
+		}
+	}
 	return WW3DAssetManager::Create_Render_Obj(name);
 }
 
@@ -761,6 +781,19 @@ RenderObjClass * W3DAssetManager::Create_Render_Obj(
 	const char *newTexture
 )
 {
+	// GeneralsX @feature T10 21/10/2026: existing maps keep their original tree
+	// model names; resolve them to the GX RTS assets here too.
+	{
+		const char *t10Alias = W3DTreeAliasResolve(name);
+		if (t10Alias != name) {
+			static Int s_t10ScaledLog = 0;
+			if (s_t10ScaledLog++ < 24) {
+				fprintf(stderr, "[TREEALIAS] scaled %s -> %s\n", name, t10Alias);
+				fflush(stderr);
+			}
+			name = t10Alias;
+		}
+	}
 	#ifdef DUMP_PERF_STATS
 	__int64 startTime64,endTime64;
 	GetPrecisionTimer(&startTime64);
@@ -1382,6 +1415,18 @@ static inline void Munge_Texture_Name(char *newname, const char *oldname, const 
 
 RenderObjClass * W3DAssetManager::Create_Render_Obj(const char * name,float scale, const Vector3 &hsv_shift)
 {
+	// GeneralsX @feature T10 21/10/2026: same tree alias for scaled draws.
+	{
+		const char *t10Alias = W3DTreeAliasResolve(name);
+		if (t10Alias != name) {
+			static Int s_t10ScaledLog = 0;
+			if (s_t10ScaledLog++ < 24) {
+				fprintf(stderr, "[TREEALIAS] scaled %s -> %s\n", name, t10Alias);
+				fflush(stderr);
+			}
+			name = t10Alias;
+		}
+	}
 	Bool isGranny = false;
 	Bool reallyscale = (WWMath::Fabs(scale - ident_scale) > scale_epsilon);
 	Bool reallyhsv_shift = (WWMath::Fabs(hsv_shift.X - ident_HSV.X) > H_epsilon ||

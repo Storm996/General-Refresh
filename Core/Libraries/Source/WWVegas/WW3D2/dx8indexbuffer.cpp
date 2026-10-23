@@ -577,10 +577,24 @@ void DynamicIBAccessClass::Allocate_DX8_Dynamic_Buffer()
 
 	// If requesting more indices than dynamic index buffer can fit, delete the ib
 	// and adjust the size to the new count.
+	// GeneralsX @bugfix Qoder 20/10/2026 R-08: append instead of wrapping while a 16-bit offset can still
+	// address the frame's total. Wrapping relies on D3D9 renaming the pool on DISCARD; the Vulkan mirror
+	// has to spend an extra generation to reproduce that, so the common case must not wrap at all.
+	bool keep_offset=false;
+	const unsigned need=(unsigned)IndexCount+_DynamicDX8IndexBufferOffset;
+	if (need>_DynamicDX8IndexBufferSize && need<=65535u) {
+		REF_PTR_RELEASE(_DynamicDX8IndexBuffer);
+		unsigned grow=(unsigned)_DynamicDX8IndexBufferSize*2u;
+		if (grow<need) grow=need;
+		if (grow>65535u) grow=65535u;
+		_DynamicDX8IndexBufferSize=(unsigned short)grow;
+		keep_offset=true;
+	}
 	if (IndexCount>_DynamicDX8IndexBufferSize) {
 		REF_PTR_RELEASE(_DynamicDX8IndexBuffer);
 		_DynamicDX8IndexBufferSize=IndexCount;
 		if (_DynamicDX8IndexBufferSize<DEFAULT_IB_SIZE) _DynamicDX8IndexBufferSize=DEFAULT_IB_SIZE;
+		keep_offset=false;
 	}
 
 	// Create a new vb if one doesn't exist currently
@@ -593,11 +607,24 @@ void DynamicIBAccessClass::Allocate_DX8_Dynamic_Buffer()
 		_DynamicDX8IndexBuffer=NEW_REF(DX8IndexBufferClass,(
 			_DynamicDX8IndexBufferSize,
 			(DX8IndexBufferClass::UsageType)usage));
-		_DynamicDX8IndexBufferOffset=0;
+		if (!keep_offset) _DynamicDX8IndexBufferOffset=0;
 	}
 
 	// Any room at the end of the buffer?
 	if (((unsigned)IndexCount+_DynamicDX8IndexBufferOffset)>_DynamicDX8IndexBufferSize) {
+		// GeneralsX @debug Qoder 20/10/2026 R-08: the index pool has the same DISCARD contract as the
+		// vertex pool; log its wrap too so a run can rule the two in or out separately.
+		static int trace = -1;
+		if (trace < 0) { const char* e = getenv("GENERALSX_VK_VBTRACE"); trace = (e && atoi(e)) ? 1 : 0; }
+		if (trace) {
+			static unsigned long long wraps = 0;
+			if (++wraps <= 400) {
+				fprintf(stderr, "[VKIBWRAP] req=%u off=%u size=%u n=%llu\n",
+					(unsigned)IndexCount, (unsigned)_DynamicDX8IndexBufferOffset,
+					(unsigned)_DynamicDX8IndexBufferSize, wraps);
+				fflush(stderr);
+			}
+		}
 		_DynamicDX8IndexBufferOffset=0;
 	}
 

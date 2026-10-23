@@ -108,6 +108,7 @@ MiniAudioManager::MiniAudioManager() :
 	m_selectedPlaybackDevice(PROVIDER_ERROR),
 	m_selectedSpeakerType(0),
 	m_lastSelectedPlaybackDevice(PROVIDER_ERROR),
+	m_disallowSpeechPlaying(NULL),
 	m_binkHandle(NULL),
 	m_pref3DProvider(AsciiString::TheEmptyString),
 	m_prefSpeaker(AsciiString::TheEmptyString)
@@ -222,6 +223,8 @@ void MiniAudioManager::reset()
 #endif
 
 	AudioManager::reset();
+	// GeneralsX @bugfix Qoder 22/10/2026 Base reset clears the global speech flag; drop the owner too.
+	m_disallowSpeechPlaying = NULL;
 	fprintf(stderr, "[MAUDIO-T %.0fms RESET\n", MAudioNowMs()); fflush(stderr);
 	stopAllAudioImmediately();
 	// GeneralsX @bugfix coolswood 18/07/2026 Restart sound groups in reset() to fix silent audio after loadGame.
@@ -650,6 +653,7 @@ void MiniAudioManager::playAudioEvent(AudioRequest *req)
 		audio->m_type = PAT_Stream;
 		if ((info->m_soundType == AT_Streaming) && event->getUninterruptible()) {
 			setDisallowSpeech(TRUE);
+			m_disallowSpeechPlaying = audio;
 		}
 		break;
 	}
@@ -810,6 +814,17 @@ void MiniAudioManager::releasePlayingAudio(PlayingAudio *release)
 {
 	if (!release) return;
 
+	// GeneralsX @bugfix Qoder 22/10/2026 The base AudioManager keeps m_disallowSpeech as a single
+	// global flag, but MiniAudio has no completion callback wired to notifyOfAudioCompletion(). Clear
+	// it here, at the single release choke point, and only for the stream that actually owns it.
+	// Without this, the first uninterruptible mission line left the flag set forever and every later
+	// AT_Streaming speech was silently dropped in AudioManager::addAudioEvent().
+	if (release == m_disallowSpeechPlaying) {
+		m_disallowSpeechPlaying = NULL;
+		if (getDisallowSpeech())
+			setDisallowSpeech(FALSE);
+	}
+
 	// GeneralsX diag: single choke point for EVERY removal path. cursor tells us how far the
 	// sound had played when it was released; playing tells us whether miniaudio still considered
 	// it live at that moment.
@@ -922,6 +937,12 @@ void MiniAudioManager::stopAllSpeech(void)
 			++it;
 		}
 	}
+
+	// GeneralsX @bugfix Qoder 22/10/2026 All speech is gone, so the uninterruptible-speech guard
+	// must not survive this call. playAudioEvent() re-arms it for the incoming stream afterwards.
+	if (getDisallowSpeech())
+		setDisallowSpeech(FALSE);
+	m_disallowSpeechPlaying = NULL;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1119,8 +1140,10 @@ void MiniAudioManager::notifyOfAudioCompletion(UnsignedInt audioCompleted, Unsig
 	if (!playing) return;
 	if (!playing->m_audioEventRTS || !playing->m_audioEventRTS->getAudioEventInfo()) return;
 
-	if (getDisallowSpeech() && playing->m_audioEventRTS->getAudioEventInfo()->m_soundType == AT_Streaming)
+	if (getDisallowSpeech() && playing->m_audioEventRTS->getAudioEventInfo()->m_soundType == AT_Streaming) {
 		setDisallowSpeech(FALSE);
+		m_disallowSpeechPlaying = NULL;
+	}
 
 	if (playing->m_audioEventRTS->getAudioEventInfo()->m_control & AC_LOOP) {
 		if (playing->m_audioEventRTS->getNextPlayPortion() == PP_Attack)

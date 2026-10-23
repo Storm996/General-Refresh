@@ -162,6 +162,8 @@ public:
 	const FVFInfoClass& FVF_Info() const { return FVFInfo; }
 	unsigned Get_Type() const { return Type; }
 	unsigned short Get_Vertex_Count() const { return VertexCount; }
+	// GeneralsX @debug Qoder 20/10/2026 R-08: pool slot this access was handed, for the DISCARD trace.
+	unsigned short Get_Vertex_Buffer_Offset() const { return VertexBufferOffset; }
 
 	// Call at the end of the execution, or at whatever time you wish to release
 	// the recycled dynamic vertex buffer.

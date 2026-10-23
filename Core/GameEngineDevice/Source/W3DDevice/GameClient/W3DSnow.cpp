@@ -135,10 +135,20 @@ static const Real RAIN_STREAK_U_BAND = 0.07f;
 // with a buffer that was never allocated for it.
 static bool Weather_Use_Point_Sprites()
 {
+	// GeneralsX @bugfix Qoder 21/10/2026: the pure-Vulkan fixed-function point path sizes gl_PointSize
+	// from the D3D point registers and the distance curve, which on this backend renders every snow
+	// particle as a screen-filling white square (normal snow and blizzard both use PARTICLE_SNOW).
+	// Rain already uses the world-space quad/streak path and looks correct. Force snow onto the retail
+	// quad fallback, whose size is the authored SnowQuadSize in world units; the D3D9 build keeps its
+	// original point-sprite path.
+#if defined(SAGE_USE_VULKAN_CORE)
+	return false;
+#else
 	return TheWeatherSetting != nullptr
 		&& TheWeatherSetting->m_particleKind != WeatherSetting::PARTICLE_RAIN
 		&& TheWeatherSetting->m_usePointSprites
 		&& DX8Wrapper::Get_Current_Caps()->Support_PointSprites();
+#endif
 }
 
 

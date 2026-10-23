@@ -34,6 +34,15 @@ void VK_NOD3D_Watch_Check(const char *where);
 // lookup (the monitor the engine presents on) and for the device.
 IDirect3D9 *VK_Stub_Create_D3D9(HWND hwnd);
 
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: mirror identity + lazy feed, the two halves of the fix for
+// recycled object addresses. VKD3D_Mirror_Identify answers the token of the stub resource that owns 'key'
+// right now (0 = nobody, which is how a mirror left by an object whose destructor never ran is retired);
+// it is registered with the mirror tables by the stub device ctor. VKD3D_Push_Mirror feeds a live object's
+// own CPU store into its Vulkan mirror, which is what the draw path calls on the frame a texture slot
+// resolves to nothing. Both answer 0/false outside the no-d3d9 driver.
+unsigned long long VKD3D_Mirror_Identify(void *key);
+bool VKD3D_Push_Mirror(void *key);
+
 // Fills the capability block the engine's DX8Caps layer and the facade read side consume. The values are
 // measured, not invented: GENERALSX_VK_CAPDUMP=1 on the d3d9 path prints the reference block.
 void VK_Stub_Fill_Caps(D3DCAPS9 *caps, UINT adapter, D3DDEVTYPE devtype);

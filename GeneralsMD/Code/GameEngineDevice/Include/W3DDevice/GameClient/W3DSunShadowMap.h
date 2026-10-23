@@ -24,17 +24,10 @@
 
 // FILE: W3DSunShadowMap.h ////////////////////////////////////////////////////
 //
-// GeneralsX @feature PS3.0 T6 - real depth-buffered sun shadow map.
-//
-// Two hooks per frame, both driven from W3DDisplay::draw():
-//   preSceneUpdate()      renders every registered shadow caster from the sun's ortho view into
-//                         an R32F depth map (occluder pass through SpecialRenderInfoClass::SunSink).
-//   renderTerrainReceiver() draws a terrain-conforming grid with a 3x3 PCF shader that multiplies
-//                         the already-drawn scene where the map says the caster geometry occludes it.
-//
-// Off by default; GENERALSX_SHADOWMAP=1 turns it on (Windows/DXVK V1 scope, same runtime-HLSL
-// boundary as the T2 blur pass).  The base game links an inline no-op stub of this class so the
-// shared Core W3DDisplay.cpp compiles unchanged for both targets.
+// GeneralsX @refactor Qoder 20/10/2026: the T6 depth-buffered sun shadow map is retired from the
+// build. The shared Core W3DDisplay.cpp still calls the two frame hooks, so this target links the
+// same inline no-op stub the base game uses; the retail projected (decal) and volumetric (stencil)
+// shadow managers own shadows again because isWanted() now reports false.
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -45,26 +38,13 @@ class CameraClass;
 class W3DSunShadowMap
 {
 	public:
-		// sceneCamera: the primary view's camera, used for the visible-terrain window.
-		static void preSceneUpdate(CameraClass *sceneCamera);
-		static void renderTerrainReceiver(CameraClass *sceneCamera);
+		static void preSceneUpdate(CameraClass *) {}
+		static void renderTerrainReceiver(CameraClass *) {}
+		static void releaseResources() {}
+		static void reAcquireResources() {}
+		static bool isReceptionActive() { return false; }
+		static float receptionStrength() { return 0.0f; }
 
-		// Device-reset plumbing. Called from W3DProjectedShadowManager's ReleaseResources /
-		// ReAcquireResources so the map's POOL_DEFAULT textures never outlive the device.
-		static void releaseResources();
-		static void reAcquireResources();
-
-		// GeneralsX @feature PS3.0-P3-23 14/10/2026: S4 three-layer composition queries.  True while
-		// the GN pass currently receives this frame's map (P3-21b armed path); receptionStrength() is the
-		// premultiplied darkening the GNS shaders apply to light 0 (Options.ini ShadowMapIntensity/100).
-		// The volumetric-shadow screen pass halves its own darkening when both are active so a mesh
-		// pixel never gets multiplied twice into "twice-dark" black (the S3 overlap the report warns of).
-		static bool isReceptionActive();
-		static float receptionStrength();
-
-		// GeneralsX @refactor Qoder 19/10/2026 R-05: true once the ShadowMap gate (Options.ini
-		// ShadowMap=1 default, GENERALSX_SHADOWMAP QA override) says the sun map owns this process's
-		// sun shadows. The legacy projected/volumetric managers check this so they stand down instead
-		// of burning 2.6 ms of CPU per frame drawing a second, redundant shadow layer.
-		static bool isWanted();
+		// False = the legacy shadow managers arm their queue (W3DScene.cpp) instead of standing down.
+		static bool isWanted() { return false; }
 };

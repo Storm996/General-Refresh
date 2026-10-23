@@ -421,7 +421,56 @@ void ShaderClass::Apply()
 		diff=CurrentShader^ShaderBits;
 	}
 
-	if(!diff) return;
+	if(!diff)
+	{
+		// GeneralsX @bugfix Qoder 21/10/2026 STATELEAK: a raw D3D render-state write (decal, scorch,
+		// explosion and other effect passes use Set_DX8_Render_State directly) can leave
+		// ALPHABLENDENABLE/SRCBLEND/DSTBLEND/ALPHATEST different from what this shader specifies while
+		// the cached shader bits still match. ShaderClass used to return here, so the next batch that
+		// reused the same shader inherited the effect pass' multiplicative ZERO/SRCCOLOR blend and
+		// rendered as a black/odd card (tracks, propellers, shells, scorch). Compare the effective
+		// states and re-apply only the blend/alpha-test block when they no longer match.
+		ULONG planeMask = (Get_Color_Mask() != ShaderClass::COLOR_WRITE_ENABLE) ? 0u : 0xffffffu;
+		D3DBLEND wantSf, wantDf;
+		if (!planeMask) { wantSf = D3DBLEND_ZERO; wantDf = D3DBLEND_ONE; }
+		else {
+			wantSf = srcBlendLUT[int(Get_Src_Blend_Func())].func;
+			wantDf = dstBlendLUT[int(Get_Dst_Blend_Func())].func;
+		}
+		const BOOL wantBlend = (wantSf != D3DBLEND_ONE || wantDf != D3DBLEND_ZERO);
+		const BOOL wantAT = (Get_Alpha_Test() == ShaderClass::ALPHATEST_ENABLE);
+		DWORD wantAf = D3DCMP_GREATEREQUAL, wantAr = 0x60;
+		if (wantAT && wantSf == D3DBLEND_INVSRCALPHA) { wantAf = D3DCMP_LESSEQUAL; wantAr = 0xffu - 0x60u; }
+
+		bool wrong = false;
+		const unsigned curBlend = DX8Wrapper::VK_Read_RS(D3DRS_ALPHABLENDENABLE);
+		if (wantBlend) {
+			if (!curBlend
+				|| DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND) != (unsigned)wantSf
+				|| DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND) != (unsigned)wantDf) wrong = true;
+		} else if (curBlend) wrong = true;
+		const unsigned curAT = DX8Wrapper::VK_Read_RS(D3DRS_ALPHATESTENABLE);
+		if (wantAT) {
+			if (!curAT
+				|| DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC) != wantAf
+				|| (DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu) != wantAr) wrong = true;
+		} else if (curAT) wrong = true;
+
+		if (!wrong) return;
+		{
+			static int s_leakLog = 0;
+			if (s_leakLog < 48) {
+				++s_leakLog;
+				fprintf(stderr, "[STATELEAK] shader=%08lX want blend=%d %u/%u at=%d %u/%u cur blend=%u %u/%u at=%u %u/%u\n",
+					(unsigned long)ShaderBits, (int)wantBlend, (unsigned)wantSf, (unsigned)wantDf,
+					(int)wantAT, (unsigned)wantAf, (unsigned)wantAr,
+					curBlend, DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND), DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND),
+					curAT, DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC) & 7u, DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu);
+				fflush(stderr);
+			}
+		}
+		diff = ShaderClass::MASK_SRCBLEND | ShaderClass::MASK_DSTBLEND | ShaderClass::MASK_ALPHATEST;
+	}
 
 
 	CurrentShader=ShaderBits;

@@ -51,6 +51,7 @@
 #include "GameClient/LampList.h"
 #include "GameClient/Shadow.h"
 #include "GameLogic/GameLogic.h"		// for real-time frame
+#include "GameLogic/TerrainLogic.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: ground height for lamp wash
 #include "GameLogic/Object.h"
 #include "GameLogic/WeaponSet.h"
 #include "GameLogic/FPUControl.h"
@@ -1773,10 +1774,12 @@ W3DModelDraw::W3DModelDraw(Thing *thing, const ModuleData* moduleData) : DrawMod
 	m_lampSet = nullptr;
 	m_lampSetResolved = false;
 	m_lampFlickerPhase = GameClientRandomValueReal(0, 6.2831853f);
+	m_headlightLight = nullptr;
+	m_structureLight = nullptr;
 
 	// only validate the current time-of-day and weather conditions by default.
 	getW3DModelDrawModuleData()->validateStuffForTimeAndWeather(getDrawable(),
-											TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT,
+											W3DDisplay::getRenderTimeOfDay() == TIME_OF_DAY_NIGHT,
 											// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: blizzard cakes
 											// props with snow too, so the test is the family, not the single retail value.
 											Weather_IsSnowFamily(TheGlobalData->m_weather));
@@ -1796,7 +1799,7 @@ W3DModelDraw::W3DModelDraw(Thing *thing, const ModuleData* moduleData) : DrawMod
 	  Object* obj = draw->getObject();
 	  if (obj)
 	  {
-		  if (TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT)
+		  if (W3DDisplay::getRenderTimeOfDay() == TIME_OF_DAY_NIGHT)
 			  m_hexColor = obj->getNightIndicatorColor();
 		  else
 			  m_hexColor = obj->getIndicatorColor();
@@ -1818,7 +1821,7 @@ W3DModelDraw::W3DModelDraw(Thing *thing, const ModuleData* moduleData) : DrawMod
 void W3DModelDraw::onDrawableBoundToObject()
 {
 	getW3DModelDrawModuleData()->validateStuffForTimeAndWeather(getDrawable(),
-											TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT,
+											W3DDisplay::getRenderTimeOfDay() == TIME_OF_DAY_NIGHT,
 											// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: blizzard cakes
 											// props with snow too, so the test is the family, not the single retail value.
 											Weather_IsSnowFamily(TheGlobalData->m_weather));
@@ -1830,6 +1833,8 @@ W3DModelDraw::~W3DModelDraw()
 {
 	// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: fade out any held lamp lights; the scene pool re-uses them.
 	releaseLamps();
+	releaseHeadlights();
+	releaseStructureLight();
 
 	if (m_trackRenderObject && TheTerrainTracksRenderObjClassSystem)
 	{
@@ -2141,6 +2146,8 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
 
 		// GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: refresh held lamp lights on the adjusted world transform.
 		updateLamps(mtx);
+		// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: real forward light for ground vehicles at night.
+		updateHeadlights(mtx);
 	}
 
 	handleClientTurretPositioning();
@@ -2164,10 +2171,41 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
 // GENERALSX_LAMPLIGHT_LOG=1 prints each lamp-set acquisition for on-hardware evidence.
 // Kept intensity <=0.6 by data convention so stage-4A explosion pulses win LightEnvironment slots.
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: the render TOD override (Options TimeOfDayPreview or
+// GENERALSX_TOD_OVERRIDE) is presentation-only, so the night look must key off it, not the logic TOD
+// which still holds the map's own slot. Restart-applied; cached like the display-side override.
+static Bool isNightRenderTOD()
+{
+	static Int s_ov = -2;
+	if (s_ov == -2) {
+		const char* ev = getenv("GENERALSX_TOD_OVERRIDE");
+		s_ov = (ev != nullptr && *ev != 0) ? atoi(ev) : OptionPreferences().getTodPreview();
+		if (s_ov < 0 || s_ov >= TIME_OF_DAY_COUNT) s_ov = 0;
+	}
+	return s_ov == (Int)TIME_OF_DAY_NIGHT;
+}
+
 void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 {
 	if (TheLampStore == nullptr)
 		return;
+	{
+		// GeneralsX @debug Qoder 20/10/2026 Forward: bounded call probe. The lamp gate runs only when
+		// this function is reached; a scene that never calls it leaves every lamp light uncreated.
+		static const Bool s_trace = (getenv("GENERALSX_LAMPLIGHT_LOG") != nullptr)
+			&& (atoi(getenv("GENERALSX_LAMPLIGHT_LOG")) != 0);
+		if (s_trace) {
+			static int s_calls = 0;
+			if (s_calls < 12) {
+				++s_calls;
+				Drawable* d = getDrawable();
+				fprintf(stderr, "[LAMP] updateLamps #%d draw=%p tpl=%s enabled=%d\n", s_calls, (void*)d,
+					(d && d->getTemplate()) ? d->getTemplate()->getName().str() : "(null)",
+					(int)TheLampStore->getGlobalLampsEnabled());
+				fflush(stderr);
+			}
+		}
+	}
 	// GeneralsX @feature PS3.0 4E 17/10/2026: env wins, else the Graphics Options page key
 	// Options.ini LampLightEffect (default ON).
 	// GeneralsX @feature Qoder 18/10/2026: the gate is now live - LampStore owns it (the options page
@@ -2191,6 +2229,16 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		return;
 	}
 
+	// Real model extent, not the small INI footprint: a power plant's cooling towers stand far outside
+	// its GeometryMajorRadius, so a lamp radius derived from the template cannot reach them.
+	Real modelRadius = 0.0f;
+	if (m_renderObject != nullptr)
+	{
+		const SphereClass& bs = m_renderObject->Get_Bounding_Sphere();
+		const Real s = worldMtx.Get_X_Vector().Length();
+		modelRadius = bs.Radius * ((s > 1e-4f) ? s : 1.0f);
+	}
+
 	if (!m_lampSetResolved)
 	{
 		// lazy one-time lookup; the store never removes entries at runtime, so caching the pointer is safe.
@@ -2209,7 +2257,13 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 	}
 
 	if (m_lampSet == nullptr || m_lampSet->getNumLamps() <= 0)
+	{
+		// No authored lamps (defensive structures, several tech buildings). Give every real structure
+		// one fallback fixture so the night pass does not leave whole buildings black.
+		updatePerimeterLights(worldMtx, modelRadius);
+		updateStructureLight(worldMtx, modelRadius);
 		return;
+	}
 
 	if (W3DDisplay::m_3DScene == nullptr)
 		return;
@@ -2256,7 +2310,10 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		Vector3 worldPos = worldMtx.Rotate_Vector(localPos);
 		worldPos += worldMtx.Get_Translation();
 
-		Real intensity = def->m_intensity * TheLampStore->getGlobalIntensityGain();
+		// Night needs more punch than the retail lamp recipe: the surfaces around a lamp are lit only by
+		// that lamp, and the reference look has buildings glowing into their own yard. Presentation-only.
+		const Real nightGain = isNightRenderTOD() ? 1.28f : 1.0f;   // user verdict: lamps a touch dimmer at night
+		Real intensity = def->m_intensity * TheLampStore->getGlobalIntensityGain() * nightGain;
 		if (def->m_flickerPeriodFrames > 0 && def->m_flickerAmp > 0.0f)
 		{
 			// smooth periodic breathing; per-instance random phase + per-lamp offset desynchronizes lamps
@@ -2266,14 +2323,254 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		}
 		if (intensity < 0.0f)
 			intensity = 0.0f;
-		if (intensity > 1.0f)
-			intensity = 1.0f;
+		if (intensity > 2.0f)
+			intensity = 2.0f;	// night gain may exceed the daytime cap; the data stays <=0.6
 
 		light->Set_Intensity(intensity);
 		light->Set_Ambient(Vector3(def->m_color.red * 0.5f, def->m_color.green * 0.5f, def->m_color.blue * 0.5f));
 		light->Set_Diffuse(Vector3(def->m_color.red, def->m_color.green, def->m_color.blue));
-		light->Set_Far_Attenuation_Range(2.0f, (def->m_radius > 3.0f) ? def->m_radius : 3.0f);
+		Real radius = ((def->m_radius > 3.0f) ? def->m_radius : 3.0f) * ((nightGain > 1.0f) ? 1.25f : 1.0f);
+		// Large models (power plant towers, airfield hangars) sit outside the authored reach.
+		if (modelRadius > 0.0f && radius < modelRadius * 1.15f)
+			radius = modelRadius * 1.15f;
+		light->Set_Far_Attenuation_Range(2.0f, radius);
 		light->Set_Position(worldPos);
+
+		// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: a second, low emitter for the same lamp. The
+		// data lamp sits above the eaves (roof glow), so the walls and the yard only saw grazing light.
+		// This one sits 3 units above the ground under it and lights the wall base and a real pool on
+		// the ground; it is night-only so the daytime look is untouched.
+		if (nightGain > 1.0f)
+		{
+			if ((Int)m_lampWashLights.size() < lampCount)
+				m_lampWashLights.resize(lampCount, nullptr);
+			W3DDynamicLight* wash = m_lampWashLights[i];
+			if (wash == nullptr)
+			{
+				wash = W3DDisplay::m_3DScene->getADynamicLight();
+				if (wash != nullptr)
+				{
+					m_lampWashLights[i] = wash;
+					wash->Set_Flag(LightClass::FAR_ATTENUATION, true);
+				}
+			}
+			if (wash != nullptr)
+			{
+				Real groundZ = worldPos.Z;
+				if (TheTerrainLogic != nullptr)
+					groundZ = TheTerrainLogic->getGroundHeight(worldPos.X, worldPos.Y);
+				wash->setEnabled(TRUE);
+				wash->setFrameFade(0, 0);
+				wash->Set_Position(Vector3(worldPos.X, worldPos.Y, groundZ + 3.0f));
+				wash->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+				wash->Set_Diffuse(Vector3(def->m_color.red, def->m_color.green, def->m_color.blue));
+				wash->Set_Intensity(intensity * 0.5f);
+				wash->Set_Far_Attenuation_Range(2.0f, radius * 0.85f);
+			}
+		}
+	}
+	updatePerimeterLights(worldMtx, modelRadius);
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: one forward light per ground vehicle at night. The
+// point it emits from sits ahead of the hull (+X is the W3D facing axis) so the road in front and the
+// ground beside it pick up a real falloff pool in both the GN body shader and the terrain shader.
+// Render-side only; the pooled light is borrowed exactly like a building lamp.
+//-------------------------------------------------------------------------------------------------
+void W3DModelDraw::updateHeadlights(const Matrix3D& worldMtx)
+{
+	if (!isNightRenderTOD() || TheLampStore == nullptr || !TheLampStore->getGlobalLampsEnabled())
+	{
+		releaseHeadlights();
+		return;
+	}
+
+	Drawable* draw = getDrawable();
+	const ThingTemplate* tt = (draw != nullptr) ? draw->getTemplate() : nullptr;
+	if (tt == nullptr || !tt->isKindOf(KINDOF_VEHICLE) || tt->isKindOf(KINDOF_AIRCRAFT) ||
+		draw->isDrawableEffectivelyHidden() || m_fullyObscuredByShroud)
+	{
+		releaseHeadlights();
+		return;
+	}
+
+	if (W3DDisplay::m_3DScene == nullptr)
+		return;
+
+	W3DDynamicLight* light = m_headlightLight;
+	if (light == nullptr)
+	{
+		light = W3DDisplay::m_3DScene->getADynamicLight();
+		if (light == nullptr)
+			return;	// pool exhausted this frame; retry on the next transform update
+		m_headlightLight = light;
+		light->Set_Flag(LightClass::FAR_ATTENUATION, true);
+	}
+
+	light->setEnabled(TRUE);
+	light->setFrameFade(0, 0);	// we own its lifecycle while it stays in front of the hull
+
+	// The emitter has to clear the hull: at +11 units the pool fell under the tank where nothing can
+	// see it. +22 puts the bright core on the road in front of the bumper, which is the look the
+	// reference wants (a lit strip of ground ahead of each vehicle).
+	const Vector3 fwd = worldMtx.Get_X_Vector();
+	Vector3 pos = worldMtx.Get_Translation();
+	pos += fwd * 22.0f;
+	pos.Z += 5.0f;
+	light->Set_Position(pos);
+	light->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+	light->Set_Diffuse(Vector3(1.0f, 0.92f, 0.78f));
+	light->Set_Intensity(1.4f);
+	light->Set_Far_Attenuation_Range(3.0f, 45.0f);
+}
+
+void W3DModelDraw::releaseHeadlights()
+{
+	if (m_headlightLight != nullptr)
+	{
+		m_headlightLight->setFrameFade(0, 5);
+		m_headlightLight->setDecayRange();
+		m_headlightLight->setDecayColor();
+		m_headlightLight = nullptr;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: fallback fixture for structures with no LampList entry
+// (defensive towers, several tech buildings). One warm point light at the model's bound centre, with a
+// reach derived from the actual render bounds so large objects are covered too. Render-side only.
+//-------------------------------------------------------------------------------------------------
+void W3DModelDraw::updateStructureLight(const Matrix3D& worldMtx, Real modelRadius)
+{
+	if (!isNightRenderTOD() || TheLampStore == nullptr || !TheLampStore->getGlobalLampsEnabled() ||
+		modelRadius < 8.0f || m_renderObject == nullptr)
+	{
+		releaseStructureLight();
+		return;
+	}
+
+	Drawable* draw = getDrawable();
+	const ThingTemplate* tt = (draw != nullptr) ? draw->getTemplate() : nullptr;
+	if (tt == nullptr || !tt->isKindOf(KINDOF_STRUCTURE) ||
+		tt->isKindOf(KINDOF_DEFENSIVE_WALL) || tt->isKindOf(KINDOF_PORTABLE_STRUCTURE) ||
+		draw->isDrawableEffectivelyHidden() || m_fullyObscuredByShroud)
+	{
+		releaseStructureLight();
+		return;
+	}
+
+	if (W3DDisplay::m_3DScene == nullptr)
+		return;
+
+	W3DDynamicLight* light = m_structureLight;
+	if (light == nullptr)
+	{
+		light = W3DDisplay::m_3DScene->getADynamicLight();
+		if (light == nullptr)
+			return;
+		m_structureLight = light;
+		light->Set_Flag(LightClass::FAR_ATTENUATION, true);
+	}
+
+	light->setEnabled(TRUE);
+	light->setFrameFade(0, 0);
+
+	Vector3 center;
+	Matrix3D::Transform_Vector(worldMtx, m_renderObject->Get_Bounding_Sphere().Center, &center);
+	center.Z += modelRadius * 0.35f;
+	light->Set_Position(center);
+	light->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+	light->Set_Diffuse(Vector3(1.0f, 0.82f, 0.62f));
+	light->Set_Intensity(0.6f);
+	light->Set_Far_Attenuation_Range(2.0f, modelRadius * 1.2f);
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: very large structures (the power plant's cooling
+// towers, airfield hangars) have their visible volume far outside the authored lamp positions. Four
+// mid-height emitters sit just outside the model's world AABB, so the outer faces of those volumes
+// catch real falloff light instead of staying black next to a lit yard.
+//-------------------------------------------------------------------------------------------------
+void W3DModelDraw::updatePerimeterLights(const Matrix3D& worldMtx, Real modelRadius)
+{
+	if (!isNightRenderTOD() || TheLampStore == nullptr || !TheLampStore->getGlobalLampsEnabled() ||
+		modelRadius < 40.0f || m_renderObject == nullptr || W3DDisplay::m_3DScene == nullptr)
+	{
+		releasePerimeterLights();
+		return;
+	}
+
+	Drawable* draw = getDrawable();
+	const ThingTemplate* tt = (draw != nullptr) ? draw->getTemplate() : nullptr;
+	if (tt == nullptr || !tt->isKindOf(KINDOF_STRUCTURE) ||
+		tt->isKindOf(KINDOF_DEFENSIVE_WALL) || tt->isKindOf(KINDOF_PORTABLE_STRUCTURE) ||
+		draw->isDrawableEffectivelyHidden() || m_fullyObscuredByShroud)
+	{
+		releasePerimeterLights();
+		return;
+	}
+
+	const AABoxClass& bb = m_renderObject->Get_Bounding_Box();
+	const Vector3 c = bb.Center;
+	const Vector3 e = bb.Extent;
+	const Vector3 sides[4] = {
+		c + Vector3(e.X, 0.0f, 0.0f),
+		c - Vector3(e.X, 0.0f, 0.0f),
+		c + Vector3(0.0f, e.Y, 0.0f),
+		c - Vector3(0.0f, e.Y, 0.0f),
+	};
+
+	if (m_perimeterLights.size() < 4)
+		m_perimeterLights.resize(4, nullptr);
+
+	for (Int i = 0; i < 4; ++i)
+	{
+		W3DDynamicLight* light = m_perimeterLights[i];
+		if (light == nullptr)
+		{
+			light = W3DDisplay::m_3DScene->getADynamicLight();
+			if (light == nullptr)
+				break;
+			m_perimeterLights[i] = light;
+			light->Set_Flag(LightClass::FAR_ATTENUATION, true);
+		}
+		Vector3 pos;
+		Matrix3D::Transform_Vector(worldMtx, sides[i], &pos);
+		pos.Z += e.Z * 0.55f;	// mid-upper: the base is covered by the wash/lamps, this ring lights tall shells
+		light->setEnabled(TRUE);
+		light->setFrameFade(0, 0);
+		light->Set_Position(pos);
+		light->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+		light->Set_Diffuse(Vector3(1.0f, 0.8f, 0.6f));
+		light->Set_Intensity(0.6f);
+		light->Set_Far_Attenuation_Range(2.0f, modelRadius * 1.05f);
+	}
+}
+
+void W3DModelDraw::releasePerimeterLights()
+{
+	for (size_t i = 0; i < m_perimeterLights.size(); ++i)
+	{
+		W3DDynamicLight* light = m_perimeterLights[i];
+		if (light != nullptr)
+		{
+			light->setFrameFade(0, 5);
+			light->setDecayRange();
+			light->setDecayColor();
+		}
+	}
+	m_perimeterLights.clear();
+}
+
+void W3DModelDraw::releaseStructureLight()
+{
+	if (m_structureLight != nullptr)
+	{
+		m_structureLight->setFrameFade(0, 5);
+		m_structureLight->setDecayRange();
+		m_structureLight->setDecayColor();
+		m_structureLight = nullptr;
 	}
 }
 
@@ -2295,6 +2592,19 @@ void W3DModelDraw::releaseLamps()
 		}
 	}
 	m_lampLights.clear();
+	for (size_t i = 0; i < m_lampWashLights.size(); ++i)
+	{
+		W3DDynamicLight* light = m_lampWashLights[i];
+		if (light != nullptr)
+		{
+			light->setFrameFade(0, 5);
+			light->setDecayRange();
+			light->setDecayColor();
+		}
+	}
+	m_lampWashLights.clear();
+	releasePerimeterLights();
+	releaseStructureLight();
 }
 
 
@@ -3999,7 +4309,29 @@ Bool W3DModelDraw::handleWeaponFireFX(WeaponSlotType wslot, Int specificBarrelTo
 		recoil.m_state = WeaponRecoilInfo::RECOIL_START;
 		recoil.m_recoilRate = getW3DModelDrawModuleData()->m_initialRecoil;
 		if (info.m_muzzleFlashBone != 0)
+		{
 			info.setMuzzleFlashHidden(m_renderObject, false);
+			// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: a real muzzle light, not just the emissive
+			// flash subobject. It lives for a handful of frames on a pooled dynamic light and feeds the
+			// same Forward+ list as the building lamps, so the shot visibly lights the tank, the ground
+			// and nearby structures (GN/GNM + terrain shaders).
+			if (m_renderObject != nullptr && W3DDisplay::m_3DScene != nullptr)
+			{
+				const Matrix3D& boneMtx = m_renderObject->Get_Bone_Transform(info.m_muzzleFlashBone);
+				W3DDynamicLight* flash = W3DDisplay::m_3DScene->getADynamicLight();
+				if (flash != nullptr)
+				{
+					flash->setEnabled(TRUE);
+					flash->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
+					flash->Set_Diffuse(Vector3(1.0f, 0.62f, 0.28f));
+					flash->Set_Position(boneMtx.Get_Translation());
+					flash->Set_Intensity(1.5f);
+					flash->Set_Far_Attenuation_Range(3.0f, 40.0f);
+					flash->setFrameFade(0, 4);
+					flash->Set_Flag(LightClass::FAR_ATTENUATION, true);
+				}
+			}
+		}
 	}
 
 	return handled;

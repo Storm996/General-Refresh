@@ -615,6 +615,23 @@ void MainMenuInit( WindowLayout *layout, void *userData )
 			GadgetButtonSetText( buttonGraphics, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
 	}
 
+	// GeneralsX @debug Qoder 21/10/2026 layout/initQA hook: open the graphics page once from the shell
+	// when GENERALSX_GFX_TEST=1, so a startup regression can be reproduced without a mouse.
+	{
+		extern void OpenGraphicsOptionsLayout();
+		static Bool s_gfxTestOpened = FALSE;
+		const char *gfxTest = getenv( "GENERALSX_GFX_TEST" );
+		if( !s_gfxTestOpened && gfxTest && *gfxTest && atoi( gfxTest ) != 0 )
+		{
+			s_gfxTestOpened = TRUE;
+			fprintf( stderr, "[GFXOPT] test open from MainMenuInit\n" );
+			fflush( stderr );
+			OpenGraphicsOptionsLayout();
+			fprintf( stderr, "[GFXOPT] test open returned\n" );
+			fflush( stderr );
+		}
+	}
+
 	dropDownWindows[DROPDOWN_SINGLE] = TheWindowManager->winGetWindowFromId( parentMainMenu, TheNameKeyGenerator->nameToKey( "MainMenu.wnd:MapBorder" ));
 	dropDownWindows[DROPDOWN_MULTIPLAYER] = TheWindowManager->winGetWindowFromId( parentMainMenu, TheNameKeyGenerator->nameToKey( "MainMenu.wnd:MapBorder1" ) );
 	dropDownWindows[DROPDOWN_MAIN] = TheWindowManager->winGetWindowFromId( parentMainMenu, TheNameKeyGenerator->nameToKey( "MainMenu.wnd:MapBorder2" ) );

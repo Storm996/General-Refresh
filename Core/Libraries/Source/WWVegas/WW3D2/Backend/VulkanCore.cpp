@@ -53,6 +53,47 @@ Vkfns G = {};
 void vktex_shutdown(VkDevice dev);
 void vkrt_shutdown(VkDevice dev); // wedge 3.4 render-target/depth mirror teardown
 
+// GeneralsX @feature Qoder 20/10/2026 standalone exe defaults: the pure-Vulkan backend used to need an
+// eleven-line launcher script (VKCORE/VKPRESENT/VKGEO/VKTEX/VKRT/VKDESC/VKDRAW/VKFFVERT/VKFFPIX/VKPGM
+// and VK_NOD3D). Those gates are still the contract, but a shipping exe should not depend on a script:
+// this constructor runs before WinMain and fills in any gate the user did not set explicitly. An
+// explicit value (including 0) always wins, so every QA A/B leg keeps working unchanged.
+//
+// GENERALSX_VK_PURE=0 opts the whole defaulting step out, which is the one switch a developer needs to
+// drive the build back to its env-driven mode without touching eleven variables.
+static void vk_install_pure_runtime_defaults()
+{
+    char v[8] = {};
+    if (GetEnvironmentVariableA("GENERALSX_VK_PURE", v, (DWORD)sizeof(v)) > 0 && v[0] == '0')
+        return;
+    static const char* const gates[] = {
+        "GENERALSX_VKCORE", "GENERALSX_VKPRESENT", "GENERALSX_VKGEO",
+        "GENERALSX_VKTEX", "GENERALSX_VKRT", "GENERALSX_VKDESC",
+        "GENERALSX_VKDRAW", "GENERALSX_VKFFVERT", "GENERALSX_VKFFPIX",
+        "GENERALSX_VKPGM", "GENERALSX_VK_NOD3D",
+    };
+    unsigned filled = 0;
+    for (unsigned i = 0; i < (unsigned)(sizeof(gates) / sizeof(gates[0])); ++i) {
+        if (GetEnvironmentVariableA(gates[i], v, (DWORD)sizeof(v)) == 0) {
+            // _putenv_s updates both the process environment (read by GetEnvironmentVariableA) and the
+            // CRT copy (read by getenv), which the NOD3D checks in dx8vertexbuffer / WinMain use.
+            _putenv_s(gates[i], "1");
+            ++filled;
+        }
+    }
+    if (filled) {
+        fprintf(stderr, "[VKPURE] standalone defaults: filled %u unset Vulkan gate(s); "
+            "set GENERALSX_VK_PURE=0 to disable and drive them from the environment\n", filled);
+        fflush(stderr);
+    }
+}
+
+struct VKPureRuntimeDefaults {
+    VKPureRuntimeDefaults() { vk_install_pure_runtime_defaults(); }
+};
+static VKPureRuntimeDefaults g_vkPureRuntimeDefaults;
+
+
 bool VulkanCore::loadLoader()
 {
     m_loader = LoadLibraryA("vulkan-1.dll");
@@ -679,6 +720,37 @@ void* VKGeo_Alloc(unsigned size, bool discard)
     return g_vulkanCore->Geo_Alloc(size, discard);
 }
 
+// ---- mirror identity (R-07): the recycled-pointer guard both tables share ------------------
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: both mirror tables are keyed by a raw D3D object pointer and
+// the allocator recycles those addresses. The shape guard catches the reuse only when width, height,
+// level count or format differ; a recycled 256x256 DXT1 landing on a dead 256x256 DXT1 was invisible and
+// the new owner sampled the dead texture's texels. The backend that owns the objects answers with a
+// per-object token, stored on the mirror at create and required at every lookup, so a reuse can neither
+// inherit an image nor keep one after its owner dies. 0 means "nobody can name this object", which is the
+// state of the d3d9/DXVK path and of the keys this layer owns itself (the scene mirror, the probes).
+VKMirror_Identify g_vkIdentify = nullptr;
+
+void VK_Set_Mirror_Identity_Fn(VKMirror_Identify fn) { g_vkIdentify = fn; }
+
+static unsigned long long vk_mirror_identity(void* key)
+{
+    if (!g_vkIdentify || !key) return 0ull;
+    return g_vkIdentify(key);
+}
+
+// The census a forensic run reads: every time a mirror is found to belong to a dead object, one line names
+// the table, the pointer and both tokens. Budgeted, because the load-time burst (hundreds of recycled
+// texture addresses in the first frames) would otherwise fill the log.
+static unsigned long long g_vkIdentDrops = 0ull;
+static void vk_log_ident_drop(const char* table, void* key, unsigned long long built, unsigned long long live)
+{
+    ++g_vkIdentDrops;
+    if (g_vkIdentDrops <= 64ull) {
+        VKWP1_LOG("mirror identity drop: %s key=%p built=%llu live=%llu total=%llu",
+            table, key, built, live, g_vkIdentDrops);
+    }
+}
+
 // ---- wedge 3.2: static texture mirror ----------------------------------------------
 // GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.2: every fully-loaded MANAGED texture is
 // mirrored into its own device-local VkImage through a growable host-visible staging buffer.
@@ -712,7 +784,11 @@ struct VKTexFmtInfo {
 // it when every field matches - a genuine in-place CPU update (terrain atlas, water bump) matches and
 // re-uploads, while a recycled-pointer mismatch destroys the old image and creates a fresh one instead
 // of recording an illegal copy into it (which is what device-lost the first mirror submit here).
-struct VKTexImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h, levels; VkFormat vkf; VkImageView view; unsigned long long hash; unsigned reups; };
+// GeneralsX @bugfix Qoder 21/10/2026 multi-match exhaustion: 'size' is the image's allocation estimate.
+// TX.vramBytes is the LIVE total (create adds, every drop/replace subtracts); without the per-entry size
+// the budget could only ever grow and, once over 3 GiB, refused every later mirror forever - the fonts
+// went white first and the next map lost every texture.
+struct VKTexImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h, levels; VkFormat vkf; VkImageView view; unsigned long long hash; unsigned reups; unsigned long long ident; unsigned long long size; };
 
 // GeneralsX @performance Qoder 19/10/2026 R-05 wave 9: async mirror upload ring. The R8 probe put
 // 4-16 ms of every glyph-atlas page turn inside _Copy_DX8_Rects, and the only ms-scale item that
@@ -1091,6 +1167,7 @@ void vktex_shutdown(VkDevice dev)
         vktex_shutdown_up_locked(dev);
     }
     TX.imgs.clear();
+    TX.vramBytes = 0;
     TX.stage = nullptr; TX.stageMem = nullptr; TX.stageMap = nullptr; TX.stageCap = 0;
 }
 
@@ -1129,6 +1206,20 @@ bool VKTex_Query(void* key, VKTex_Info* out)
     if (!VKTex_Ready() || !key) return false;
     vk_queue_lock();
     VKTexImg* e = vktex_find(key);
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: the answer must belong to whoever holds this pointer NOW.
+    // A mirror whose owner died (or whose address was handed to a newer object) is retired here rather
+    // than sampled: the caller gets a miss, which the draw path resolves to the built-in white, and the
+    // next upload from the live object rebuilds the mirror under the same key.
+    if (e && g_vkIdentify) {
+        const unsigned long long live = vk_mirror_identity(key);
+        if (e->ident != live) {
+            vk_log_ident_drop("tex", key, e->ident, live);
+            g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+            TX.vramBytes = (TX.vramBytes >= e->size) ? (TX.vramBytes - e->size) : 0ull;
+            TX.imgs.erase(TX.imgs.begin() + (long)(e - &TX.imgs[0]));
+            e = nullptr;
+        }
+    }
     if (e) {
         out->image = (void*)e->img;
         out->view = (void*)e->view;
@@ -1151,6 +1242,9 @@ void VKTex_Drop(void* key)
     VKTexImg* e = vktex_find(key);
     if (e) {
         g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+        // GeneralsX @bugfix Qoder 21/10/2026: keep the budget honest. The image is leaving this table
+        // now; the reaper only delays the actual vkFreeMemory by the in-flight window.
+        TX.vramBytes = (TX.vramBytes >= e->size) ? (TX.vramBytes - e->size) : 0ull;
         TX.imgs.erase(TX.imgs.begin() + (long)(e - &TX.imgs[0]));
     }
     vk_queue_unlock();
@@ -1167,14 +1261,18 @@ static bool vktex_upload_2d_locked(unsigned width, unsigned height, unsigned lev
 
     VKTexImg* existing = vktex_find(key);
     unsigned carriedReups = 0;
+    const unsigned long long ident = vk_mirror_identity(key);
     if (existing && (existing->w != width || existing->h != height ||
-                     existing->levels != levels || existing->vkf != f.vkf)) {
+                     existing->levels != levels || existing->vkf != f.vkf ||
+                     existing->ident != ident)) {
         // Recycled D3D address: same pointer, different texture. Do NOT copy into this image -
         // release it and fall through to the create path (re-inserted under the same key below).
         // The old image may still be sampled by a frame that is already submitted, so it goes to the
         // reaper instead of being destroyed here (wedge 5 made these images live in real draw graphs).
+        // GeneralsX @bugfix Qoder 20/10/2026 R-07: the identity term is the one that catches a reuse the
+        // shape guard could see at all - same extent, same format, same level count, different owner.
         g_vulkanCore->Retire_Mirror(existing->img, existing->view, existing->mem);
-        TX.vramBytes -= 0; // vram is recomputed on the fresh create below
+        TX.vramBytes = (TX.vramBytes >= existing->size) ? (TX.vramBytes - existing->size) : 0ull;
         size_t idx = (size_t)(existing - &TX.imgs[0]);
         // GeneralsX @feature Qoder 19/10/2026 R-04 census: carry the lifetime reupload count through
         // a recycled-address rebuild, else "reup top" restarts at zero every time the allocator
@@ -1183,10 +1281,14 @@ static bool vktex_upload_2d_locked(unsigned width, unsigned height, unsigned lev
         TX.imgs.erase(TX.imgs.begin() + (long)idx);
         existing = nullptr;
     }
-    if (!existing && (TX.imgs.size() >= 8192 || TX.vramBytes >= (3ull << 30))) {
+    // GeneralsX @bugfix Qoder 21/10/2026 multi-match exhaustion: both terms describe what is LIVE now
+    // (every drop subtracts), so a heavy map load can push the budget over and the following releases
+    // bring it back. The image-count ceiling is a guard against pathological churn, not a map budget:
+    // one campaign map plus the menu can legitimately keep more than the old 8192 live entries.
+    if (!existing && (TX.imgs.size() >= 32768 || TX.vramBytes >= (3ull << 30))) {
         if (!TX.budgetWarned) {
             TX.budgetWarned = true;
-            VKWP1_LOG("tex mirror budget hit (8192 images / 3 GiB) - skipping further mirrors until wedge 5 eviction wiring");
+            VKWP1_LOG("tex mirror budget hit (32768 live images / 3 GiB live) - skipping new mirrors until releases drop it");
         }
         ++TX.budgetSkips; return false;
     }
@@ -1482,7 +1584,7 @@ static bool vktex_upload_2d_locked(unsigned width, unsigned height, unsigned lev
             ++TX.fmtSkips;
             return false;
         }
-        TX.imgs.push_back({ key, img, mem, width, height, levels, f.vkf, v, hashed ? srcHash : 0ull, carriedReups });
+        TX.imgs.push_back({ key, img, mem, width, height, levels, f.vkf, v, hashed ? srcHash : 0ull, carriedReups, ident, ireq.size });
         ++TX.uploads;
         TX.vramBytes += ireq.size;
     } else {
@@ -1534,7 +1636,9 @@ namespace {
 // Wedge 4 adds the view: an RT mirror that nothing can sample is only half a mirror. The shadow chain,
 // the bloom composite and (from wedge 5) the present chain all bind render targets as textures, and the
 // aspect follows the image kind (depth mirrors get a DEPTH aspect view).
-struct VKRTImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h; VkFormat vkf; bool depth; VkImageView view; VkImageLayout layout; };
+// GeneralsX @bugfix Qoder 21/10/2026: 'size' mirrors the texture table - RT.vramBytes is live usage,
+// subtracted on every replace/drop, so a map's offscreen pair cannot exhaust the budget permanently.
+struct VKRTImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h; VkFormat vkf; bool depth; VkImageView view; VkImageView sampleView; VkImageLayout layout; unsigned long long ident; unsigned long long size; };
 
 struct VKRTStateT {
     std::vector<VKRTImg> imgs;
@@ -1695,16 +1799,25 @@ bool vkrt_create_locked(void* key, unsigned w, unsigned h, VkFormat vkf, bool de
     VkDevice dev = g_vulkanCore->Device();
     if (!w || !h) { ++RT.fmtSkips; return false; }
     VKRTImg* existing = vkrt_find(key);
-    if (existing && (existing->w != w || existing->h != h || existing->vkf != vkf || existing->depth != depth)) {
+    const unsigned long long ident = vk_mirror_identity(key);
+    if (existing && (existing->w != w || existing->h != h || existing->vkf != vkf ||
+                     existing->depth != depth || existing->ident != ident)) {
         // Same shape-guard reason as the texture mirror, and the same reason it now matters: wedge 5
-        // renders into these, so a frame in flight can still name this image.
+        // renders into these, so a frame in flight can still name this image. The identity term covers the
+        // case the shape guard cannot see at all: W3DShaderManager::init re-creates its offscreen pair at
+        // the same extent and format on every height-map rebuild, so the new target used to inherit the
+        // retired one's bytes and the screen filter read last map's noise.
         g_vulkanCore->Retire_Mirror(existing->img, existing->view, existing->mem);
+        if (existing->sampleView && existing->sampleView != existing->view)
+            g_vulkanCore->Retire_Mirror(nullptr, existing->sampleView, nullptr);
+        RT.vramBytes = (RT.vramBytes >= existing->size) ? (RT.vramBytes - existing->size) : 0ull;
         size_t idx = (size_t)(existing - &RT.imgs[0]);
         RT.imgs.erase(RT.imgs.begin() + (long)idx);
         existing = nullptr;
     }
     if (existing) return true; // already mirrored with this shape
-    if (RT.imgs.size() >= 1024 || RT.vramBytes >= (2ull << 30)) {
+    // Live terms only (replace/drop subtract); the old 1024/2 GiB values were lifetime totals in practice.
+    if (RT.imgs.size() >= 4096 || RT.vramBytes >= (2ull << 30)) {
         ++RT.budgetSkips; return false;
     }
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -1743,7 +1856,21 @@ bool vkrt_create_locked(void* key, unsigned w, unsigned h, VkFormat vkf, bool de
         ++RT.fmtSkips;
         return false;
     }
-    RT.imgs.push_back({ key, img, mem, w, h, vkf, depth, v, VK_IMAGE_LAYOUT_UNDEFINED });
+    // The attachment view above has both aspects, which is what a stencil pipeline needs. The same view
+    // cannot also be bound as a sampled image (Vulkan only allows one aspect there), so a depth+stencil
+    // mirror gets a second DEPTH-only view for readers. Color mirrors sample through 'v' directly.
+    VkImageView sample = v;
+    if (depth && (viewAspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        sample = vktex_make_view(dev, img, vkf, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (!sample) {
+            G.vkDestroyImageView(dev, v, nullptr);
+            G.vkFreeMemory(dev, mem, nullptr);
+            G.vkDestroyImage(dev, img, nullptr);
+            ++RT.fmtSkips;
+            return false;
+        }
+    }
+    RT.imgs.push_back({ key, img, mem, w, h, vkf, depth, v, sample, VK_IMAGE_LAYOUT_UNDEFINED, ident, ireq.size });
     RT.vramBytes += ireq.size;
     if (depth) ++RT.depths; else ++RT.colors;
     return true;
@@ -1985,6 +2112,100 @@ bool VKRT_Mirror_Readback(void* key, const unsigned char* bits, unsigned int pit
     return r;
 }
 
+// GeneralsX @bugfix Qoder 21/10/2026 SHADOWRT: GPU copy from a render-target mirror into a texture
+// mirror. W3DProjectedShadow::updateTexture bakes each caster into one shared RT and then "copies"
+// it into that caster's permanent shadow texture through D3D9 GetRenderTargetData/Surface::Copy.
+// Under the pure-Vulkan facade the D3D9 surface store is empty, so that copy hands back zeros and
+// every shadow texture mirrored black - the multiplicative decal then darkens its whole quad. The
+// baked pixels only exist in the RT's VkImage, so move them image-to-image instead. Called after the
+// bake's nested End_Render has submitted the frame, so the one-time submit below is queue-ordered
+// after the render that produced the source pixels.
+bool VKTex_Copy_RT_To_Texture(void* dst_texture, void* src_render_target,
+                              unsigned width, unsigned height)
+{
+#if defined(SAGE_USE_VULKAN_CORE)
+    if (!VKRT_Ready() || !g_vulkanCore || !dst_texture || !src_render_target) return false;
+    vk_queue_lock();
+    VKTexImg* d = vktex_find(dst_texture);
+    VKRTImg* s = vkrt_find(src_render_target);
+    bool ok = d && s && d->img && s->img && d->vkf == s->vkf;
+    if (!ok) {
+        vk_queue_unlock();
+        return false;
+    }
+    if (!width)  width  = d->w;
+    if (!height) height = d->h;
+    if (width > d->w || height > d->h || width > s->w || height > s->h) {
+        vk_queue_unlock();
+        return false;
+    }
+
+    VkDevice dev = g_vulkanCore->Device();
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = g_vulkanCore->Pool();
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cb = nullptr;
+    if (!chk("AllocCmd(shadowrt)", G.vkAllocateCommandBuffers(dev, &cai, &cb))) {
+        vk_queue_unlock();
+        return false;
+    }
+    VkCommandBufferBeginInfo bb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    ok = chk("BeginCmd(shadowrt)", G.vkBeginCommandBuffer(cb, &bb));
+    if (ok) {
+        const VkImageLayout srcFrom = s->layout;
+        vkrt_cmd_barrier(cb, s->img, 1, false, false, srcFrom, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkrt_cmd_barrier(cb, d->img, 1, false, false,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkImageBlit region = {};
+        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.srcOffsets[0] = { 0, 0, 0 };
+        region.srcOffsets[1] = { (int32_t)width, (int32_t)height, 1 };
+        region.dstOffsets[0] = { 0, 0, 0 };
+        region.dstOffsets[1] = { (int32_t)width, (int32_t)height, 1 };
+        G.vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+
+        vkrt_cmd_barrier(cb, d->img, 1, false, false,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        vkrt_cmd_barrier(cb, s->img, 1, false, false,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcFrom);
+        ok = chk("EndCmd(shadowrt)", G.vkEndCommandBuffer(cb));
+    }
+    if (ok) {
+        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkFence fence = nullptr;
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cb;
+        ok = chk("Fence(shadowrt)", G.vkCreateFence(dev, &fi, nullptr, &fence)) &&
+             chk("Submit(shadowrt)", G.vkQueueSubmit(g_vulkanCore->Queue(), 1, &si, fence)) &&
+             chk("Wait(shadowrt)", G.vkWaitForFences(dev, 1, &fence, VK_TRUE, ~0ull));
+        if (fence) G.vkDestroyFence(dev, fence, nullptr);
+        if (ok) ++RT.readbacks;
+    }
+    G.vkFreeCommandBuffers(dev, g_vulkanCore->Pool(), 1, &cb);
+    vk_queue_unlock();
+    {
+        static int s_shadowRtLog = 0;
+        if (s_shadowRtLog < 12) {
+            ++s_shadowRtLog;
+            fprintf(stderr, "[SHADOWRT] dst=%p src=%p %ux%u fmt=%u ok=%d\n",
+                dst_texture, src_render_target, width, height, (unsigned)d->vkf, ok ? 1 : 0);
+            fflush(stderr);
+        }
+    }
+    return ok;
+#else
+    (void)dst_texture; (void)src_render_target; (void)width; (void)height;
+    return false;
+#endif
+}
+
+
 void VKRT_Run_Probe()
 {
     if (!VKRT_Ready()) return;
@@ -1997,13 +2218,29 @@ void vkrt_shutdown(VkDevice dev)
 {
     if (dev) {
         for (auto& e : RT.imgs) {
+            if (e.sampleView && e.sampleView != e.view) G.vkDestroyImageView(dev, e.sampleView, nullptr);
             if (e.view) G.vkDestroyImageView(dev, e.view, nullptr);
             if (e.img) G.vkDestroyImage(dev, e.img, nullptr);
             if (e.mem) G.vkFreeMemory(dev, e.mem, nullptr);
         }
     }
     RT.imgs.clear();
+    RT.vramBytes = 0;
 }
+
+#if defined(SAGE_USE_VULKAN_CORE)
+void VKDiag_Log_Mirror_State(const char* why)
+{
+    unsigned used = 0u, cap = 0u;
+    unsigned long long insertFails = 0ull;
+    VKD3D_Live_Stats(&used, &cap, &insertFails);
+    VKWP1_LOG("[VKMEM] %s: tex imgs=%zu live=%llu MiB up=%llu reup=%llu skip=%llu | rt imgs=%zu live=%llu MiB skip=%llu | live objects=%u/%u insertFail=%llu",
+        (why && *why) ? why : "?",
+        TX.imgs.size(), TX.vramBytes >> 20, TX.uploads, TX.reuploads, TX.budgetSkips,
+        RT.imgs.size(), RT.vramBytes >> 20, RT.budgetSkips,
+        used, cap, insertFails);
+}
+#endif
 
 // ---- wedge 5 accessors into the render-target mirror ---------------------------------------
 // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5: VulkanDraw.cpp records real frames against
@@ -2052,9 +2289,25 @@ bool VKRT_Query(void* key, VKRT_Info* out)
     if (!VKRT_Ready() || !key) return false;
     vk_queue_lock();
     VKRTImg* e = vkrt_find(key);
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: same identity rule as the texture mirror. The recorder
+    // resolves its current target and every sampled RT through this call, so an orphaned mirror here is
+    // how one map's noise reached the next map's screen filter.
+    if (e && g_vkIdentify) {
+        const unsigned long long live = vk_mirror_identity(key);
+        if (e->ident != live) {
+            vk_log_ident_drop("rt", key, e->ident, live);
+            g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+            if (e->sampleView && e->sampleView != e->view)
+                g_vulkanCore->Retire_Mirror(nullptr, e->sampleView, nullptr);
+            RT.vramBytes = (RT.vramBytes >= e->size) ? (RT.vramBytes - e->size) : 0ull;
+            RT.imgs.erase(RT.imgs.begin() + (long)(e - &RT.imgs[0]));
+            e = nullptr;
+        }
+    }
     if (e) {
         out->image = (void*)e->img;
         out->view = (void*)e->view;
+        out->sample_view = (void*)(e->sampleView ? e->sampleView : e->view);
         out->format = (unsigned)e->vkf;
         out->width = e->w; out->height = e->h;
         out->levels = 1;                      // every mirror is created single-mip
@@ -2063,6 +2316,24 @@ bool VKRT_Query(void* key, VKRT_Info* out)
     }
     vk_queue_unlock();
     return e != nullptr;
+}
+
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: forget an RT key at its owner's real death. The table had no
+// such entry point (VKTex_Drop is the only one in the tree), so a render target released by the engine left
+// its image registered under a pointer the allocator hands to the next object of the same shape.
+void VKRT_Drop(void* key)
+{
+    if (!key || !g_vulkanCore || !g_vulkanCore->IsReady() || !vkrt_env_on()) return;
+    vk_queue_lock();
+    VKRTImg* e = vkrt_find(key);
+    if (e) {
+        g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+        if (e->sampleView && e->sampleView != e->view)
+            g_vulkanCore->Retire_Mirror(nullptr, e->sampleView, nullptr);
+        RT.vramBytes = (RT.vramBytes >= e->size) ? (RT.vramBytes - e->size) : 0ull;
+        RT.imgs.erase(RT.imgs.begin() + (long)(e - &RT.imgs[0]));
+    }
+    vk_queue_unlock();
 }
 
 bool VKRT_Cmd_Transition(void* command_buffer, void* key, int to)
@@ -2349,7 +2620,7 @@ bool vkdesc_build()
     VkDevice dev = g_vulkanCore->Device();
 
     // ---- descriptor set layout: the one engine-wide binding surface ----
-    VkDescriptorSetLayoutBinding b[4] = {};
+    VkDescriptorSetLayoutBinding b[6] = {};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     // GeneralsX @feature Qoder 18/10/2026 Wedge 8: eight texture slots (was four) so terrain NM
     // can sample register s4. Existing twins that declare u_tex[4] stay legal: binding a shader
@@ -2367,16 +2638,32 @@ bool vkdesc_build()
     // wording; wedge 6 declares the block as a uniform block in GLSL.
     b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // GeneralsX @feature Qoder 22/10/2026 Forward+ night: binding 4 is the Forward+ light block for
+    // programs that share binding 3 with another stage. The PS-only terrain programs are paired with
+    // vkff.vert, which reads its fixed-function state from binding 3; a fragment program cannot also
+    // read the light block there without feeding the vertex stage the wrong bytes. Binding 4 is a
+    // static-offset UBO because the per-frame slot address is fixed for the whole slot (the set cache
+    // is per slot), so it adds no dynamic offset to any bind call.
+    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[4].descriptorCount = 1; b[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // GeneralsX @feature Qoder 22/10/2026 light shadows: binding 5 samples the strongest dynamic
+    // light's own depth map. Always written (white fallback), so a shader may declare it unconditionally.
+    b[5].binding = 5; b[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[5].descriptorCount = 1; b[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 4; lci.pBindings = b;
+    lci.bindingCount = 6; lci.pBindings = b;
     if (!chk("CreateDescriptorSetLayout", G.vkCreateDescriptorSetLayout(dev, &lci, nullptr, &D4.setLayout))) return false;
 
     // ---- pool ----
     const unsigned MAXSETS = 4096;
-    VkDescriptorPoolSize ps[2] = {
+    VkDescriptorPoolSize ps[4] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXSETS * 8u },
         // Three dynamic uniform bindings per set: vertex constants, pixel constants, lights.
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAXSETS * 3u },
+        // One static uniform binding per set: the Forward+ block at binding 4.
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAXSETS * 1u },
+        // Light-shadow map at binding 5 (one combined image sampler per set).
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXSETS * 1u },
     };
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -2384,7 +2671,7 @@ bool vkdesc_build()
     // array holds two - the ring split is vertex/pixel/lights but lights share the DYNAMIC_UNIFORM pool
     // size, so the third entry was a read past the end of ps[] (garbage type + count, and the loader
     // happily consumed it because validation layers are not installed on this host).
-    pci.maxSets = MAXSETS; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    pci.maxSets = MAXSETS; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
     if (!chk("CreateDescriptorPool", G.vkCreateDescriptorPool(dev, &pci, nullptr, &D4.pool))) return false;
 
     // ---- constant rings ----
@@ -2457,7 +2744,7 @@ bool vkdesc_write_set(VkDescriptorSet set, void* const views[8], void* const sam
         img[i].imageView = v;
         img[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    VkWriteDescriptorSet w[4] = {};
+    VkWriteDescriptorSet w[6] = {};
     unsigned n = 0;
     w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     w[n].dstSet = set; w[n].dstBinding = 0; w[n].descriptorCount = 8;
@@ -2478,6 +2765,22 @@ bool vkdesc_write_set(VkDescriptorSet set, void* const views[8], void* const sam
         w[n].dstSet = set; w[n].dstBinding = (uint32_t)(1 + i); w[n].descriptorCount = 1;
         w[n].descriptorType = typeOf[i]; w[n].pBufferInfo = &bi[i]; ++n;
     }
+    // GeneralsX @feature Qoder 22/10/2026: binding 4 must be written too (unwritten descriptors in a
+    // bound set are undefined). The probes' shaders do not declare it; any valid range from the lights
+    // ring satisfies the layout, and the draw path overwrites this binding with the real FP block.
+    VkDescriptorBufferInfo bfp = { D4.ring[VKDESC_RING_LIGHTS].buf, 0, 16 };
+    w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w[n].dstSet = set; w[n].dstBinding = 4; w[n].descriptorCount = 1;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[n].pBufferInfo = &bfp; ++n;
+    // Binding 5: the light-shadow map. The probes never declare it; the built-in white is a valid
+    // descriptor and the draw path overwrites this binding with the real map.
+    VkDescriptorImageInfo lsImg = {};
+    lsImg.sampler = D4.defSampler;
+    lsImg.imageView = D4.whiteView;
+    lsImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w[n].dstSet = set; w[n].dstBinding = 5; w[n].descriptorCount = 1;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &lsImg; ++n;
     G.vkUpdateDescriptorSets(dev, n, w, 0, nullptr);
     return true;
 }
@@ -3853,8 +4156,9 @@ enum {
     PX_TA_SPECULAR = 4, PX_TA_TEMP = 5, PX_TA_CONSTANT = 6,
     PX_TA_COMPLEMENT = 0x10, PX_TA_ALPHAREPLICATE = 0x20
 };
+// 1-based like D3DCMPFUNC; VKFF_PACK_ALPHA_TEST converts to the shader's 0-based table.
 enum {
-    PX_CMP_NEVER = 0, PX_CMP_LESS, PX_CMP_EQUAL, PX_CMP_LESSEQUAL,
+    PX_CMP_NEVER = 1, PX_CMP_LESS, PX_CMP_EQUAL, PX_CMP_LESSEQUAL,
     PX_CMP_GREATER, PX_CMP_NOTEQUAL, PX_CMP_GREATEREQUAL, PX_CMP_ALWAYS
 };
 // D3DTTFF_* (the coordinate-transform flags one stage carries): the low bits count components, and the
@@ -5146,11 +5450,18 @@ namespace {
 
 #define VKSHOT_W   480u
 #define VKSHOT_H   270u
-#define VKSHOT_BYTES (VKSHOT_W * VKSHOT_H * 4ull)
+#define VKSHOT_MAX_W 3840u
+#define VKSHOT_MAX_H 2160u
 
 struct VKShot {
     bool built;
     bool dirMade;
+    // GeneralsX @debug Qoder 20/10/2026 R-07: the fixed 480x270 ring cannot tell WHICH texture a striped
+    // ground wedge carries - every tile is a few pixels wide there. GENERALSX_VKSHOT_W/_H raise the ring to
+    // the presented extent (a forensic-tool change only; the default stays 480x270 so the older legs replay
+    // byte for byte), so the capture is read at the resolution the player sees.
+    unsigned w;
+    unsigned h;
     VkImage img; VkDeviceMemory mem;
     VkBuffer buf; VkDeviceMemory bufMem; unsigned char* map;
     VkDeviceSize off[3];
@@ -5158,18 +5469,27 @@ struct VKShot {
     unsigned long long shots;
     struct Slot { bool pending; unsigned long long frame; } s[3];
 };
-VKShot SH = { false, false, nullptr, nullptr, nullptr, nullptr, nullptr, { 0, 0, 0 },
+VKShot SH = { false, false, VKSHOT_W, VKSHOT_H, nullptr, nullptr, nullptr, nullptr, nullptr, { 0, 0, 0 },
               VK_IMAGE_LAYOUT_UNDEFINED, 0ull, { { false, 0 }, { false, 0 }, { false, 0 } } };
 
 bool vkshot_build_locked()
 {
     if (SH.built) return true;
     if (!vk_env_gate("GENERALSX_VKSHOT")) return false;
+    {
+        const char* ew = getenv("GENERALSX_VKSHOT_W");
+        const char* eh = getenv("GENERALSX_VKSHOT_H");
+        const long rw = (ew && atoi(ew) > 0) ? atol(ew) : (long)VKSHOT_W;
+        const long rh = (eh && atoi(eh) > 0) ? atol(eh) : (long)VKSHOT_H;
+        SH.w = (unsigned)(rw < (long)VKSHOT_MAX_W ? rw : (long)VKSHOT_MAX_W);
+        SH.h = (unsigned)(rh < (long)VKSHOT_MAX_H ? rh : (long)VKSHOT_MAX_H);
+    }
+    const VkDeviceSize shotBytes = (VkDeviceSize)SH.w * (VkDeviceSize)SH.h * 4ull;
     VkDevice dev = g_vulkanCore->Device();
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = VK_FORMAT_B8G8R8A8_UNORM;
-    ii.extent = { VKSHOT_W, VKSHOT_H, 1u };
+    ii.extent = { SH.w, SH.h, 1u };
     ii.mipLevels = 1; ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_LINEAR;
@@ -5186,7 +5506,7 @@ bool vkshot_build_locked()
         !chk("VKSHOT BindImageMemory", G.vkBindImageMemory(dev, SH.img, SH.mem, 0))) return false;
 
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bi.size = (VkDeviceSize)VKSHOT_BYTES * 3ull;
+    bi.size = (VkDeviceSize)shotBytes * 3ull;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (!chk("VKSHOT CreateBuffer", G.vkCreateBuffer(dev, &bi, nullptr, &SH.buf))) return false;
@@ -5198,10 +5518,10 @@ bool vkshot_build_locked()
         !chk("VKSHOT AllocBufferMemory", G.vkAllocateMemory(dev, &mai, nullptr, &SH.bufMem)) ||
         !chk("VKSHOT BindBuffer", G.vkBindBufferMemory(dev, SH.buf, SH.bufMem, 0)) ||
         !chk("VKSHOT Map", G.vkMapMemory(dev, SH.bufMem, 0, bi.size, 0, (void**)&SH.map))) return false;
-    for (int i = 0; i < 3; ++i) SH.off[i] = (VkDeviceSize)VKSHOT_BYTES * (unsigned long long)i;
+    for (int i = 0; i < 3; ++i) SH.off[i] = shotBytes * (unsigned long long)i;
     SH.built = true;
     VKWP1_LOG("VKSHOT on: every frame captured to Vulkan\\logs\\shots at %ux%u",
-        (unsigned)VKSHOT_W, (unsigned)VKSHOT_H);
+        (unsigned)SH.w, (unsigned)SH.h);
     return true;
 }
 
@@ -5253,7 +5573,7 @@ void VKCore_Shot_Record(void* cmd_, void* sceneImage_, unsigned w, unsigned h, u
     reg.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
     reg.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     reg.dstOffsets[0] = { 0, 0, 0 };
-    reg.dstOffsets[1] = { (int32_t)VKSHOT_W, (int32_t)VKSHOT_H, 1 };
+    reg.dstOffsets[1] = { (int32_t)SH.w, (int32_t)SH.h, 1 };
     G.vkCmdBlitImage(cmd, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         SH.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg, VK_FILTER_LINEAR);
     vkshot_barrier(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -5262,7 +5582,75 @@ void VKCore_Shot_Record(void* cmd_, void* sceneImage_, unsigned w, unsigned h, u
     VkBufferImageCopy cc = {};
     cc.bufferOffset = SH.off[slot];
     cc.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    cc.imageExtent = { VKSHOT_W, VKSHOT_H, 1u };
+    cc.imageExtent = { SH.w, SH.h, 1u };
+    G.vkCmdCopyImageToBuffer(cmd, SH.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, SH.buf, 1, &cc);
+    SH.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    SH.s[slot].pending = true; SH.s[slot].frame = frame;
+    vk_queue_unlock();
+}
+
+
+// GeneralsX @feature Qoder 22/10/2026: capture the PRESENTED image instead of the scene mirror. The
+// present-side post pass (FXAA/bloom/AO/grading) writes the swapchain, so the ordinary forensic shot -
+// which blits the scene mirror - cannot show any of it. This variant blits the swapchain image between
+// its PRESENT_SRC barriers.
+void VKCore_Shot_RecordSwap(void* cmd_, void* swapImage_, unsigned w, unsigned h, unsigned slot, unsigned long long frame)
+{
+    if (!g_vulkanCore || !g_vulkanCore->IsReady() || slot > 2u) return;
+    {
+        static unsigned s_every = 0;
+        if (!s_every)
+        {
+            const char* ev = getenv("GENERALSX_VKSHOT_EVERY");
+            s_every = (ev && atoi(ev) > 0) ? (unsigned)atoi(ev) : 1u;
+        }
+        if (s_every > 1u && (frame % s_every) != 0ull) return;
+    }
+    vk_queue_lock();
+    if (!vkshot_build_locked()) { vk_queue_unlock(); return; }
+    const VkCommandBuffer cmd = (VkCommandBuffer)cmd_;
+    const VkImage src = (VkImage)swapImage_;
+    if (!cmd || !src || !w || !h) { vk_queue_unlock(); return; }
+
+    VkImageMemoryBarrier toBlit = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toBlit.srcAccessMask = 0;
+    toBlit.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toBlit.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toBlit.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toBlit.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toBlit.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toBlit.image = src;
+    toBlit.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    G.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toBlit);
+
+    vkshot_barrier(cmd, SH.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit reg = {};
+    reg.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    reg.srcOffsets[0] = { 0, 0, 0 };
+    reg.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    reg.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    reg.dstOffsets[0] = { 0, 0, 0 };
+    reg.dstOffsets[1] = { (int32_t)SH.w, (int32_t)SH.h, 1 };
+    G.vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        SH.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg, VK_FILTER_LINEAR);
+
+    VkImageMemoryBarrier toPresent = toBlit;
+    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toPresent.dstAccessMask = 0;
+    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    G.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toPresent);
+
+    vkshot_barrier(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy cc = {};
+    cc.bufferOffset = SH.off[slot];
+    cc.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    cc.imageExtent = { SH.w, SH.h, 1u };
     G.vkCmdCopyImageToBuffer(cmd, SH.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, SH.buf, 1, &cc);
     SH.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     SH.s[slot].pending = true; SH.s[slot].frame = frame;
@@ -5276,46 +5664,80 @@ void VKCore_Shot_Poll(unsigned slot)
     const unsigned char* p = SH.map ? (const unsigned char*)SH.map + SH.off[slot] : nullptr;
     if (!p) return;
     if (!SH.dirMade) { SH.dirMade = true; CreateDirectoryA("Vulkan", nullptr); CreateDirectoryA("Vulkan\\logs", nullptr); CreateDirectoryA("Vulkan\\logs\\shots", nullptr); }
-    const unsigned long long n = VKSHOT_W * VKSHOT_H;
+    const unsigned long long n = (unsigned long long)SH.w * (unsigned long long)SH.h;
     unsigned long long white = 0, black = 0;
-    unsigned long long sum = 0;
+    unsigned long long sum = 0, sumTop = 0;
+    const unsigned long long nTop = (unsigned long long)SH.w * (SH.h / 2ull);
+    // GeneralsX @debug Qoder 20/10/2026 R-06 round three: the surviving flicker dims the upper half and the
+    // bottom band by different factors, and the bottom band is HUD + near terrain mixed together, so neither
+    // half nor quadrant separates "the terrain receiver multiplied the scene" from "something darkens the
+    // presented image". One mean per eighth of the image height gives the vertical profile per frame: the
+    // row where the ratio stops being (1-strength) is the boundary of whatever darkens.
+    enum { BANDS = 8u };
+    const unsigned bandH = SH.h / BANDS;
+    unsigned long long band[BANDS] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    unsigned long long bandN[BANDS] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    unsigned x = 0, y = 0;
     for (unsigned long long i = 0; i < n; ++i) {
         const unsigned b = p[i * 4ull], g = p[i * 4ull + 1ull], r = p[i * 4ull + 2ull];
         sum += r + g + b;
+        if (i < nTop) sumTop += r + g + b;
         if (r >= 240u && g >= 240u && b >= 240u) ++white;
         else if (r < 10u && g < 10u && b < 10u) ++black;
+        unsigned bi = y / bandH;
+        if (bi >= BANDS) bi = BANDS - 1u;
+        band[bi] += r + g + b; bandN[bi] += 1ull;
+        if (++x == SH.w) { x = 0u; ++y; }
+    }
+    char bandTxt[BANDS * 8 + 8];
+    {
+        unsigned o = 0;
+        for (unsigned i = 0; i < BANDS; ++i)
+            o += (unsigned)_snprintf(bandTxt + o, sizeof(bandTxt) - o, "%s%.1f", i ? "/" : "",
+                bandN[i] ? (double)band[i] / (double)(bandN[i] * 3ull) : 0.0);
     }
     // 24-bit bottom-up BMP, rows padded to 4: 480*3=1440 is already a multiple of 4.
     unsigned char hdr[54] = { 0 };
-    const unsigned rowBytes = VKSHOT_W * 3u;
-    const unsigned pixBytes = rowBytes * VKSHOT_H;
+    const unsigned rowBytes = (SH.w * 3u + 3u) & ~3u;   // BMP rows are 4-byte aligned
+    const unsigned pixBytes = rowBytes * SH.h;
     hdr[0] = 'B'; hdr[1] = 'M';
     const unsigned fileSize = 54u + pixBytes;
     hdr[2] = (unsigned char)fileSize; hdr[3] = (unsigned char)(fileSize >> 8);
     hdr[4] = (unsigned char)(fileSize >> 16); hdr[5] = (unsigned char)(fileSize >> 24);
     hdr[10] = 54;
     hdr[14] = 40;
-    hdr[18] = (unsigned char)VKSHOT_W; hdr[19] = (unsigned char)(VKSHOT_W >> 8);
-    hdr[22] = (unsigned char)VKSHOT_H; hdr[23] = (unsigned char)(VKSHOT_H >> 8);
+    hdr[18] = (unsigned char)SH.w; hdr[19] = (unsigned char)(SH.w >> 8);
+    hdr[22] = (unsigned char)SH.h; hdr[23] = (unsigned char)(SH.h >> 8);
     hdr[26] = 1; hdr[28] = 24;
     char path[96];
-    _snprintf(path, sizeof(path), "Vulkan\\logs\\shots\\vkshot_%06llu.bmp", SH.shots + 1ull);
+    // GeneralsX @debug Qoder 20/10/2026 R-06 second round: the flicker's true period is below the
+    // 90-frame shot cadence, and every-frame BMPs would write ~25 GB in a minute. GENERALSX_VKSHOT_NOFILE=1
+    // keeps the census line (the time series) and drops the picture, so GENERALSX_VKSHOT_EVERY=1 becomes
+    // affordable for a frame-accurate brightness trace.
+    static const bool s_nofile = (getenv("GENERALSX_VKSHOT_NOFILE") != nullptr);
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path, "wb") == 0 && fp) {
-        fwrite(hdr, 1, 54, fp);
-        unsigned char line[VKSHOT_W * 3];
-        for (unsigned y = 0; y < VKSHOT_H; ++y) {
-            const unsigned char* src = p + (size_t)(VKSHOT_H - 1u - y) * (size_t)VKSHOT_W * 4u;
-            for (unsigned x = 0; x < VKSHOT_W; ++x) {
-                line[x * 3u] = src[x * 4u];
-                line[x * 3u + 1u] = src[x * 4u + 1u];
-                line[x * 3u + 2u] = src[x * 4u + 2u];
+    path[0] = 0;
+    if (!s_nofile)
+    {
+        _snprintf(path, sizeof(path), "Vulkan\\logs\\shots\\vkshot_%06llu.bmp", SH.shots + 1ull);
+        if (fopen_s(&fp, path, "wb") == 0 && fp) {
+            fwrite(hdr, 1, 54, fp);
+            unsigned char* line = new unsigned char[rowBytes];
+            for (unsigned y = 0; y < SH.h; ++y) {
+                const unsigned char* src = p + (size_t)(SH.h - 1u - y) * (size_t)SH.w * 4u;
+                memset(line, 0, rowBytes);
+                for (unsigned x = 0; x < SH.w; ++x) {
+                    line[x * 3u] = src[x * 4u];
+                    line[x * 3u + 1u] = src[x * 4u + 1u];
+                    line[x * 3u + 2u] = src[x * 4u + 2u];
+                }
+                fwrite(line, 1, rowBytes, fp);
             }
-            fwrite(line, 1, rowBytes, fp);
+            delete[] line;
+            fclose(fp);
+        } else {
+            strcpy_s(path, "Vulkan\\logs\\shots\\FAILED");
         }
-        fclose(fp);
-    } else {
-        strcpy_s(path, "Vulkan\\logs\\shots\\FAILED");
     }
     ++SH.shots;
     // GeneralsX @bugfix Qoder 19/10/2026 R-02 forensics: every shot line carries the constant rings'
@@ -5330,10 +5752,10 @@ void VKCore_Shot_Poll(unsigned slot)
     static unsigned long long s_cwLast[3] = { 0, 0, 0 }, s_csLast[3] = { 0, 0, 0 };
     const unsigned long long ffCap = VKDraw_Get_Const_WindowCap(2);
     const double ffUse = ffCap ? (double)pk[2] * 100.0 / (double)ffCap : 0.0;
-    VKWP1_LOG("VKSHOT #%llu frame=%llu white%%=%.2f black%%=%.2f mean=%.1f cwrap=+%llu/+%llu/+%llu cum=%llu/%llu/%llu cspill=+%llu ffWin=%.1f%% of %lluKB file=%s ok=%d",
+    VKWP1_LOG("VKSHOT #%llu frame=%llu white%%=%.2f black%%=%.2f mean=%.1f top=%.1f bands=%s cwrap=+%llu/+%llu/+%llu cum=%llu/%llu/%llu cspill=+%llu ffWin=%.1f%% of %lluKB file=%s ok=%d",
         SH.shots, SH.s[slot].frame ? SH.s[slot].frame : 0ull,
         (double)white * 100.0 / (double)n, (double)black * 100.0 / (double)n,
-        (double)sum / (double)(n * 3ull),
+        (double)sum / (double)(n * 3ull), (double)sumTop / (double)(nTop * 3ull), bandTxt,
         cw[0] - s_cwLast[0], cw[1] - s_cwLast[1], cw[2] - s_cwLast[2],
         cw[0], cw[1], cw[2], cs[2] - s_csLast[2], ffUse, ffCap >> 10, path, fp ? 1 : 0);
     for (int i = 0; i < 3; ++i) { s_cwLast[i] = cw[i]; s_csLast[i] = cs[i]; }

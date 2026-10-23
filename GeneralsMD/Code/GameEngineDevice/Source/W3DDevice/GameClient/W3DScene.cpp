@@ -36,12 +36,15 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Common/GameUtility.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/TerrainLogic.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/ParticleSys.h"
 #include "GameClient/Color.h"
@@ -65,6 +68,9 @@
 #include "WW3D2/colorspace.h"
 
 #include "WW3D2/shdlib.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanForward.h"
+#endif
 
 // GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13B): splits RTS3DScene's render traversal
 // into the segments that can hold the 3.25 ms views= CPU cost measured at 4K@240: the light
@@ -1016,7 +1022,7 @@ void RTS3DScene::updateFixedLightEnvironments(RenderInfoClass & rinfo)
 	if( TheGlobalData->m_scriptOverrideInfantryLightScale != -1.0f )
 		infantryLightScale = TheGlobalData->m_scriptOverrideInfantryLightScale;
 	else
-		infantryLightScale = TheGlobalData->m_infantryLightScale[TheGlobalData->m_timeOfDay];
+		infantryLightScale = TheGlobalData->m_infantryLightScale[W3DDisplay::getRenderTimeOfDay()];
 
 	//Generate the default light environment
 	m_defaultLightEnv.Reset(Vector3(0,0,0), Get_Ambient_Light());
@@ -1888,6 +1894,109 @@ void RTS3DScene::removeDynamicLight(W3DDynamicLight * obj)
 void RTS3DScene::doRender( CameraClass * cam )
 {
 	m_camera = cam;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 20/10/2026 Forward+: publish every active point light once per frame.
+	// The draw layer turns this list into a screen-tile index block; the per-object LightEnvironment is
+	// still built for the fixed pipeline and for the GN fallback, but no longer caps the per-pixel path
+	// at one object's top-eight lights.
+	// Graphics Options: 0 off, 1 2D tiles, 2 3D clusters; budget 32..256.
+	VK_Forward_SetMode(OptionPreferences().getForwardPlusMode());
+	VK_Forward_SetBudget(OptionPreferences().getForwardLightBudget());
+	VK_Forward_Begin();
+	// GeneralsX @feature Qoder 22/10/2026 FPSTRESS: wall-clock frame-time probe (release-visible so the
+	// 256-light leg can be measured without a debug build). Gated; one line every 120 frames.
+	{
+		static const int s_perf = (getenv("GENERALSX_VK_FP_PERF") != nullptr)
+			? atoi(getenv("GENERALSX_VK_FP_PERF")) : 0;
+		if (s_perf) {
+			static DWORD s_last = GetTickCount();
+			static int s_frames = 0;
+			if (++s_frames >= 120) {
+				const DWORD now = GetTickCount();
+				const DWORD dt = now - s_last;
+				if (dt > 0) {
+					fprintf(stderr, "[VKFPPERF] %d frames in %u ms -> %.2f fps (%.2f ms/frame)\n",
+						s_frames, (unsigned)dt, (double)s_frames * 1000.0 / (double)dt, (double)dt / (double)s_frames);
+					fflush(stderr);
+				}
+				s_last = now; s_frames = 0;
+			}
+		}
+	}
+	{
+		RefRenderObjListIterator it(&LightList);
+		for (it.First(); !it.Is_Done(); it.Next()) {
+			LightClass* light = (LightClass*)it.Peek_Obj();
+			if (light != nullptr && light->Get_Type() == LightClass::POINT) {
+				Vector3 d(0.0f, 0.0f, 0.0f);
+				light->Get_Diffuse(&d);
+				const float intensity = light->Get_Intensity();
+				float inner = 0.0f, outer = 0.0f;
+				light->Get_Far_Attenuation_Range(inner, outer);
+				const Vector3& p = light->Get_Position();
+				if (intensity > 0.0f)
+					VK_Forward_Add_Light(p.X, p.Y, p.Z, inner, outer,
+						d.X * intensity, d.Y * intensity, d.Z * intensity);
+			}
+		}
+		RefRenderObjListIterator dynIt(&m_dynamicLightList);
+		for (dynIt.First(); !dynIt.Is_Done(); dynIt.Next()) {
+			W3DDynamicLight* dl = (W3DDynamicLight*)dynIt.Peek_Obj();
+			if (dl == nullptr || !dl->isEnabled() || dl->Get_Type() != LightClass::POINT)
+				continue;
+			Vector3 d(0.0f, 0.0f, 0.0f);
+			dl->Get_Diffuse(&d);
+			const float intensity = dl->Get_Intensity();
+			if (intensity <= 0.0f)
+				continue;
+			float inner = 0.0f, outer = 0.0f;
+			dl->Get_Far_Attenuation_Range(inner, outer);
+			const Vector3& p = dl->Get_Position();
+			VK_Forward_Add_Light(p.X, p.Y, p.Z, inner, outer,
+				d.X * intensity, d.Y * intensity, d.Z * intensity);
+		}
+		// GeneralsX @feature Qoder 21/10/2026 FPNIGHT: vertical-slice rig. Night mode switches the
+		// global time-of-day once and injects a deterministic ring of warm/cool point lights around
+		// the camera, so the Forward+ path can be exercised (and screenshotted) without authoring a
+		// new map. Both knobs are QA-only; no shipping default touches the scene.
+		const char* nightEnv = getenv("GENERALSX_VK_FP_NIGHT");
+		const bool nightOn = nightEnv != nullptr && atoi(nightEnv) != 0;
+		// Night itself comes from the existing render-side TOD override (GENERALSX_TOD_OVERRIDE=4 or
+		// the Options TimeOfDayPreview row); keeping logic TOD untouched preserves determinism. The
+		// FPNIGHT switch adds only the synthetic point-light rig below.
+		const char* demoEnv = getenv("GENERALSX_VK_FP_DEMO_LIGHTS");
+		const int demoLights = (demoEnv != nullptr && *demoEnv) ? atoi(demoEnv) : (nightOn ? 128 : 0);
+		if (demoLights > 0)
+		{
+			const Coord3D& focus = TheTacticalView->getPosition();
+			const Vector3 eye(focus.x, focus.y, focus.z);
+			const int n = demoLights > 256 ? 256 : demoLights;
+			for (int i = 0; i < n; ++i)
+			{
+				const float a = (float)i * 6.2831853f / (float)n;
+				const float ring = 30.0f + (float)(i % 8) * 18.0f;
+				const float x = eye.X + WWMath::Cos(a) * ring;
+				const float y = eye.Y + WWMath::Sin(a) * ring;
+				const float z = (TheTerrainLogic != nullptr)
+					? TheTerrainLogic->getGroundHeight(x, y) + 8.0f : 8.0f;
+				float r, g, b;
+				switch (i % 3) {
+					case 0: r = 1.0f; g = 0.38f; b = 0.10f; break;   // sodium warm
+					case 1: r = 0.10f; g = 0.45f; b = 1.0f; break;   // cool blue
+					default: r = 0.20f; g = 1.0f; b = 0.35f; break;  // green accent
+				}
+				VK_Forward_Add_Light(x, y, z, 15.0f, 140.0f, r * 2.5f, g * 2.5f, b * 2.5f);
+			}
+			static int s_nightLog = 0;
+			if (s_nightLog < 4) {
+				++s_nightLog;
+				fprintf(stderr, "[FPNIGHT] injected %d demo point lights around (%.0f,%.0f,%.0f) night=%d\n",
+					n, eye.X, eye.Y, eye.Z, nightOn ? 1 : 0);
+				fflush(stderr);
+			}
+		}
+	}
+#endif
 	DRAW();
 	m_camera = nullptr;
 

@@ -964,7 +964,7 @@ HRESULT W3DShaderManager::compileShaderAtBestProfile(const char* hlslSource, Boo
 			// translated-program registry. The hash is over hlslSource (not the prefixed buffer), because
 			// that is the bytes the exported block and scripts/pgm_hash.py describe. A source with no row
 			// is logged once and simply leaves the D3D9 path in charge.
-			const unsigned boundTag = VKPgm_Note_Compiled(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, hlslSource, logTag);
+			[[maybe_unused]] const unsigned boundTag = VKPgm_Note_Compiled(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, hlslSource, logTag);
 			// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under no-d3d9 an untagged handle has no twin to
 			// execute, and the draw path refuses every batch that binds one - the whole family would
 			// disappear instead of staying on its fixed-function leg. Release the handle and fail the
@@ -2022,7 +2022,7 @@ Int ShroudTextureShader::set(Int stage)
 	//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 	//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 	W3DShroud *shroud;
-	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
+	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr && shroud->isTextureReady())
 	{	///@todo: All this code really only need to be done once per camera/view.  Find a way to optimize it out.
 		Matrix4x4 curView;
 		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
@@ -2115,7 +2115,7 @@ Int FlatShroudTextureShader::set(Int stage)
 	//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 	//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 	W3DShroud *shroud;
-	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
+	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr && shroud->isTextureReady())
 	{	///@todo: All this code really only need to be done once per camera/view.  Find a way to optimize it out.
 		Matrix4x4 curView;
 		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
@@ -2833,10 +2833,23 @@ static Real clamp01(Real value)
 
 void W3DShaderManager::setBloomIntensity(Real intensity01)
 {
-	if (lightingEnvPresent("GENERALSX_BLOOM_INTENSITY"))
-		return;
-	s_bloomIntensityLive = clamp01(intensity01);
-	fprintf(stderr, "[BLOOM3] user set intensity=%.2f\n", (double)s_bloomIntensityLive);
+	// GeneralsX @feature Qoder 20/10/2026: the env override still keeps the file value out, but the
+	// Vulkan knob is pushed either way - the getter is the single authority on what a frame will use.
+	if (!lightingEnvPresent("GENERALSX_BLOOM_INTENSITY"))
+		s_bloomIntensityLive = clamp01(intensity01);
+	const Real live = getBloomIntensity();
+	DX8Wrapper::VK_Set_Post_Knobs(live, DX8Wrapper::VK_Post_AA());
+	fprintf(stderr, "[BLOOM3] user set intensity=%.2f\n", (double)live);
+	fflush(stderr);
+}
+
+// GeneralsX @feature Qoder 20/10/2026: the anti-aliasing row of the graphics page. On the D3D path it can
+// only take effect on the next device creation, but the pure-Vulkan present pass resolves it live, so the
+// same slider/tick that names the level now switches the FXAA term of that pass on or off.
+void W3DShaderManager::setPostAntiAliasing(Bool enabled)
+{
+	DX8Wrapper::VK_Set_Post_Knobs(getBloomIntensity(), enabled != FALSE);
+	fprintf(stderr, "[VKPOST] anti-aliasing knob -> %s\n", enabled != FALSE ? "on" : "off");
 	fflush(stderr);
 }
 
@@ -2990,6 +3003,22 @@ static void Upload_Terrain30_Fog_Constants(void)
 	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
 	DX8Wrapper::Set_Pixel_Shader_Constant(0, (const float*)&haze, 1);
 	DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)&ramp, 1);
+
+	// GeneralsX @feature Qoder 22/10/2026 light shadows: c6..c9 = world -> light clip rows (row-vector,
+	// D3D), c10 = light xyz + range with .w = 1 when this frame built the strongest light's map. The
+	// receiver applies it to list index 0 only, so a missing map is one disabled uniform, not a branch.
+	float lsVP[16], lsPR[4];
+	if (DX8Wrapper::VK_LightShadow_Info(lsVP, lsPR))
+	{
+		DX8Wrapper::Set_Pixel_Shader_Constant(6, lsVP, 4);
+		Vector4 pr(lsPR[0], lsPR[1], lsPR[2], 1.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(10, (const float*)&pr, 1);
+	}
+	else
+	{
+		Vector4 off(0.0f, 0.0f, 0.0f, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(10, (const float*)&off, 1);
+	}
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio below has
@@ -3006,7 +3035,9 @@ static Bool s_terrainHlslFog = FALSE;
 // never sample a stage-4 that the atlas loader left unbound: white would fold the modulation, flat
 // keeps it at exactly 1.0. Read once at shader init; changing it at runtime is not supported.
 static Bool s_terrainNMEnv = TRUE;
-static Real s_terrainNMGain = 1.0f;
+// < 0 means "follow the options-menu NormalMapStrength slider"; >= 0 is a QA override
+// from GENERALSX_TERRAIN_NM_GAIN.
+static Real s_terrainNMGain = -1.0f;
 static IDirect3DTexture9 *s_nmFlatFallback = nullptr;
 
 // GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: TRUE only while the derivative macro-normal (PPL)
@@ -3017,7 +3048,14 @@ static Bool s_terrainPPL = FALSE;
 
 Bool W3DShaderManager::isTerrainNormalEnabled()
 {
-	return (s_terrainHlslFog && s_terrainNMEnv) ? TRUE : FALSE;
+	if (!s_terrainHlslFog) return FALSE;
+	// GeneralsX @feature Qoder 21/10/2026: the terrain NM layer now follows the same
+	// NormalMapping option as the model/dot3 path (DX8NormalMap::Is_Enabled is updated live by
+	// the options menu). GENERALSX_TERRAIN_NM remains a QA override. Missing *_nm.tga sheets
+	// still fall back to flat normals per texture class, so detection stays asset-driven.
+	const char* nenv = getenv("GENERALSX_TERRAIN_NM");
+	if (nenv != nullptr && *nenv != 0) return (atoi(nenv) != 0) ? TRUE : FALSE;
+	return DX8NormalMap::Is_Enabled() ? TRUE : FALSE;
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: same contract for the road dual-noise HLSL swap.
@@ -3033,7 +3071,7 @@ void W3DShaderManager::uploadPerPixelFogConstants()
 // GeneralsX @feature PS3.0 Weather W5 16/10/2026: the shader half of the weather coupling.
 // Two values travel into the WW3D2 dot3/PBR layer, which cannot read game-side weather state itself
 // (platform-isolation rule, same as the Set_Fog injection at the install below):
-//   - the weather-scaled haze ramp for the GN/ML per-pixel families (c25/c26). The shader install only
+//   - the weather-scaled haze ramp for the GN per-pixel family (c25/c26). The shader install only
 //     ever runs once, so without this refresh a script-driven storm would move the terrain, road and
 //     tree haze but leave every normal-mapped unit at clear-sky fog;
 //   - the rain wetness, which the PBR pixel shaders read out of the previously-unused c8.w / c11.w slot
@@ -3397,9 +3435,12 @@ Int TerrainShaderPixelShader::init()
 						"    a.xy *= c2.w;\n"
 						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
 						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
-						"    gm = normalize(gm);\n"
+						"    float gl = length(gm);\n"
+						"    gm = (gl > 1e-6) ? gm / gl : float3(0.0, 0.0, 1.0);\n"
 						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
-						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    float3 nn = float3(a.xy, 0.0) + a.z * gm;\n"
+						"    float nl = length(nn);\n"
+						"    float3 n = (nl > 1e-6) ? nn / nl : gm;\n"
 						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
 						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
 						"    return lerp(c, float4(c0.rgb, c.a), fogf);\n"
@@ -3432,9 +3473,12 @@ Int TerrainShaderPixelShader::init()
 						"    a.xy *= c2.w;\n"
 						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
 						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
-						"    gm = normalize(gm);\n"
+						"    float gl = length(gm);\n"
+						"    gm = (gl > 1e-6) ? gm / gl : float3(0.0, 0.0, 1.0);\n"
 						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
-						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    float3 nn = float3(a.xy, 0.0) + a.z * gm;\n"
+						"    float nl = length(nn);\n"
+						"    float3 n = (nl > 1e-6) ? nn / nl : gm;\n"
 						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
 						"    c = c * tex2D(s2, i.dep.xy);\n"
 						"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"
@@ -3470,9 +3514,12 @@ Int TerrainShaderPixelShader::init()
 						"    a.xy *= c2.w;\n"
 						"    float3 wv = cross(ddx(i.dep), ddy(i.dep));\n"
 						"    float3 gm = wv.x * c3.xyz + wv.y * c4.xyz + wv.z * c5.xyz;\n"
-						"    gm = normalize(gm);\n"
+						"    float gl = length(gm);\n"
+						"    gm = (gl > 1e-6) ? gm / gl : float3(0.0, 0.0, 1.0);\n"
 						"    gm *= (gm.z < 0.0) ? -1.0 : 1.0;\n"
-						"    float3 n = normalize(float3(a.xy, 0.0) + a.z * gm);\n"
+						"    float3 nn = float3(a.xy, 0.0) + a.z * gm;\n"
+						"    float nl = length(nn);\n"
+						"    float3 n = (nl > 1e-6) ? nn / nl : gm;\n"
 						"    c.rgb *= saturate(dot(n, c2.xyz)) / max(c2.z, 0.05);\n"
 						"    c = c * tex2D(s2, i.dep.xy);\n"
 						"    c = c * tex2D(s3, i.uv3);\n"
@@ -3485,9 +3532,10 @@ Int TerrainShaderPixelShader::init()
 				// terrain (the .pso disasm mirror does not reproduce the retail FF stage wiring exactly).
 				// Shipping default is back to the retail fixed-function/.pso path; GENERALSX_TERRAIN30=1
 				// keeps the HLSL leg alive as a QA opt-in.
-				// GeneralsX @feature PS3.0 L2.2 17/10/2026: the switch is now also a Graphics Options
-				// page checkbox (Options.ini "Terrain30Shading"). The getter keeps the QA env winner and
-				// the OFF factory default, so retail parity is unchanged unless the user opts in.
+				// GeneralsX @feature PS3.0 L2.2 17/10/2026: the switch had a Graphics Options page row.
+				// GeneralsX @refactor Qoder 20/10/2026: that row is retired - TerrainPerPixel below is the
+				// single terrain row and now arms this leg itself. The getter keeps the QA env winner and
+				// the legacy ini key, so retail parity is unchanged unless the user opts in.
 				// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under GENERALSX_VK_NOD3D the retail .pso trio
 				// can never run - the stub device hands out identity handles with no driver behind them and
 				// the draw path refuses every batch whose shader pair carries no translated twin - so the
@@ -3498,24 +3546,42 @@ Int TerrainShaderPixelShader::init()
 #else
 				const bool vkNod3d = false;
 #endif
-				const bool terrain30On = (OptionPreferences().getTerrain30Shading() != FALSE) || vkNod3d;
+				// GeneralsX @refactor Qoder 20/10/2026: the two terrain rows were merged into one. The
+				// "现代地形光影" parent and "地形逐像素光照" child were one chain, and under pure Vulkan the
+				// parent was forced on anyway, so its checkbox read as a dead row. TerrainPerPixel is now
+				// the single user switch and implies the ps_3_0 + NM leg; the legacy Terrain30Shading key
+				// and GENERALSX_TERRAIN30 env still arm the leg alone for QA.
+				const bool pplOn = OptionPreferences().getTerrainPerPixel() != FALSE;
+				const bool terrain30On = pplOn
+					|| (OptionPreferences().getTerrain30Shading() != FALSE) || vkNod3d;
 
 				// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: read the normal-pass switches once,
 				// here where the terrain leg decides its shader variants. NM defaults ON but is only
 				// reachable through terrain30On, so GENERALSX_TERRAIN30=0 keeps the exact batch23 pair.
 				{
 					const char* nenv = getenv("GENERALSX_TERRAIN_NM");
-					s_terrainNMEnv = (nenv == nullptr || *nenv == 0) ? TRUE : (atoi(nenv) != 0);
+					// GeneralsX @bugfix Qoder 21/10/2026: the terrain normal atlas is packed without a
+					// per-tile gutter, so bilinear sampling across a 256px tile edge blends two
+					// unrelated normals and shades a dark/bright grid on every 2-cell tile
+					// boundary (Alpine Assault). The reference Vulkan fork has no terrain NM
+					// layer at all. Keep NM off by default; GENERALSX_TERRAIN_NM=1 remains the
+					// development opt-in until the atlas carries per-tile padding.
+					Bool globalNM = (TheGlobalData != nullptr && TheGlobalData->m_useNormalMapping != FALSE) ? TRUE : FALSE;
+					// Same QA overrides the model/dot3 path honors, so one switch really means one switch.
+					if (const char* ev = getenv("GENERALSX_NORMALMAP")) globalNM = (strcmp(ev, "0") != 0) ? TRUE : FALSE;
+					if (const char* cmd = GetCommandLineA()) {
+						if (strstr(cmd, "-nonormalmap") != nullptr) globalNM = FALSE;
+						else if (strstr(cmd, "-normalmap") != nullptr) globalNM = TRUE;
+					}
+					s_terrainNMEnv = (nenv != nullptr && *nenv != 0) ? (atoi(nenv) != 0) : globalNM;
 					const char* genv = getenv("GENERALSX_TERRAIN_NM_GAIN");
 					if (genv != nullptr && *genv != 0) s_terrainNMGain = (Real)atof(genv);
 				}
-				// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: read the per-pixel child switch once,
-				// next to the NM pair it rides on. Requested while terrain30On arms the derivative
-				// macro-normal trio below; it also forces the NM layer ON (the PPL variants share the
-				// s4/c2 contract, and the 1x1 flat fallback keeps them asset-parity). Never reachable
-				// unless the parent gate has already passed, so the batch22 factory-OFF default stands.
-				const bool pplReq = terrain30On && (OptionPreferences().getTerrainPerPixel() != FALSE);
-				if (pplReq) s_terrainNMEnv = TRUE;
+				// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: the per-pixel switch arms the
+				// derivative macro-normal trio below; it also forces the NM layer ON (the PPL variants
+				// share the s4/c2 contract, and the 1x1 flat fallback keeps them asset-parity).
+				const bool pplReq = pplOn;
+				// PPL without NM is legal: s4 falls back to the flat 1x1 normal.
 				// Pick the normal variants only while NM is on; if their compile fails the block below
 				// falls back to the retail .pso trio exactly like before (no half-installed NM state).
 				const bool useNM = (s_terrainNMEnv != FALSE);
@@ -3628,9 +3694,9 @@ Int TerrainShaderPixelShader::set(Int pass)
 		// variants. The atlas (stage slot 4) is only present when *_nm.tga sheets were found for this
 		// map; the shaders are compiled for NM the whole session, so an unbound stage 4 would sample
 		// white and fold the ground - the flat 1x1 fallback keeps the ratio exactly 1.0 instead.
-		if (s_terrainNMEnv)
+		if (W3DShaderManager::isTerrainNormalEnabled() || s_terrainPPL)
 		{
-			TextureClass *nmAtlas = W3DShaderManager::getShaderTexture(4);
+			TextureClass *nmAtlas = W3DShaderManager::isTerrainNormalEnabled() ? W3DShaderManager::getShaderTexture(4) : nullptr;
 			IDirect3DTexture9 *nmTex = (nmAtlas != nullptr) ? nmAtlas->Peek_D3D_Texture() : nullptr;
 			if (nmTex == nullptr)
 			{
@@ -3671,7 +3737,14 @@ Int TerrainShaderPixelShader::set(Int pass)
 				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 				DX8Wrapper::Set_DX8_Sampler_State(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 				DX8Wrapper::Set_DX8_Texture_Stage_State(4, D3DTSS_TEXCOORDINDEX, 0);
+			}
 
+			// GeneralsX @bugfix Qoder 22/10/2026 Sun/gain constants must be uploaded even when the
+			// 1x1 flat-normal fallback could not be created. They used to live inside the nmTex
+			// branch, so a failed s4 bind left c2 = (0,0,0,0); the PPL shader then multiplied every
+			// terrain pixel by dot(n, 0) / 0.05 = 0 and the ground read as if all textures vanished.
+			// The sampler bind stays optional (s4 is only sampled by the NM/PPL variants).
+			{
 				// Sun vector: same -m_terrainLightPos[0] the CPU doTheLight loop shades the vertex
 				// diffuse with (HeightMap.cpp builds lightRay from it), normalized here because the
 				// shader divides by L.z so a flat texel lands on exactly 1.0. Degenerate/missing sun
@@ -3683,7 +3756,13 @@ Int TerrainShaderPixelShader::set(Int pass)
 					Real mag = L.Length();
 					if (mag < 1e-3f) { sun[0] = 0.0f; sun[1] = 0.0f; sun[2] = 1.0f; }
 					else { sun[0] = L.X / mag; sun[1] = L.Y / mag; sun[2] = L.Z / mag; }
-					sun[3] = s_terrainNMGain;
+					// GeneralsX @feature Qoder 22/10/2026: follow the same NormalMapStrength slider
+					// as the model dot3 path (live). The terrain shader adds the normal-map xy to
+					// the interpolated world normal without a full TBN, so full slider strength
+					// reads exaggerated; map 0..2 to 0..1 (default 0.8 -> 0.4).
+					sun[3] = (s_terrainNMGain >= 0.0f)
+						? s_terrainNMGain
+						: (DX8NormalMap::Get_Strength() * 0.25f);
 				}
 				DX8Wrapper::Set_Pixel_Shader_Constant(2, sun, 1);
 
@@ -4670,8 +4749,6 @@ static void InitNormalMapShaders()
 			// the DOT3-vs-fixed-pipeline comparison can. The old wording claimed it "proved" the normal
 			// was inverted, which is what sent #73 hunting an asset defect instead of the matrix step.
 			// Covers both mounted pairs: swapped in here for the plain dot3 PS and at the PBR compile
-			// site below; the ML pair is intentionally not probed (buildings carry no point lights in
-			// their light environment, so ML never mounts on them).
 			const char* lamEnv = getenv("GENERALSX_NORMALMAP_LAMBERT");
 			if (lamEnv != nullptr && lamEnv[0] != 0 && strcmp(lamEnv, "0") != 0) {
 				pixelShaderSrc = kPixelShaderLambertRaw;
@@ -4689,114 +4766,9 @@ static void InitNormalMapShaders()
 		}
 	}
 
-	// GeneralsX @feature PS3.0 T5 13/10/2026 per-pixel multi-light variants.  The single-light pair
-	// above rotates ONE sun into tangent space per vertex; these carry the world position and the
-	// full TBN basis through to the pixel, so every point light in the mesh's LightEnvironment
-	// (max 8 since P3-18 widened the engine's collection cap) gets its own per-pixel direction,
-	// smoothstep radius falloff and Blinn specular.  The sun pass reproduces the single-light result
-	// per-pixel, so a mesh without point lights looks the same modulo interpolation precision.
-	// dx8normalmap.cpp binds this pair only when it actually collected >=1 point light, so the T1
-	// path is untouched.  ps_2_0 fallback note: mlights spans c17..c32, so on a runtime that refuses
-	// ps_3_0 the ML PS does not compile and the install step simply leaves ML unmounted.
-	static const char* kVertexShaderML =
-		"float4 c0 : register(c0);\n"
-		"float4 c1 : register(c1);\n"
-		"float4 c2 : register(c2);\n"
-		"float4 c3 : register(c3);\n"
-		"float4 c7 : register(c7);\n"                  //Westwood world matrix ROWS (see @bugfix PS3.0-#76b; was wmDx8 rows = world->model)
-		"float4 c8 : register(c8);\n"
-		"float4 c9 : register(c9);\n"
-		"struct VS_OUT\n"
-		"{\n"
-		"    float4 pos     : POSITION;\n"
-		"    float4 diffuse : COLOR0;\n"
-		"    float2 uv      : TEXCOORD0;\n"
-		"    float3 wpos    : TEXCOORD1;\n"
-		"    float3 tT      : TEXCOORD2;\n"
-		"    float3 tB      : TEXCOORD3;\n"
-		"    float3 tN      : TEXCOORD4;\n"
-		"    float eye      : TEXCOORD5;\n"               // batch8 P0: clip w = eye depth; POSITION PS inputs are rejected by fxc (X4502)
-		"};\n"
-		"VS_OUT main(float4 pos : POSITION, float3 normal : NORMAL, float4 diffuse : COLOR0,\n"
-		"            float2 uv0 : TEXCOORD0, float3 tangent : TEXCOORD1, float3 binormal : TEXCOORD2)\n"
-		"{\n"
-		"    VS_OUT o;\n"
-		"    o.pos = float4(dot(pos, c0), dot(pos, c1), dot(pos, c2), dot(pos, c3));\n"
-		"    o.wpos = float3(dot(pos, c7), dot(pos, c8), dot(pos, c9));\n"
-		"    o.diffuse = diffuse;\n"
-		"    o.uv = uv0;\n"
-		"    o.tT = float3(dot(tangent, c7.xyz), dot(tangent, c8.xyz), dot(tangent, c9.xyz));\n"
-		"    o.tB = float3(dot(binormal, c7.xyz), dot(binormal, c8.xyz), dot(binormal, c9.xyz));\n"
-		"    o.tN = float3(dot(normal, c7.xyz), dot(normal, c8.xyz), dot(normal, c9.xyz));\n"
-		"    o.eye = o.pos.w;\n"                            // batch8 P0: relay clip w so the PS fog sees eye depth
-		"    return o;\n"
-		"}\n";
-
-	static const char* kPixelShaderML =
-		"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
-		"sampler s1 : register(s1);\n"                 // tangent-space normal map (stage1)
-		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
-		"float4 c2 : register(c2);\n"                  // ambient rgb
-		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): bump xy/z scaling
-		"float4 c4 : register(c4);\n"                  // world sun direction (toward the light)
-		"float4 c5 : register(c5);\n"                  // world eye direction (camera +Z)
-		"float4 c6 : register(c6);\n"                  // (specPow, specIntensity, -, -)
-		"float4 c8 : register(c8);\n"                  // GeneralsX @feature PS3.0-P3-12: hemi ambient rgb (x = unused), scaled by world-up n.z
-		"float4 c9 : register(c9);\n"                  // GeneralsX @feature PS3.0-P3-14: fog rgb haze color, w = blend strength (0 = identity)
-		"float4 c10 : register(c10);\n"                // GeneralsX @feature PS3.0-P3-14: fog x = eye-depth start, y = 1/ramp length
-		"float4 c16 : register(c16);\n"                // x = number of active point lights (0..8)
-		"float4 mlights[16] : register(c17);\n"        // pairs: (center.xyz, innerRadius), (diffuse.rgb, outerRadius)  c17..c32
-		"struct PS_IN\n"
-		"{\n"
-		"    float4 diffuse : COLOR0;\n"
-		"    float2 uv      : TEXCOORD0;\n"
-		"    float3 wpos    : TEXCOORD1;\n"
-		"    float3 tT      : TEXCOORD2;\n"
-		"    float3 tB      : TEXCOORD3;\n"
-		"    float3 tN      : TEXCOORD4;\n"
-		"    float eye      : TEXCOORD5;\n"               // batch8 P0: clip w = eye depth; POSITION PS inputs are rejected by fxc (X4502)
-		"};\n"
-		"float4 main(PS_IN i) : COLOR\n"
-		"{\n"
-		"    float4 base = tex2D(s0, i.uv);\n"
-		"    base.rgb *= i.diffuse.rgb;\n"
-		"    float3 tn = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
-		"    tn.xy = tn.xy * c3.x + c3.y;\n"
-		"    tn.z  = tn.z  * c3.z + c3.w;\n"
-		"    tn = normalize(tn);\n"
-		"    float3 T = normalize(i.tT);\n"
-		"    float3 B = normalize(i.tB);\n"
-		"    float3 N = normalize(i.tN);\n"
-		"    float3 n = tn.x * T + tn.y * B + tn.z * N;\n"   // world-space perturbed normal
-		"    float3 E = normalize(c5.xyz);\n"
-		"    float3 L = normalize(c4.xyz);\n"
-		"    float ndl = saturate(dot(n, L));\n"
-		"    float3 hs = L + E;\n"
-		"    float hsl = length(hs);\n"
-		"    float ndh = (hsl > 0.001) ? saturate(dot(n, hs / hsl)) : 0.0;\n"  // degenerate half-vector guard (SEL, ps_2_0 safe)
-		"    float3 col = base.rgb * (ndl * c1.xxx + c2.rgb + c8.rgb * n.z) + pow(ndh, c6.x) * c6.y * ndl;\n"	// GeneralsX @feature PS3.0-P3-12 14/10/2026: c8 * world-up (W3D Z-up) hemi ambient
-		"    for (int k = 0; k < 8; k++)\n"
-		"    {\n"
-		"        float4 lp = mlights[2 * k];\n"
-		"        float4 lc = mlights[2 * k + 1];\n"
-		"        float on = ((float)k < c16.x) ? 1.0 : 0.0;\n"	//static loop + mask: ps_2_0 has no dynamic break
-		"        float3 Lv = lp.xyz - i.wpos;\n"
-		"        float dist = length(Lv);\n"
-		"        float att = saturate((lc.w - dist) / max(lc.w - lp.w, 0.0001));\n"
-		"        att *= att;\n"
-		"        float3 Ld = Lv / max(dist, 0.0001);\n"
-		"        float ndl2 = saturate(dot(n, Ld));\n"
-		"        float3 h2 = Ld + E;\n"
-		"        float h2l = length(h2);\n"
-		"        float ndh2 = (h2l > 0.001) ? saturate(dot(n, h2 / h2l)) : 0.0;\n"
-		"        col += on * att * (base.rgb * (ndl2 * c1.xxx) * lc.rgb + pow(ndh2, c6.x) * c6.y * ndl2);\n"
-		"    }\n"
-		"    return float4(lerp(col, c9.rgb, saturate((i.eye - c10.x) * c10.y) * c9.w), base.a * i.diffuse.a);\n"	// GeneralsX @feature PS3.0-P3-14 14/10/2026 A1: eye-depth haze, c9.w=0 keeps the pixel exact (batch8 P0: VS-relayed TEXCOORD depth, POSITION inputs are X4502). GeneralsX @bugfix Qoder 16/10/2026: FF-parity alpha (texel x vertex), see kPixelShader.
-		"}\n";
-
 	// GeneralsX @feature PS3.0-P4-1 15/10/2026 PBR (roughness/metalness) variant pair for the dot3
 	// single-light path (光影三阶段/粗糙度引擎承接工作清单.md M1+M2).  Uniform-branched so one pair
-	// covers both rollout steps; DX8NormalMap::Apply mounts it only when GENERALSX_PBR=1/2 AND the
+	// covers both rollout steps; the GN merged path mounts it only when the roughness toggle is on AND the
 	// diffuse carries a "<stem>_rp" companion (R=roughness, G=metalness, contract §1).
 	// VS: identical to kVertexShader except it also emits the tangent-space eye vector eT as
 	// TEXCOORD4 - the GGX branch needs NdotV/VdotH per pixel, and the main pair only folds eT into
@@ -4919,96 +4891,6 @@ static void InitNormalMapShaders()
 		"    return float4(col, base.a * i.diffuse.a);\n"   // GeneralsX @bugfix Qoder 16/10/2026 FF-parity alpha (see kPixelShader)
 		"}\n";
 
-	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pixel shader (光影四阶段/调研/03):
-	// the ML world-TBN skeleton (c4/c5 world sun/eye, hemi c8, fog c9/c10, c16 count + c17..c32
-	// mlight pairs, static 8-step masked loop) upgraded with the M2 GGX lobe from kPixelShaderPBR:
-	// the sun AND every collected point light get D*F*G specular and (1-F)(1-M) kd, sampling the
-	// "<stem>_rp" companion on stage2.  c11 = (mode, LI, ENV, wetness) mirrors the single-light PBR c8
-	// contract in a free register (c8 stays the ML hemi).  Mounted by dx8normalmap only when
-	// PBR mode == 2 with an rp companion and >=1 point light; GENERALSX_PBRML=0 forces it off.
-	// The V is the world eye constant (c5), not per-pixel - the same approximation the proven ML
-	// Blinn term already makes; at RTS distances the lobes are indistinguishable.
-	static const char* kPixelShaderPBRML =
-		"sampler s0 : register(s0);\n"                 // diffuse (stage0, uv)
-		"sampler s1 : register(s1);\n"                 // tangent-space normal map (stage1)
-		"sampler s2 : register(s2);\n"                 // rp companion: R=roughness, G=metalness (stage2)
-		"float4 c1 : register(c1);\n"                  // (strength, -, -, -)
-		"float4 c2 : register(c2);\n"                  // ambient rgb
-		"float4 c3 : register(c3);\n"                  // (k, 0, 1, 0): bump xy/z scaling
-		"float4 c4 : register(c4);\n"                  // world sun direction (toward the light)
-		"float4 c5 : register(c5);\n"                  // world eye direction (camera +Z)
-		"float4 c8 : register(c8);\n"                  // hemi ambient rgb, scaled by world-up n.z
-		"float4 c9 : register(c9);\n"                  // fog rgb haze color, w = blend strength
-		"float4 c10 : register(c10);\n"                // fog x = eye-depth start, y = 1/ramp length
-		"float4 c11 : register(c11);\n"                // (mode, LI, ENV, wetness)  GGX contract (cf. PBR c8)
-		"float4 c16 : register(c16);\n"                // x = number of active point lights (0..8)
-		"float4 mlights[16] : register(c17);\n"        // pairs: (center.xyz, innerRadius), (diffuse.rgb, outerRadius)
-		"struct PS_IN\n"
-		"{\n"
-		"    float4 diffuse : COLOR0;\n"
-		"    float2 uv      : TEXCOORD0;\n"
-		"    float3 wpos    : TEXCOORD1;\n"
-		"    float3 tT      : TEXCOORD2;\n"
-		"    float3 tB      : TEXCOORD3;\n"
-		"    float3 tN      : TEXCOORD4;\n"
-		"    float eye      : TEXCOORD5;\n"
-		"};\n"
-		"float3 ggxLobe(float3 n, float3 L, float3 E, float3 F0, float metal, float a2, float kk, float ndl, out float3 kd)\n"
-		"{\n"
-		"    float3 H = normalize(L + E);\n"
-		"    float ndh = saturate(dot(n, H));\n"
-		"    float vnd = max(dot(n, E), 0.05);\n"      // grazing-V clamp (same as kPixelShaderPBR)
-		"    float vnh = saturate(dot(E, H));\n"
-		"    float3 fres = F0 + (1.0 - F0) * pow(1.0 - vnh, 5.0);\n"
-		"    kd = (1.0 - fres) * (1.0 - metal);\n"
-		"    float dnom = ndh * ndh * (a2 - 1.0) + 1.0;\n"
-		"    float D = a2 / max(dnom * dnom, 1e-4);\n"
-		"    float G = (ndl / max(ndl * (1.0 - kk) + kk, 1e-3)) * (vnd / max(vnd * (1.0 - kk) + kk, 1e-3));\n"
-		"    return D * fres * G * 0.25;\n"
-		"}\n"
-		"float4 main(PS_IN i) : COLOR\n"
-		"{\n"
-		"    float4 base = tex2D(s0, i.uv);\n"
-		"    base.rgb *= i.diffuse.rgb;\n"
-		"    float3 tn = tex2D(s1, i.uv).xyz * 2.0 - 1.0;\n"
-		"    tn.xy = tn.xy * c3.x + c3.y;\n"
-		"    tn.z  = tn.z  * c3.z + c3.w;\n"
-		"    tn = normalize(tn);\n"
-		"    float3 T = normalize(i.tT);\n"
-		"    float3 B = normalize(i.tB);\n"
-		"    float3 N = normalize(i.tN);\n"
-		"    float3 n = tn.x * T + tn.y * B + tn.z * N;\n"   // world-space perturbed normal
-		"    float3 E = normalize(c5.xyz);\n"
-		"    float3 L = normalize(c4.xyz);\n"
-		"    float ndl = saturate(dot(n, L));\n"
-		"    float2 rm = tex2D(s2, i.uv).xy;\n"        // R=roughness, G=metalness
-		"    rm.x = rm.x * (1.0 - c11.w * 0.75);\n"   // GeneralsX @feature PS3.0 Weather W5: rain-slick, same contract as the single-light PBR c8.w (see kPixelShaderPBR)
-		"    float3 F0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, rm.y);\n"
-		"    float a = rm.x * rm.x;\n"
-		"    float a2 = a * a;\n"
-		"    float kk = (rm.x + 1.0) * (rm.x + 1.0) * 0.125;\n"
-		"    float3 kd;\n"
-		"    float3 sunSpec = ggxLobe(n, L, E, F0, rm.y, a2, kk, ndl, kd);\n"
-		"    float3 lit = ndl * c1.xxx + c2.rgb + c8.rgb * n.z;\n"   // sun lambert + ambient + hemi (ML convention)
-		"    float3 col = base.rgb * kd * lit * c11.y + c11.z * F0 + sunSpec * c11.y * ndl;\n"
-		"    for (int k = 0; k < 8; k++)\n"
-		"    {\n"
-		"        float4 lp = mlights[2 * k];\n"
-		"        float4 lc = mlights[2 * k + 1];\n"
-		"        float on = ((float)k < c16.x) ? 1.0 : 0.0;\n"	//static loop + mask: ps_2_0 has no dynamic break
-		"        float3 Lv = lp.xyz - i.wpos;\n"
-		"        float dist = length(Lv);\n"
-		"        float att = saturate((lc.w - dist) / max(lc.w - lp.w, 0.0001));\n"
-		"        att *= att;\n"
-		"        float3 Ld = Lv / max(dist, 0.0001);\n"
-		"        float ndl2 = saturate(dot(n, Ld));\n"
-		"        float3 kd2;\n"
-		"        float3 spec2 = ggxLobe(n, Ld, E, F0, rm.y, a2, kk, ndl2, kd2);\n"
-		"        col += on * att * lc.rgb * (base.rgb * kd2 * (ndl2 * c1.xxx) * c11.y + spec2 * c11.y * ndl2);\n"
-		"    }\n"
-		"    return float4(lerp(col, c9.rgb, saturate((i.eye - c10.x) * c10.y) * c9.w), base.a * i.diffuse.a);\n"	// FF-parity alpha (texel x vertex), see kPixelShader
-		"}\n";
-
 	// GeneralsX @feature PS3.0 batch7 13/10/2026 the pair is emitted through the shared ladder: on a
 	// device that accepts it this compiles as vs_3_0/ps_3_0 (flow control, 32 temporaries, 224 pixel
 	// constants) and drops back to the previous vs_2_0/ps_2_0 automatically if the runtime refuses the
@@ -5031,59 +4913,11 @@ static void InitNormalMapShaders()
 		// GeneralsX @build d3d9 port 11/10/2026 - UINT_PTR carries the interface pointer losslessly on x64.
 		DX8NormalMap::Install((UINT_PTR)vsHandle, (UINT_PTR)psHandle);
 
-		// GeneralsX @feature PS3.0 T5 13/10/2026 compile the multi-light pair on top of the main one.
-		// Failure here is purely additive: g_VS_ML/g_PS_ML stay 0 and dx8normalmap never mounts them.
-		{
-			// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): this is no longer a
-			// user toggle. OptionPreferences() reports the multi-light family ON unconditionally (the
-			// menu row and the Options.ini key are gone), so the ONLY way down left is the
-			// GENERALSX_MULTILIGHT=0 env, kept for scripted A/B. When it is set, the ML pair simply never
-			// installs and those batches fall back to the fixed pipeline - note the post-P3 merged base
-			// has no point-light terms, so a lamp-lit mesh is NOT covered by DX8GeomNormal.
-			if (!OptionPreferences().getMultiLightEnabled()) {
-				fprintf(stderr, "[ML] disabled (env GENERALSX_MULTILIGHT=0; point lights fall back to the fixed pipeline)\n");
-			} else {
-				IDirect3DVertexShader9* mlVS = nullptr;
-				IDirect3DPixelShader9* mlPS = nullptr;
-				const char* mlVSProfile = nullptr;
-				const char* mlPSProfile = nullptr;
-				HRESULT mlHR = W3DShaderManager::compileShaderAtBestProfile(kVertexShaderML, true, "[ML]", &mlVSProfile, (void**)&mlVS);
-				if (SUCCEEDED(mlHR) && mlVS != nullptr)
-					mlHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderML, false, "[ML]", &mlPSProfile, (void**)&mlPS);
-				if (SUCCEEDED(mlHR) && mlVS != nullptr && mlPS != nullptr) {
-					DX8NormalMap::Install_ML((UINT_PTR)mlVS, (UINT_PTR)mlPS);
-					fprintf(stderr, "[ML] multi-light shaders installed vs=%s ps=%s (max 8 point lights)\n",
-						mlVSProfile, mlPSProfile);
-
-					// GeneralsX @feature PS3.0 4C 16/10/2026: compile the GGX multi-light PS on top of
-					// the ML pair it reuses the VS from. Purely additive - on failure dx8normalmap keeps
-					// mounting the plain Blinn ML pair, and GENERALSX_PBRML=0 skips this at runtime.
-					IDirect3DPixelShader9* pbrmlPS = nullptr;
-					const char* pbrmlProfile = nullptr;
-					HRESULT pbrmlHR = W3DShaderManager::compileShaderAtBestProfile(kPixelShaderPBRML, false, "[PBRML]", &pbrmlProfile, (void**)&pbrmlPS);
-					if (SUCCEEDED(pbrmlHR) && pbrmlPS != nullptr) {
-						DX8NormalMap::Install_PBRML((UINT_PTR)pbrmlPS);
-						fprintf(stderr, "[PBRML] GGX multi-light PS compiled ps=%s\n", pbrmlProfile);
-					} else {
-						if (pbrmlPS != nullptr) pbrmlPS->Release();
-						fprintf(stderr, "[PBRML] compile failed (hr=0x%08X), ML stays Blinn-only\n", (unsigned)pbrmlHR);
-					}
-					fflush(stderr);
-				} else {
-					if (mlVS != nullptr) mlVS->Release();
-					if (mlPS != nullptr) mlPS->Release();
-					fprintf(stderr, "[ML] multi-light compile failed, single-light path only\n");
-				}
-				fflush(stderr);
-			}
-		}
-
 		// GeneralsX @feature PS3.0-P4-1 15/10/2026 / #70 Qoder 15/10/2026: compile the PBR (roughness/
 		// metalness) variant UNCONDITIONALLY.  Roughness became an independent runtime toggle (options
 		// menu "RoughnessMapping" -> DX8NormalMap::Set_PBR_Mode), so the shaders must exist even when
 		// the process started without GENERALSX_PBR; the menu/env decides mounting in Apply, not here.
-		// Failure stays purely additive: Install_PBR never runs, DX8NormalMap::Apply keeps mounting
-		// the plain single-light pair bit-for-bit.
+		// Failure stays purely additive: the GN merged path simply keeps its plain (non-PBR) base.
 		{
 			{
 				IDirect3DVertexShader9* pbrVS = nullptr;
@@ -5624,7 +5458,7 @@ static void InitNormalMapShaders()
 				// stays on the rigid GN variants).  Samplers: s0 diffuse, s1 _nm, s2 sun map (GN
 				// convention - the rp companion MOVES from s2 to s3 to free it), s3 _rp.  Vertex
 				// diffuse rides through with the FF-parity chain (base*diffuse, alpha texel x vertex)
-				// the dot3/ML/skin pairs already ship.  "缺资产＝逐位不变": both branch flags 0 makes the
+				// the GN/dot3/skin pairs already ship.  "缺资产＝逐位不变": both branch flags 0 makes the
 				// pixel the plain GN pixel modulo the COLOR0 relay (flat fallback §7.2).
 				static const char* kVertexShaderGNMerged_TG3 =
 					"float4 c0 : register(c0);\n"
@@ -5694,7 +5528,7 @@ static void InitNormalMapShaders()
 					"float4 c25 : register(c25);\n"                // fog: rgb haze color, w = blend strength (0 = identity)
 					"float4 c26 : register(c26);\n"                // fog: x = eye-depth start, y = 1/ramp length
 					"float4 c27 : register(c27);\n"                // layers: (bumpK, bumpOn, shadowOn, rpOn)
-					"float4 c28 : register(c28);\n"                // rp contract: (mode, LI, ENV, wetness) - cf. PBR c8/PBRML c11
+					"float4 c28 : register(c28);\n"                // rp contract: (mode, LI, ENV, wetness) - cf. PBR c8/c11
 					"struct PS_IN\n"
 					"{\n"
 					"    float4 diffuse : COLOR0;\n"
@@ -5705,7 +5539,7 @@ static void InitNormalMapShaders()
 					"    float4 sv      : TEXCOORD4;\n"
 					"    float  eye     : TEXCOORD5;\n"
 					"};\n"
-					// The M2 GGX lobe, verbatim from kPixelShaderPBRML (Schlick fresnel, Smith-Schlick G,
+					// The M2 GGX lobe, verbatim from kPixelShaderPBR (Schlick fresnel, Smith-Schlick G,
 					// grazing-V clamp, the 0.25-folded NDF). kd comes back through the out param.
 					"float3 ggxLobe(float3 n, float3 L, float3 E, float3 F0, float metal, float a2, float kk, float ndl, out float3 kd)\n"
 					"{\n"
@@ -5725,8 +5559,21 @@ static void InitNormalMapShaders()
 					"    float4 base = tex2D(s0, i.uv);\n"
 					"    base.rgb *= i.diffuse.rgb;\n"           // FF parity: vertex tint multiplies the albedo (dot3/skin-pair chain)
 					// --- 细节层 1: the normal. Bumped reads the s1 tangent map through the world TBN
-					// (ML PS recipe); flat reads the interpolated geometric normal (plain GN recipe,
+					// (programmable recipe); flat reads the interpolated geometric normal (plain GN recipe,
 					// with its degenerate-length guard).
+					// GeneralsX @bugfix Qoder 22/10/2026 GNM two-sided flip keys on the GEOMETRIC normal.
+					// #73 defined the rule for a pure geometric normal (kPixelShaderGN), and its dot3 twin
+					// reflects the tangent-space light Z by sign(dot(eye, vertexNormal)) - bump-independent.
+					// The merged PS (P3, 17/10) rebuilt n from the _nm sample first and then tested the
+					// PERTURBED vector: on a bumpy roof/barrel the per-texel dot(n,eye) crosses zero, so
+					// whole regions invert and the result depends on the object's yaw - two identical units
+					// facing opposite directions shade differently even though their roof geometric normals
+					// are the same world-up face. Keying on i.tN and reflecting only the N coefficient
+					// reproduces the dot3 flip exactly:
+					//   dot(tn, (Lt, Lb, Ln*facing)) == dot(tn.x*T + tn.y*B + tn.z*facing*N, L).
+					"    float gl = length(i.tN);\n"
+					"    float3 geoN = (gl > 1e-6) ? i.tN / gl : float3(0.0, 1.0, 0.0);\n"
+					"    float facing = (dot(geoN, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
 					"    float3 n;\n"
 					"    if (c27.y > 0.5)\n"
 					"    {\n"
@@ -5736,16 +5583,13 @@ static void InitNormalMapShaders()
 					"        float3 T = normalize(i.tT);\n"
 					"        float3 B = normalize(i.tB);\n"
 					"        float3 N = normalize(i.tN);\n"
-					"        n = tn.x * T + tn.y * B + tn.z * N;\n"
+					"        n = tn.x * T + tn.y * B + (tn.z * facing) * N;\n"
 					"    }\n"
 					"    else\n"
 					"    {\n"
-					"        float l = length(i.tN);\n"
-					"        n = (l > 1e-6) ? i.tN / l : float3(0.0, 1.0, 0.0);\n"
+					"        n = geoN * facing;\n"
 					"    }\n"
 					"    n = normalize(n);\n"
-					// Two-sided flip (#73), same rule as kPixelShaderGN, applied to the reconstructed n.
-					"    n *= (dot(n, c13.xyz) < 0.0) ? -1.0 : 1.0;\n"
 					// --- sun shadow: the GNS 3x3 kernel behind a uniform branch (c27.z=0 keeps the
 					// exact unshadowed pixel and never touches the unbound s2).
 					"    float shade = 1.0;\n"
@@ -5784,8 +5628,8 @@ static void InitNormalMapShaders()
 					// --- 细节层 2: the specular/roughness layer. No rp = the plain T1 Blinn (bit-exact
 					// GN term); mode 1 = roughness-driven Blinn (kPixelShaderPBR M1); mode 2 = M2 GGX
 					// (Schlick F + Smith-Schlick G + metal-killed diffuse), sun shadow folded into shade,
-					// env = constant hemisphere c28.z*F0 exactly as the shipped PBR/PBRML contract.
-					// 调研 §2: the V is the world eye CONSTANT (c13), same proven approximation as ML/PBRML.
+					// env = constant hemisphere c28.z*F0 exactly as the shipped PBR contract.
+					// 调研 §2: the V is the world eye CONSTANT (c13), the same approximation the dot3 path used.
 					"    if (c27.w < 0.5)\n"
 					"    {\n"
 					"        float3 spec = c14.rgb * pow(saturate(dot(n, h)), c13.w) * ndl0 * shade;\n"
@@ -5895,8 +5739,7 @@ static void InitNormalMapShaders()
 			// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): compile the merged TG3 pair as its
 			// own additive step (same discipline as GNSKIN: a failure here can never take the plain trio
 			// or the skin pair down). Without the handles DX8GeomNormal::Apply declines every TG3 batch
-			// and those meshes stay on the fixed pipeline, while DX8NormalMap::Apply keeps serving the
-			// point-light ML family from its own handles. Skipped in raw-probe mode (scripted forensics
+			// and those meshes stay on the fixed pipeline. Skipped in raw-probe mode (scripted forensics
 			// leg - the probe replaces only the plain GN pixel program).
 			if (gnVS1 != nullptr && gnVS2 != nullptr && gnPS != nullptr && gnPsSrc == kPixelShaderGN)
 			{
@@ -5912,7 +5755,7 @@ static void InitNormalMapShaders()
 				} else {
 					if (gnmVS != nullptr) gnmVS->Release();
 					if (gnmPS != nullptr) gnmPS->Release();
-					fprintf(stderr, "[GNM] merged pair compile failed, bump/roughness meshes stay fixed pipeline (ML unaffected)\n");
+					fprintf(stderr, "[GNM] merged pair compile failed, bump/roughness meshes stay fixed pipeline\n");
 				}
 				fflush(stderr);
 			}
@@ -5990,10 +5833,6 @@ static void InitNormalMapShaders()
 		}
 		DX8NormalMap::Set_PBR_Mode(pbrMode);
 
-		// GeneralsX @feature PS3.0 4E 17/10/2026: seed the GGX multi-light mount toggle from
-		// Options.ini PBRMultiLight (GENERALSX_PBRML wins inside the getter, 4C QA legs unchanged);
-		// the Graphics Options page re-arms it live through gameOptionApply_PBRML.
-		DX8NormalMap::Set_PBRML_Enabled(OptionPreferences().getPBRMLEnabled() ? 1 : 0);
 		fprintf(stderr, "[DOT3] shaders installed (enabled=%d strength=%.2f; default follows options-menu NormalMapping toggle)\n",
 			(int)enable, strength);
 		fprintf(stderr, "[PBR] mode=%d (0=off 1=roughness-Blinn 2=GGX; bump=%d, roughness-only mounts with flat normals)\n",
@@ -6001,7 +5840,7 @@ static void InitNormalMapShaders()
 		fflush(stderr);
 
 		// GeneralsX @feature PS3.0-P3-14 14/10/2026: inject the eye-depth fog ramp the GN-family PS
-		// (c25/c26) and the multi-light PS (c9/c10) blend toward. WW3D2 cannot read GlobalData, so the
+		// (c25/c26) blend toward. WW3D2 cannot read GlobalData, so the
 		// device layer computes the pair here once at shader install. Ramp derives from the camera's
 		// far clip (start = 45%, length = 50% of it) so the haze sits beyond normal play distances;
 		// the tint is a hand-picked cold grey-blue (true sky colour arrives with the P3-15 sky work).
@@ -6086,6 +5925,18 @@ static void Report_Render_To_Texture_Mode(Int mode, UINT width, UINT height, D3D
 void W3DShaderManager::init()
 {
 	int i,j;
+
+	// GeneralsX @feature Qoder 20/10/2026 present-side post seed: FXAA and bloom are applied by the
+	// pure-Vulkan present pass, which has no startup path of its own, so their knobs are seeded here from
+	// the player's options. AA comes from the ini value and not from the device: the Vulkan path never
+	// creates a multisampled swapchain, so every device-reported level would read back as none.
+	{
+		const Real seedBloom = getBloomIntensity();
+		const Bool seedAA = OptionPreferences().getAntiAliasing() != WW3D::MULTISAMPLE_MODE_NONE;
+		DX8Wrapper::VK_Set_Post_Knobs(seedBloom, seedAA != FALSE);
+		fprintf(stderr, "[VKPOST] options seed: bloom=%.2f aa=%u\n", (double)seedBloom, seedAA != FALSE ? 1u : 0u);
+		fflush(stderr);
+	}
 
 	D3DSURFACE_DESC desc = {};
 	// For now, check & see if we are gf3 or higher on the food chain.
@@ -7688,7 +7539,7 @@ Int W3DShaderManager::setShroudTex(Int stage)
 	//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 	//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 	W3DShroud *shroud;
-	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
+	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr && shroud->isTextureReady())
 	{
 		DX8Wrapper::Set_Texture(stage, shroud->getShroudTexture());
 

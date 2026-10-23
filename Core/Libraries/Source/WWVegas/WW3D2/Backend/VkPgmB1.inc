@@ -1,5 +1,5 @@
 // GeneralsX @feature Qoder-B1 18/10/2026 wedge 8 bundle B1: weather, terrain30 (plain trio), road, tree,
-// dot3 diagnostic probes, ML multi-light pair, monochrome screen filter.
+// dot3 diagnostic probes and the monochrome screen filter.
 // Owned row file; VKPGM_COUNT and VKPgm_Program are already defined by VulkanPgm.cpp.
 //
 // Hashes are the pgm_hash.py output over the exported blocks in 引擎改造/Vulkan/文档/内联HLSL/ (byte counts
@@ -30,8 +30,6 @@
 #define VKPGM_HASH_KPIXELSHADERNOSTAGE1    0xF36101AF52714116ULL   // kPixelShaderNoStage1.hlsl (439 bytes)
 #define VKPGM_HASH_KPIXELSHADERRAW         0x2F30B57679A2ACBDULL   // kPixelShaderRaw.hlsl (210 bytes)
 #define VKPGM_HASH_KPIXELSHADERLAMBERTRAW  0x1FDC60EF1CABA791ULL   // kPixelShaderLambertRaw.hlsl (492 bytes)
-#define VKPGM_HASH_KVERTEXSHADERML         0x6564C0A831086FBCULL   // kVertexShaderML.hlsl (1118 bytes)
-#define VKPGM_HASH_KPIXELSHADERML          0x6C88328455A58706ULL   // kPixelShaderML.hlsl (2044 bytes)
 #define VKPGM_HASH_KMONOCHROMESHADERBODY   0x8E7D0DEE57C064C3ULL   // kMonochromeShaderBody.hlsl (340 bytes)
 
 static const VKPgm_Program kPgmB1Programs[] = {
@@ -76,12 +74,6 @@ static const VKPgm_Program kPgmB1Programs[] = {
       VKPGM_COUNT(VKPGMB1_DOT3_RAW_FRAG_SPV),        "b1.dot3.raw" },           // 210 B
     { 132u, 1u, VKPGM_HASH_KPIXELSHADERLAMBERTRAW, VKPGMB1_DOT3_LAMBERT_RAW_FRAG_SPV,
       VKPGM_COUNT(VKPGMB1_DOT3_LAMBERT_RAW_FRAG_SPV), "b1.dot3.lambert_raw" },  // 492 B
-
-    // ML multi-light pair (4573/4607): one tag per stage, kVertexShaderML has no variants
-    { 140u, 0u, VKPGM_HASH_KVERTEXSHADERML, VKPGMB1_ML_VERT_SPV,
-      VKPGM_COUNT(VKPGMB1_ML_VERT_SPV), "b1.ml.vert" },                         // 1118 B
-    { 141u, 1u, VKPGM_HASH_KPIXELSHADERML,  VKPGMB1_ML_FRAG_SPV,
-      VKPGM_COUNT(VKPGMB1_ML_FRAG_SPV),  "b1.ml.frag" },                        // 2044 B
 
     // misc (953, compiled verbatim at 1022); tag 151 reserved for the profiler capture PS
     { 150u, 1u, VKPGM_HASH_KMONOCHROMESHADERBODY, VKPGMB1_MONOCHROME_FRAG_SPV,

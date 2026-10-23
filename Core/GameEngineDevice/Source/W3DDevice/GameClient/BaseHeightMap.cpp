@@ -88,6 +88,9 @@
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/light.h"
 #include "WW3D2/scene.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanDraw.h"	// GeneralsX @bugfix Qoder 21/10/2026 sun-shadow per-map reset
+#endif
 #include "W3DDevice/GameClient/W3DPoly.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 
@@ -1847,6 +1850,14 @@ Int BaseHeightMapRenderObjClass::initHeightData(Int x, Int y, WorldHeightMap *pM
 {
 
 	REF_PTR_SET(m_map, pMap);	//update our heightmap pointer in case it changed since last call.
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @bugfix Qoder 21/10/2026: the native sun shadow fits its light box around the ground
+	// height of the world being drawn. A new height map is a new world; without this reset the fit
+	// keeps the previous map's estimate and converges only as casters stream in, which is the
+	// few-second "shadows are late" window after loading.
+	VKDraw_Shadow_Reset();
+#endif
 
 	if (m_shroud)
 		m_shroud->init(m_map,TheGlobalData->m_partitionCellSize,TheGlobalData->m_partitionCellSize);

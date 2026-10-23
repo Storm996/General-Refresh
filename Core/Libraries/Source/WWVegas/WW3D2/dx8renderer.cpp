@@ -1417,6 +1417,14 @@ void DX8SkinFVFCategoryContainer::Render()
 	}
 	AnythingToRender=false;
 
+	// GeneralsX @bugfix Qoder 20/10/2026 native sun shadow: this container writes world-space vertices
+	// (Get_Deformed_Vertices runs the skeleton on the CPU), so the world transform the device multiplies
+	// by must be the identity. It used to inherit whatever the previous rigid mesh left behind; that was
+	// invisible while the skin batches happened to follow another skin, but it silently transforms them
+	// when it does not, and the shadow pass replays them from the recorded world.
+	DX8Wrapper::Set_World_Identity();
+	DX8Wrapper::VK_Set_Skin_Batch(true);
+
 	DX8Wrapper::Set_Vertex_Buffer(nullptr);	// Free up the reference to the current vertex buffer
 														// (in case it is the dynamic, which may have to be resized)
 
@@ -1451,6 +1459,22 @@ void DX8SkinFVFCategoryContainer::Render()
 		sorting ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8,
 		nm_batch ? dynamic_fvf_type_nm : dynamic_fvf_type,
 		maxVertexCount);
+	// GeneralsX @debug Qoder 20/10/2026 R-08: near-full skin batches are the ones an in-frame pool wrap
+	// corrupts first. One line every 60 batches, armed only by GENERALSX_VK_VBTRACE.
+	{
+		static int trace = -1;
+		if (trace < 0) { const char* e = getenv("GENERALSX_VK_VBTRACE"); trace = (e && atoi(e)) ? 1 : 0; }
+		if (trace) {
+			static unsigned long long calls = 0;
+			if ((++calls % 60ull) == 0ull) {
+				fprintf(stderr, "[VKSKIN] n=%llu sorting=%d nm=%d vis=%u max=%u pool=%u off=%u\n",
+					calls, sorting ? 1 : 0, nm_batch ? 1 : 0, VisibleVertexCount, maxVertexCount,
+					(unsigned)DynamicVBAccessClass::Get_Default_Vertex_Count(),
+					(unsigned)vb.Get_Vertex_Buffer_Offset());
+				fflush(stderr);
+			}
+		}
+	}
 	SNAPSHOT_SAY(("DynamicVBAccess - %s - %d vertices",sorting ? "sorting" : "non-sorting",VisibleVertexCount));
 
 	unsigned int renderedVertexCount=0;
@@ -1649,6 +1673,7 @@ void DX8SkinFVFCategoryContainer::Render()
 	WWASSERT(renderedVertexCount==VisibleVertexCount);
 
 	clearVisibleSkinList();
+	DX8Wrapper::VK_Set_Skin_Batch(false);
 }
 
 bool DX8SkinFVFCategoryContainer::Check_If_Mesh_Fits(MeshModelClass* mmc)
@@ -1995,6 +2020,26 @@ void DX8TextureCategoryClass::Render()
 			continue;
 		}
 
+		// GeneralsX @debug Qoder 21/10/2026 PROPDRAW: the rotor subobjects disappear entirely,
+		// so record whether their categories reach the immediate renderer at all and with which
+		// texture/pass. Bounded to the first few submissions.
+		{
+			static int s_propLog = 0;
+			const char *meshName = mesh->Get_Name();
+			if (s_propLog < 16 && meshName
+				&& (strstr(meshName, "PROP") || strstr(meshName, "PROPELLER") || strstr(meshName, "ROTOR")))
+			{
+				++s_propLog;
+				const char *tex0 = Peek_Texture(0) ? (const char *)Peek_Texture(0)->Get_Texture_Name() : "(none)";
+				fprintf(stderr, "[PROPDRAW] mesh='%s' pass=%u sort=%u sortingEnabled=%u userData=%p tex0='%s' alphaOverride=%.2f\n",
+					meshName, renderer->Get_Pass(),
+					(unsigned)(!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)),
+					(unsigned)WW3D::Is_Sorting_Enabled(),
+					mesh->Get_User_Data(), tex0, mesh->Get_Alpha_Override());
+				fflush(stderr);
+			}
+		}
+
 		SNAPSHOT_SAY(("mesh = %s",mesh->Get_Name()));
 
 		#ifdef WWDEBUG
@@ -2112,53 +2157,10 @@ void DX8TextureCategoryClass::Render()
 			DX8Wrapper::Set_Transform(D3DTS_WORLD,*world_transform);
 		}
 
-		/*
-		** GeneralsX @feature T3-0 M4 (段E): dot3 逐像素法线着色 - 仅对"需法线贴图"的刚性 mesh、
-		** 开关命中且句柄就绪时挂载自定义 VS/PS; 默认关闭时下面整段短路, 严格走原固定管线 (零回归)。
-		*/
-		bool nmApplied = false;
-		// GeneralsX @feature PS3.0 #70 15/10/2026: (this mount could also arm with the normal-map
-		// switch OFF when the roughness pair was ready.) GeneralsX @feature Qoder 17/10/2026 P3: gate 1
-		// is the multi-light 兼容层 only now - Ready_To_Render (bump switch + both pairs installed) is
-		// its real precondition, and DX8NormalMap::Apply declines anything without an _nm companion or a
-		// collected point light, leaving every other bump/roughness batch to gate 2's merged base.
-		// GeneralsX @bugfix Qoder 16/10/2026 T3-0 white-flicker CLASS fix (was: per-texture file moves):
-		// the dot3/PBR pair may only take over a batch when the custom pipeline can reproduce the
-		// ENTIRE render semantics of that batch. Forensics on the CB civilian buildings (w3d_matdump.py
-		// over 4800 assets) showed their "white snow flicker" material: multi-pass W3D meshes where
-		// pass 0 = LAKEDUSK.tga sky-reflection base layer (ENVIRONMENT-mapped, opaque ONE/ZERO, writes
-		// depth) and pass 1 = the building shell (SRC_ALPHA/INV_SRC_ALPHA, NO depth write) composited
-		// on top. That recipe draws the same triangles twice per frame BY DESIGN - "画了两遍". The old
-		// 11/10 note mislabelled pass 0 as alpha-blended glass; it is opaque, so the blend-only gate
-		// never excluded it. Our custom VS/PS breaks two invariants of the recipe at once: (1) it only
-		// rewrites pass 0's output, so pass 1's alpha composite blends over a different base than the
-		// asset was authored against, and (2) the VS samples raw vertex UVs - every non-plain texture
-		// mapper (ENVIRONMENT/CHEAP_ENVIRONMENT/LINEAR_OFFSET/SCREEN/...) whose UVs are generated
-		// per-frame from view vectors or animated offsets silently degenerates to static UV. Either
-		// alone changes the look; together with the animated water background it reads as flicker.
-		// Exclusions below are per-material SEMANTICS (same rule set the GN gate already ships):
-		// multi-pass composites and mapper-generated UVs stay on the fixed pipeline; single-pass plain
-		// UV batches (tanks, hulls, roofs) keep the normal-map upgrade. No asset file is excluded.
-		// The Alpha_Override / MATERIAL_OVERRIDE parity conditions close the other half of the
-		// original flicker theory: the retail per-prt alpha swap (below) installs theAlphaShader AFTER
-		// this gate decided, so a mounted custom pair could be drawn alpha-blended with our raw
-		// texture-alpha - now such prts never mount, and the swap always runs on the fixed pipeline.
+		// The legacy dot3/ML mount used to live here. It was our DX9-only multi-light
+		// work, not retail; the merged GN pair below is the only programmable path now.
 		bool nmMapperPlain = (vmaterial == nullptr)
 			|| (vmaterial->Peek_Mapper(0) == nullptr && vmaterial->Peek_Mapper(1) == nullptr);
-		if (DX8NormalMap::Ready_To_Render()
-			&& (Get_Container()->Get_FVF() == DX8_FVF_XYZNDUV1TG3 || Get_Container()->Is_Normal_Map_Batch())
-			&& mesh->Peek_Model()->Uses_Normal_Map()
-			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
-			&& mesh->Peek_Model()->Get_Pass_Count() == 1
-			&& mesh->Get_Alpha_Override() == 1.0f
-			&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
-			&& nmMapperPlain
-			&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
-			&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO) {
-			// lenv may be null on battlefield objects (they rely on the global sun); Apply falls
-			// back to the injected global light in that case.
-			nmApplied = DX8NormalMap::Apply(*world_transform, lenv, Peek_Texture(0));
-		}
 
 		/*
 		** GeneralsX @feature PS3.0 L2 (段E'): 几何法线逐像素漫反射 - 只接管 dot3 路径没碰过的普通
@@ -2169,7 +2171,7 @@ void DX8TextureCategoryClass::Render()
 		// GeneralsX @debug PS3.0 L2 forensics: the GN run mounted zero batches. Log the first few
 		// rigid candidates' actual FVF and every gate sub-condition so we can see exactly which one
 		// blocks the mount (wrong FVF expectation vs blend/pass/sort/skin vs alpha-override).
-		if (!nmApplied && DX8GeomNormal::Ready_To_Render()) {
+		if (DX8GeomNormal::Ready_To_Render()) {
 			static unsigned s_gnProbe = 0;
 			if (s_gnProbe < 12u) {
 				++s_gnProbe;
@@ -2197,9 +2199,14 @@ void DX8TextureCategoryClass::Render()
 			gnLenvSafe = true;
 		} else if (lenv->Get_Light_Count() <= LightEnvironmentClass::MAX_LIGHTS) {
 			gnLenvSafe = true;
+#if !defined(SAGE_USE_VULKAN_CORE)
+			// GeneralsX @feature Qoder 20/10/2026 Forward: the Vulkan GN twins evaluate point lights
+			// per pixel (PS c32..c48), so a lamp/explosion no longer disqualifies the batch. The D3D9
+			// HLSL family has no such loop; it keeps the old vertex-lit fallback there.
 			for (int li = 0; li < lenv->Get_Light_Count(); ++li) {
 				if (lenv->isPointLight(li)) { gnLenvSafe = false; break; }
 			}
+#endif
 		}
 		// GeneralsX @feature Qoder 18/10/2026 P3 diagnostics: the only replay available carries two point
 		// lights, so the GN pair never mounts in it and the submit-side probe stays silent. This default-off
@@ -2237,11 +2244,11 @@ void DX8TextureCategoryClass::Render()
 			gnVBLayout = Get_Container()->Get_FVF();
 		}
 		// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8 diagnosis: GNPROBE samples every
-		// candidate before nmApplied/Ready are known; this second probe samples the batches where GN is
+		// candidate before Ready is known; this second probe samples the batches where GN is
 		// actually ready and prints the remaining gate inputs, so a mount that never happens can be
 		// attributed to one clause. Point-light count is explicit because gnLenvSafe is the only gate
 		// input GNPROBE does not show.
-		if (!nmApplied && DX8GeomNormal::Ready_To_Render()) {
+		if (DX8GeomNormal::Ready_To_Render()) {
 			static unsigned s_gnProbe2 = 0;
 			if (s_gnProbe2 < 24u) {
 				++s_gnProbe2;
@@ -2268,7 +2275,7 @@ void DX8TextureCategoryClass::Render()
 				fflush(stderr);
 			}
 		}
-		if (!nmApplied && gnLenvSafe && DX8GeomNormal::Ready_To_Render()
+		if (gnLenvSafe && DX8GeomNormal::Ready_To_Render()
 			&& (gnVBLayout == (unsigned)DX8_FVF_XYZNUV1 || gnVBLayout == (unsigned)DX8_FVF_XYZNUV2
 				|| gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2
 				// GeneralsX @feature Qoder 17/10/2026 P3: the tangent layout rides the merged base now
@@ -2337,14 +2344,13 @@ void DX8TextureCategoryClass::Render()
 		** a category-level constant - so the only transitions are mount<->fixed. Unmount BEFORE a
 		** fallback task draws; otherwise stay installed for the next same-kind task.
 		*/
-		if (nmApplied || gnApplied) {
+		if (gnApplied) {
 			if (mountedKind == 0) ++s_stickyInstalls;
-			mountedKind = nmApplied ? 1 : 2;
+			mountedKind = 2;
 		} else if (mountedKind != 0) {
-			if (mountedKind == 1) DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
 			// GeneralsX @feature Qoder 17/10/2026 P2: restore with the layout the mount actually used
 			// (skin batches: the dynamic DUV2, never the nominal NUV1 container label).
-			else DX8GeomNormal::Restore(gnMountFVF != 0 ? gnMountFVF : Get_Container()->Get_FVF());
+			DX8GeomNormal::Restore(gnMountFVF != 0 ? gnMountFVF : Get_Container()->Get_FVF());
 			++s_stickyUnmounts;
 			mountedKind = 0;
 		}
@@ -2388,6 +2394,20 @@ void DX8TextureCategoryClass::Render()
 					oldMapper->Set_LastUsedSyncTime(WW3D::Get_Sync_Time());	//make sure zero time passes for the mapper.
 					oldMapper->Get_Current_UV_Offset(oldUVOffset);
 					oldMapper->Set_Current_UV_Offset(matOverride->customUVOffset);
+					// GeneralsX @bugfix Qoder 21/10/2026 TREADUV: write the mapper texture matrix
+					// now, not only when the material is next applied. The tank code changes the
+					// override offset after the category's Set_Material, and a later Apply can be
+					// skipped entirely, which left the Vulkan FF block packing the previous offset
+					// (treads tiled correctly but frozen). Apply also refreshes DX8Transforms.
+					oldMapper->Apply(oldMapper->Get_Stage());
+					static int s_treadUvLog = 0;
+					if (s_treadUvLog < 8) {
+						++s_treadUvLog;
+						fprintf(stderr, "[TREADUV] mesh='%s' offset=(%.3f,%.3f) stage=%d\n",
+							mesh->Get_Name(), matOverride->customUVOffset.X, matOverride->customUVOffset.Y,
+							oldMapper->Get_Stage());
+						fflush(stderr);
+					}
 				}
 				else
 					oldMapper=nullptr;
@@ -2461,9 +2481,7 @@ void DX8TextureCategoryClass::Render()
 	}
 	const long double vk15Td = vk15 ? vkf15::now_us() : 0.0L;
 
-	if (mountedKind == 1) {
-		DX8NormalMap::Restore(DX8_FVF_XYZNDUV1TG3);
-	} else if (mountedKind == 2) {
+	if (mountedKind == 2) {
 		// GeneralsX @feature Qoder 17/10/2026 P2: effective layout, see the per-prt unmount above.
 		DX8GeomNormal::Restore(gnMountFVF != 0 ? gnMountFVF : Get_Container()->Get_FVF());
 	}

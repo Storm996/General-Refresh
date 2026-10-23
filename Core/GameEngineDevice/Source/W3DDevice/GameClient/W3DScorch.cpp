@@ -137,6 +137,23 @@ void W3DScorch::drawScorches(WorldHeightMap& map)
 	{
 		return;
 	}
+
+	// GeneralsX @bugfix Qoder 22/10/2026 Never draw the MissingTexture fallback as a scorch decal:
+	// its X1R5G5B5 surface has alpha = 1 everywhere, so SRCALPHA blending paints the whole quad as an
+	// opaque black square. The base Generals asset path fix should make EXScorch01 load; this guard
+	// keeps a future lookup failure from turning every crater into a hard square.
+	if (m_scorchTexture == nullptr || m_scorchTexture->Is_Missing_Texture())
+	{
+		static Bool s_missingScorchLogged = FALSE;
+		if (!s_missingScorchLogged)
+		{
+			s_missingScorchLogged = TRUE;
+			fprintf(stderr, "[SCORCH] EXScorch atlas unavailable; scorch decals skipped to avoid black quads\n");
+			fflush(stderr);
+		}
+		return;
+	}
+
 	DX8Wrapper::Set_Index_Buffer(m_indexScorch, 0);
 	DX8Wrapper::Set_Vertex_Buffer(m_vertexScorch);
 	DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaShader);

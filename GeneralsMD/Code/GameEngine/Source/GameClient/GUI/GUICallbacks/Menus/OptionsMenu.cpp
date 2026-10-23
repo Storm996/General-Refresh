@@ -68,6 +68,8 @@
 #include "GameClient/Mouse.h"
 #include "GameClient/GameText.h"
 #include "GameClient/Display.h"
+// GeneralsX @feature Qoder 21/10/2026 weather presets + vegetation render options.
+#include "GameClient/Snow.h"
 #include "GameClient/IMEManager.h"
 #include "GameClient/ShellHooks.h"
 #include "GameClient/GUICallbacks.h"
@@ -84,6 +86,7 @@
 
 #include "WW3D2/ww3d.h"
 #include "WW3D2/texturefilter.h"
+#include "WW3D2/dx8wrapper.h"	// GeneralsX @feature Qoder 20/10/2026 real-shadow row drives the native pass
 #include "WW3D2/dx8normalmap.h"	// GeneralsX @feature 11/10/2026 dot3 normal-mapping toggle
 
 // This is for non-RC builds only!!!
@@ -273,6 +276,10 @@ static Int gameOptionFallback_AntiAliasing()
 static void gameOptionApply_AntiAliasing(Int level)
 {
 	TheWritableGlobalData->m_antiAliasLevel = level;
+	// GeneralsX @feature Qoder 20/10/2026: the Vulkan present pass resolves this live (FXAA); on D3D the
+	// value still waits for the next device creation, exactly as the row always did.
+	if (TheDisplay != nullptr)
+		TheDisplay->setAntiAliasLevel(level);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -310,24 +317,72 @@ static Int gameOptionFallback_Bloom()
 	return (Int)(OptionPreferences().getBloomIntensity() * 100.0f + 0.5f);
 }
 
-static Int gameOptionFallback_ShadowDensity()
+// GeneralsX @feature Qoder 20/10/2026: the two shadow-density rows drive the native sun shadow.
+// The retail managers are back on their shipped constants and are muted while the native row is on,
+// so these mirrors only feed VulkanDraw's receiver: projected density is its darkening strength and
+// volumetric density is the PCSS penumbra scale. Pushed on every apply, so a slider move previews on
+// the next frame. 25 and 22 are the shipped values and map to the receiver's previous 0.58 / 1.0.
+static Real s_sunShadowStrength = 0.58f;
+static Real s_sunShadowPenumbra = 1.0f;
+
+static Real shadowStrengthFromDensity(Int tick)
 {
-	return OptionPreferences().getShadowMapIntensity();
+	if (tick <= 0)
+		return 0.0f;
+	if (tick <= 25)
+		return 0.58f * (Real)tick / 25.0f;
+	const Real t = (Real)(tick - 25) / 75.0f;
+	return 0.58f + 0.42f * (t > 1.0f ? 1.0f : t);
 }
 
-static Int gameOptionFallback_ShadowSoftening()
+// The merged pass has no separate volumetric layer, so the volumetric row scales the PCSS penumbra
+// (edge softness) instead. Anchored at the shipped 22 -> 1.0, the receiver's previous constant.
+static Real shadowPenumbraFromVolume(Int tick)
 {
-	return OptionPreferences().getShadowSoftening();
+	Real p = 1.0f + (Real)(tick - 22) * 0.02f;
+	if (p < 0.5f)
+		p = 0.5f;
+	if (p > 2.5f)
+		p = 2.5f;
+	return p;
 }
 
-static Int gameOptionFallback_SunShadowRes()
+static void pushSunShadowKnobs()
 {
-	return OptionPreferences().getSunShadowMapResolution();
+	DX8Wrapper::VK_Set_Sun_Shadow_Knobs(s_sunShadowStrength, s_sunShadowPenumbra);
+}
+
+static Int gameOptionFallback_ShadowVolumetric()
+{
+	const Int tick = (Int)(OptionPreferences().getShadowVolumetricIntensity() + 0.5f);
+	s_sunShadowPenumbra = shadowPenumbraFromVolume(tick);
+	pushSunShadowKnobs();
+	return tick;
+}
+
+static void gameOptionApply_ShadowVolumetric(Int tick)
+{
+	s_sunShadowPenumbra = shadowPenumbraFromVolume(tick);
+	pushSunShadowKnobs();
+	fprintf(stderr, "[SHADOWOPT] volumetric=%d -> penumbra=%.2f\n", tick, (double)s_sunShadowPenumbra);
+	fflush(stderr);
 }
 
 static Int gameOptionFallback_ShadowMap()
 {
 	return OptionPreferences().getShadowMapEnabled() != FALSE;
+}
+
+// GeneralsX @feature Qoder 20/10/2026: the "real shadow" row now owns the Vulkan sun shadow. On mutes
+// the retail decal/stencil sun shadows and runs the native shadow-map receiver; off restores the retail
+// managers and skips the native pass. GENERALSX_SHADOWMAP stays the QA override (env wins).
+static void gameOptionApply_ShadowMap(Int on)
+{
+	const char *env = getenv("GENERALSX_SHADOWMAP");
+	const Bool enabled = env ? (atoi(env) > 0) : (on != 0);
+	fprintf(stderr, "[SHADOWOPT] apply on=%d env=%s -> native=%d\n", on, env ? env : "(unset)", (int)enabled);
+	fflush(stderr);
+	DX8Wrapper::VK_Set_Real_Shadow_Enabled(enabled != FALSE);
 }
 
 static void gameOptionApply_NormalStrength(Int tick)
@@ -352,13 +407,6 @@ static void gameOptionApply_Roughness(Int mode)
 
 static const Int s_roughnessValues[] = { 0, 1, 2 };
 static const wchar_t *const s_roughnessTexts[] = { L"\u5173\u95ed", L"\u57fa\u7840\u9ad8\u5149", L"\u5b8c\u6574 PBR" };
-
-static const Int s_shadowSofteningValues[] = { 0, 1, 2, 3 };
-static const wchar_t *const s_shadowSofteningTexts[] = { L"\u5173", L"\u4f4e", L"\u4e2d", L"\u9ad8" };
-
-// GeneralsX @feature PS3.0-P3-22 14/10/2026: 2048 joins the sun-map resolution dropdown (S2 tiers).
-static const Int s_sunShadowResValues[] = { 256, 512, 1024, 2048 };
-static const wchar_t *const s_sunShadowResTexts[] = { L"256", L"512", L"1024", L"2048" };
 
 //-------------------------------------------------------------------------------------------------
 // GeneralsX @feature PS3.0 4E 17/10/2026: lighting stage-four (4A/4B/4C) switches on the page.
@@ -393,16 +441,6 @@ static void gameOptionApply_LampIntensity(Int tick)
 		TheLampStore->setGlobalIntensityGain((Real)tick * 0.01f);
 }
 
-static Int gameOptionFallback_PBRML()
-{
-	return OptionPreferences().getPBRMLEnabled() != FALSE;
-}
-
-static void gameOptionApply_PBRML(Int on)
-{
-	DX8NormalMap::Set_PBRML_Enabled(on != 0);
-}
-
 //-------------------------------------------------------------------------------------------------
 // GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: four rows that used to be restart-only
 // now push straight into the layer that consumes them, following the setDistanceHaze route (the page is
@@ -411,10 +449,9 @@ static void gameOptionApply_PBRML(Int on)
 //  * 建筑灯光       -> LampStore::setGlobalLampsEnabled; the render side then releases every held lamp.
 //  * 泛光强度       -> Display::setBloomIntensity -> the composite constant (and the fixed-function
 //                     fallback glow byte, which used to ignore the slider completely).
-//  * 阴影浓度       -> Display::setShadowMapStrength -> both W3DSunShadowMap consumers.
 // Each receiving layer still resolves GENERALSX_LIGHTPULSE / GENERALSX_LAMPLIGHT /
-// GENERALSX_BLOOM_INTENSITY / GENERALSX_SHADOWMAP_INT first and ignores a menu push while its env leg
-// is present, so a scripted parity run cannot be moved from the page.
+// GENERALSX_BLOOM_INTENSITY first and ignores a menu push while its env leg is present, so a scripted
+// parity run cannot be moved from the page.
 //-------------------------------------------------------------------------------------------------
 static void gameOptionApply_LightPulse(Int on)
 {
@@ -434,34 +471,33 @@ static void gameOptionApply_Bloom(Int tick)
 		TheDisplay->setBloomIntensity((Real)tick * 0.01f);
 }
 
-static void gameOptionApply_ShadowDensity(Int tick)
-{
-	if (TheDisplay != nullptr)
-		TheDisplay->setShadowMapStrength((Real)tick * 0.01f);
-}
-
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 18/10/2026: the two shadow knobs that had no row at all, only an ini key.
-// Both are cached when W3DShadowManager is constructed once per process (density feeds
-// TexProjectClass::Set_Intensity, the volumetric one feeds the fullscreen SRCBLEND colour), and that
-// manager lives in the project's device layer, which this engine-side file cannot reach - so these
-// rows stay restart-only, the documented convention for once-per-process resources. Ticks are the
-// getters' own 0-100 percent domain; the factory defaults are the shipped 25 / 22.
+// GeneralsX @feature Qoder 18/10/2026: projected density had an ini key but no row. It is the darkening
+// of every retail ground decal, and - since 20/10/2026 - the native receiver's strength as well, which
+// makes this row live in both modes. Ticks are the getter's own 0-100 percent domain; the factory
+// default is the shipped 25.
 //-------------------------------------------------------------------------------------------------
 static Int gameOptionFallback_ShadowProjected()
 {
-	return (Int)(OptionPreferences().getShadowProjectedIntensity() + 0.5f);
+	const Int tick = (Int)(OptionPreferences().getShadowProjectedIntensity() + 0.5f);
+	s_sunShadowStrength = shadowStrengthFromDensity(tick);
+	pushSunShadowKnobs();
+	return tick;
 }
 
-static Int gameOptionFallback_ShadowVolumetric()
+static void gameOptionApply_ShadowProjected(Int tick)
 {
-	return (Int)(OptionPreferences().getShadowVolumetricIntensity() + 0.5f);
+	s_sunShadowStrength = shadowStrengthFromDensity(tick);
+	pushSunShadowKnobs();
+	fprintf(stderr, "[SHADOWOPT] projected=%d -> strength=%.3f\n", tick, (double)s_sunShadowStrength);
+	fflush(stderr);
 }
 
-// GeneralsX @feature Qoder 18/10/2026: the terrain per-pixel macro-normal child switch finally gets a
-// row. Options.ini TerrainPerPixel, factory default OFF (as is its parent Terrain30Shading - the batch22
-// retail-parity red line, untouched here). Restart-only: the HLSL terrain trio is compiled at terrain
-// shader init, and this child only arms once the parent is on.
+// GeneralsX @feature Qoder 18/10/2026: the terrain per-pixel macro-normal switch gets a row.
+// GeneralsX @refactor Qoder 20/10/2026: this is now the ONLY terrain row - it implies the ps_3_0 + NM
+// leg that used to sit behind the "现代地形光影" parent switch (the parent row is gone). Options.ini
+// TerrainPerPixel, factory default OFF (batch22 retail-parity red line). Restart-only: the HLSL
+// terrain trio is compiled at terrain shader init.
 //-------------------------------------------------------------------------------------------------
 static Int gameOptionFallback_TerrainPerPixel()
 {
@@ -509,22 +545,28 @@ static Int gameOptionFallback_TodPreview()
 {
 	return OptionPreferences().getTodPreview();
 }
+// GeneralsX @feature Qoder 22/10/2026 Forward+: the visible rows the night work was missing. Both
+// values are read live by RTS3DScene::doRender every frame, so the generic save loop is all they need
+// (no apply hook; no restart).
+static Int gameOptionFallback_ForwardPlusMode()
+{
+	return OptionPreferences().getForwardPlusMode();
+}
+static Int gameOptionFallback_ForwardLightBudget()
+{
+	return OptionPreferences().getForwardLightBudget();
+}
+static const Int s_forwardPlusModeValues[] = { 0, 1, 2 };
+static const wchar_t *const s_forwardPlusModeTexts[] =
+{
+	L"\u5173\u95ed", L"3D \u7c07", L"\u76f4\u63a5 256 \u706f", // off / 3D clusters / direct 256-light loop
+};
 
 static const Int s_todPreviewValues[] = { 0, 1, 2, 3, 4 };
 static const wchar_t *const s_todPreviewTexts[] =
 {
 	L"\u8ddf\u968f", L"\u4e0a\u5348", L"\u4e0b\u5348", L"\u508d\u665a", L"\u591c\u665a", // follow / morning / afternoon / evening / night
 };
-
-// GeneralsX @feature PS3.0 L2.2 17/10/2026: TERRAIN30 (the ps_3_0 HLSL terrain trio that carries the
-// L2.1 normal-map leg) as a page checkbox. The trio is compiled once per process at terrain shader
-// init, so this row is restart-only (apply = nullptr); fallback reads the same OptionPreferences
-// getter the renderer consumes, GENERALSX_TERRAIN30 env override included, and the factory default
-// is OFF (batch22 retail-parity verdict).
-static Int gameOptionFallback_Terrain30()
-{
-	return OptionPreferences().getTerrain30Shading() != FALSE;
-}
 
 // GeneralsX @feature Qoder 17/10/2026: "逐像素光照" - the per-pixel lighting master switch. It names
 // what DX8GeomNormal has always been (fixed pipeline -> per-pixel lighting against the interpolated
@@ -544,6 +586,52 @@ static void gameOptionApply_PerPixelLighting(Int on)
 {
 	DX8GeomNormal::Set_Enabled(on != 0);
 }
+
+// GeneralsX @feature Qoder 21/10/2026 vegetation rows. The shared record in Snow.h is what the
+// device-side grass buffer reads every frame, so an apply here is visible on the next drawn frame and
+// master-off skips the channel outright. Fallbacks mirror the same record so the page opens on the
+// values the renderer is actually using.
+static Int gameOptionFallback_Vegetation()      { return g_vegetationRenderOptions.enabled ? 1 : 0; }
+static Int gameOptionFallback_Grass()           { return g_vegetationRenderOptions.grassEnabled ? 1 : 0; }
+static Int gameOptionFallback_GrassDensity()    { return (Int)(g_vegetationRenderOptions.grassDensity + 0.5f); }
+static Int gameOptionFallback_GrassHeight()     { return (Int)(g_vegetationRenderOptions.grassHeightScale + 0.5f); }
+static Int gameOptionFallback_GrassDistance()   { return (Int)(g_vegetationRenderOptions.grassDistanceScale + 0.5f); }
+static Int gameOptionFallback_Rocks()           { return g_vegetationRenderOptions.rocksEnabled ? 1 : 0; }
+static Int gameOptionFallback_RockDensity()     { return (Int)(g_vegetationRenderOptions.rockDensity + 0.5f); }
+
+static void gameOptionApply_Vegetation(Int on)      { g_vegetationRenderOptions.enabled = on != 0; }
+static void gameOptionApply_Grass(Int on)           { g_vegetationRenderOptions.grassEnabled = on != 0; }
+static void gameOptionApply_GrassDensity(Int tick)  { g_vegetationRenderOptions.grassDensity = (Real)tick; }
+static void gameOptionApply_GrassHeight(Int tick)   { g_vegetationRenderOptions.grassHeightScale = (Real)tick; }
+static void gameOptionApply_GrassDistance(Int tick) { g_vegetationRenderOptions.grassDistanceScale = (Real)tick; }
+static void gameOptionApply_Rocks(Int on)           { g_vegetationRenderOptions.rocksEnabled = on != 0; }
+static void gameOptionApply_RockDensity(Int tick)   { g_vegetationRenderOptions.rockDensity = (Real)tick; }
+
+// GeneralsX @feature Qoder 21/10/2026 weather preset: -1 follows the map/script, 0..5 forces a type.
+// The manager publishes the recipe (particles, screen filter, lighting) on the same frame, so picking
+// an entry is a live switch rather than a restart-only setting.
+static Int gameOptionFallback_Weather()
+{
+	return TheSnowManager ? TheSnowManager->getUserWeatherOverride() : -1;
+}
+
+static void gameOptionApply_Weather(Int value)
+{
+	if (TheSnowManager)
+		TheSnowManager->setUserWeatherOverride(value);
+}
+
+static const Int s_weatherValues[] = { -1, 0, 1, 2, 3, 4, 5 };
+static const wchar_t *const s_weatherTexts[] =
+{
+	L"\u8ddf\u968f\u5730\u56fe",	// follow map
+	L"\u6674\u6717",				// clear
+	L"\u5c0f\u96ea",				// light snow
+	L"\u5c0f\u96e8",				// light rain
+	L"\u66b4\u96e8",				// storm
+	L"\u96f7\u66b4",				// thunder
+	L"\u66b4\u98ce\u96ea",		// blizzard
+};
 
 // GeneralsX @feature Qoder 13/10/2026 Control names are the bare gadget names (no layout prefix):
 // the init loop formats "<layoutPrefix>:<name>", so the SAME rows drive both the retail
@@ -601,37 +689,14 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		nullptr, nullptr, 0, 0, 100,
 		gameOptionFallback_Bloom, gameOptionApply_Bloom,
 	},
-	{
-		GAME_OPTION_SLIDER, "ShadowMapIntensity", "SliderShadowDensity",
-		"StaticTextShadowDensity", L"\u9634\u5f71\u6d53\u5ea6",
-		nullptr, nullptr, 0, 0, 100,
-		gameOptionFallback_ShadowDensity, gameOptionApply_ShadowDensity,
-	},
-	{
-		GAME_OPTION_COMBO, "ShadowSoftening", "ComboBoxShadowSoftening",
-		"StaticTextShadowSoftening", L"\u9634\u5f71\u67d4\u5316",
-		s_shadowSofteningValues, s_shadowSofteningTexts, (Int)ARRAY_SIZE(s_shadowSofteningValues), 0, 0,
-		gameOptionFallback_ShadowSoftening, nullptr,
-	},
-	{
-		GAME_OPTION_COMBO, "SunShadowMapResolution", "ComboBoxSunShadowRes",
-		"StaticTextSunShadowRes", L"\u9634\u5f71\u5206\u8fa8\u7387",
-		s_sunShadowResValues, s_sunShadowResTexts, (Int)ARRAY_SIZE(s_sunShadowResValues), 0, 0,
-		gameOptionFallback_SunShadowRes, nullptr,
-	},
-	// GeneralsX @refactor Qoder 17/10/2026 PS3.0 lighting T0 (P3 follow-up): the "multi-light effect"
-	// row is gone. Since P3 the multi-light family is a permanently-on layer of the merged per-pixel
-	// base, the row was restart-only (apply = nullptr) so it never affected a running client, and GGX
-	// multi-light specular stays user-facing further down as its own row (PBRMultiLight).
-	// OptionPreferences now reports the feature ON, and CheckMultiLight was removed from
-	// GraphicsOptions.wnd in the same step - leaving the gadget behind would have shown an inert
-	// checkbox, exactly the "switch does nothing" trap the per-pixel row first fell into. Scripted A/B
-	// still turns it off with GENERALSX_MULTILIGHT=0.
+	// GeneralsX @refactor Qoder 20/10/2026: the sun-shadow rows (阴影浓度 / 阴影分辨率) are gone with
+	// W3DSunShadowMap. Both gadgets fed only that pass, so leaving them on the page would have been two
+	// dead knobs; the retail projected/volumetric shadow rows above remain live.
 	{
 		GAME_OPTION_BOOL, "ShadowMap", "CheckShadowMap",
 		nullptr, L"\u771f\u5b9e\u9634\u5f71\uff08\u5b9e\u9a8c\uff09",
 		nullptr, nullptr, 0, 0, 0,
-		gameOptionFallback_ShadowMap, nullptr,
+		gameOptionFallback_ShadowMap, gameOptionApply_ShadowMap,
 	},
 	// GeneralsX @feature PS3.0 4E 17/10/2026 stage-four rows (see the helpers above): 4A pulses,
 	// 4B lamps, 4C GGX multi-light + time-of-day preview. The pulse and lamp gates became live rows on
@@ -656,26 +721,27 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		gameOptionFallback_LampIntensity, gameOptionApply_LampIntensity,
 	},
 	{
-		GAME_OPTION_BOOL, "PBRMultiLight", "CheckPBRML",
-		nullptr, L"GGX \u591a\u706f\u9ad8\u5149",
-		nullptr, nullptr, 0, 0, 0,
-		gameOptionFallback_PBRML, gameOptionApply_PBRML,
-	},
-	{
 		GAME_OPTION_COMBO, "TimeOfDayPreview", "ComboBoxTodPreview",
 		"StaticTextTodPreview", L"\u65f6\u523b\u9884\u89c8",
 		s_todPreviewValues, s_todPreviewTexts, (Int)ARRAY_SIZE(s_todPreviewValues), 0, 0,
 		gameOptionFallback_TodPreview, nullptr,
 	},
-	// GeneralsX @feature PS3.0 L2.2 17/10/2026: terrain HLSL leg opt-in (restart needed, see helper).
+	// GeneralsX @feature Qoder 22/10/2026 Forward+ night: light budget + cluster mode rows.
 	{
-		GAME_OPTION_BOOL, "Terrain30Shading", "CheckTerrain30Shading",
-		nullptr, L"\u73b0\u4ee3\u5730\u5f62\u5149\u5f71\uff08\u5b9e\u9a8c\uff09",
-		nullptr, nullptr, 0, 0, 0,
-		gameOptionFallback_Terrain30, nullptr,
+		GAME_OPTION_SLIDER, "ForwardLightBudget", "SliderForwardBudget",
+		"StaticTextForwardPlus", L"\u706f\u5149\u9884\u7b97",
+		nullptr, nullptr, 0, 32, 256,
+		gameOptionFallback_ForwardLightBudget, nullptr,
 	},
-	// GeneralsX @feature Qoder 18/10/2026: the P4 terrain per-pixel child switch gets its own row (see
-	// the helper above). It only arms while the row above is on, and both stay OFF on a fresh install.
+	{
+		GAME_OPTION_COMBO, "ForwardPlusMode", "ComboBoxForwardPlusMode",
+		"StaticTextForwardPlusMode", L"Forward+ \u6a21\u5f0f",
+		s_forwardPlusModeValues, s_forwardPlusModeTexts, (Int)ARRAY_SIZE(s_forwardPlusModeValues), 0, 0,
+		gameOptionFallback_ForwardPlusMode, nullptr,
+	},
+	// GeneralsX @refactor Qoder 20/10/2026: the "现代地形光影（实验）" parent row is gone. It was the
+	// carrier for the ps_3_0/NM leg that this row now implies, and under pure Vulkan it was forced on,
+	// so it showed as a checkbox that changed nothing. TerrainPerPixel is the single terrain switch.
 	{
 		GAME_OPTION_BOOL, "TerrainPerPixel", "CheckTerrainPerPixel",
 		nullptr, L"\u5730\u5f62\u9010\u50cf\u7d20\u5149\u7167\uff08\u5b9e\u9a8c\uff09",
@@ -697,21 +763,69 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		nullptr, nullptr, 0, 0, 100,
 		gameOptionFallback_DistanceHazeStrength, gameOptionApply_DistanceHazeStrength,
 	},
-	// GeneralsX @feature Qoder 18/10/2026: the two unit-shadow density knobs (see the helpers above).
-	// Restart-only rows - W3DShadowManager caches them at construction - but they were previously
-	// reachable only by hand-editing Options.ini, and they decide how dark the shadows under every
-	// tank and soldier are, which is the single most visible shadow number on the page.
+	// GeneralsX @feature Qoder 18/10/2026: the two shadow-density rows (see the helpers above). Both are
+	// live in the native mode since 20/10/2026; the retail managers keep their shipped constants.
 	{
 		GAME_OPTION_SLIDER, "ShadowProjectedIntensity", "SliderShadowProjected",
 		"StaticTextShadowProjected", L"\u6295\u5f71\u9634\u5f71\u6d53\u5ea6",
 		nullptr, nullptr, 0, 0, 100,
-		gameOptionFallback_ShadowProjected, nullptr,
+		gameOptionFallback_ShadowProjected, gameOptionApply_ShadowProjected,
 	},
 	{
 		GAME_OPTION_SLIDER, "ShadowVolumetricIntensity", "SliderShadowVolumetric",
 		"StaticTextShadowVolumetric", L"\u4f53\u79ef\u9634\u5f71\u6d53\u5ea6",
 		nullptr, nullptr, 0, 0, 100,
-		gameOptionFallback_ShadowVolumetric, nullptr,
+		gameOptionFallback_ShadowVolumetric, gameOptionApply_ShadowVolumetric,
+	},
+	// GeneralsX @feature Qoder 21/10/2026 vegetation + weather rows (helpers above). Master off means
+	// the grass/stone channel is not even scanned, so the retail renderer is bit-for-bit unaffected.
+	{
+		GAME_OPTION_BOOL, "VegetationEnabled", "CheckVegetation",
+		nullptr, L"\u690d\u88ab\u603b\u5f00\u5173",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_Vegetation, gameOptionApply_Vegetation,
+	},
+	{
+		GAME_OPTION_BOOL, "GrassEnabled", "CheckGrass",
+		nullptr, L"\u9010\u6839\u8349\u53f6",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_Grass, gameOptionApply_Grass,
+	},
+	{
+		GAME_OPTION_SLIDER, "GrassDensity", "SliderGrassDensity",
+		"StaticTextGrassDensity", L"\u8349\u4e1b\u5bc6\u5ea6",
+		nullptr, nullptr, 0, 0, 100,
+		gameOptionFallback_GrassDensity, gameOptionApply_GrassDensity,
+	},
+	{
+		GAME_OPTION_SLIDER, "GrassHeight", "SliderGrassHeight",
+		"StaticTextGrassHeight", L"\u8349\u53f6\u9ad8\u5ea6",
+		nullptr, nullptr, 0, 50, 200,
+		gameOptionFallback_GrassHeight, gameOptionApply_GrassHeight,
+	},
+	{
+		GAME_OPTION_SLIDER, "GrassDistance", "SliderGrassDistance",
+		"StaticTextGrassDistance", L"\u8349\u5730\u89c6\u8ddd",
+		nullptr, nullptr, 0, 50, 200,
+		gameOptionFallback_GrassDistance, gameOptionApply_GrassDistance,
+	},
+	{
+		GAME_OPTION_BOOL, "RocksEnabled", "CheckRocks",
+		nullptr, L"\u77f3\u5934",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_Rocks, gameOptionApply_Rocks,
+	},
+	{
+		GAME_OPTION_SLIDER, "RockDensity", "SliderRockDensity",
+		"StaticTextRockDensity", L"\u77f3\u5934\u5bc6\u5ea6",
+		nullptr, nullptr, 0, 0, 200,
+		gameOptionFallback_RockDensity, gameOptionApply_RockDensity,
+	},
+	{
+		GAME_OPTION_COMBO, "WeatherPreview", "ComboBoxWeather",
+		"StaticTextWeather", L"\u5929\u6c14",
+		s_weatherValues, s_weatherTexts, (Int)ARRAY_SIZE(s_weatherValues), 0, 0,
+		gameOptionFallback_Weather, gameOptionApply_Weather,
 	},
 };
 
@@ -735,7 +849,11 @@ static void initGameOptionControls( const OptionPreferences *optionsPref,
 			TheNameKeyGenerator->nameToKey( fullName ) );
 		slots[i] = control;
 		if (!control)
+		{
+			fprintf( stderr, "[GFXOPT] missing gadget %s\n", fullName.str() );
+			fflush( stderr );
 			continue; // layout variant without this gadget: safe no-op
+		}
 
 		if (desc.labelText)
 		{
@@ -865,11 +983,19 @@ void OpenGraphicsOptionsLayout()
 	if (!s_graphicsLayout)
 		s_graphicsLayout = TheWindowManager->winCreateLayout( "Menus/GraphicsOptions.wnd" );
 	if (!s_graphicsLayout)
+	{
+		fprintf( stderr, "[GFXOPT] winCreateLayout(Menus/GraphicsOptions.wnd) FAILED\n" );
+		fflush( stderr );
 		return;
+	}
 
+	fprintf( stderr, "[GFXOPT] layout=%p runInit start\n", (void *)s_graphicsLayout );
+	fflush( stderr );
 	s_graphicsLayout->runInit();
 	s_graphicsLayout->hide( FALSE );
 	s_graphicsLayout->bringForward();
+	fprintf( stderr, "[GFXOPT] runInit done\n" );
+	fflush( stderr );
 
 	GameWindow *root = s_graphicsLayout->getFirstWindow();
 	if (root)
@@ -916,6 +1042,9 @@ static void CloseGraphicsOptionsLayout( Bool save )
 // push/pop unloads the page below, and each reopen re-reads the ini through its own init.
 void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
 {
+	fprintf( stderr, "[GFXOPT] GraphicsOptionsMenuInit start quitting=%d pref=%p\n",
+		TheGameEngine ? (int)TheGameEngine->getQuitting() : -1, (void *)pref );
+	fflush( stderr );
 	if (TheGameEngine->getQuitting())
 		return;
 
@@ -924,6 +1053,8 @@ void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
 
 	initGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls,
 		"GraphicsOptions.wnd" );
+	fprintf( stderr, "[GFXOPT] GraphicsOptionsMenuInit controls done\n" );
+	fflush( stderr );
 
 	// Title label comes from code: the localized string table lives inside a BIG, so the loose
 	// layout keeps TEXT = "[None]" (same pattern as the main-menu Chinese button labels).
@@ -993,12 +1124,65 @@ WindowMsgHandledType GraphicsOptionsMenuSystem( GameWindow *window, UnsignedInt 
 {
 	static NameKeyType buttonGraphicsAccept = NAMEKEY_INVALID;
 	static NameKeyType buttonGraphicsBack = NAMEKEY_INVALID;
+	// GeneralsX @feature Qoder 21/10/2026 live vegetation/weather controls.
+	static GameWindow *vegCheckVegetation = nullptr, *vegCheckGrass = nullptr, *vegCheckRocks = nullptr;
+	static GameWindow *vegSliderDensity = nullptr, *vegSliderHeight = nullptr;
+	static GameWindow *vegSliderDistance = nullptr, *vegSliderRockDensity = nullptr;
+	static GameWindow *vegComboWeather = nullptr;
+	static Int vegLastWeather = -999;
 
 	switch( msg )
 	{
 		case GWM_CREATE:
 			buttonGraphicsAccept = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonGraphicsAccept" );
 			buttonGraphicsBack = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonBack@pop" );
+			vegCheckVegetation = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckVegetation" ) );
+			vegCheckGrass = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckGrass" ) );
+			vegCheckRocks = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckRocks" ) );
+			vegSliderDensity = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassDensity" ) );
+			vegSliderHeight = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassHeight" ) );
+			vegSliderDistance = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassDistance" ) );
+			vegSliderRockDensity = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderRockDensity" ) );
+			vegComboWeather = TheWindowManager->winGetWindowFromId( nullptr,
+				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ComboBoxWeather" ) );
+			break;
+
+		case GSM_SLIDER_TRACK:
+		case GSM_SLIDER_DONE:
+		{
+			// Preview density/height/distance while the thumb moves; Accept writes the same values.
+			if (vegSliderDensity && GadgetSliderGetPosition(vegSliderDensity) >= 0)
+				g_vegetationRenderOptions.grassDensity = (Real)GadgetSliderGetPosition(vegSliderDensity);
+			if (vegSliderHeight && GadgetSliderGetPosition(vegSliderHeight) >= 0)
+				g_vegetationRenderOptions.grassHeightScale = (Real)GadgetSliderGetPosition(vegSliderHeight);
+			if (vegSliderDistance && GadgetSliderGetPosition(vegSliderDistance) >= 0)
+				g_vegetationRenderOptions.grassDistanceScale = (Real)GadgetSliderGetPosition(vegSliderDistance);
+			if (vegSliderRockDensity && GadgetSliderGetPosition(vegSliderRockDensity) >= 0)
+				g_vegetationRenderOptions.rockDensity = (Real)GadgetSliderGetPosition(vegSliderRockDensity);
+			break;
+		}
+
+		case GCM_SELECTED:
+			// GeneralsX @feature Qoder 21/10/2026: the combo commits its row selection to the owner as
+			// GCM_SELECTED (not GBM_SELECTED), so the weather preset must be applied here to be instant.
+			if (vegComboWeather)
+			{
+				Int sel = 0;
+				GadgetComboBoxGetSelectedPos(vegComboWeather, &sel);
+				if (sel != vegLastWeather)
+				{
+					vegLastWeather = sel;
+					if (TheSnowManager)
+						TheSnowManager->setUserWeatherOverride(sel - 1);
+				}
+			}
 			break;
 
 		case GWM_INPUT_FOCUS:
@@ -1011,6 +1195,27 @@ WindowMsgHandledType GraphicsOptionsMenuSystem( GameWindow *window, UnsignedInt 
 			GameWindow *control = (GameWindow *)mData1;
 			if( !control )
 				break;
+
+			// GeneralsX @feature Qoder 21/10/2026 live sync for the vegetation/weather rows. Reading the
+			// gadgets (not the click target) covers checkboxes, sliders and the combo's listbox alike.
+			if (vegCheckVegetation) g_vegetationRenderOptions.enabled = GadgetCheckBoxIsChecked(vegCheckVegetation) ? TRUE : FALSE;
+			if (vegCheckGrass)      g_vegetationRenderOptions.grassEnabled = GadgetCheckBoxIsChecked(vegCheckGrass) ? TRUE : FALSE;
+			if (vegCheckRocks)      g_vegetationRenderOptions.rocksEnabled = GadgetCheckBoxIsChecked(vegCheckRocks) ? TRUE : FALSE;
+			if (vegSliderDensity)   g_vegetationRenderOptions.grassDensity = (Real)GadgetSliderGetPosition(vegSliderDensity);
+			if (vegSliderHeight)    g_vegetationRenderOptions.grassHeightScale = (Real)GadgetSliderGetPosition(vegSliderHeight);
+			if (vegSliderDistance)  g_vegetationRenderOptions.grassDistanceScale = (Real)GadgetSliderGetPosition(vegSliderDistance);
+			if (vegSliderRockDensity) g_vegetationRenderOptions.rockDensity = (Real)GadgetSliderGetPosition(vegSliderRockDensity);
+			if (vegComboWeather)
+			{
+				Int sel = 0;
+				GadgetComboBoxGetSelectedPos(vegComboWeather, &sel);
+				if (sel != vegLastWeather)
+				{
+					vegLastWeather = sel;
+					if (TheSnowManager)
+						TheSnowManager->setUserWeatherOverride(sel - 1);	// entry 0 = follow map
+				}
+			}
 
 			// GeneralsX @bugfix Qoder 13/10/2026 In-game the page is a persistent overlay over the
 			// pause menu, so Accept/Back destroy that overlay instead of popping the shell stack (a

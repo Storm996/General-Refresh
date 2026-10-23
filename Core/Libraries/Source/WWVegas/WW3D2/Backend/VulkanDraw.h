@@ -182,13 +182,17 @@ struct VKDraw_PSO_Key {
 // interpreter reads these three from one word instead of the pipeline state, and the pipeline key keeps its
 // own copies only as a description of what the wedge-5 mechanism path was told. The reference is the raw
 // 0..255 integer the shadow holds (VK_Read_RS's documented default is 0), the compare is the D3DCOMPAREFUNC
-// ordinal (0 never .. 7 always), and bit 0 says whether either is consulted at all.
+// ordinal converted to the shader's 0-based table (D3DCMP_NEVER=1 .. D3DCMP_ALWAYS=8), and bit 0 says
+// whether either is consulted at all. The packed field MUST stay 0-based because vkff.frag decodes it
+// with CMP_NEVER=0..CMP_ALWAYS=7; packing the raw enum shifted every compare by one and turned the
+// vegetation pass' GREATEREQUAL(7) into ALWAYS(7), which is why alpha-cut tree cards stayed opaque.
 // flags[3] stays reserved.
 #define VKFF_ALPHA_TEST_ENABLE(f) ((f) & 1u)
 #define VKFF_ALPHA_FUNC(f)        (((f) >> 1) & 7u)
 #define VKFF_ALPHA_REF(f)         (((f) >> 8) & 0xFFu)
+#define VKFF_ALPHA_CMP_INDEX(f)   (((f) >= 1u && (f) <= 8u) ? ((f) - 1u) : 7u)
 #define VKFF_PACK_ALPHA_TEST(en, func, ref) \
-    (((en) ? 1u : 0u) | (((func) & 7u) << 1) | (((ref) & 0xFFu) << 8))
+    (((en) ? 1u : 0u) | (VKFF_ALPHA_CMP_INDEX(func) << 1) | (((ref) & 0xFFu) << 8))
 
 // One light: 7 vec4. D3DLIGHT9 fields land in these slots (see DX8Wrapper::Set_Light for what the engine
 // actually fills in - it puts the spot EXPONENT in Falloff and both cone angles in Phi/Theta).
@@ -280,6 +284,10 @@ struct VKDraw_Submit {
     unsigned           start_index;       // first index to read
     unsigned           polygon_count;
     unsigned           base_vertex;       // D3D9 BaseVertexIndex; same meaning as vertexOffset
+
+    // 1 while the engine is replaying CPU-skinned geometry (DX8SkinFVFCategoryContainer): its vertices are
+    // already in world space, so the recorder must not apply the world transform a second time.
+    unsigned           skin_batch;
 
     void*              texture_views[VKDRAW_MAX_TEX_SLOTS];    // VkImageView, nullptr = white fallback
     void*              texture_samplers[VKDRAW_MAX_TEX_SLOTS]; // VkSampler,   nullptr = default sampler
@@ -395,6 +403,38 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
                                           const void* vertex_data, unsigned vertex_count, unsigned stride,
                                           const void* index_data, unsigned index_count, unsigned base_vertex,
                                           const VKDraw_Submit* state);
+
+// GeneralsX @feature Qoder 20/10/2026 native sun shadow (ported from ModernGeneralsZH): after the scene
+// batches are recorded, replay every captured opaque caster into a sun-space depth map and multiply the
+// scene by a screen-space PCSS visibility pass. 'sun_dir' is the map's sun position in world space
+// (W3DShadowManager::getLightPosWorld(0), i.e. a far point along the direction toward the sun); the
+// backend normalizes it. Call once per frame between the 3D views and the UI. Returns false when the
+// gate is off, nothing was captured, or the pass could not be recorded.
+bool VKDraw_Shadow_Apply(const float sun_dir[3]);
+
+// GeneralsX @bugfix Qoder 21/10/2026: drop the per-world sun-fit state when a new map/height map
+// takes over the scene. The ground-height estimate and the caster list describe the world that was
+// being drawn; keeping them across a map change makes the fit start at the old terrain height and
+// converge only as new casters stream in, which reads as "shadows appear a few seconds late".
+// Shadow resources stay alive - only the frame-window state is cleared.
+void VKDraw_Shadow_Reset();
+
+// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation: draw instanced grass blades and stones
+// into the scene pass that is open right now (called from W3DGrassBuffer::render, after the terrain).
+// Instances are 12 floats: (x,y,z,halfWidth), (height,leanAngle,leanAmount,phase), (r,g,b,seed) for
+// grass; (x,y,z,scale), (rotX,rotY,rotZ,variant), (r,g,b,0) for stones. 'view_proj' is WW3D's column-vector
+// projection*view in row-major memory and is transposed here for GLSL. Returns false when the Vulkan core is off, no pass
+// is open, or the instance payload is empty - the caller then keeps the retail billboard path.
+bool VKDraw_Vegetation_Ready();
+// GeneralsX @feature Qoder 22/10/2026 light shadows: the strongest dynamic light's own shadow map, as
+// this frame built it. False when the feature is off or has no map/light; the caller then leaves the
+// receiver constants disabled. The VP is row-vector (D3D) and projects world -> light clip (0..1 z).
+bool VKDraw_LightShadow_Info(float vp[16], float pos_range[4]);
+bool VKDraw_Vegetation_Draw(const void* grass, unsigned grass_count,
+                            const void* rocks, unsigned rock_count,
+                            const float view_proj[16], const float camera[3], float time_seconds,
+                            const float sun_dir[3], const float fog_color[3],
+                            float fog_start, float fog_end, float cull_distance);
 
 // ---- counters and the wedge-5 self test -------------------------------------------
 struct VKDraw_Stats {

@@ -90,9 +90,13 @@ static void drawFramerateBar();
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/GameClient/W3DDebugDisplay.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
+#include "W3DDevice/GameClient/W3DShadow.h"	// GeneralsX @feature Qoder 20/10/2026 native sun shadow: TheW3DShadowManager light direction
 #include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @feature PS3.0 T6 (base game links the inline no-op stub)
 #include "W3DDevice/GameClient/W3DScreenshot.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanDraw.h"	// GeneralsX @feature Qoder 20/10/2026 native sun shadow entry point
+#endif
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
@@ -1078,8 +1082,35 @@ void W3DDisplay::init()
 			case 0:
 			{
 				// set our default width and height and bit depth
-				setWidth( TheGlobalData->m_xResolution );
-				setHeight( TheGlobalData->m_yResolution );
+				// GeneralsX @bugfix Qoder 21/10/2026 WINDOWCLAMP: a windowed game may not create a
+				// window larger than the desktop work area. Resolution 3840x2160 on a 2560x1440
+				// screen produced a window whose bottom/right were off-screen, which read as "only
+				// the top-left of the game is visible". Fullscreen keeps the user's choice.
+				Int xres = TheGlobalData->m_xResolution;
+				Int yres = TheGlobalData->m_yResolution;
+				if (TheGlobalData->m_windowed) {
+					RECT work = { 0, 0, 0, 0 };
+					if (SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0)) {
+						const Int dw = work.right - work.left, dh = work.bottom - work.top;
+						if (dw > 0 && dh > 0 && (xres > dw || yres > dh)) {
+							const Int oldW = xres, oldH = yres;
+							const float sx = (float)dw / (float)xres;
+							const float sy = (float)dh / (float)yres;
+							const float s = (sx < sy) ? sx : sy;
+							xres = (Int)(xres * s);
+							yres = (Int)(yres * s);
+							if (xres < 800) xres = 800;
+							if (yres < 600) yres = 600;
+							TheWritableGlobalData->m_xResolution = xres;
+							TheWritableGlobalData->m_yResolution = yres;
+							fprintf(stderr, "[DISPLAY] windowed resolution clamped %dx%d -> %dx%d (desktop %dx%d)\n",
+								(int)oldW, (int)oldH, (int)xres, (int)yres, (int)dw, (int)dh);
+							fflush(stderr);
+						}
+					}
+				}
+				setWidth( xres );
+				setHeight( yres );
 				setBitDepth( DEFAULT_DISPLAY_BIT_DEPTH );
 				break;
 			}
@@ -2452,22 +2483,26 @@ AGAIN:
 				if (numRenderTargetPolygons || numRenderTargetVertices)
 					Debug_Statistics::Record_DX8_Polys_And_Vertices(numRenderTargetPolygons,numRenderTargetVertices,ShaderClass::_PresetOpaqueShader);
 
-				// GeneralsX @feature PS3.0 T6 sun shadow map: depth pass immediately before drawViews, so
-				// this frame's map is what the GN shadows and the terrain receiver sample. Nothing has
-				// drawn the world yet, and the render frame is open (wedge 9.G moved it here).
-				W3DSunShadowMap::preSceneUpdate(primaryW3DView->get3DCamera());
-
 				// draw all views of the world
 				{
 					VKFph2Scope s(vkP ? &g_fph2.views : nullptr);
 					drawViews();
 				}
 
-				// GeneralsX @feature PS3.0 T6 sun shadow map: darken terrain where this frame's
-				// depth map says casters occlude the sun.  Inside the open scene, like the UI.
+				// GeneralsX @feature Qoder 20/10/2026 native sun shadow (ported from ModernGeneralsZH):
+				// drawViews recorded every opaque world-space batch; this replays them from the sun into a
+				// depth map and darkens the scene where the depth test says a caster blocks the light.
+				// It runs inside the open scene, before the UI, so the shadow only covers the world.
 				{
 					VKFph2Scope s(vkP ? &g_fph2.receiver : nullptr);
-					W3DSunShadowMap::renderTerrainReceiver(primaryW3DView->get3DCamera());
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+					if (TheW3DShadowManager)
+					{
+						const Vector3 &sunPos = TheW3DShadowManager->getLightPosWorld(0);
+						const float sunDir[3] = { sunPos.X, sunPos.Y, sunPos.Z };
+						VKDraw_Shadow_Apply(sunDir);
+					}
+#endif
 				}
 
 				// draw the user interface
@@ -2826,6 +2861,28 @@ void W3DDisplay::enableLetterBox(Bool enable)
 // W3DDisplay::setTimeOfDay ===================================================
 /** */
 //=============================================================================
+// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD (after the preview override), shared
+// with presentation tables that must follow night even though the logic TOD stays at the map value.
+static TimeOfDay s_renderTimeOfDay = TIME_OF_DAY_AFTERNOON;
+TimeOfDay W3DDisplay::getRenderTimeOfDay()
+{
+	return s_renderTimeOfDay;
+}
+
+// GeneralsX @tweak Qoder 22/10/2026 night colour temperature (user verdict: keep the warm/cool
+// contrast, push the night itself cooler). Applied wherever a raw night table value is read, so a
+// second setTimeOfDay can never compound the shift. Presentation-only.
+static void NightCoolTint(float& r, float& g, float& b, bool ambient)
+{
+	const float sr = ambient ? 0.74f : 0.78f;
+	const float sg = ambient ? 0.90f : 0.93f;
+	const float sb = ambient ? 1.25f : 1.20f;
+	r *= sr; g *= sg; b *= sb;
+	if (r > 1.0f) r = 1.0f;
+	if (g > 1.0f) g = 1.0f;
+	if (b > 1.0f) b = 1.0f;
+}
+
 void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 {
 	// GeneralsX @feature PS3.0 4C 16/10/2026 render-side TOD override (光影四阶段/调研/03): same
@@ -2853,12 +2910,20 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			// Rule 7 (determinism) holds; a later scripted TOD change re-fills from logic tod and the
 			// ensuing GameClient->setTimeOfDay fan-out re-applies this override - stays in step.
 			for (Int t = 0; t < MAX_GLOBAL_LIGHTS; t++) {
-				TheWritableGlobalData->m_terrainAmbient[t]   = TheGlobalData->m_terrainLighting[tod][t].ambient;
-				TheWritableGlobalData->m_terrainDiffuse[t]   = TheGlobalData->m_terrainLighting[tod][t].diffuse;
+				RGBColor amb = TheGlobalData->m_terrainLighting[tod][t].ambient;
+				RGBColor dif = TheGlobalData->m_terrainLighting[tod][t].diffuse;
+				if (tod == TIME_OF_DAY_NIGHT) {
+					NightCoolTint(amb.red, amb.green, amb.blue, true);
+					NightCoolTint(dif.red, dif.green, dif.blue, false);
+				}
+				TheWritableGlobalData->m_terrainAmbient[t]   = amb;
+				TheWritableGlobalData->m_terrainDiffuse[t]   = dif;
 				TheWritableGlobalData->m_terrainLightPos[t]  = TheGlobalData->m_terrainLighting[tod][t].lightPos;
 			}
 		}
 	}
+
+	s_renderTimeOfDay = tod;
 
 	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: weather -> lighting coupler.
 	// The active weather recipe carries two multipliers (ambientScale / keyScale); they are folded
@@ -2922,6 +2987,11 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 	if( m_3DScene )
 	{
 		Vector3 sceneAmbient( ol->ambient.red, ol->ambient.green, ol->ambient.blue );
+		if (tod == TIME_OF_DAY_NIGHT) {
+			float r = sceneAmbient.X, g = sceneAmbient.Y, b = sceneAmbient.Z;
+			NightCoolTint(r, g, b, true);
+			sceneAmbient.Set(r, g, b);
+		}
 		if (wxActive) {
 			sceneAmbient *= wxAmb;
 		}
@@ -2936,6 +3006,11 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 
 			m_myLight[i]->Set_Ambient( Vector3( 0.0f, 0.0f, 0.0f ) );
 			Vector3 slotDiffuse( ol->diffuse.red, ol->diffuse.green, ol->diffuse.blue );
+			if (tod == TIME_OF_DAY_NIGHT) {
+				float r = slotDiffuse.X, g = slotDiffuse.Y, b = slotDiffuse.Z;
+				NightCoolTint(r, g, b, false);
+				slotDiffuse.Set(r, g, b);
+			}
 			if (wxActive) {
 				// slot0 is the key sun, slots1..3 are fill/bounce/map lamps -> all non-key terms dim
 				// with the ambient scale (the same split the L1c crush knob uses).
@@ -3243,6 +3318,13 @@ void W3DDisplay::setDistanceHaze( Bool enabled, Real strength01 )
 void W3DDisplay::setBloomIntensity( Real intensity01 )
 {
 	W3DShaderManager::setBloomIntensity(intensity01);
+}
+
+// GeneralsX @feature Qoder 20/10/2026: the anti-aliasing row, live on the Vulkan backend. The D3D path
+// only consumes this level at the next device creation, so the forwarding call is a value push there.
+void W3DDisplay::setAntiAliasLevel( Int level )
+{
+	W3DShaderManager::setPostAntiAliasing(level != 0);
 }
 
 void W3DDisplay::setShadowMapStrength( Real strength01 )

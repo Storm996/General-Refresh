@@ -404,6 +404,12 @@ Int HeightMapRenderObjClass::updateVB(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *
 				vb->v1=V[0];
 				vb->u2=UA[0];
 				vb->v2=VA[0];
+				// GeneralsX @bugfix Qoder 21/10/2026: the terrain FVF has always carried a normal
+				// channel (XYZNUV2), but updateVB never filled it, so the FF vertex stage fed the
+				// pixel shaders a zero normal. Store the per-corner normal here; the PPL terrain
+				// shaders now light with this interpolated vertex normal instead of the per-triangle
+				// face normal reconstructed from depth, which was drawing diamond-shaped facets.
+				vb->nx = normalAtTexel.X; vb->ny = normalAtTexel.Y; vb->nz = normalAtTexel.Z;
 				doTheLight(vb, lightRay, &normalAtTexel, pLightsIterator, alpha[0]);
 				vb++;
 
@@ -426,6 +432,12 @@ Int HeightMapRenderObjClass::updateVB(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *
 				vb->v1=V[1];
 				vb->u2=UA[1];
 				vb->v2=VA[1];
+				// GeneralsX @bugfix Qoder 21/10/2026: the terrain FVF has always carried a normal
+				// channel (XYZNUV2), but updateVB never filled it, so the FF vertex stage fed the
+				// pixel shaders a zero normal. Store the per-corner normal here; the PPL terrain
+				// shaders now light with this interpolated vertex normal instead of the per-triangle
+				// face normal reconstructed from depth, which was drawing diamond-shaped facets.
+				vb->nx = normalAtTexel.X; vb->ny = normalAtTexel.Y; vb->nz = normalAtTexel.Z;
 				doTheLight(vb, lightRay, &normalAtTexel, pLightsIterator, alpha[1]);
 				vb++;
 
@@ -452,6 +464,12 @@ Int HeightMapRenderObjClass::updateVB(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *
 				vb->v1=V[2];
 				vb->u2=UA[2];
 				vb->v2=VA[2];
+				// GeneralsX @bugfix Qoder 21/10/2026: the terrain FVF has always carried a normal
+				// channel (XYZNUV2), but updateVB never filled it, so the FF vertex stage fed the
+				// pixel shaders a zero normal. Store the per-corner normal here; the PPL terrain
+				// shaders now light with this interpolated vertex normal instead of the per-triangle
+				// face normal reconstructed from depth, which was drawing diamond-shaped facets.
+				vb->nx = normalAtTexel.X; vb->ny = normalAtTexel.Y; vb->nz = normalAtTexel.Z;
 				doTheLight(vb, lightRay, &normalAtTexel, pLightsIterator, alpha[2]);
 				vb++;
 
@@ -483,6 +501,12 @@ Int HeightMapRenderObjClass::updateVB(DX8VertexBufferClass	*pVB, VERTEX_FORMAT *
 				vb->v1=V[3];
 				vb->u2=UA[3];
 				vb->v2=VA[3];
+				// GeneralsX @bugfix Qoder 21/10/2026: the terrain FVF has always carried a normal
+				// channel (XYZNUV2), but updateVB never filled it, so the FF vertex stage fed the
+				// pixel shaders a zero normal. Store the per-corner normal here; the PPL terrain
+				// shaders now light with this interpolated vertex normal instead of the per-triangle
+				// face normal reconstructed from depth, which was drawing diamond-shaped facets.
+				vb->nx = normalAtTexel.X; vb->ny = normalAtTexel.Y; vb->nz = normalAtTexel.Z;
 				doTheLight(vb, lightRay, &normalAtTexel, pLightsIterator, alpha[3]);
 				vb++;
 
@@ -1348,11 +1372,7 @@ Int HeightMapRenderObjClass::initHeightData(Int x, Int y, WorldHeightMap *pMap, 
 		m_vertexBufferBackup = NEW VERTEX_FORMAT [m_numVertexBufferTiles * HEIGHTMAP_VERTEX_NUM];
 
 		for (i=0; i<m_numVertexBufferTiles; i++) {
-#ifdef USE_NORMALS
-			m_vertexBufferTiles[i] = NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZNUV2,HEIGHTMAP_VERTEX_NUM,DX8VertexBufferClass::USAGE_DEFAULT));
-#else
 			m_vertexBufferTiles[i] = NEW_REF(DX8VertexBufferClass,(DX8_VERTEX_FORMAT,HEIGHTMAP_VERTEX_NUM,DX8VertexBufferClass::USAGE_DEFAULT));
-#endif
 		}
 
 		//go with a preset material for now.

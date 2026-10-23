@@ -401,6 +401,41 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 			fflush(stderr);
 		}
 	}
+
+	// GeneralsX @bugfix Qoder 21/10/2026: same background fill as the 16-bit path below. The diffuse
+	// atlas is 32-bit in the shipped build; ~60% of it is unwritten transparent black, so every mip
+	// level below the first averages black into the ground colour. Cells whose UV jumps at a base-tile
+	// boundary make the sampler dive to those levels, which drew a black grid line over grass.
+	if (pixelBytes == 4 &&
+		(surface_desc.Format == D3DFMT_A8R8G8B8 || surface_desc.Format == D3DFMT_X8R8G8B8)) {
+		UnsignedByte *bits = (UnsignedByte*)locked_rect.pBits;
+		unsigned long long sr = 0, sg = 0, sb = 0, n = 0;
+		for (UnsignedInt fy = 0; fy < surface_desc.Height; ++fy) {
+			const UnsignedByte *p = bits + (size_t)fy * locked_rect.Pitch;
+			for (UnsignedInt fx = 0; fx < surface_desc.Width; ++fx, p += 4) {
+				if ((p[0] | p[1] | p[2] | p[3]) == 0) continue;
+				sb += p[0]; sg += p[1]; sr += p[2]; ++n;
+			}
+		}
+		if (n > 0) {
+			const UnsignedByte fr = (UnsignedByte)(sr / n);
+			const UnsignedByte fg = (UnsignedByte)(sg / n);
+			const UnsignedByte fb = (UnsignedByte)(sb / n);
+			unsigned long long filled = 0;
+			for (UnsignedInt fy = 0; fy < surface_desc.Height; ++fy) {
+				UnsignedByte *p = bits + (size_t)fy * locked_rect.Pitch;
+				for (UnsignedInt fx = 0; fx < surface_desc.Width; ++fx, p += 4) {
+					if ((p[0] | p[1] | p[2] | p[3]) != 0) continue;
+					p[0] = fb; p[1] = fg; p[2] = fr; p[3] = 255; ++filled;
+				}
+			}
+			fprintf(stderr, "[TERRAIN] atlas background fill: rgb=(%u,%u,%u) texels=%llu of %ux%u\n",
+				(unsigned)fr, (unsigned)fg, (unsigned)fb, filled,
+				(unsigned)surface_desc.Width, (unsigned)surface_desc.Height);
+			fflush(stderr);
+		}
+	}
+
 	surface_level->UnlockRect();
 	surface_level->Release();
 	// GeneralsX @performance Qoder 10/07/2026 Triangle instead of box filtering:
@@ -695,6 +730,43 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 		}
 
 	}
+
+	// GeneralsX @bugfix Qoder 21/10/2026: the atlas is mostly unwritten background. A 204-tile
+	// 8192x4096 atlas is ~60% transparent black, so every mip level below the first averages that
+	// black into the ground colour. Terrain cells whose UV jumps at a base-tile boundary make the
+	// sampler dive to those levels (Alpine Assault changes tile every 2x2 cells), which drew a black
+	// grid line over grass. Filling the unwritten texels with the mean of the written ones keeps the
+	// deep mips terrain-coloured instead of black. Only fully transparent black is replaced, so the
+	// actual tile content is untouched.
+	if (surface_desc.Format == D3DFMT_A8R8G8B8 || surface_desc.Format == D3DFMT_X8R8G8B8) {
+		UnsignedByte *bits = (UnsignedByte*)locked_rect.pBits;
+		unsigned long long sr = 0, sg = 0, sb = 0, n = 0;
+		for (UnsignedInt fy = 0; fy < surface_desc.Height; ++fy) {
+			const UnsignedByte *p = bits + (size_t)fy * locked_rect.Pitch;
+			for (UnsignedInt fx = 0; fx < surface_desc.Width; ++fx, p += 4) {
+				if ((p[0] | p[1] | p[2] | p[3]) == 0) continue;
+				sb += p[0]; sg += p[1]; sr += p[2]; ++n;
+			}
+		}
+		if (n > 0) {
+			const UnsignedByte fr = (UnsignedByte)(sr / n);
+			const UnsignedByte fg = (UnsignedByte)(sg / n);
+			const UnsignedByte fb = (UnsignedByte)(sb / n);
+			unsigned long long filled = 0;
+			for (UnsignedInt fy = 0; fy < surface_desc.Height; ++fy) {
+				UnsignedByte *p = bits + (size_t)fy * locked_rect.Pitch;
+				for (UnsignedInt fx = 0; fx < surface_desc.Width; ++fx, p += 4) {
+					if ((p[0] | p[1] | p[2] | p[3]) != 0) continue;
+					p[0] = fb; p[1] = fg; p[2] = fr; p[3] = 255; ++filled;
+				}
+			}
+			fprintf(stderr, "[TERRAIN] atlas background fill: rgb=(%u,%u,%u) texels=%llu of %ux%u\n",
+				(unsigned)fr, (unsigned)fg, (unsigned)fb, filled,
+				(unsigned)surface_desc.Width, (unsigned)surface_desc.Height);
+			fflush(stderr);
+		}
+	}
+
 	surface_level->UnlockRect();
 	surface_level->Release();
 	DX8_ErrorCode(D3DXFilterTexture(D3DTexture, nullptr, 0, D3DX_FILTER_BOX));
@@ -1524,6 +1596,12 @@ void ScorchTextureClass::Apply(unsigned int stage)
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1 );
+	// GeneralsX @bugfix Qoder 23/10/2026: SELECTARG1 reads ALPHAARG1, but this override never wrote it.
+	// The terrain pass that runs immediately before the scorch batch leaves stage 0 at D3DTA_CURRENT
+	// (alpha 1.0), so every crater sampled its own mask yet blended with a constant opaque alpha and
+	// stamped a hard dark square on the terrain. Bind the alpha source to the atlas, the same contract
+	// flushDecals uses for its decals.
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);

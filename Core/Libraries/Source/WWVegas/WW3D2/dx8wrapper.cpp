@@ -84,13 +84,15 @@
 #include "render2d.h"
 #include "sortingrenderer.h"
 #include "shattersystem.h"
+// GeneralsX @build Qoder 22/10/2026 VulkanPgm.cpp is compiled into ww3d2 on every platform and its
+// header is explicitly platform-neutral; keep the declaration visible without SAGE_USE_VULKAN_CORE.
+#include "Backend/VulkanPgm.h"   // wedge 8: IDirect3D*Shader9 handle -> translated program tag
 // GeneralsX @feature Qoder 17/10/2026 WP1 wedge 1: optional Vulkan device core (opt-in tree only).
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 #include "Backend/VulkanCore.h"
 #include "Backend/VulkanGeo.h" // wedge 3.4: render-target/depth mirror alloc hooks
 #include "Backend/VulkanDraw.h" // wedge 5: frame boundaries, render targets and the draw path
 #include "Backend/VulkanDesc.h"  // wedge 7: the sampler LUT the submit loop reads through
-#include "Backend/VulkanPgm.h"   // wedge 8: IDirect3D*Shader9 handle -> translated program tag
 #include "Backend/VKD3DStubImpl.h" // wedge 9.J: the no-d3d9 driver front and its hit census
 #include "Backend/VulkanTexMirror.h" // wedge 3.2: dynamic texture payloads -> keyed VkImage
 #endif
@@ -1278,6 +1280,14 @@ unsigned DX8Wrapper::VK_Read_Sampler(unsigned stage, unsigned token, unsigned fa
 {
 	const unsigned raw = SamplerStates[stage & (MAX_TEXTURE_STAGES - 1u)][token & 0xFu];
 	return (raw == 0x12345678u) ? fallback : raw;
+}
+
+// GeneralsX @debug Qoder 20/10/2026 R-06 round five: the slot the capture loop will read for this stage.
+// Textures[] is written by two different owners - Set_DX8_Texture directly, and the deferred texture's
+// Apply() - so a pass that bound its own texture can be looking at somebody else's key by draw time.
+void* DX8Wrapper::VK_Read_Texture(unsigned stage)
+{
+	return (void*)Textures[stage & (MAX_TEXTURE_STAGES - 1u)];
 }
 
 // ----------------------------------------------------------------------------
@@ -3836,14 +3846,172 @@ namespace {
 		return false;
 	}
 
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round three: the terrain shadow receiver darkens the whole
+	// grid on 20 of every 27 frames with a byte-identical CPU-side submit, so the question is what its
+	// sampler is pointed at. vk_texture_view resolves one of two mirrors for the same key and the answer
+	// can only change if a mirror appears, disappears or is re-created - which is exactly what the
+	// VKTex_Drop comment in VulkanGeo.h documents as having happened before. Gate GENERALSX_VKMIRROR=1:
+	// one line per *change* of the resolution for a key (first sighting included), budget 24 lines per
+	// key, plus the frame stamp so the line can be joined with the per-frame shot census.
+	// (The gate is GENERALSX_VKMIRROR; the older [VKBIND] tag below is the pixel-program binding census.)
+	struct VKBindFlipRow {
+		void* key;
+		void* chosen;
+		int   texHit;
+		int   rtHit;
+		unsigned lines;
+	};
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round four: the first VKMIRROR run filled this 24-slot
+	// table with 64x64 upload mirrors that change view every frame, so the shadow map never got a row.
+	VKBindFlipRow VKBindFlips[96];
+	unsigned VKBindFlipCount = 0u;
+	unsigned VKBindFlipLines = 0u;
+
+	bool vk_bind_on()
+	{
+		static bool s_on = (getenv("GENERALSX_VKMIRROR") != nullptr);
+		return s_on;
+	}
+
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round four: the flip census above cannot answer "what did
+	// the receiver's stage-0 bind resolve to on THIS frame", because it only prints changes and drops
+	// keys after its table is full. A caller may therefore nominate one key (the sun shadow map does)
+	// and gets exactly one [VKWATCH] line per frame: how many times the resolution ran, whether more
+	// than one view answered during that frame, and both mirrors' identity and layout. The layout is
+	// the point - a map still marked COLOR_ATTACHMENT when the receiver samples it is undefined work
+	// and reads 0, which is what a whole-grid multiply by (1-strength) looks like.
+	void* VKBindWatch = nullptr;
+	unsigned long long VKWatch_Frame = 0ull;
+	void* VKWatch_First = nullptr;
+	unsigned VKWatch_Calls = 0u;
+	unsigned VKWatch_Distinct = 0u;
+	int VKWatch_Use = 0;
+	unsigned VKWatch_Lines = 0u;
+	bool VKWatch_Open = false;
+
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round five: the capture window. A pass that opens it immediately
+	// before one of its own facade draws gets a [VKCAP] line naming what the recorder actually read out of
+	// the shadow for that batch - the four stage keys, their resolved views and the sampler tuple - which is
+	// the only way to tell "the map was never bound" from "the bind was replaced by a deferred apply".
+	int VKCapWatch = 0;
+	unsigned VKCapLines = 0u;
+
+	// Set while DX8SkinFVFCategoryContainer replays its CPU-deformed, world-space vertex batch.
+	bool g_vkSkinBatch = false;
+
+	// GeneralsX @debug Qoder 20/10/2026 R-07 pending/shadow split probe: DX8Wrapper::Set_Texture early-exits
+	// on "incoming == render_state.Textures[stage]" and never looks at the raw shadow slot the recorder
+	// reads. Invalidate_Cached_Render_States (and every raw Set_DX8_Texture) clears that shadow while
+	// leaving the pending pointer alone, so the next batch that rebinds the same texture as its neighbour
+	// takes the early exit and draws with an empty stage - the combiner then disables the stage and the
+	// pixels come out as vertex colour. Naming the pending texture is what ties a missing tile to its asset.
+	unsigned VKSplitLines = 0u;
+	bool vk_split_on()
+	{
+		static bool s_on = (getenv("GENERALSX_VKSPLIT") != nullptr);
+		return s_on;
+	}
+
+	void vk_watch_flush()
+	{
+		if (!VKWatch_Open || VKWatch_Lines >= 1500u) return;
+		++VKWatch_Lines;
+		VKTex_Info ti; const bool haveTi = VKTex_Query(VKBindWatch, &ti);
+		VKRT_Info ri; const bool haveRi = VKRT_Query(VKBindWatch, &ri);
+		fprintf(stderr, "[VKWATCH] f=%llu calls=%u distinct=%u use=%c chosen=%p tex=%p(%p %ux%u f=%u) rt=%p(%p %ux%u f=%u lay=%u dep=%u)\n",
+			VKWatch_Frame, VKWatch_Calls, VKWatch_Distinct,
+			VKWatch_Use == 1 ? 'T' : (VKWatch_Use == 2 ? 'R' : '-'), VKWatch_First,
+			haveTi ? ti.view : nullptr, haveTi ? ti.image : nullptr,
+			haveTi ? ti.width : 0u, haveTi ? ti.height : 0u, haveTi ? ti.format : 0u,
+			haveRi ? ri.view : nullptr, haveRi ? ri.image : nullptr,
+			haveRi ? ri.width : 0u, haveRi ? ri.height : 0u, haveRi ? ri.format : 0u,
+			haveRi ? (unsigned)ri.layout : 0u, haveRi ? (unsigned)ri.is_depth : 0u);
+		fflush(stderr);
+		VKWatch_Open = false;
+	}
+
+	void vk_note_watch_resolution(void* chosen, int use)
+	{
+		const unsigned long long f = VKCore_Frame_No();
+		if (VKWatch_Open && f != VKWatch_Frame) vk_watch_flush();
+		if (!VKWatch_Open) {
+			VKWatch_Open = true; VKWatch_Frame = f; VKWatch_Calls = 0u;
+			VKWatch_First = chosen; VKWatch_Distinct = chosen ? 1u : 0u; VKWatch_Use = use;
+		}
+		++VKWatch_Calls;
+		if (chosen && chosen != VKWatch_First) ++VKWatch_Distinct;
+	}
+
+	void vk_note_bind_resolution(void* key, void* chosen, int texHit, int rtHit)
+	{
+		if (key == VKBindWatch) vk_note_watch_resolution(chosen, texHit ? 1 : (rtHit ? 2 : 0));
+		if (VKBindFlipLines >= 1200u) return;
+		unsigned idx = VKBindFlipCount;
+		for (unsigned i = 0; i < VKBindFlipCount; ++i) {
+			if (VKBindFlips[i].key == key) { idx = i; break; }
+		}
+		if (idx == VKBindFlipCount) {
+			if (VKBindFlipCount >= 96u) return;
+			VKBindFlipRow& r = VKBindFlips[VKBindFlipCount++];
+			r.key = key; r.chosen = nullptr; r.texHit = -1; r.rtHit = -1; r.lines = 0u;
+		}
+		VKBindFlipRow& r = VKBindFlips[idx];
+		if (r.chosen == chosen && r.texHit == texHit && r.rtHit == rtHit) return;
+		if (r.lines >= 24u) return;
+		++r.lines; ++VKBindFlipLines;
+		r.chosen = chosen; r.texHit = texHit; r.rtHit = rtHit;
+		VKTex_Info ti; const bool haveTi = VKTex_Query(key, &ti);
+		VKRT_Info ri; const bool haveRi = VKRT_Query(key, &ri);
+		fprintf(stderr, "[VKMIRROR] f=%llu key=%p use=%c chosen=%p tex=%p(%ux%u f=%u) rt=%p(%ux%u f=%u lay=%u dep=%u)\n",
+			VKCore_Frame_No(), key, chosen ? (texHit ? 'T' : 'R') : '-', chosen,
+			haveTi ? ti.view : nullptr, haveTi ? ti.width : 0u, haveTi ? ti.height : 0u, haveTi ? ti.format : 0u,
+			haveRi ? ri.view : nullptr, haveRi ? ri.width : 0u, haveRi ? ri.height : 0u,
+			haveRi ? ri.format : 0u, haveRi ? (unsigned)ri.layout : 0u, haveRi ? (unsigned)ri.is_depth : 0u);
+		fflush(stderr);
+	}
+
 	// Uploaded art answers through VKTex; a target the recorder wrote answers through VKRT. Both are
 	// valid sampled sources, so a texture slot accepts either. Depth mirrors are attachment-only.
 	void* vk_texture_view(void* key)
 	{
 		VKTex_Info ti;
-		if (VKTex_Query(key, &ti) && ti.view) return ti.view;
+		if (VKTex_Query(key, &ti) && ti.view) {
+			if (vk_bind_on()) {
+				VKRT_Info ri;
+				vk_note_bind_resolution(key, ti.view, 1, (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) ? 1 : 0);
+			}
+			return ti.view;
+		}
 		VKRT_Info ri;
-		if (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) return ri.view;
+		const int rtHit = (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) ? 1 : 0;
+		if (vk_bind_on()) vk_note_bind_resolution(key, rtHit ? ri.view : nullptr, 0, rtHit);
+		if (rtHit) return ri.view;
+		// GeneralsX @bugfix Qoder 20/10/2026 R-07: nothing mirrors this pointer, and the batch is about to be
+		// drawn with the built-in white. Two ways to get here, both created by the same recycled-address
+		// design: the owner died and its mirror was just retired as an orphan, or its pixels arrived through a
+		// path that never fed an upload. The object bound here is alive and holds the bytes, so ask its owner
+		// to feed the mirror now and sample the result this same frame - the deferred form of what the loader
+		// does when it unlocks. Bounded per frame, because every real upload drains the queue and the point of
+		// the fix is not to put a fence back into the draw loop.
+		static unsigned long long s_pushFrame = 0ull;
+		static unsigned s_pushes = 0u;
+		static unsigned s_pushLogged = 0u;
+		if (VK_NOD3D_Enabled()) {
+			const unsigned long long f = VKCore_Frame_No();
+			if (f != s_pushFrame) { s_pushFrame = f; s_pushes = 0u; }
+			if (s_pushes < 16u) {
+				++s_pushes;
+				if (VKD3D_Push_Mirror(key) && VKTex_Query(key, &ti) && ti.view) {
+					if (s_pushLogged < 64u) {
+						++s_pushLogged;
+						fprintf(stderr, "[VKREBIND] f=%llu key=%p fed at bind %ux%u lv=%u vkf=%u\n",
+							f, key, ti.width, ti.height, ti.levels, ti.format);
+						fflush(stderr);
+					}
+					return ti.view;
+				}
+			}
+		}
 		return nullptr;
 	}
 
@@ -4203,7 +4371,7 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	// the compare, D3DRS_ALPHAREF is the 0..255 reference the shadow holds, and the enable bit decides
 	// whether either is consulted. flags[3] stays reserved.
 	ff.flags[2] = VKFF_PACK_ALPHA_TEST(VK_Read_RS(D3DRS_ALPHATESTENABLE) ? 1u : 0u,
-	                                   VK_Read_RS(D3DRS_ALPHAFUNC) & 7u,
+	                                   VK_Read_RS(D3DRS_ALPHAFUNC),
 	                                   VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu);
 	// flags[3] carries the last enabled combiner stage; it is written after the tss loop below.
 
@@ -4410,6 +4578,122 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	}
 }
 
+void DX8Wrapper::VK_Set_Skin_Batch(bool on)
+{
+	g_vkSkinBatch = on;
+}
+
+// GeneralsX @debug Qoder 20/10/2026: consumed by DoShadows() before either retail manager runs.
+// Off until the Vulkan frame loop syncs it with the options row, so a non-Vulkan path keeps retail shadows.
+bool g_vkRetailShadowOff = false;
+
+void DX8Wrapper::VK_Set_Retail_Shadow_Off(bool on)
+{
+	g_vkRetailShadowOff = on;
+}
+
+bool DX8Wrapper::VK_Retail_Shadow_Off()
+{
+	return g_vkRetailShadowOff;
+}
+
+// GeneralsX @feature Qoder 20/10/2026: single entry point for the options-page "real shadow" row. The
+// retail decal/stencil managers are the fallback path, so the two states are always complementary.
+static bool g_vkRealShadowOn = true;
+
+void DX8Wrapper::VK_Set_Real_Shadow_Enabled(bool on)
+{
+	g_vkRealShadowOn = on;
+	g_vkRetailShadowOff = on;
+}
+
+bool DX8Wrapper::VK_Real_Shadow_Enabled()
+{
+	return g_vkRealShadowOn;
+}
+
+// GeneralsX @feature Qoder 20/10/2026: strengths handed over by the graphics page. The defaults are the
+// receiver's previous constants (0.58 strength, 1.0 penumbra), so a client whose Options.ini predates the
+// wiring keeps the shipped look. OptionPreferences still owns the retail values; these are the native
+// mirror, pushed by the two apply hooks in OptionsMenu.cpp.
+static float g_vkSunShadowStrength = 0.58f;
+static float g_vkSunShadowPenumbra = 1.0f;
+
+void DX8Wrapper::VK_Set_Sun_Shadow_Knobs(float strength, float penumbra)
+{
+	g_vkSunShadowStrength = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+	g_vkSunShadowPenumbra = penumbra < 0.25f ? 0.25f : (penumbra > 4.0f ? 4.0f : penumbra);
+}
+
+float DX8Wrapper::VK_Sun_Shadow_Strength()
+{
+	return g_vkSunShadowStrength;
+}
+
+float DX8Wrapper::VK_Sun_Shadow_Penumbra()
+{
+	return g_vkSunShadowPenumbra;
+}
+
+// GeneralsX @feature Qoder 20/10/2026: present-side post knobs. Defaults reproduce the plain blit
+// (no halo, no FXAA) so a build whose options were never pushed keeps the exact old present path; the
+// first filtered frame and the two options apply hooks replace them with the player's values.
+static float g_vkPostBloom = 0.0f;
+static bool  g_vkPostAA = false;
+
+void DX8Wrapper::VK_Set_Post_Knobs(float bloom, bool aa)
+{
+	g_vkPostBloom = bloom < 0.0f ? 0.0f : (bloom > 1.0f ? 1.0f : bloom);
+	g_vkPostAA = aa;
+}
+
+float DX8Wrapper::VK_Post_Bloom()
+{
+	return g_vkPostBloom;
+}
+
+bool DX8Wrapper::VK_Post_AA()
+{
+	return g_vkPostAA;
+}
+
+// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation bridge (see VulkanDraw.h).
+bool DX8Wrapper::VK_LightShadow_Info(float vp[16], float pos_range[4])
+{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	return VKDraw_LightShadow_Info(vp, pos_range);
+#else
+	(void)vp; (void)pos_range;
+	return false;
+#endif
+}
+
+bool DX8Wrapper::VK_Vegetation_Ready()
+{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	return VKDraw_Vegetation_Ready();
+#else
+	return false;
+#endif
+}
+
+bool DX8Wrapper::VK_Vegetation_Draw(const void* grass, unsigned grass_count,
+	const void* rocks, unsigned rock_count,
+	const float view_proj[16], const float camera[3], float time_seconds,
+	const float sun_dir[3], const float fog_color[3],
+	float fog_start, float fog_end, float cull_distance)
+{
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	return VKDraw_Vegetation_Draw(grass, grass_count, rocks, rock_count, view_proj, camera,
+		time_seconds, sun_dir, fog_color, fog_start, fog_end, cull_distance);
+#else
+	(void)grass; (void)grass_count; (void)rocks; (void)rock_count; (void)view_proj;
+	(void)camera; (void)time_seconds; (void)sun_dir; (void)fog_color;
+	(void)fog_start; (void)fog_end; (void)cull_distance;
+	return false;
+#endif
+}
+
 void DX8Wrapper::VK_Fill_Submit_State(VKDraw_Submit& s, VKDraw_FF_State& ffState,
 	const FVFInfoClass& info, unsigned vsTag, unsigned psTag, unsigned primitive_type)
 {
@@ -4511,6 +4795,53 @@ void DX8Wrapper::VK_Fill_Submit_State(VKDraw_Submit& s, VKDraw_FF_State& ffState
 		s.texture_views[t] = vk_texture_view((void*)Textures[t]);
 	}
 	vkf17::add(vkf17::F_VIEW, t17f);
+
+	// GeneralsX @debug Qoder 20/10/2026 R-07: one line per batch whose deferred texture never reached the
+	// shadow slot this batch is actually sampled from (see VKSplitLines above). The split has two shapes -
+	// an empty shadow (the stage gets disabled and the pixels come out as vertex colour) and a stale shadow
+	// naming somebody else's texture (the batch samples that instead) - so the test is "shadow != pending's
+	// own base texture", not merely "shadow is null". psTag names the pixel program, so the census shows
+	// whether the split is confined to one family or engine-wide. The budget is PER pixel program: the first
+	// run spent all 2000 lines on the effect overlays (ps=242, which bind stage 0 raw and are therefore
+	// expected to differ from the pending pointer) and never reached the terrain or unit families.
+	{
+		static unsigned s_splitTag = 0xFFFFFFFFu;
+		static unsigned s_splitTagLines = 0u;
+		if (psTag != s_splitTag) { s_splitTag = psTag; s_splitTagLines = 0u; }
+		if (vk_split_on() && VKSplitLines < 2000u && s_splitTagLines < 40u) {
+			for (unsigned ts = 0; ts < 8u; ++ts) {
+				TextureBaseClass* pending = render_state.Textures[ts];
+				if (pending == nullptr) continue;
+				const void* want = (const void*)pending->Peek_D3D_Base_Texture();
+				if ((const void*)Textures[ts] == want) continue;
+				++VKSplitLines; ++s_splitTagLines;
+				fprintf(stderr, "[VKSPLIT] f=%llu ps=%u stage=%u pending=%s want=%p shadow=%p\n",
+					VKCore_Frame_No(), psTag, ts, pending->Get_Texture_Name().str(),
+					want, (void*)Textures[ts]);
+				fflush(stderr);
+			}
+		}
+	}
+
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round five: the draw the caller opened a window for, reported
+	// from inside the capture. Slot 0 with v=0 is the built-in white (the passthrough a null or unmirrored
+	// bind samples), so a receiver that asked for its shadow map and got v=0 multiplied the scene by 1 -
+	// no darkening - and one that got somebody else's key is shaded by that instead.
+	if (VKCapWatch && VKCapLines < 1500u && vk_bind_on()) {
+		++VKCapLines;
+		fprintf(stderr, "[VKCAP] f=%llu ps=%u blend=%u/%u/%u write=%X", VKCore_Frame_No(), psTag,
+			s.key.blend_enable, s.key.src_blend, s.key.dst_blend, s.key.write_mask);
+		for (unsigned t3 = 0; t3 < 4u; ++t3) {
+			fprintf(stderr, " |%u k=%p v=%p", t3, (void*)Textures[t3], s.texture_views[t3]);
+		}
+		fprintf(stderr, " samp(aU=%u aV=%u min=%u mag=%u mip=%u)\n",
+			VK_Read_Sampler(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP),
+			VK_Read_Sampler(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP),
+			VK_Read_Sampler(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR),
+			VK_Read_Sampler(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR),
+			VK_Read_Sampler(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT));
+		fflush(stderr);
+	}
 
 	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: binding census for every distinct custom pixel
 	// program. The GPU-side atlas mirror proved byte-clean, so the red terrain patches must come from
@@ -4762,6 +5093,7 @@ void DX8Wrapper::VK_Fill_Submit_State(VKDraw_Submit& s, VKDraw_FF_State& ffState
 	// GENERALSX_VKFFVERT cannot silently change what the pipeline was told to draw.
 	VK_FF_Pack(&ffState, info);
 	s.ff = &ffState;
+	s.skin_batch = g_vkSkinBatch ? 1u : 0u;
 	s.vertex_constant_vec4s = MAX_VERTEX_SHADER_CONSTANTS;
 	s.pixel_constant_vec4s  = MAX_PIXEL_SHADER_CONSTANTS;
 	vkf17::add(vkf17::F_PACK, t17f);
@@ -5475,6 +5807,17 @@ void DX8Wrapper::VK_RT_Probe(void* texture_key)
 	VKDraw_RTProbe(texture_key);
 }
 
+void DX8Wrapper::VK_Watch_Bind(void* texture_key)
+{
+	VKBindWatch = texture_key;
+	VKWatch_Open = false;
+}
+
+void DX8Wrapper::VK_Watch_Capture(int on)
+{
+	VKCapWatch = on;
+}
+
 void DX8Wrapper::VK_Suspend_Scene_Target()
 {
 	// The recorder keeps its scene target bindings; only ownership is cleared, which is the same state
@@ -5490,7 +5833,32 @@ void DX8Wrapper::VK_Suspend_Scene_Target()
 bool DX8Wrapper::VK_Publish_Render_Target(void*, void*) { return false; }
 void DX8Wrapper::VK_Publish_Scene_Target() {}
 void DX8Wrapper::VK_RT_Probe(void*) {}
+void DX8Wrapper::VK_Watch_Bind(void*) {}
+void DX8Wrapper::VK_Watch_Capture(int) {}
 void DX8Wrapper::VK_Suspend_Scene_Target() {}
+
+// GeneralsX @build Qoder 22/10/2026 Non-Vulkan parity stubs for the shadow/post/vegetation bridge.
+// The callers (OptionsMenu, W3DShaderManager, DoShadows, grass buffer, skin containers) are shared
+// code compiled without SAGE_USE_VULKAN_CORE; retail shadows and the fixed-function vegetation path
+// remain in charge, so every query reports "not handled here".
+void DX8Wrapper::VK_Set_Skin_Batch(bool) {}
+void DX8Wrapper::VK_Set_Retail_Shadow_Off(bool) {}
+bool DX8Wrapper::VK_Retail_Shadow_Off() { return false; }
+void DX8Wrapper::VK_Set_Real_Shadow_Enabled(bool) {}
+bool DX8Wrapper::VK_Real_Shadow_Enabled() { return false; }
+void DX8Wrapper::VK_Set_Sun_Shadow_Knobs(float, float) {}
+float DX8Wrapper::VK_Sun_Shadow_Strength() { return 0.58f; }
+float DX8Wrapper::VK_Sun_Shadow_Penumbra() { return 1.0f; }
+void DX8Wrapper::VK_Set_Post_Knobs(float, bool) {}
+float DX8Wrapper::VK_Post_Bloom() { return 0.0f; }
+bool DX8Wrapper::VK_Post_AA() { return false; }
+bool DX8Wrapper::VK_Vegetation_Ready() { return false; }
+bool DX8Wrapper::VK_Vegetation_Draw(const void*, unsigned, const void*, unsigned,
+	const float[16], const float[3], float, const float[3], const float[3], float, float, float)
+{
+	return false;
+}
+bool DX8Wrapper::VK_LightShadow_Info(float[16], float[4]) { return false; }
 
 #endif // _WIN32 && SAGE_USE_VULKAN_CORE
 

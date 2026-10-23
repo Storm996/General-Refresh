@@ -663,6 +663,15 @@ public:
 	/// mark the UI as dirty so the context of everything is re-evaluated
 	void markUIDirty();
 
+	/// GeneralsX @feature Qoder 22/10/2026 RA3-style right sidebar production focus.
+	/// Focus a producer without changing the world selection; 0/INVALID_ID clears it.
+	void setProductionFocus( ObjectID objectID );
+	void clearProductionFocus();
+	ObjectID getProductionFocusObjectID() const { return m_productionFocusObjectID; }
+
+	/// Expose a context-sensitive command window to the right sidebar mirror buttons.
+	GameWindow *getCommandWindowForSidebar( Int index ) const;
+
 	/// a drawable has just become selected
 	void onDrawableSelected( Drawable *draw );
 
@@ -911,6 +920,7 @@ protected:
 	GameWindow *m_contextParent[ NUM_CONTEXT_PARENTS ];		///< "parent" window for buttons that are part of the context sensitive interface
 
 	Drawable *m_currentSelectedDrawable;					///< currently selected drawable for the context sensitive interface
+	ObjectID m_productionFocusObjectID;					///< RA3-style sidebar production target (independent of world selection)
 	ControlBarContext m_currContext;							///< our current displayed context
 
 	DrawableID m_rallyPointDrawableID;						///< rally point drawable for visual rally point

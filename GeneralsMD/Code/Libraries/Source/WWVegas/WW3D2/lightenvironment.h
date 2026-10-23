@@ -100,6 +100,10 @@ public:
 	const Vector3 &	Get_Light_Diffuse(int i) const				{ return InputLights[i].Diffuse; }
 
 	bool isPointLight(int i) const {return InputLights[i].m_point;}
+	// GeneralsX @feature Qoder 20/10/2026 Forward: a point light whose diffuse was below the LOD
+	// cutoff got folded into the ambient term (Diffuse zeroed in the output list). The per-pixel
+	// point loop must not add it again, or dim lamps double-count as ambient + diffuse.
+	bool isPointDiffuseRejected(int i) const {return InputLights[i].DiffuseRejected;}
 	float getPointIrad(int i) const {return InputLights[i].m_innerRadius;}
 	float getPointOrad(int i) const {return InputLights[i].m_outerRadius;}
 	const Vector3 &	getPointDiffuse(int i) const				{ return InputLights[i].m_diffuse; }

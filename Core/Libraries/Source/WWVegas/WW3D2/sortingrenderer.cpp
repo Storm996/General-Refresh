@@ -378,6 +378,17 @@ void SortingRendererClass::Insert_To_Sorted_List(SortingNodeStruct *state)
 void SortingRendererClass::Insert_To_Sorting_Pool(SortingNodeStruct* state)
 {
 	if (overlapping_node_count>=MAX_OVERLAPPING_NODES) {
+		// GeneralsX @debug Qoder 21/10/2026 PROPDROP: confirm whether the rotor blur nodes are
+		// the ones falling off the fixed-size sorted pool (4096 nodes/frame).
+		static int s_propDrop = 0;
+		const char* tn = (state->sorting_state.Textures[0])
+			? (const char*)state->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+		if (s_propDrop < 8 && tn && strstr(tn, "avcomanche_p")) {
+			++s_propDrop;
+			fprintf(stderr, "[PROPDROP] tex='%s' at node=%u polys=%u verts=%u\n",
+				tn, overlapping_node_count, state->polygon_count, state->vertex_count);
+			fflush(stderr);
+		}
 		Release_Refs(state);
 		delete state;
 		WWASSERT(0);
@@ -444,6 +455,15 @@ static void Apply_Render_State(RenderStateStruct& render_state)
 
 void SortingRendererClass::Flush_Sorting_Pool()
 {
+	{
+		static int s_poolEnter = 0;
+		if (s_poolEnter < 12) {
+			++s_poolEnter;
+			fprintf(stderr, "[PROPPOOLIN] nodes=%u polys=%u verts=%u\n",
+				overlapping_node_count, overlapping_polygon_count, overlapping_vertex_count);
+			fflush(stderr);
+		}
+	}
 	if (!overlapping_node_count) return;
 	const bool vk14p = vkf14b::on();
 	if (vk14p) vkf14b::g_seg[vkf14b::SEG_POOLINS].cnt += overlapping_node_count;
@@ -576,6 +596,29 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			}
 		}
 
+		// GeneralsX @debug Qoder 21/10/2026 PROPFLUSH: the Chinook rotor blur (PROPS01/02) is a
+		// sorted SRC_ALPHA/INV_SRC_ALPHA mesh that never reaches the screen. Confirm whether its
+		// nodes are actually flushed and drawn, and with which state, before touching the blend path.
+		{
+			static int s_propFlush = 0;
+			for (unsigned a = chunkOffset; a < chunkEnd && s_propFlush < 8; ++a) {
+				SortingNodeStruct* st = overlapping_nodes[tis[a].idx];
+				const char* tn = st->sorting_state.Textures[0]
+					? (const char*)st->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+				if (tn && strstr(tn, "avcomanche_p")) {
+					++s_propFlush;
+					fprintf(stderr, "[PROPFLUSH] tex='%s' polys=%u verts=%u start=%u vtxRange=%u shader=%08x depthMask=%u src=%u dst=%u\n",
+						tn, st->polygon_count, st->vertex_count, st->start_index, st->min_vertex_index,
+						st->sorting_state.shader.Get_Bits(),
+						(unsigned)st->sorting_state.shader.Get_Depth_Mask(),
+						(unsigned)st->sorting_state.shader.Get_Src_Blend_Func(),
+						(unsigned)st->sorting_state.shader.Get_Dst_Blend_Func());
+					fflush(stderr);
+					break;
+				}
+			}
+		}
+
 		// Set index buffer and render!
 
 		DX8Wrapper::Set_Index_Buffer(dyn_ib_access,0); // Override with this buffer (do something to prevent need for this!)
@@ -620,6 +663,18 @@ void SortingRendererClass::Flush_Sorting_Pool()
 	}
 	if (vk14p) { vkf14b::g_seg[vkf14b::SEG_CHUNK].us += vkf14b::now_us() - t_chunk; vkf14b::g_seg[vkf14b::SEG_CHUNK].cnt++; }
 
+	// GeneralsX @debug Qoder 21/10/2026 PROPPOOL: one bounded line per heavy frame, so the rotor
+	// node can be matched against the pool ceiling.
+	{
+		static int s_propPool = 0;
+		if (s_propPool < 12 && overlapping_node_count > 0) {
+			++s_propPool;
+			fprintf(stderr, "[PROPPOOL] nodes=%u polygons=%u vertices=%u\n",
+				overlapping_node_count, overlapping_polygon_count, overlapping_vertex_count);
+			fflush(stderr);
+		}
+	}
+
 	// Release all references and return nodes back to the clean list for the frame...
 	for (unsigned node_id=0;node_id<overlapping_node_count;++node_id) {
 		SortingNodeStruct* state=overlapping_nodes[node_id];
@@ -639,6 +694,13 @@ void SortingRendererClass::Flush_Sorting_Pool()
 void SortingRendererClass::Flush()
 {
 	WWPROFILE("SortingRenderer::Flush");
+	static int s_sortFlushLog = 0;
+	if (s_sortFlushLog < 8) {
+		++s_sortFlushLog;
+		fprintf(stderr, "[SORTFLUSH] sorted=%u unsorted=%u\n",
+			(unsigned)sorted_list.size(), (unsigned)unsorted_list.size());
+		fflush(stderr);
+	}
 	const bool vk14 = vkf14b::on();
 	if (vk14) { vkf14b::g_ticks++; if (vkf14b::g_ticks >= 300) vkf14b::dump(); }
 	Matrix4x4 old_view;
@@ -659,6 +721,20 @@ void SortingRendererClass::Flush()
 		SortingNodeStruct* state = sorted_list.front();
 		sorted_list.pop_front();
 
+		{
+			static int s_nodeLog = 0;
+			if (s_nodeLog < 12) {
+				++s_nodeLog;
+				const char* tn = state->sorting_state.Textures[0]
+					? (const char*)state->sorting_state.Textures[0]->Get_Texture_Name() : "(null)";
+				fprintf(stderr, "[SORTNODE] tex='%s' polys=%u verts=%u vbType=%u ibType=%u\n",
+					tn, state->polygon_count, state->vertex_count,
+					(unsigned)state->sorting_state.vertex_buffer_types[0],
+					(unsigned)state->sorting_state.index_buffer_type);
+				fflush(stderr);
+			}
+		}
+
 		if ((state->sorting_state.index_buffer_type==BUFFER_TYPE_SORTING || state->sorting_state.index_buffer_type==BUFFER_TYPE_DYNAMIC_SORTING) &&
 			(state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_SORTING || state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_DYNAMIC_SORTING)) {
 			if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_POOLINS); (void)s;
@@ -666,6 +742,17 @@ void SortingRendererClass::Flush()
 		}
 		else {
 			{
+			static int s_propDirect = 0;
+			const char* tn = state->sorting_state.Textures[0]
+				? (const char*)state->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+			if (s_propDirect < 8 && tn && strstr(tn, "avcomanche_p")) {
+				++s_propDirect;
+				fprintf(stderr, "[PROPDIRECT] tex='%s' polys=%u verts=%u vbType=%u ibType=%u\n",
+					tn, state->polygon_count, state->vertex_count,
+					(unsigned)state->sorting_state.vertex_buffer_types[0],
+					(unsigned)state->sorting_state.index_buffer_type);
+				fflush(stderr);
+			}
 			vkf14b::Scope s(vk14, vkf14b::SEG_DIRECT);
 			DX8Wrapper::Set_Render_State(state->sorting_state);
 			DX8Wrapper::Draw_Triangles(state->start_index,state->polygon_count,state->min_vertex_index,state->vertex_count);

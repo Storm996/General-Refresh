@@ -116,6 +116,9 @@
 #include "assetstatus.h"
 #include "ringobj.h"
 #include "sphereobj.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanGeo.h"	// VKDiag_Log_Mirror_State: cross-match live-mirror snapshot
+#endif
 #include "shdlib.h"
 
 /*
@@ -493,6 +496,11 @@ void WW3DAssetManager::Release_Unused_Assets()
 	// and remove them from our lists.
 	Release_Unused_Textures();
 	Release_Unused_Font3DDatas();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 21/10/2026 multi-match forensics: same snapshot as the MD tree; one line
+	// per game reset with live mirror bytes/images, budget skips and stub live-object occupancy.
+	VKDiag_Log_Mirror_State("Release_Unused_Assets");
+#endif
 }
 
 /***********************************************************************************************

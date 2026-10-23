@@ -443,6 +443,12 @@ void MeshModelClass::Detect_And_Build_Normal_Map()
 	//      sprite/overlay/decal, not a surface, and tangent-space re-lighting there replaces
 	//      art-authored shading (unit bodies are 900+ polys, the offending parts 8-35).
 	// Class-level by construction: no per-file moves, and both feature arms stay fully on.
+	// GeneralsX @tweak Qoder 20/10/2026 TEMP EXPERIMENT: the whole #87 rejection block below is
+	// commented out (normally it refuses meshes whose diffuse/companion is < 128px on the short
+	// side or that have < 48 polygons). This is a temporary local test to see whether these
+	// meshes can mount dot3/PBR at all; the rejections are class-level asset contracts from
+	// 16/10/2026 (#68/#87) and are EXPECTED to come back - do not ship this state.
+/*
 	{
 		const int polys = Get_Polygon_Count();
 		int nmSide = 0;
@@ -456,6 +462,7 @@ void MeshModelClass::Detect_And_Build_Normal_Map()
 			return;
 		}
 	}
+*/
 
 	if (Compute_Mesh_Tangents(this, &VertexTangent, &VertexBinormal)) {
 		UsesNormalMap = true;

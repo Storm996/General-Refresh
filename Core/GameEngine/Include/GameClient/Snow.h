@@ -189,6 +189,24 @@ extern WeatherSetting *getWeatherProfile(Weather type);			///<owned profile, nev
 extern Weather getActiveWeatherType();								///<type the active profile describes.
 extern void applyWeatherType(Weather type);						///<point TheWeatherSetting at that type's profile.
 
+// GeneralsX @feature Qoder 21/10/2026 vegetation render options, shared by the options page and the
+// device-side grass buffer. The page's apply hooks write these directly (no Options.ini round-trip to
+// preview a change); refreshVegetationRenderOptions() seeds them from Options.ini at client init.
+// Master 'enabled' being false means the grass/rock channel is not touched at all: no scan, no
+// instance build, no draw - the retail game runs exactly as before.
+struct VegetationRenderOptions
+{
+	Bool enabled;				///< master switch for the whole vegetation channel.
+	Bool grassEnabled;			///< individual blade layer.
+	Bool rocksEnabled;			///< scattered stones.
+	Real grassDensity;			///< percent of qualifying cells that grow a clump, 0..100.
+	Real grassHeightScale;		///< percent height multiplier, 50..200 (100 = shipped height).
+	Real grassDistanceScale;	///< percent view radius multiplier, 50..200.
+	Real rockDensity;			///< percent of rock candidates kept, 0..200.
+};
+extern VegetationRenderOptions g_vegetationRenderOptions;
+extern void refreshVegetationRenderOptions();
+
 class SnowManager : public SubsystemInterface
 {
   public :
@@ -219,9 +237,16 @@ class SnowManager : public SubsystemInterface
 	// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: switch the active recipe at runtime
 	// (map data, script action or the QA env leg). Purely client-side: the enum value it mirrors is
 	// owned by GlobalData/the script, so nothing here reaches the CRC state stream.
+	// GeneralsX @feature Qoder 21/10/2026 weather preset UI: a user-selected type that outranks the
+	// map/script mirror until the player switches back to "follow map" (-1). Purely client-side; the
+	// logic enum is never written, so replays and CRCs are unaffected.
 	virtual void setWeatherType(Weather type);
 	Weather getWeatherType() const { return m_weatherType; }
-	/// GeneralsX @feature Storm996 16/10/2026 PS3.0 Weather W1: script/map visibility gate, read by the
+	void setUserWeatherOverride(Int type);			///< -1 = follow map/script, 0..WEATHER_COUNT-1 = force.
+	Int getUserWeatherOverride() const { return m_userWeatherType; }
+	/// GeneralsX @feature Qoder 21/10/2026: re-read the WeatherPreview key from Options.ini.
+	void loadWeatherUserOverride();
+	/// GeneralsX @feature Qoder 21/10/2026 script/map visibility gate, read by the
 	/// render pass alongside the recipe's own enable flags.
 	Bool isWeatherVisible() const { return m_isVisible; }
 
@@ -242,6 +267,7 @@ class SnowManager : public SubsystemInterface
 	Real				m_emitterSpacing;		///<used to control how many emitters are present per world unit
 	Bool				m_isVisible;		///<used to prevent map weather (if defined) from rendering.
 	Weather			m_weatherType;		///<GeneralsX @feature PS3.0 Weather W1 16/10/2026 type the current recipe describes.
+	Int					m_userWeatherType;	///<GeneralsX @feature Qoder 21/10/2026 -1 follow map, else forced type.
 };
 
 extern SnowManager *TheSnowManager;  ///< the ray effects singleton external

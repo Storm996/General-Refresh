@@ -535,6 +535,19 @@ public:
 	// (the sun shadow map's "did the fill land" question). No-op unless GENERALSX_VKRTPROBE=1.
 	static void VK_RT_Probe(void* texture_key);
 
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round four: nominate one texture key whose sampled-view
+	// resolution the recorder then logs once per frame as [VKWATCH] (gate GENERALSX_VKMIRROR=1) - which
+	// mirror answered, whether more than one view appeared in the frame, and the render-target mirror's
+	// layout at bind time. The sun shadow map uses it to answer what its terrain receiver really bound.
+	static void VK_Watch_Bind(void* texture_key);
+
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round five: the bind census above keys on one texture pointer,
+	// which only answers "was this the map" for the frames where it matched. Opening a capture window makes
+	// the recorder log everything it read out of the shadow for the very next facade draw - stage keys,
+	// resolved views and the blend triple - so a pass can ask "what did you record for my batch" instead of
+	// inferring it. Gate GENERALSX_VKMIRROR=1; window stays open until closed, one line per draw.
+	static void VK_Watch_Capture(int on);
+
 	// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9: a post chain whose offscreen targets were
 	// not opted in still binds D3D9 textures. The recorder is left on the scene mirror during that chain,
 	// so without this gate its fixed-function copy quad is recorded into the scene with a source Vulkan
@@ -757,6 +770,53 @@ public:
 		unsigned short first_index, unsigned short polygon_count,
 		unsigned short min_vertex_index, unsigned short vertex_count, unsigned long long base_vertex);
 
+	// GeneralsX @bugfix Qoder 20/10/2026 native sun shadow: DX8SkinFVFCategoryContainer writes deformed
+	// world-space vertices and renders them in one batch, so the submitted world is always the identity.
+	// This flag carries that fact to the recorder, which otherwise cannot tell a skin batch from terrain -
+	// both are identity-world and, with per-pixel lighting off, both use the fixed-function vertex stage.
+	static void VK_Set_Skin_Batch(bool on);
+
+	// GeneralsX @debug Qoder 20/10/2026 retail decal/stencil A/B: the native shadow capture can mute
+	// the two retail managers for one segment so all three lighting paths share a camera timeline.
+	static void VK_Set_Retail_Shadow_Off(bool on);
+	static bool VK_Retail_Shadow_Off();
+
+	// GeneralsX @feature Qoder 20/10/2026: the options-page "ShadowMap" row owns the native sun shadow.
+	// On enables the shadow-map receiver and mutes the retail decal/stencil sun shadows; off restores
+	// the retail managers and skips the native pass.
+	static void VK_Set_Real_Shadow_Enabled(bool on);
+	static bool VK_Real_Shadow_Enabled();
+
+	// GeneralsX @feature Qoder 20/10/2026: the options page's two density rows reach the native pass.
+	// "投影阴影浓度" maps onto the receiver's darkening strength and "体积阴影浓度" onto the PCSS
+	// penumbra. The retail managers keep their shipped constants, so these only affect the native row.
+	// The receiver reads both once per frame, so a slider move previews immediately.
+	static void VK_Set_Sun_Shadow_Knobs(float strength, float penumbra);
+	static float VK_Sun_Shadow_Strength();
+	static float VK_Sun_Shadow_Penumbra();
+
+	// GeneralsX @feature Qoder 20/10/2026: knobs for the pure-Vulkan present-side post pass (FXAA +
+	// bloom). The D3D9 bloom chain never runs under the Vulkan core (its RTT probe needs a render
+	// target the stub cannot return), and every attachment on this path is one sample, so the two
+	// user settings are applied here instead: the slider maps to the halo gain and the anti-aliasing
+	// mode to the FXAA tap. Pushed on the first filtered frame and again by the options apply hooks.
+	static void VK_Set_Post_Knobs(float bloom, bool aa);
+	static float VK_Post_Bloom();
+	static bool VK_Post_AA();
+
+	// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation. The device-side grass buffer builds
+	// the instance stream; this bridge records the instanced draw into the scene pass that is open at
+	// the time of the call. False on any non-Vulkan build, so the retail billboard path stays in charge.
+	static bool VK_Vegetation_Ready();
+	// GeneralsX @feature Qoder 22/10/2026 light shadows: the strongest dynamic light's map (see
+	// VKDraw_LightShadow_Info). False on any non-Vulkan build.
+	static bool VK_LightShadow_Info(float vp[16], float pos_range[4]);
+	static bool VK_Vegetation_Draw(const void* grass, unsigned grass_count,
+	                               const void* rocks, unsigned rock_count,
+	                               const float view_proj[16], const float camera[3], float time_seconds,
+	                               const float sun_dir[3], const float fog_color[3],
+	                               float fog_start, float fog_end, float cull_distance);
+
 	// GeneralsX @refactor Qoder 18/10/2026 pure-Vulkan wedge 9: the shadow-to-submit translation both draw
 	// paths share. It fills everything except the vertex/index source, which is what differs between an
 	// indexed batch and a user-memory one. 'ff_state' is the caller's storage for the packed fixed-function
@@ -812,6 +872,13 @@ public:
 	// census put in csv - so this only answers the sentinel question; decoding them is vkdesc_make_sampler's
 	// job and it decodes D3D8 ordinals, nothing else.
 	static unsigned VK_Read_Sampler(unsigned stage, unsigned token, unsigned fallback);
+
+	// GeneralsX @debug Qoder 20/10/2026 R-06 round five: the raw texture shadow a facade draw will hand the
+	// recorder - the same Textures[] array the capture loop reads. A pass that binds through Set_DX8_Texture
+	// can have that bind replaced before its own draw lands, because Apply_Render_State_Changes() applies a
+	// pending deferred texture (TextureClass::Apply writes the slot AND the samplers). The receiver census
+	// uses this to see its own stage-0 key at each point of its state writes.
+	static void* VK_Read_Texture(unsigned stage);
 
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: pack the fixed-function vertex-stage block
 	// (VKDraw_FF_State, the third dynamic uniform of every submit) out of the facade's shadows for one
@@ -1969,7 +2036,25 @@ WWINLINE void DX8Wrapper::Set_Texture(unsigned stage,TextureBaseClass* texture)
 		return;
 	}
 
-	if (texture==render_state.Textures[stage]) return;
+	if (texture==render_state.Textures[stage])
+	{
+		// GeneralsX @bugfix Qoder 20/10/2026 R-07 mismatch family 6: this early return only compared the
+		// pending slot, so a batch that asked for the same texture as last time never re-marked the dirty
+		// bit - even though the device had moved on. Invalidate_Cached_Render_States() clears the device
+		// slot and the dirty mask but leaves pending untouched, and any raw Set_DX8_Texture() bind (the
+		// shadow-map receiver, water bump, blur passes) also moves the device without touching pending.
+		// The next frame's Set_Texture of the same texture then returned early and the batch drew with the
+		// foreign texture still in the device slot: particle effects sampled a 512x512 render-target stub,
+		// and the ground blob-shadow decals - which ask for shadow.tga every single frame - sampled
+		// whatever unit skin the previous batch left there, stamping infantry and palm silhouettes flat
+		// onto the terrain. Only a null request may keep the old behaviour: pending null means "nothing to
+		// apply", and the raw-binders above rely on their bind surviving until their own draw.
+		if (texture==nullptr ||
+			Textures[stage]==texture->Peek_D3D_Base_Texture())
+		{
+			return;
+		}
+	}
 	REF_PTR_SET(render_state.Textures[stage],texture);
 	render_state_changed|=(TEXTURE0_CHANGED<<stage);
 }
@@ -1992,9 +2077,10 @@ WWINLINE void DX8Wrapper::Set_Material(const VertexMaterialClass* material)
 
 WWINLINE void DX8Wrapper::Set_Shader(const ShaderClass& shader)
 {
-	if (!ShaderClass::ShaderDirty && ((unsigned&)shader==(unsigned&)render_state.shader)) {
-		return;
-	}
+	// GeneralsX @bugfix Qoder 21/10/2026 STATELEAK: do not early-out on identical shader bits. Effect
+	// passes write blend/alpha states directly, so the next batch may reuse the same shader while the
+	// live states belong to the decal. ShaderClass::Apply now re-checks the effective blend/alpha
+	// states and returns cheaply when they already match, so always offering the shader is correct.
 	render_state.shader=shader;
 	render_state_changed|=SHADER_CHANGED;
 
@@ -2092,6 +2178,14 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		Matrix4x4 m2=m.Transpose();
+		// GeneralsX @bugfix Qoder 21/10/2026 TEXMATRIX: every TextureMapperClass
+		// (LinearOffset for tank treads, environment for rotor reflections, grid flipbooks)
+		// writes its D3DTS_TEXTUREn matrix through this overload. The FF block packing in
+		// dx8wrapper.cpp reads DX8Transforms, which only _Set_DX8_Transform used to fill, so
+		// mapper-driven UV scroll/tiling silently fell back to identity under Vulkan. Store
+		// exactly the bytes handed to D3D (transposed engine matrix), the same convention
+		// vkff.vert's texMat multiply expects.
+		DX8Transforms[transform]=m2;
 		DX8CALL(SetTransform(transform,(D3DMATRIX*)&m2));
 		break;
 	}
@@ -2115,6 +2209,7 @@ WWINLINE void DX8Wrapper::Set_Transform(D3DTRANSFORMSTATETYPE transform,const Ma
 	default:
 		DX8_RECORD_MATRIX_CHANGE();
 		Matrix4x4 m2=Matrix4x4(m).Transpose();
+		DX8Transforms[transform]=m2;
 		DX8CALL(SetTransform(transform,(D3DMATRIX*)&m2));
 		break;
 	}

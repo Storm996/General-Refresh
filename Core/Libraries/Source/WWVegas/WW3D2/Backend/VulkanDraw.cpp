@@ -15,11 +15,18 @@
 #include "VulkanGeo.h"
 #include "VulkanDesc.h"
 #include "VulkanPgm.h"
+#include "VulkanForward.h"
 #include "VkShadersDraw.h"
 #include "VkShadersFF.h"
+#include "VkShadersShadow.h"
+#include "VkShadersPost.h"
+// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation instance pass.
+#include "VkShadersVeg.h"
+#include "WW3D2/dx8wrapper.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 #include <deque>
 #include <unordered_map>
@@ -273,6 +280,19 @@ struct VKGeoBack {
     // GeneralsX @bugfix Qoder 19/10/2026 R-05: tombstone flag. See VKDrawState::geo - the deque never
     // erases from the middle, so a removed entry sits freed until the free list recycles its slot.
     int freed = 0;
+    // GeneralsX @bugfix Qoder 20/10/2026 R-08: DISCARD generations. The engine restarts its pool offset at
+    // zero whenever the next batch would not fit, which in D3D9 is a buffer rename: the new writes go to
+    // fresh storage and every draw already recorded keeps reading the old bytes. One region per frame slot
+    // cannot express that, and the second batch of a frame then overwrote vertices a skinned mesh (or the
+    // UI) had already recorded - the atlas-coloured triangles stretching out of infantry. A generation is
+    // one more pool-sized region inside this frame's slot, so an in-frame discard moves forward instead of
+    // over the bytes still in flight. It grows only when a frame actually discards twice.
+    unsigned           gens = 1;
+    unsigned           curGen = 0;
+    unsigned long long lockFrame = ~0ull;
+    int                lockedInFrame = 0;
+    // GeneralsX @debug Qoder 20/10/2026 R-08: the event this fix is about, one bounded line per discard.
+    unsigned           traceDiscards = 0;
 };
 
 // A backing that has been dropped by its WW3D object, or rebuilt because the object grew, is not ours to
@@ -317,6 +337,7 @@ struct VKDrawSetEntry {
     // which is what lets one set cover every draw that reuses the same constant payload.
     void*           cbuf[3];
     unsigned long long cbytes[3];
+    void*           lightMap;      // binding 5's view: a rebuilt mirror must not be sampled by a stale set
     VkDescriptorSet set;
 };
 
@@ -350,6 +371,42 @@ struct VKDrawConstRing {
     // window has reached, in bytes. A ring that fills without wrapping is the near miss that says the
     // wrap counter alone is one frame away from lying, so both numbers travel with every shot line.
     unsigned long long peak = 0;
+};
+
+// GeneralsX @feature Qoder 20/10/2026 native sun shadow: one opaque batch remembered while the scene is
+// drawn, replayed from the sun before the receiver runs. The handles stay valid for the rest of the frame
+// because the geometry backings are only retired at a frame boundary.
+struct VKShadowCaster {
+    VkBuffer     vb;
+    VkDeviceSize voff;
+    VkBuffer     ib;
+    VkDeviceSize ioff;
+    unsigned     index_count;
+    int          base_vertex;
+    unsigned     stride;
+    unsigned     pos_offset;
+    unsigned     topology;
+    float        world[16];
+    // Alpha-tested casters (W3DTreeBuffer foliage and other leaf cards): skipping them was why a forest
+    // produced no visible shadow at all. The cutout runs in the cast fragment stage with the same texture
+    // and compare the scene used, so the card quad occludes nothing and the leaves do.
+    void*        tex;
+    void*        samp;
+    unsigned     uv_offset;
+    unsigned     alpha_enable, alpha_ref, alpha_cmp;
+    // GeneralsX @debug Qoder 20/10/2026: CPU-skinned batches are the only casters whose world is the
+    // identity; the diagnostic in mode 13 replays just those, so their silhouettes can be read without
+    // the terrain and building clutter.
+    unsigned     skin;
+};
+struct VKShadowCastPSO {
+    unsigned   stride, pos_offset, topology, uv_offset, alpha_enable;
+    VkPipeline pso;
+};
+struct VKShadowCastSet {
+    void*           tex;
+    void*           samp;
+    VkDescriptorSet set;
 };
 
 struct VKDrawState {
@@ -482,8 +539,94 @@ struct VKDrawState {
     unsigned sceneW = 0, sceneH = 0;
     unsigned rectX = 0, rectY = 0, rectW = 0, rectH = 0;
 
+    // ---- GeneralsX @feature Qoder 21/10/2026 in-game vegetation -------------------------------------
+    // A self-contained instanced pass recorded inside the scene's open pass from W3DGrassBuffer. The
+    // instance stream carries (base,width), (height,lean,phase) and tint; both shaders synthesise their
+    // geometry from gl_VertexIndex, so there is no per-vertex buffer and no descriptor set - the camera
+    // and fog travel in a 128-byte push constant block, the maximum the spec guarantees.
+    struct VKVegState {
+        bool failed = false, ready = false;
+        VkShaderModule gvs = nullptr, gfs = nullptr, rvs = nullptr, rfs = nullptr;
+        VkPipelineLayout layout = nullptr;
+        VkPipeline gpipe = nullptr, rpipe = nullptr;
+        VkRenderPass pass = nullptr;
+        unsigned samples = 1;
+        VkBuffer     buf[VKGEO_SLOT_COUNT] = {};
+        VkDeviceMemory mem[VKGEO_SLOT_COUNT] = {};
+        void*        map[VKGEO_SLOT_COUNT] = {};
+        unsigned long long cap[VKGEO_SLOT_COUNT] = {};
+        unsigned long long draws = 0, instances = 0;
+    };
+    VKVegState veg;
+
     VKDraw_Stats st = {};
     unsigned long long submitTicks = 0;
+
+    // ---- GeneralsX @feature Qoder 20/10/2026 native sun shadow -------------------------------------
+    // Casters for the frame being recorded; filled by VK_Draw_Submit, consumed and cleared by
+    // VKDraw_Shadow_Apply between the 3D views and the UI.
+    std::vector<VKShadowCaster> casters;
+    // The last scene batch's matrices: the camera the receiver reconstructs world positions with.
+    float shView[16] = {}, shProj[16] = {};
+    // GeneralsX @bugfix Qoder 21/10/2026: the viewport that produced the scene depth, in target pixels.
+    // The tactical view is 0,0,W,0.8H (control bar), not the whole target, so the screen-space shadow
+    // receiver must unproject through this rect instead of assuming full-screen NDC.
+    float shViewport[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    // Hysteresis state for the sun box side: a camera idling on a 256-unit quantization boundary used
+    // to flip the size every frame (shell-map flicker). 0 = no previous fit (map change / first frame).
+    float shFitSide = 0.0f;
+    int   shHaveVP = 0;
+    bool  shEnvChecked = false, shOn = true, shFailed = false, shReady = false;
+    // GeneralsX @debug Qoder 20/10/2026 A/B capture: flip the pass every N presented frames so one run
+    // yields interleaved on/off pairs at the same camera path. Temporary forensic switch.
+    unsigned shAlt = 0u;
+    // GeneralsX @debug Qoder 20/10/2026 three-way A/B: 0 = retail decal/stencil only, 1 = native only,
+    // 2 = both. The retail mute is read by DoShadows() later in this same frame.
+    bool     abOn = false;
+    unsigned abMode = 0u;
+    // GeneralsX @tweak Qoder 21/10/2026 far-view salt-and-pepper: the fit is capped at 4096 world
+    // units, so a 2048 map gives 2 units per texel and a detailed caster aliases into holes that the
+    // PCSS taps turn into stipple. Match the reference's top tier: 4096 keeps 1 unit/texel at the
+    // cap. A QA run can still force 1024/2048/4096 through GENERALSX_VKSHADOW_SIZE.
+    unsigned shMapSize = 4096u;
+    VkShaderModule shCastVs = nullptr, shCastPs = nullptr, shCastAlphaPs = nullptr;
+    VkShaderModule shRecvVs = nullptr, shRecvPs = nullptr;
+    VkPipelineLayout shCastLayout = nullptr, shCastAlphaLayout = nullptr, shRecvLayout = nullptr;
+    VkDescriptorSetLayout shSetLayout = nullptr, shCastSetLayout = nullptr;
+    VkDescriptorPool shPool = nullptr;
+    // Alpha-tested casters each need the texture and sampler the scene used, so the cutout matches the
+    // visible leaves. One descriptor set per distinct pair, recycled with the slot that recorded them.
+    VkDescriptorPool shCastPool[VKGEO_SLOT_COUNT] = {};
+    std::vector<VKShadowCastSet> shCastSets[VKGEO_SLOT_COUNT];
+    VkDescriptorSet shSets[VKGEO_SLOT_COUNT] = {};
+    void* shSetViews[VKGEO_SLOT_COUNT][2] = {};
+    VkSampler shSampler = nullptr;
+    std::vector<VKShadowCastPSO> shCastPSOs;
+    VkPipeline shRecvPSO = nullptr;
+    unsigned shRecvPass = 0xFFFFFFFFu;
+    char shColorKey[8] = {}, shDepthKey[8] = {};
+    float shGroundZ = 0.0f;
+    int   shGroundInit = 0;
+    unsigned long long shFrames = 0ull, shCasterTotal = 0ull, shReplayDraws = 0ull, shNoCasterFrames = 0ull;
+    unsigned long long shFramesLogged = 0ull;
+    // GeneralsX @debug Qoder 20/10/2026 periodic-vanish forensics: the fit inputs that can flip a frame
+    // from "shadowed" to "fully lit" without changing any of the counters the trace already prints.
+    unsigned shLastHits = 0u;
+    float shLastCam[3] = { 0.0f, 0.0f, 0.0f };
+    float shLastProj[3] = { 0.0f, 0.0f, 0.0f };
+
+    // ---- GeneralsX @feature Qoder 20/10/2026 Forward+ -----------------------------------------------
+    // One host-visible dynamic UBO, one 64 KiB slice per in-flight frame slot. The slice carries the
+    // frame's point lights and a coarse screen-tile index list; GN pixel shaders read it through the
+    // already-existing binding 3 (the FF light block) whenever c31.x says the tile path is live.
+    VkBuffer fpBuf = nullptr;
+    VkDeviceMemory fpMem = nullptr;
+    void* fpMap = nullptr;
+    unsigned long long fpBuiltFrame = ~0ull;
+    int fpActive = 0;                 // this frame's block has at least one light in some tile
+    int fpEnvChecked = 0, fpEnvOn = 1;
+    unsigned fpTilesX = 0, fpTilesY = 0, fpTileSize = 0;
+    unsigned long long fpBuilds = 0ull, fpLightTotal = 0ull, fpTileMaxLights = 0ull;
 };
 VKDrawState X;
 
@@ -569,6 +712,351 @@ void free_host_buffer(VkBuffer buf, VkDeviceMemory mem, void** map)
     if (mem) G.vkFreeMemory(dev, mem, nullptr);
     if (buf) G.vkDestroyBuffer(dev, buf, nullptr);
     if (map) *map = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Forward+ point-light feed (see Backend/VulkanForward.h)
+// ---------------------------------------------------------------------------
+// The block layout below is the std140 image of the GLSL `GNForwardPlus` block declared by the GN
+// fragment shaders. It travels through the already-existing binding 3 (the FF light block), so no new
+// descriptor, pipeline layout or shader stage is introduced: each in-flight slot gets one 64 KiB slice
+// of a host-visible uniform buffer, written once per frame at the first scene draw.
+enum {
+    // 3D clustered feed: 1024 clusters = screen tiles x 8 eye-depth slices, 16 lights per cluster,
+    // selected per cluster by proximity (see fp_build_block) rather than by global strength. The std140
+    // block is 16 + 16 + 256*32 (lights) + 1024*20*4 (clusters) = 90,144 bytes, so the slice grew to
+    // 128 KiB.
+    VKFP_MAX_LIGHTS    = 256,
+    VKFP_MAX_CLUSTERS  = 1024,
+    VKFP_Z_SLICES      = 8,
+    VKFP_MAX_PER_CLUSTER = 16,
+    VKFP_CLUSTER_UINTS = 20,                         // count + 16 one-uint indices + 3 pad
+    VKFP_MAX_TILES     = VKFP_MAX_CLUSTERS,          // legacy name used by the stats/probes
+    VKFP_MAX_PER_TILE  = VKFP_MAX_PER_CLUSTER,
+    VKFP_TILE_UINTS    = VKFP_CLUSTER_UINTS,
+    VKFP_SLOT_BYTES    = 131072
+};
+
+struct VKFPBlock {
+    float    header[4];                              // tilesX, tilesY, tileSize, lightCount
+    float    header2[4];                             // zSlices, depthNear, depthFar, clusterStride
+    float    lights[VKFP_MAX_LIGHTS * 8];            // (pos.xyz, inner) / (color.rgb, outer)
+    unsigned tiles[VKFP_MAX_CLUSTERS * VKFP_CLUSTER_UINTS]; // per cluster: count + 8 one-uint indices
+};
+
+static float s_fpLights[VKFP_MAX_LIGHTS][8];
+// GeneralsX @feature Qoder 22/10/2026 light shadows: the strongest published light (index 0 after the
+// score sort in fp_build_block) plus the state of its top-down shadow map. Default OFF: the feature is
+// opt-in until it has been evaluated on hardware, so the shipping look cannot regress.
+static float s_fpTopLight[8];
+static int   s_fpTopValid = 0;
+static int   s_lsKeyObj = 0;                       // stable dummy key for the VKRT mirror
+static void* const s_lsKey = (void*)&s_lsKeyObj;
+static int   s_lsValid = 0;                        // the map holds this frame's light shadows
+static float s_lsVP[16];                           // light-space view projection (row-vector, D3D)
+static float s_lsPosRange[4];                      // light xyz + range, for the receiver constants
+static int   s_lsEnv = -1;
+static const unsigned s_lsSize = 1024u;
+static int   s_fpLightCount = 0;
+static int   s_fpFresh = 0;      // the game layer began a scene light list this frame
+static int   s_fpDirty = 0;      // rebuild the block even if a pre-render pass built an empty one
+static int   s_fpMode = 1;       // 0 off, 1 2D tiles, 2 3D clusters (Graphics Options)
+static int   s_fpBudget = 256;   // global light cap, 32..256
+static int   s_fpUseForTests = -1;
+static int   s_fpLog = -1;       // GENERALSX_VK_VBTRACE gates the [VKFP] diagnostic lines
+
+} // namespace (the forward+ entry points below need external linkage)
+
+// GeneralsX @feature Qoder 20/10/2026 Forward+: public entry points. The state above stays file-local;
+// these four functions are the only symbols the game layer and DX8GeomNormal resolve across TUs.
+int VK_Forward_Enabled()
+{
+    if (s_fpMode == 0) return 0;
+    if (s_fpUseForTests < 0) {
+        const char* e = getenv("GENERALSX_VK_FORWARDPLUS");
+        // Default ON: the per-object list is the fallback the shaders keep when the tile block is empty.
+        s_fpUseForTests = (e && *e) ? ((atoi(e) != 0) ? 1 : 0) : 1;
+    }
+    return s_fpUseForTests;
+}
+
+void VK_Forward_SetMode(int mode)
+{
+    s_fpMode = (mode >= 0 && mode <= 2) ? mode : 2;
+    s_fpDirty = 1;
+}
+
+void VK_Forward_SetBudget(int budget)
+{
+    if (budget < 32) budget = 32;
+    if (budget > VKFP_MAX_LIGHTS) budget = VKFP_MAX_LIGHTS;
+    s_fpBudget = budget;
+    s_fpDirty = 1;
+}
+
+void VK_Forward_Begin()
+{
+    s_fpLightCount = 0;
+    s_fpFresh = 1;
+    s_fpDirty = 1;
+}
+
+void VK_Forward_Add_Light(float x, float y, float z, float inner, float outer,
+                          float r, float g, float b)
+{
+    if (s_fpLightCount >= s_fpBudget) return;
+    float* L = s_fpLights[s_fpLightCount];
+    L[0] = x; L[1] = y; L[2] = z; L[3] = inner;
+    L[4] = r; L[5] = g; L[6] = b; L[7] = outer;
+    ++s_fpLightCount;
+}
+
+int VK_Forward_Active()
+{
+    // 'fresh' is set by the game layer before the scene draw and cleared at End_Frame; the built-frame
+    // check keeps c31 and the descriptor binding in lockstep: the PS only takes the tile path once this
+    // frame's block exists, and upload_constants binds exactly that block under the same test.
+    return (VK_Forward_Enabled() && s_fpFresh && s_fpLightCount > 0
+            && X.fpBuiltFrame == core_()->FrameIndex()) ? 1 : 0;
+}
+
+namespace {
+
+// Called at End_Frame: the feed is consumed once, so a frame whose scene does not publish lights (the
+// shell screens, shadow-only passes) falls back to the per-object list instead of reusing stale data.
+static void VK_Forward_End_Frame()
+{
+    s_fpFresh = 0;
+    s_fpDirty = 0;
+}
+
+static void fp_build_block(unsigned slot, const unsigned viewport[4], unsigned w, unsigned h)
+{
+    if (!X.fpMap || !X.fpBuf || !w || !h) return;
+    // Water/shadow pre-renders draw before RTS3DScene publishes this frame's list. Without the dirty
+    // bit they built an empty block and every later scene draw reused it - Forward+ silently saw zero
+    // lights. Begin() marks the list fresh, so the first scene draw rebuilds once.
+    if (!s_fpDirty && X.fpBuiltFrame == core_()->FrameIndex()) return;
+    // mode 1 = 3D clusters, mode 2 = direct 256-light loop (visual quality/debug), mode 0 = off.
+    const int slices = (s_fpMode == 1) ? VKFP_Z_SLICES : 0;
+    unsigned ts = 128u, tx = 0, ty = 0;
+    for (;;) {
+        tx = (w + ts - 1u) / ts;
+        ty = (h + ts - 1u) / ts;
+        if ((unsigned long long)tx * ty * (unsigned)slices <= VKFP_MAX_CLUSTERS) break;
+        ts <<= 1;
+        if (ts > 8192u) { X.fpActive = 0; return; }
+    }
+    X.fpTilesX = tx; X.fpTilesY = ty; X.fpTileSize = ts;
+
+    VKFPBlock* blk = (VKFPBlock*)((char*)X.fpMap + (unsigned long long)slot * VKFP_SLOT_BYTES);
+    memset(blk, 0, sizeof(VKFPBlock));
+    // Mode 0 is the "off" leg. GN already gates on c31, but the terrain PS reads this block directly
+    // from binding 4, so switch the count off here as well instead of leaving lights on the ground.
+    blk->header[0] = (float)tx; blk->header[1] = (float)ty;
+    blk->header[2] = (float)ts; blk->header[3] = (s_fpMode != 0) ? (float)s_fpLightCount : 0.0f;
+    const float depthNear = 1.0f, depthFar = 4000.0f;
+    blk->header2[0] = (float)slices;
+    blk->header2[1] = depthNear;
+    blk->header2[2] = depthFar;
+    blk->header2[3] = 0.0f;   // filled with the viewport height below (shader flips gl_FragCoord.y)
+    if (slices == 0) {
+        // Direct mode: the PS iterates fpHeader.w lights. No cluster pass, so the whole screen sees
+        // every light in range. This is the quality reference while the clustered path is validated.
+        X.fpActive = (s_fpMode != 0) && s_fpLightCount > 0;
+        X.fpBuiltFrame = core_()->FrameIndex();
+        s_fpDirty = 0;
+        ++X.fpBuilds;
+        X.fpLightTotal += (unsigned long long)((s_fpMode != 0) ? s_fpLightCount : 0);
+        static int s_directLog = 0;
+        if (s_directLog < 3) {
+            ++s_directLog;
+            fprintf(stderr, "[VKFP] DIRECT frame=%llu count=%d\n", X.fpBuiltFrame, s_fpLightCount);
+            fflush(stderr);
+        }
+        return;
+    }
+
+    const int count = (s_fpMode == 0) ? 0
+        : (s_fpLightCount > VKFP_MAX_LIGHTS ? VKFP_MAX_LIGHTS : s_fpLightCount);
+    // Strongest-first: when a cluster overflows its 8-light cap (or the global list hits 256), the
+    // lights that survive are the brightest/strongest contributors rather than whichever the scene
+    // iterated first. Scores use raw color energy times reach; a light with no far range counts as 1.
+    static float score[VKFP_MAX_LIGHTS];
+    for (int i = 0; i < count; ++i) {
+        const float* L = s_fpLights[i];
+        const float reach = (L[7] > 0.0f) ? L[7] : 1.0f;
+        score[i] = (L[4] + L[5] + L[6]) * reach;
+    }
+    for (int i = 1; i < count; ++i) {
+        const float ks = score[i];
+        float kv[8];
+        memcpy(kv, s_fpLights[i], sizeof(kv));
+        int j = i - 1;
+        while (j >= 0 && score[j] < ks) {
+            score[j + 1] = score[j];
+            memcpy(s_fpLights[j + 1], s_fpLights[j], sizeof(kv));
+            --j;
+        }
+        score[j + 1] = ks;
+        memcpy(s_fpLights[j + 1], kv, sizeof(kv));
+    }
+    if (count > 0) memcpy(blk->lights, s_fpLights, (size_t)count * 8u * sizeof(float));
+    // The list is strongest-first; the light map is built for slot 0.
+    s_fpTopValid = count > 0 ? 1 : 0;
+    if (count > 0) memcpy(s_fpTopLight, s_fpLights[0], sizeof(s_fpTopLight));
+
+    // Camera matrices in the exact row-vector convention the vertex twins use: a world point reaches
+    // clip space through object->world (identity for the point) -> view -> projection.
+    Matrix4x4 view, proj;
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, view);
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, proj);
+    Matrix4x4 vp = view * proj;
+    Matrix4x4 vpT = vp.Transpose();
+
+    const float vx = (float)viewport[0], vy = (float)viewport[1];
+    const float vw = viewport[2] ? (float)viewport[2] : (float)w;
+    const float vh = viewport[3] ? (float)viewport[3] : (float)h;
+    // Cluster X/Y are built in D3D's top-left screen space. Vulkan's gl_FragCoord.y starts at the
+    // bottom, so the PS flips it back with this height; without it every cluster was mirrored in Y
+    // and only a thin band of pixels ever matched a light.
+    blk->header2[3] = vh;
+    const float yscale = fabsf(proj[1][1]);
+
+    static unsigned short counts[VKFP_MAX_CLUSTERS];
+    static unsigned char  idx[VKFP_MAX_CLUSTERS][VKFP_MAX_PER_CLUSTER];
+    // Per-cluster relevance of every candidate, kept sorted descending alongside idx. GeneralsX
+    // @bugfix Qoder 22/10/2026: the old fill took lights in global strength order, so eight strong
+    // lights from one building (4 lamps + 4 ground washes) could occupy a cluster and push out a
+    // nearer, dimmer light that would actually have reached the surface there - a parked tank next to
+    // a lit building stayed dark. Selection is now per cluster: score = energy / (1 + (d/reach)^2),
+    // with d the world-space distance from the light to that cluster's centre at its slice depth.
+    static float scoreCl[VKFP_MAX_CLUSTERS][VKFP_MAX_PER_CLUSTER];
+    memset(counts, 0, sizeof(counts));
+    int any = 0;
+    static int s_fpProbeLog = 0;
+    const float depthRange = depthFar - depthNear;
+    for (int li = 0; li < count; ++li) {
+        const float* L = s_fpLights[li];
+        Vector4 clip;
+        Matrix4x4::Transform_Vector(vpT, Vector4(L[0], L[1], L[2], 1.0f), &clip);
+        if (clip.W <= 0.05f) continue;
+        const float inv = 1.0f / clip.W;
+        const float sx = vx + (clip.X * inv * 0.5f + 0.5f) * vw;
+        const float sy = vy + (0.5f - clip.Y * inv * 0.5f) * vh;
+        float rpx = yscale * L[7] * inv * (vh * 0.5f);
+        if (!(rpx >= 0.0f) || L[7] <= 0.0f) rpx = (float)ts * 2.0f;   // no far range: conservative
+        if (rpx > 4096.0f) rpx = 4096.0f;
+        int x0 = (int)floorf((sx - rpx) / (float)ts);
+        int x1 = (int)floorf((sx + rpx) / (float)ts);
+        int y0 = (int)floorf((sy - rpx) / (float)ts);
+        int y1 = (int)floorf((sy + rpx) / (float)ts);
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 >= (int)tx) x1 = (int)tx - 1;
+        if (y1 >= (int)ty) y1 = (int)ty - 1;
+        if (x0 > x1 || y0 > y1) continue;
+        // The cluster's depth axis is the light's own view-space W (eye depth). Expand by the far
+        // radius so a light whose centre is outside a slice still lights geometry inside it.
+        const float depth = clip.W;
+        int z0 = (int)floorf((depth - L[7] - depthNear) / depthRange * (float)slices);
+        int z1 = (int)floorf((depth + L[7] - depthNear) / depthRange * (float)slices);
+        if (z0 < 0) z0 = 0;
+        if (z1 >= slices) z1 = slices - 1;
+        if (z0 > z1) continue;
+        if (li == 0 && count > 0 && s_fpProbeLog < 3 && (s_fpLog != 0)) {
+            ++s_fpProbeLog;
+            fprintf(stderr, "[VKFP] L0 world=(%.1f,%.1f,%.1f) r=%.1f depth=%.1f screen=(%.1f,%.1f) rpx=%.1f tile=(%d..%d,%d..%d) z=(%d..%d) vp=(%.0f,%.0f %.0fx%.0f)\n",
+                L[0], L[1], L[2], L[7], depth, sx, sy, rpx, x0, x1, y0, y1, z0, z1, vx, vy, vw, vh);
+            fflush(stderr);
+        }
+        const float energy = L[4] + L[5] + L[6];
+        const float reach = (L[7] > 1.0f) ? L[7] : 1.0f;
+        for (int zz = z0; zz <= z1; ++zz) {
+            const float sliceDepth = depthNear + ((float)zz + 0.5f) * (depthRange / (float)slices);
+            const float worldPerPix = (yscale > 1e-6f) ? (2.0f * sliceDepth / (yscale * vh)) : 1.0f;
+            const float tileWorld = (float)ts * worldPerPix;
+            for (int yy = y0; yy <= y1; ++yy) {
+                const float ccy = ((float)yy + 0.5f) * (float)ts;
+                for (int xx = x0; xx <= x1; ++xx) {
+                    const unsigned ci = (unsigned)((zz * (int)ty + yy) * (int)tx + xx);
+                    if (ci >= (unsigned)VKFP_MAX_CLUSTERS) continue;
+                    const float ccx = ((float)xx + 0.5f) * (float)ts;
+                    const float dx = (sx - ccx) * worldPerPix;
+                    const float dy = (sy - ccy) * worldPerPix;
+                    const float dz = depth - sliceDepth;
+                    const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                    // Hard cull: beyond its own reach plus a tile of slack the light cannot contribute.
+                    if (dist > reach + tileWorld * 0.75f) continue;
+                    const float t = dist / reach;
+                    const float sc = energy / (1.0f + t * t);
+                    unsigned short& n = counts[ci];
+                    if (n < (unsigned short)VKFP_MAX_PER_CLUSTER) {
+                        int pos = (int)n;
+                        while (pos > 0 && scoreCl[ci][pos - 1] < sc) {
+                            scoreCl[ci][pos] = scoreCl[ci][pos - 1];
+                            idx[ci][pos] = idx[ci][pos - 1];
+                            --pos;
+                        }
+                        scoreCl[ci][pos] = sc;
+                        idx[ci][pos] = (unsigned char)li;
+                        ++n;
+                        any = 1;
+                    } else if (sc > scoreCl[ci][VKFP_MAX_PER_CLUSTER - 1]) {
+                        int pos = VKFP_MAX_PER_CLUSTER - 1;
+                        while (pos > 0 && scoreCl[ci][pos - 1] < sc) {
+                            scoreCl[ci][pos] = scoreCl[ci][pos - 1];
+                            idx[ci][pos] = idx[ci][pos - 1];
+                            --pos;
+                        }
+                        scoreCl[ci][pos] = sc;
+                        idx[ci][pos] = (unsigned char)li;
+                    }
+                }
+            }
+        }
+    }
+
+    X.fpTileMaxLights = 0;
+    const unsigned clusters = tx * ty * (unsigned)slices;
+    for (unsigned ci = 0; ci < clusters; ++ci) {
+        const unsigned base = ci * VKFP_CLUSTER_UINTS;
+        const unsigned c = counts[ci];
+        blk->tiles[base] = c;
+        if (c > X.fpTileMaxLights) X.fpTileMaxLights = c;
+        for (unsigned j = 0; j < c; ++j)
+            blk->tiles[base + 1u + j] = (unsigned)idx[ci][j];
+    }
+    X.fpActive = any;
+    X.fpBuiltFrame = core_()->FrameIndex();
+    s_fpDirty = 0;
+    ++X.fpBuilds;
+    X.fpLightTotal += (unsigned long long)count;
+    // Bounded proof line: how many lights the scene published, how the screen/depth was clustered,
+    // and the densest cluster this frame. A run where this never prints is not exercising the feed.
+    if (s_fpLog < 0) {
+        const char* e = getenv("GENERALSX_VK_VBTRACE");
+        s_fpLog = (e && atoi(e)) ? 1 : 0;
+    }
+    {
+        static int s_fpNonEmptyLogged = 0;
+        if (s_fpLog && count > 0 && s_fpNonEmptyLogged < 4) {
+            ++s_fpNonEmptyLogged;
+            Vector4 dbg;
+            Matrix4x4::Transform_Vector(vpT, Vector4(s_fpLights[0][0], s_fpLights[0][1], s_fpLights[0][2], 1.0f), &dbg);
+            fprintf(stderr, "[VKFP] LIGHTS frame=%llu count=%d tiles=%ux%u z=%u clusters=%u maxPerCluster=%llu active=%d L0clip=(%.1f,%.1f,%.1f,%.1f) L0r=%.1f\n",
+                X.fpBuiltFrame, count, tx, ty, (unsigned)slices, clusters, X.fpTileMaxLights, X.fpActive,
+                (double)dbg.X, (double)dbg.Y, (double)dbg.Z, (double)dbg.W, s_fpLights[0][7]);
+            fflush(stderr);
+        }
+    }
+    if (s_fpLog && (X.fpBuilds <= 3ull || (X.fpBuilds % 600ull) == 0ull)) {
+        const unsigned mid = ((slices / 2) * ty + ty / 2) * tx + tx / 2;
+        fprintf(stderr, "[VKFP] build #%llu frame=%llu lights=%d tiles=%ux%u z=%u clusters=%u size=%u maxPerCluster=%llu midCluster=%u active=%d\n",
+            X.fpBuilds, X.fpBuiltFrame, count, tx, ty, (unsigned)slices, clusters, ts,
+            X.fpTileMaxLights, (unsigned)counts[mid], X.fpActive);
+        fflush(stderr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +1159,14 @@ struct VKDraw_Const_Bind {
     unsigned long long   off[3];
 };
 
+// GeneralsX @feature Qoder 20/10/2026 Forward+: the GN fragment programs are the only ones that
+// declare the 45 KiB GNForwardPlus block at binding 3. ffState travels with EVERY submit (the facade
+// packs it unconditionally), so the binding decision must be by program, not by "s->ff != null".
+static bool fp_program_tag(unsigned ps_tag)
+{
+    return ps_tag == 8u || ps_tag == 10u || ps_tag == 201u || ps_tag == 203u || ps_tag == 211u;
+}
+
 void upload_constants(const VKDraw_Submit* s, VKDraw_Const_Bind* out)
 {
     const void*    src[3]    = { s->vertex_constants, s->pixel_constants, s->ff };
@@ -690,6 +1186,14 @@ void upload_constants(const VKDraw_Submit* s, VKDraw_Const_Bind* out)
         } else {
             out->buf[i] = (void*)zero[i];
         }
+    }
+    // GeneralsX @feature Qoder 20/10/2026 Forward+: the GN family declares GNForwardPlus at binding 3,
+    // so those programs always bind the 45 KiB block (c31 decides whether the tile branch runs). Every
+    // other program keeps the FF state block; they either read it (vkff) or do not declare binding 3.
+    if (X.fpBuf && fp_program_tag(s->key.ps_tag)) {
+        out->buf[2] = (void*)X.fpBuf;
+        out->off[2] = (unsigned long long)X.slot * VKFP_SLOT_BYTES;
+        out->bytes[2] = sizeof(VKFPBlock);
     }
 }
 
@@ -1210,6 +1714,13 @@ bool set_for(void* const views[VKDRAW_MAX_TEX_SLOTS], void* const samplers[VKDRA
     h ^= vkdraw_hash_bytes(samplers, sizeof(void*) * VKDRAW_MAX_TEX_SLOTS);
     h ^= vkdraw_hash_bytes(cb.buf, sizeof(void*) * 3);
     h ^= vkdraw_hash_bytes(cb.bytes, sizeof(unsigned long long) * 3);
+    // Resolve the light-shadow view before the cache lookup so a rebuilt map is part of the identity.
+    void* lightMapView = nullptr;
+    {
+        VKRT_Info lmi = {};
+        if (s_lsValid && VKRT_Query(s_lsKey, &lmi) && lmi.view) lightMapView = lmi.view;
+    }
+    h ^= vkdraw_hash_bytes(&lightMapView, sizeof(lightMapView));
     const std::pair<std::unordered_multimap<unsigned long long, unsigned>::iterator,
                      std::unordered_multimap<unsigned long long, unsigned>::iterator> range =
         X.setIdx[X.slot].equal_range(h);
@@ -1221,7 +1732,8 @@ bool set_for(void* const views[VKDRAW_MAX_TEX_SLOTS], void* const samplers[VKDRA
         if (memcmp(e.views, views, sizeof(void*) * VKDRAW_MAX_TEX_SLOTS) == 0 &&
             memcmp(e.samplers, samplers, sizeof(void*) * VKDRAW_MAX_TEX_SLOTS) == 0 &&
             memcmp(e.cbuf, cb.buf, sizeof(void*) * 3) == 0 &&
-            memcmp(e.cbytes, cb.bytes, sizeof(unsigned long long) * 3) == 0) {
+            memcmp(e.cbytes, cb.bytes, sizeof(unsigned long long) * 3) == 0 &&
+            e.lightMap == lightMapView) {
             *out = e.set; ++X.st.setsReused; return true;
         }
     }
@@ -1249,7 +1761,7 @@ bool set_for(void* const views[VKDRAW_MAX_TEX_SLOTS], void* const samplers[VKDRA
         bufs[i] = { (VkBuffer)cb.buf[i], 0, (VkDeviceSize)cb.bytes[i] };
     }
 
-    VkWriteDescriptorSet w[4] = {};
+    VkWriteDescriptorSet w[6] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = set; w[0].dstBinding = 0;
     // No stageFlags on VkWriteDescriptorSet - the binding's shader stage lives in the pipeline layout,
     // which the wedge-4 set layout already fixed.
@@ -1261,11 +1773,33 @@ bool set_for(void* const views[VKDRAW_MAX_TEX_SLOTS], void* const samplers[VKDRA
         w[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         w[1 + i].pBufferInfo = &bufs[i];
     }
-    G.vkUpdateDescriptorSets(dev_(), 4, w, 0, nullptr);
+    // GeneralsX @feature Qoder 22/10/2026 Forward+ night: binding 4 carries this frame slot's FP block
+    // for the PS-only terrain programs. It is a static UBO (slot address is fixed for the slot), so the
+    // draw path's dynamic-offset array stays at three entries. ffState keeps binding 3 untouched.
+    VkDescriptorBufferInfo bfp = {};
+    unsigned writes = 4;
+    if (X.fpBuf) {
+        bfp = { (VkBuffer)X.fpBuf, (VkDeviceSize)X.slot * VKFP_SLOT_BYTES, (VkDeviceSize)sizeof(VKFPBlock) };
+        w[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[4].dstSet = set; w[4].dstBinding = 4; w[4].descriptorCount = 1;
+        w[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[4].pBufferInfo = &bfp;
+        writes = 5;
+    }
+    // GeneralsX @feature Qoder 22/10/2026 light shadows: binding 5 always has a valid descriptor; the
+    // built-in white means "no light shadow" to a receiver that declares it.
+    VkDescriptorImageInfo lsImg = {};
+    lsImg.sampler = (VkSampler)VKDesc_Default_Sampler();
+    lsImg.imageView = (VkImageView)(lightMapView ? lightMapView : VKDesc_White_View());
+    lsImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    w[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[5].dstSet = set; w[5].dstBinding = 5; w[5].descriptorCount = 1;
+    w[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[5].pImageInfo = &lsImg;
+    G.vkUpdateDescriptorSets(dev_(), writes + 1u, w, 0, nullptr);
 
     VKDrawSetEntry e;
     for (int i = 0; i < VKDRAW_MAX_TEX_SLOTS; ++i) { e.views[i] = views[i]; e.samplers[i] = samplers[i]; }
     for (int i = 0; i < 3; ++i) { e.cbuf[i] = cb.buf[i]; e.cbytes[i] = cb.bytes[i]; }
+    e.lightMap = lightMapView;
     e.set = set;
     X.setIdx[X.slot].emplace(h, (unsigned)cache.size());
     cache.push_back(e);
@@ -1643,11 +2177,34 @@ void* VKGeo_Back_Lock(void* key, unsigned int bytes, unsigned int stride, int dy
     vk_queue_lock();
 
     const unsigned long long slotBytes = (bytes + 255ull) & ~255ull;
-    const unsigned long long cap = dynamic ? slotBytes * VKGEO_SLOT_COUNT : slotBytes;
+    const unsigned long long frame = core_()->FrameIndex();
 
     VKGeoBack* b = geo_find(key);
+    if (b && b->dynamic && b->lockFrame != frame) {
+        // A new frame starts a new write window in this backing; its slot region is free again because the
+        // fence for the frame that last used that slot has already been waited.
+        b->lockFrame = frame;
+        b->curGen = 0;
+        b->lockedInFrame = 0;
+        b->traceDiscards = 0;
+    }
+
+    // GeneralsX @bugfix Qoder 20/10/2026 R-08: DISCARD generations. A discard inside a frame that has
+    // already written this backing must land in fresh storage, exactly like the D3D9 buffer rename; the
+    // draw already recorded keeps reading the bytes it captured. Each generation is one more pool-sized
+    // region inside the frame slot, and the backing is widened only when a frame really discards twice.
+    unsigned wantGens = (b && b->dynamic) ? b->gens : 1u;
+    if (b && b->dynamic && discard && b->lockedInFrame) {
+        const unsigned need = b->curGen + 2u;
+        if (need > wantGens) wantGens = need;
+    }
+    const unsigned long long cap = dynamic
+        ? slotBytes * (unsigned long long)wantGens * (unsigned long long)VKGEO_SLOT_COUNT
+        : slotBytes;
+
     if (b && b->cap < cap) {            // the object grew: rebuild wider, the old data is being rewritten
-        VKWP1_LOG("wedge5 backing rebuilt: key=%p cap=%llu->%llu oldbuf=%p", key, b->cap, cap, (void*)b->buf);
+        VKWP1_LOG("wedge5 backing rebuilt: key=%p cap=%llu->%llu gens=%u oldbuf=%p",
+            key, b->cap, cap, wantGens, (void*)b->buf);
         geo_tombstone(b, key);
         b = nullptr;
     }
@@ -1669,26 +2226,51 @@ void* VKGeo_Back_Lock(void* key, unsigned int bytes, unsigned int stride, int dy
             return nullptr;
         }
         b->cap = cap; b->slotBytes = slotBytes; b->dynamic = dynamic ? 1 : 0;
+        b->gens = dynamic ? wantGens : 1u;
+        b->lockFrame = frame;
         X.geoByKey[key] = b;
         X.geoByBuf[b->buf] = b;
         geo_life(key, cap, dynamic ? 0 : 1, 1, b->buf);
     }
 
-    // Rotating slot for a dynamic buffer; a static one always writes region 0. 'discard' is the D3D
-    // DISCARD hint and has no extra meaning here beyond the rotation the slot index already gives.
-    unsigned slot = 0;
+    // A static backing always writes region 0; a dynamic one rotates over frame slots, and inside a slot
+    // over the generations a discard has consumed so far.
+    unsigned slot = 0, genIdx = 0;
     if (b->dynamic) {
         slot = core_()->FrameSlot();
         if (slot != b->slot) ++X.st.ringRotations;
         b->slot = slot;
+        if (b->lockedInFrame && discard) ++b->curGen;
+        if (b->curGen >= b->gens) b->curGen = b->gens - 1u;
+        b->lockedInFrame = 1;
+        genIdx = b->curGen;
+    }
+    // GeneralsX @debug Qoder 20/10/2026 R-08: one bounded line per discard, so a captured run can be
+    // matched one-to-one against a stretched mesh.
+    {
+        static int trace = -1;
+        if (trace < 0) {
+            const char* e = getenv("GENERALSX_VK_VBTRACE");
+            trace = (e && atoi(e)) ? 1 : 0;
+        }
+        if (trace && b->dynamic && discard) {
+            ++b->traceDiscards;
+            static unsigned long long logged = 0;
+            if (logged < 400) {
+                ++logged;
+                fprintf(stderr, "[VKDISCARD] frame=%llu key=%p cap=%llu slotBytes=%llu gen=%u gens=%u byteoff=%llu n=%u\n",
+                    frame, key, b->cap, b->slotBytes, genIdx, b->gens,
+                    (unsigned long long)bytes, b->traceDiscards);
+                fflush(stderr);
+            }
+        }
     }
     b->stride = stride;
-    b->curOffset = (unsigned long long)slot * b->slotBytes;
+    b->curOffset = ((unsigned long long)slot * b->gens + genIdx) * b->slotBytes;
     b->curBytes = slotBytes;
     // R-05: a lock IS a write window - the caller is about to fill these bytes. Bump the generation so any
     // cached per-range fact about this backing (idxMax) is refused until it is re-read.
     b->gen = ++X.geoGenSeq;
-    (void)discard;
     vk_queue_unlock();
     return (char*)b->map + b->curOffset;
 }
@@ -1895,6 +2477,8 @@ bool VKDraw_Create()
               const_ring_create(X.cr[0], 16ull << 20, 1ull) &&
               const_ring_create(X.cr[1], 16ull << 20, 1ull) &&
               const_ring_create(X.cr[2], ffRingMb << 20, 4ull) &&
+              make_host_buffer((unsigned long long)VKFP_SLOT_BYTES * VKGEO_SLOT_COUNT,
+                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &X.fpBuf, &X.fpMem, &X.fpMap) &&
               make_host_buffer(VKDrawState::SCRATCH_CAP, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &X.fanBuf, &X.fanMem, &X.fanMap) &&
               make_host_buffer(VKDrawState::SCRATCH_CAP,
                   (VkBufferUsageFlags)(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT),
@@ -1942,7 +2526,49 @@ void VKDraw_Destroy()
         if (X.ffPs) G.vkDestroyShaderModule(dev, X.ffPs, nullptr);
         for (size_t i = 0; i < X.pgmModules.size(); ++i)
             G.vkDestroyShaderModule(dev, X.pgmModules[i].mod, nullptr);
+        // Native sun shadow: the shadow map images belong to the VKRT mirror layer, everything created
+        // here is owned by this layer and goes away with it.
+        for (size_t i = 0; i < X.shCastPSOs.size(); ++i) G.vkDestroyPipeline(dev, X.shCastPSOs[i].pso, nullptr);
+        if (X.shRecvPSO) G.vkDestroyPipeline(dev, X.shRecvPSO, nullptr);
+        if (X.shCastVs) G.vkDestroyShaderModule(dev, X.shCastVs, nullptr);
+        if (X.shCastPs) G.vkDestroyShaderModule(dev, X.shCastPs, nullptr);
+        if (X.shCastAlphaPs) G.vkDestroyShaderModule(dev, X.shCastAlphaPs, nullptr);
+        if (X.shRecvVs) G.vkDestroyShaderModule(dev, X.shRecvVs, nullptr);
+        if (X.shRecvPs) G.vkDestroyShaderModule(dev, X.shRecvPs, nullptr);
+        if (X.shPool) G.vkDestroyDescriptorPool(dev, X.shPool, nullptr);
+        for (int i = 0; i < VKGEO_SLOT_COUNT; ++i)
+            if (X.shCastPool[i]) G.vkDestroyDescriptorPool(dev, X.shCastPool[i], nullptr);
+        if (X.shCastLayout) G.vkDestroyPipelineLayout(dev, X.shCastLayout, nullptr);
+        if (X.shCastAlphaLayout) G.vkDestroyPipelineLayout(dev, X.shCastAlphaLayout, nullptr);
+        if (X.shRecvLayout) G.vkDestroyPipelineLayout(dev, X.shRecvLayout, nullptr);
+        if (X.shSetLayout) G.vkDestroyDescriptorSetLayout(dev, X.shSetLayout, nullptr);
+        if (X.shCastSetLayout) G.vkDestroyDescriptorSetLayout(dev, X.shCastSetLayout, nullptr);
+        if (X.shSampler) G.vkDestroySampler(dev, X.shSampler, nullptr);
+        // GeneralsX @feature Qoder 21/10/2026 vegetation instancing resources.
+        if (X.veg.gpipe) G.vkDestroyPipeline(dev, X.veg.gpipe, nullptr);
+        if (X.veg.rpipe) G.vkDestroyPipeline(dev, X.veg.rpipe, nullptr);
+        if (X.veg.layout) G.vkDestroyPipelineLayout(dev, X.veg.layout, nullptr);
+        if (X.veg.gvs) G.vkDestroyShaderModule(dev, X.veg.gvs, nullptr);
+        if (X.veg.gfs) G.vkDestroyShaderModule(dev, X.veg.gfs, nullptr);
+        if (X.veg.rvs) G.vkDestroyShaderModule(dev, X.veg.rvs, nullptr);
+        if (X.veg.rfs) G.vkDestroyShaderModule(dev, X.veg.rfs, nullptr);
+        for (int i = 0; i < VKGEO_SLOT_COUNT; ++i)
+            if (X.veg.buf[i]) free_host_buffer(X.veg.buf[i], X.veg.mem[i], &X.veg.map[i]);
+        X.veg = VKDrawState::VKVegState();
     }
+    X.shCastPSOs.clear();
+    X.shRecvPSO = nullptr; X.shRecvPass = 0xFFFFFFFFu;
+    X.shCastVs = X.shCastPs = X.shCastAlphaPs = X.shRecvVs = X.shRecvPs = nullptr;
+    X.shCastLayout = X.shCastAlphaLayout = X.shRecvLayout = nullptr;
+    X.shSetLayout = nullptr; X.shCastSetLayout = nullptr;
+    X.shPool = nullptr; X.shSampler = nullptr;
+    for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) {
+        X.shSets[i] = nullptr;
+        X.shSetViews[i][0] = X.shSetViews[i][1] = nullptr;
+        X.shCastPool[i] = nullptr;
+        X.shCastSets[i].clear();
+    }
+    X.shReady = false; X.shHaveVP = 0; X.casters.clear();
     X.pgmModules.clear();
     X.psos.clear(); X.psoIdx.clear(); X.fbs.clear(); X.passes.clear();
     for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) { X.pool[i] = nullptr; X.sets[i].clear(); X.setIdx[i].clear(); }
@@ -1960,10 +2586,13 @@ void VKDraw_Destroy()
     free_host_buffer(X.zeroVtx, X.zeroVtxMem, nullptr);
     free_host_buffer(X.zeroPix, X.zeroPixMem, nullptr);
     free_host_buffer(X.zeroLight, X.zeroLightMem, nullptr);
+    free_host_buffer(X.fpBuf, X.fpMem, &X.fpMap);
     for (int i = 0; i < 3; ++i) const_ring_destroy(X.cr[i]);
     free_host_buffer(X.fanBuf, X.fanMem, &X.fanMap);
     free_host_buffer(X.upBuf, X.upMem, &X.upMap);
     X.zeroVtx = nullptr; X.zeroPix = nullptr; X.zeroLight = nullptr;
+    X.fpBuf = nullptr; X.fpMem = nullptr; X.fpMap = nullptr;
+    X.fpActive = 0; X.fpBuiltFrame = ~0ull;
     X.fanBuf = nullptr; X.upBuf = nullptr;
     X.built = false; X.broken = false; X.inPass = 0; X.frameOpen = 0; X.cmd = nullptr;
 }
@@ -2109,12 +2738,13 @@ struct VKRTProbe {
     unsigned  fmt;                        // VkFormat of the pending sample
     unsigned  w, h;                       // mirror extent of the pending sample
     unsigned  recSlot;                    // frame slot the pending copy was recorded into
+    unsigned long long offerFrame;        // recorder frame label when the sample was offered (R-06 pairing)
     unsigned  stuck;                      // record attempts refused while a sample was unread
     VkBuffer  buf;
     VkDeviceMemory mem;
     unsigned char* map;
 };
-VKRTProbe RP = { false, false, false, false, 0ull, 30ull, 0ull, 0u, 0u, 0u, 0u, 0u,
+VKRTProbe RP = { false, false, false, false, 0ull, 30ull, 0ull, 0u, 0u, 0u, 0u, 0ull, 0u,
                  nullptr, nullptr, nullptr };
 
 bool vkrt_probe_on()
@@ -2211,9 +2841,9 @@ void vkrt_probe_poll(unsigned slot)
     }
     const unsigned long long mid = (px / 2ull) * 4ull;
     fprintf(stderr,
-        "[VKRTPROBE] map %ux%u R: min=%.4f max=%.4f mean=%.4f nonzero=%.2f%% aboveHalf=%.2f%%"
+        "[VKRTPROBE] f=%llu map %ux%u R: min=%.4f max=%.4f mean=%.4f nonzero=%.2f%% aboveHalf=%.2f%%"
         " | t0=(%.3f,%.3f,%.3f,%.3f) tmid=(%.3f,%.3f,%.3f,%.3f)\n",
-        RP.w, RP.h, (double)mn, (double)mx, sum / (double)px,
+        RP.offerFrame, RP.w, RP.h, (double)mn, (double)mx, sum / (double)px,
         100.0 * (double)nonzero / (double)px, 100.0 * (double)aboveHalf / (double)px,
         (double)half_to_f_(t[0]), (double)half_to_f_(t[1]), (double)half_to_f_(t[2]), (double)half_to_f_(t[3]),
         (double)half_to_f_(t[mid]), (double)half_to_f_(t[mid + 1]), (double)half_to_f_(t[mid + 2]), (double)half_to_f_(t[mid + 3]));
@@ -2259,7 +2889,1467 @@ void VKDraw_RTProbe(void* key)
     VKRT_Cmd_Transition(X.cmd, key, VKRT_LAYOUT_SHADER_READ_ONLY);
     open_pass();
     RP.pending = true; RP.recSlot = X.slot; RP.fmt = ri.format; RP.w = ri.width; RP.h = ri.height;
+    RP.offerFrame = g_vkStepFrame.load();
     vk_queue_unlock();
+}
+
+// ===========================================================================
+// GeneralsX @feature Qoder 20/10/2026 native sun shadow (ported from ModernGeneralsZH)
+//
+// Two steps, both inside the frame's command buffer, both between the 3D views and the UI:
+//  1. replay every opaque batch captured during the scene into a sun-space depth map (R32F colour read
+//     back by the receiver, D32 depth for the caster-to-caster occlusion);
+//  2. draw one full-screen triangle over the scene colour that reconstructs each pixel's world position
+//     from the scene depth and multiplies the scene by a PCSS visibility factor.
+// The engine-side entry point is VKDraw_Shadow_Apply, called from W3DDisplay after drawViews.
+// ===========================================================================
+namespace {
+
+bool shadow_env_on()
+{
+    if (!X.shEnvChecked) {
+        X.shEnvChecked = true;
+        // GENERALSX_VKSHADOW=0 is the QA force-off; the shipped switch is the options-page
+        // "ShadowMap" row, which DX8Wrapper::VK_Set_Real_Shadow_Enabled() keeps in sync.
+        const char* e = getenv("GENERALSX_VKSHADOW");
+        X.shOn = (e == nullptr) || (atoi(e) != 0);
+        const char* a = getenv("GENERALSX_VKSHADOW_ALT");
+        X.shAlt = (a && atoi(a) > 0) ? (unsigned)atoi(a) : 0u;
+    }
+    if (!X.shOn) return false;
+    // GeneralsX @debug Qoder 20/10/2026 three-way A/B: the mode is latched at the frame boundary.
+    if (X.abOn) return X.abMode != 0u;
+    // GeneralsX @debug Qoder 20/10/2026 A/B capture: alternate the pass itself. Every shadow state is
+    // rebuilt from scratch each frame (casters are cleared in VKDraw_Shadow_Apply), so a skipped frame
+    // leaves nothing behind.
+    if (X.shAlt) {
+        static unsigned long long s_seg = ~0ull;
+        const unsigned long long seg = X.st.framesBegun / X.shAlt;
+        const bool on = (seg & 1ull) == 0ull;
+        if (seg != s_seg) {
+            s_seg = seg;
+            fprintf(stderr, "[VKSHADOW] alt segment=%llu frame=%llu on=%d\n",
+                seg, X.st.framesBegun, on ? 1 : 0);
+            fflush(stderr);
+        }
+        return on;
+    }
+    // Options-page "ShadowMap" row: on runs the native pass, off leaves the retail managers alone.
+    return DX8Wrapper::VK_Real_Shadow_Enabled();
+}
+
+// GeneralsX @feature Qoder 20/10/2026: both receiver knobs are owned by the graphics page now. The QA env
+// variables stay authoritative for scripted A/B runs, so they are resolved once and win over any menu push.
+float shadow_strength()
+{
+    static bool init = false;
+    static bool hasEnv = false;
+    static float envValue = 0.58f;
+    if (!init) {
+        init = true;
+        if (const char* e = getenv("GENERALSX_VKSHADOW_STRENGTH")) {
+            const float v = (float)atof(e);
+            if (v >= 0.0f && v <= 1.0f) { envValue = v; hasEnv = true; }
+        }
+    }
+    return hasEnv ? envValue : DX8Wrapper::VK_Sun_Shadow_Strength();
+}
+
+float shadow_penumbra()
+{
+    static bool init = false;
+    static bool hasEnv = false;
+    static float envValue = 1.0f;
+    if (!init) {
+        init = true;
+        if (const char* e = getenv("GENERALSX_VKSHADOW_SOFT")) {
+            const float v = (float)atof(e);
+            if (v >= 0.25f && v <= 4.0f) { envValue = v; hasEnv = true; }
+        }
+    }
+    return hasEnv ? envValue : DX8Wrapper::VK_Sun_Shadow_Penumbra();
+}
+
+// Diagnostics: 1 = scene depth, 2 = pass stage classification, 3 = shadow-map sample, 4 = rejection-reason
+// tint, 5 = receiver light-space depth, 6 = blocker count over a huge radius, 7 = RGB triple of lc.z,
+// scene depth and blocker count, 8 = same triple with the map's depth at the receiver's own texel in R,
+// 9 = the shadow map stretched over the screen, 10 = receiver light-space uv coverage,
+// 11 = own texel depth vs the y-flipped row vs lc.z.
+// The receiver reads a negative strength as "debug mode n" and replaces the colour instead of scaling it.
+int shadow_debug_mode()
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("GENERALSX_VKSHADOW_DEBUG");
+        mode = e ? atoi(e) : 0;
+        if (mode < 0 || mode > 13) mode = 0;
+    }
+    return mode;
+}
+
+// 4x4 multiply in the convention the shaders read: arrays are column-major, out = a * b.
+void shadow_mat_mul(float out[16], const float a[16], const float b[16])
+{
+    float t[16];
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k) s += a[k * 4 + r] * b[c * 4 + k];
+            t[c * 4 + r] = s;
+        }
+    }
+    memcpy(out, t, sizeof(t));
+}
+
+bool shadow_mat_inverse(float out[16], const float m[16])
+{
+    const float a00 = m[0],  a01 = m[1],  a02 = m[2],  a03 = m[3];
+    const float a10 = m[4],  a11 = m[5],  a12 = m[6],  a13 = m[7];
+    const float a20 = m[8],  a21 = m[9],  a22 = m[10], a23 = m[11];
+    const float a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
+    const float b00 = a00 * a11 - a01 * a10;
+    const float b01 = a00 * a12 - a02 * a10;
+    const float b02 = a00 * a13 - a03 * a10;
+    const float b03 = a01 * a12 - a02 * a11;
+    const float b04 = a01 * a13 - a03 * a11;
+    const float b05 = a02 * a13 - a03 * a12;
+    const float b06 = a20 * a31 - a21 * a30;
+    const float b07 = a20 * a32 - a22 * a30;
+    const float b08 = a20 * a33 - a23 * a30;
+    const float b09 = a21 * a32 - a22 * a31;
+    const float b10 = a21 * a33 - a23 * a31;
+    const float b11 = a22 * a33 - a23 * a32;
+    const float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    if (fabsf(det) < 1e-20f) return false;
+    const float id = 1.0f / det;
+    out[0]  = ( a11 * b11 - a12 * b10 + a13 * b09) * id;
+    out[1]  = (-a01 * b11 + a02 * b10 - a03 * b09) * id;
+    out[2]  = ( a31 * b05 - a32 * b04 + a33 * b03) * id;
+    out[3]  = (-a21 * b05 + a22 * b04 - a23 * b03) * id;
+    out[4]  = (-a10 * b11 + a12 * b08 - a13 * b07) * id;
+    out[5]  = ( a00 * b11 - a02 * b08 + a03 * b07) * id;
+    out[6]  = (-a30 * b05 + a32 * b02 - a33 * b01) * id;
+    out[7]  = ( a20 * b05 - a22 * b02 + a23 * b01) * id;
+    out[8]  = ( a10 * b10 - a11 * b08 + a13 * b06) * id;
+    out[9]  = (-a00 * b10 + a01 * b08 - a03 * b06) * id;
+    out[10] = ( a30 * b04 - a31 * b02 + a33 * b00) * id;
+    out[11] = (-a20 * b04 + a21 * b02 - a23 * b00) * id;
+    out[12] = (-a10 * b09 + a11 * b07 - a12 * b06) * id;
+    out[13] = ( a00 * b09 - a01 * b07 + a02 * b06) * id;
+    out[14] = (-a30 * b03 + a31 * b01 - a32 * b00) * id;
+    out[15] = ( a20 * b03 - a21 * b01 + a22 * b00) * id;
+    return true;
+}
+
+// Clip-space corner back to world space: inverse(proj*view) applied to (nx, ny, nz, 1).
+bool shadow_unproject(const float invVP[16], float nx, float ny, float nz, float out[3])
+{
+    const float x = invVP[0] * nx + invVP[4] * ny + invVP[8]  * nz + invVP[12];
+    const float y = invVP[1] * nx + invVP[5] * ny + invVP[9]  * nz + invVP[13];
+    const float z = invVP[2] * nx + invVP[6] * ny + invVP[10] * nz + invVP[14];
+    const float w = invVP[3] * nx + invVP[7] * ny + invVP[11] * nz + invVP[15];
+    if (fabsf(w) < 1e-8f) return false;
+    out[0] = x / w; out[1] = y / w; out[2] = z / w;
+    return true;
+}
+
+// Fits an orthographic sun projection around what this frame can actually shade. The receiver rebuilds
+// world points with inverse(proj*view), so the fit uses that same matrix: every screen corner is
+// unprojected onto two ground-parallel slabs, and the recorded casters' world origins are folded in.
+// Recovering an eye position from the view matrix was the first approach, but the engine's stored bytes
+// do not follow the camera convention it assumed (the reconstructed eye sat below the map and the box
+// covered empty ground). Deriving the footprint from the matrix the receiver itself uses removes that
+// guess. The rest is the reference's recipe: a caster margin along the light axis, a 256-unit size
+// quantization and a texel-grid snap in x/y so the map does not shimmer as the camera moves.
+bool shadow_build_light(const float sun[3], const float view[16], const float proj[16], float groundZ,
+                        float outVP[16], float& outRange, float& outMapWorld,
+                        float outLo[3], float outHi[3])
+{
+    float s[3] = { sun[0], sun[1], sun[2] };
+    if (s[2] < 0.15f) s[2] = 0.15f;
+    const float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+    if (sl < 1e-6f) return false;
+    s[0] /= sl; s[1] /= sl; s[2] /= sl;
+    const float d[3] = { -s[0], -s[1], -s[2] };   // the way the light travels
+
+    float r[3], u[3];
+    r[0] = d[1] * 1.0f - d[2] * 0.0f; r[1] = d[2] * 0.0f - d[0] * 1.0f; r[2] = d[0] * 0.0f - d[1] * 0.0f;
+    const float rl = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    if (rl < 1e-6f) return false;
+    r[0] /= rl; r[1] /= rl; r[2] /= rl;
+    u[0] = r[1] * d[2] - r[2] * d[1];
+    u[1] = r[2] * d[0] - r[0] * d[2];
+    u[2] = r[0] * d[1] - r[1] * d[0];
+
+    float pv[16], invVP[16];
+    shadow_mat_mul(pv, proj, view);
+    if (!shadow_mat_inverse(invVP, pv)) return false;
+
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    auto addPoint = [&](const float p[3]) {
+        const float a[3] = { p[0] * r[0] + p[1] * r[1] + p[2] * r[2],
+                             p[0] * u[0] + p[1] * u[1] + p[2] * u[2],
+                             p[0] * d[0] + p[1] * d[1] + p[2] * d[2] };
+        for (int i = 0; i < 3; ++i) {
+            if (a[i] < lo[i]) lo[i] = a[i];
+            if (a[i] > hi[i]) hi[i] = a[i];
+        }
+    };
+
+    // Each corner pixel maps to a world ray between its near and far clip points; wherever that ray
+    // crosses a ground-parallel slab is part of the visible footprint. Terrain is not recorded as a
+    // caster (identity-world batches are rejected by shadow_record_caster), so groundZ is only a
+    // caster-average estimate. Two slabs plus the old 60-unit far padding therefore clipped valleys
+    // and cliff bases: their receivers failed the lc.z test in vkshadow_recv.frag and came out fully
+    // lit, leaving the shadow on the casters only. Sample a ladder of heights across a full terrain
+    // range instead, and fall back to the whole visible frustum when a ray crosses none of them.
+    static const float kHeightOffsets[6] = { -600.0f, -300.0f, -60.0f, 60.0f, 240.0f, 600.0f };
+    float cornerNear[4][3] = {};
+    float cornerFar[4][3] = {};
+    bool  cornerValid[4] = { false, false, false, false };
+    int footprintHits = 0;
+    static int s_cornerProbe = 8;
+    static int s_matrixProbe = 2;
+    const bool realView = fabsf(view[0]) < 0.99f;   // loading frames hand us an identity view
+    if (s_matrixProbe > 0 && realView) {
+        --s_matrixProbe;
+        VKWP1_LOG("[VKSHADOW] view: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+            (double)view[0], (double)view[1], (double)view[2], (double)view[3],
+            (double)view[4], (double)view[5], (double)view[6], (double)view[7],
+            (double)view[8], (double)view[9], (double)view[10], (double)view[11],
+            (double)view[12], (double)view[13], (double)view[14], (double)view[15]);
+        VKWP1_LOG("[VKSHADOW] proj: %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
+            (double)proj[0], (double)proj[1], (double)proj[2], (double)proj[3],
+            (double)proj[4], (double)proj[5], (double)proj[6], (double)proj[7],
+            (double)proj[8], (double)proj[9], (double)proj[10], (double)proj[11],
+            (double)proj[12], (double)proj[13], (double)proj[14], (double)proj[15]);
+    }
+    for (int k = 0; k < 4; ++k) {
+        const float nx = (k & 1) ? 1.0f : -1.0f;
+        const float ny = (k & 2) ? 1.0f : -1.0f;
+        float w0[3], w1[3];
+        if (!shadow_unproject(invVP, nx, ny, -1.0f, w0) || !shadow_unproject(invVP, nx, ny, 1.0f, w1))
+            continue;
+        memcpy(cornerNear[k], w0, sizeof(cornerNear[k]));
+        memcpy(cornerFar[k], w1, sizeof(cornerFar[k]));
+        cornerValid[k] = true;
+        if (s_cornerProbe > 0 && realView) {
+            --s_cornerProbe;
+            VKWP1_LOG("[VKSHADOW] corner[%d] (%+.0f,%+.0f) w0=(%.0f %.0f %.0f) w1=(%.0f %.0f %.0f) ground=%.0f",
+                k, (double)nx, (double)ny,
+                (double)w0[0], (double)w0[1], (double)w0[2],
+                (double)w1[0], (double)w1[1], (double)w1[2], (double)groundZ);
+        }
+        const float dz = w1[2] - w0[2];
+        if (fabsf(dz) < 1e-6f) continue;
+        for (int h = 0; h < 6; ++h) {
+            const float hz = groundZ + kHeightOffsets[h];
+            const float t = (hz - w0[2]) / dz;
+            if (t < 0.0f || t > 1.0f) continue;   // the slab is outside this corner's depth range
+            const float p[3] = { w0[0] + (w1[0] - w0[0]) * t,
+                                 w0[1] + (w1[1] - w0[1]) * t,
+                                 hz };
+            addPoint(p);
+            ++footprintHits;
+        }
+    }
+    if (footprintHits == 0) {
+        // Camera along the ground or above the slab ladder: keep the whole visible frustum so the
+        // receivers inside the view still fall in the map instead of being reported as lit.
+        for (int k = 0; k < 4; ++k) {
+            if (!cornerValid[k]) continue;
+            addPoint(cornerNear[k]);
+            addPoint(cornerFar[k]);
+            ++footprintHits;
+        }
+        static int s_frustumFallback = 4;
+        if (footprintHits > 0 && s_frustumFallback > 0) {
+            --s_frustumFallback;
+            VKWP1_LOG("[VKSHADOW] footprint: frustum fallback (ground=%.1f corners=%d)",
+                (double)groundZ, footprintHits);
+        }
+    }
+    if (footprintHits == 0 && realView) {
+        static int s_noHit = 4;
+        if (s_noHit > 0) {
+            --s_noHit;
+            VKWP1_LOG("[VKSHADOW] footprint: no corner ray reached a slab (ground=%.1f)", (double)groundZ);
+        }
+    }
+    X.shLastHits = (unsigned)footprintHits;
+    X.shLastCam[0] = view[12]; X.shLastCam[1] = view[13]; X.shLastCam[2] = view[14];
+    X.shLastProj[0] = proj[0]; X.shLastProj[1] = proj[10]; X.shLastProj[2] = proj[14];
+    // GeneralsX @bugfix Qoder 21/10/2026: caster origins may keep the box sane when no corner ray
+    // reached a slab, but once the footprint exists they must not inflate it. The shell map's far
+    // camera sees casters spread over the whole map; folding all of them in pushed the side to 12k+
+    // world units (a 2048 map then has 6 units per texel and small building shadows vanish). Keep only
+    // casters near the visible footprint; the reference implementation does not fold casters in at all.
+    const bool haveFootprint = lo[0] <= hi[0];
+    const float casterFitMargin = 800.0f;
+    for (size_t i = 0; i < X.casters.size(); ++i) {
+        const float* w = X.casters[i].world;
+        if (fabsf(w[12]) > 60000.0f || fabsf(w[13]) > 60000.0f || fabsf(w[14]) > 5000.0f) continue;
+        const float p[3] = { w[12], w[13], w[14] };
+        if (haveFootprint) {
+            const float a[3] = { p[0] * r[0] + p[1] * r[1] + p[2] * r[2],
+                                 p[0] * u[0] + p[1] * u[1] + p[2] * u[2],
+                                 p[0] * d[0] + p[1] * d[1] + p[2] * d[2] };
+            if (a[0] < lo[0] - casterFitMargin || a[0] > hi[0] + casterFitMargin ||
+                a[1] < lo[1] - casterFitMargin || a[1] > hi[1] + casterFitMargin) continue;
+        }
+        addPoint(p);
+    }
+    if (!(lo[0] <= hi[0])) return false;
+    {
+        static int s_fpProbe = 3;
+        if (s_fpProbe > 0 && realView) {
+            --s_fpProbe;
+            VKWP1_LOG("[VKSHADOW] footprint: hits=%d lo=(%.0f %.0f %.0f) hi=(%.0f %.0f %.0f) casters=%u",
+                footprintHits, (double)lo[0], (double)lo[1], (double)lo[2],
+                (double)hi[0], (double)hi[1], (double)hi[2], (unsigned)X.casters.size());
+        }
+    }
+
+    // Room for the casters themselves: geometry above a receiver lies toward the sun (smaller light-space
+    // depth), and a receiver can sit slightly below the slab. The far side used to add only 60 units,
+    // which clipped every terrain level below the caster average: those receivers answered "outside the
+    // map" and lost their shadow. The range only costs R32F depth precision, not map resolution.
+    lo[0] -= 400.0f; hi[0] += 400.0f;
+    lo[1] -= 400.0f; hi[1] += 400.0f;
+    lo[2] -= 1200.0f;
+    hi[2] += 1000.0f;
+
+    // GeneralsX @bugfix Qoder 21/10/2026 shell-map flicker: the fit side is quantized to 256-unit
+    // steps, and a camera that idles near a step boundary made it alternate 4352/4608 frame after
+    // frame (measured in the shell map: 4608 x284, 4352 x181, 4608 x124, 4352 x8 while the camera
+    // moved <1 unit/frame). Every flip rescaled the light map and re-snapped its origin, which is the
+    // visible flicker. Grow at once, shrink only after the request is clearly smaller, and cap the
+    // box so a far menu camera keeps usable texels instead of losing the shadows entirely.
+    const float ext[2] = { hi[0] - lo[0], hi[1] - lo[1] };
+    const float kFitMaxSide = 4096.0f;
+    const float kFitShrinkRatio = 0.80f;
+    float need = ext[0] > ext[1] ? ext[0] : ext[1];
+    need = ceilf(need / 256.0f) * 256.0f;
+    if (need < 256.0f) need = 256.0f;
+    if (need > kFitMaxSide) need = kFitMaxSide;
+    float side = X.shFitSide;
+    if (side <= 0.0f || side > kFitMaxSide) side = need;
+    else if (need > side) side = need;
+    else if (need < side * kFitShrinkRatio) side = need;
+    X.shFitSide = side;
+    // Centre the (possibly capped) box on the requested footprint so the view centre keeps shadows.
+    const float cx = (lo[0] + hi[0]) * 0.5f;
+    const float cy = (lo[1] + hi[1]) * 0.5f;
+    lo[0] = cx - side * 0.5f;
+    lo[1] = cy - side * 0.5f;
+    hi[0] = lo[0] + side;
+    hi[1] = lo[1] + side;
+    const float texel = side / (float)X.shMapSize;
+    lo[0] = floorf(lo[0] / texel) * texel;
+    lo[1] = floorf(lo[1] / texel) * texel;
+    hi[0] = lo[0] + side;
+    hi[1] = lo[1] + side;
+    outRange = hi[2] - lo[2];
+    if (outRange < 1.0f) return false;
+    outMapWorld = side;
+    memcpy(outLo, lo, sizeof(lo));
+    memcpy(outHi, hi, sizeof(hi));
+
+    const float sa = 2.0f / side, sb = 2.0f / side, sc = 1.0f / outRange;
+    memset(outVP, 0, sizeof(float) * 16);
+    // Column-major: row i of the light view-projection sits in outVP[0*4+i], outVP[1*4+i], ...
+    outVP[0] = r[0] * sa; outVP[4] = r[1] * sa; outVP[8]  = r[2] * sa; outVP[12] = -lo[0] * sa - 1.0f;
+    outVP[1] = u[0] * sb; outVP[5] = u[1] * sb; outVP[9]  = u[2] * sb; outVP[13] = -lo[1] * sb - 1.0f;
+    outVP[2] = d[0] * sc; outVP[6] = d[1] * sc; outVP[10] = d[2] * sc; outVP[14] = -lo[2] * sc;
+    outVP[3] = 0.0f;      outVP[7] = 0.0f;      outVP[11] = 0.0f;      outVP[15] = 1.0f;
+    return true;
+}
+
+VkShaderModule shadow_module(const uint32_t* code, size_t bytes)
+{
+    VkShaderModuleCreateInfo smvi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smvi.codeSize = bytes; smvi.pCode = code;
+    VkShaderModule m = nullptr;
+    if (!chk("vkCreateShaderModule(vkshadow)", G.vkCreateShaderModule(dev_(), &smvi, nullptr, &m))) return nullptr;
+    return m;
+}
+
+bool shadow_ensure()
+{
+    if (X.shFailed) return false;
+    // shRecvPSO is created lazily inside the first receiver pass, so it cannot be the completion signal:
+    // testing it made the second frame build a whole second set of modules, layouts and pools.
+    if (X.shReady) return true;
+    // GeneralsX @feature Qoder 20/10/2026 the reference backend picks 4096 for its top quality tier.
+    // 2048 stays the default; a test run can ask for the sharper tier without a rebuild.
+    if (const char* q = getenv("GENERALSX_VKSHADOW_SIZE")) {
+        const int v = atoi(q);
+        if (v == 1024 || v == 2048 || v == 4096) X.shMapSize = (unsigned)v;
+    }
+    VkDevice dev = dev_();
+    if (!dev || !core_()) return false;
+
+    VkPhysicalDeviceProperties props = {};
+    G.vkGetPhysicalDeviceProperties(core_()->Phys(), &props);
+    // The receiver pushes two mat4 plus three vec4 = 176 bytes (viewport + normal-offset aux); the
+    // specification only guarantees 128, so a part below that cannot run this pass and the reason is
+    // named once instead of failing every frame.
+    if (props.limits.maxPushConstantsSize < 176u) {
+        X.shFailed = true;
+        VKWP1_LOG("[VKSHADOW] off: maxPushConstantsSize=%u < 176",
+            (unsigned)props.limits.maxPushConstantsSize);
+        return false;
+    }
+
+    if (!X.shCastVs) X.shCastVs = shadow_module(VKSHADOW__CAST_VERT_SPV, sizeof(VKSHADOW__CAST_VERT_SPV));
+    if (!X.shCastPs) X.shCastPs = shadow_module(VKSHADOW__CAST_FRAG_SPV, sizeof(VKSHADOW__CAST_FRAG_SPV));
+    if (!X.shCastAlphaPs)
+        X.shCastAlphaPs = shadow_module(VKSHADOW__CAST_ALPHA_FRAG_SPV, sizeof(VKSHADOW__CAST_ALPHA_FRAG_SPV));
+    if (!X.shRecvVs) X.shRecvVs = shadow_module(VKSHADOW__RECV_VERT_SPV, sizeof(VKSHADOW__RECV_VERT_SPV));
+    if (!X.shRecvPs) X.shRecvPs = shadow_module(VKSHADOW__RECV_FRAG_SPV, sizeof(VKSHADOW__RECV_FRAG_SPV));
+    if (!X.shCastVs || !X.shCastPs || !X.shCastAlphaPs || !X.shRecvVs || !X.shRecvPs) {
+        X.shFailed = true;
+        VKWP1_LOG("[VKSHADOW] off: shader module creation failed");
+        return false;
+    }
+
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT, 0, 128u };
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (!chk("vkCreatePipelineLayout(vkshadow cast)", G.vkCreatePipelineLayout(dev, &plci, nullptr, &X.shCastLayout))) {
+        X.shFailed = true; return false;
+    }
+
+    VkDescriptorSetLayoutBinding texBinding = {};
+    texBinding.binding = 0;
+    texBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    texBinding.descriptorCount = 1;
+    texBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo clci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    clci.bindingCount = 1; clci.pBindings = &texBinding;
+    if (!chk("vkCreateDescriptorSetLayout(vkshadow cast)",
+             G.vkCreateDescriptorSetLayout(dev, &clci, nullptr, &X.shCastSetLayout))) {
+        X.shFailed = true; return false;
+    }
+    // The alpha-tested variant pushes one extra vec4 (reference, compare, enable) and reads the texture,
+    // so it needs both stages in the range and the texture set in the layout. Opaque casters keep the
+    // smaller layout: no descriptor is bound for them, and one layout cannot describe both.
+    VkPushConstantRange pcrA = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144u };
+    VkPipelineLayoutCreateInfo plciA = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plciA.setLayoutCount = 1; plciA.pSetLayouts = &X.shCastSetLayout;
+    plciA.pushConstantRangeCount = 1; plciA.pPushConstantRanges = &pcrA;
+    if (!chk("vkCreatePipelineLayout(vkshadow cast alpha)", G.vkCreatePipelineLayout(dev, &plciA, nullptr, &X.shCastAlphaLayout))) {
+        X.shFailed = true; return false;
+    }
+
+    for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) {
+        VkDescriptorPoolSize cps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024u };
+        VkDescriptorPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        cpci.maxSets = 1024u;
+        cpci.poolSizeCount = 1; cpci.pPoolSizes = &cps;
+        if (!chk("vkCreateDescriptorPool(vkshadow cast)", G.vkCreateDescriptorPool(dev, &cpci, nullptr, &X.shCastPool[i]))) {
+            X.shFailed = true; return false;
+        }
+    }
+
+    VkDescriptorSetLayoutBinding binding[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        binding[i].binding = (uint32_t)i;
+        binding[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding[i].descriptorCount = 1;
+        binding[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo slci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    slci.bindingCount = 2; slci.pBindings = binding;
+    if (!chk("vkCreateDescriptorSetLayout(vkshadow)",
+             G.vkCreateDescriptorSetLayout(dev, &slci, nullptr, &X.shSetLayout))) {
+        X.shFailed = true; return false;
+    }
+    VkPushConstantRange pcr2 = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 176u };
+    VkPipelineLayoutCreateInfo plci2 = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci2.setLayoutCount = 1; plci2.pSetLayouts = &X.shSetLayout;
+    plci2.pushConstantRangeCount = 1; plci2.pPushConstantRanges = &pcr2;
+    if (!chk("vkCreatePipelineLayout(vkshadow recv)", G.vkCreatePipelineLayout(dev, &plci2, nullptr, &X.shRecvLayout))) {
+        X.shFailed = true; return false;
+    }
+
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * (uint32_t)VKGEO_SLOT_COUNT };
+    VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = (uint32_t)VKGEO_SLOT_COUNT;
+    pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    if (!chk("vkCreateDescriptorPool(vkshadow)", G.vkCreateDescriptorPool(dev, &pci, nullptr, &X.shPool))) {
+        X.shFailed = true; return false;
+    }
+
+    VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    si.magFilter = VK_FILTER_NEAREST; si.minFilter = VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.compareEnable = VK_FALSE;
+    si.minLod = 0.0f; si.maxLod = 0.0f;
+    if (!chk("vkCreateSampler(vkshadow)", G.vkCreateSampler(dev, &si, nullptr, &X.shSampler))) {
+        X.shFailed = true; return false;
+    }
+
+    // The map's colour is what the receiver samples: R = light-space NDC depth, far = 1. The depth
+    // attachment only resolves caster-to-caster occlusion inside the replay.
+    if (!VKRT_Alloc_Color_Format(X.shColorKey, X.shMapSize, X.shMapSize, (unsigned)VK_FORMAT_R32_SFLOAT) ||
+        !VKRT_Alloc_Depth_Format(X.shDepthKey, X.shMapSize, X.shMapSize, (unsigned)VK_FORMAT_D32_SFLOAT)) {
+        X.shFailed = true;
+        VKWP1_LOG("[VKSHADOW] off: shadow map targets could not be created (%ux%u R32F/D32)",
+            X.shMapSize, X.shMapSize);
+        return false;
+    }
+    X.shReady = true;
+    VKWP1_LOG("[VKSHADOW] ready: %ux%u R32F depth map, strength=%.2f penumbra=%.2f", X.shMapSize, X.shMapSize,
+        (double)shadow_strength(), (double)shadow_penumbra());
+    return true;
+}
+
+VkPipeline shadow_cast_pso(const VKShadowCaster& c)
+{
+    for (size_t i = 0; i < X.shCastPSOs.size(); ++i) {
+        const VKShadowCastPSO& e = X.shCastPSOs[i];
+        // uv_offset and alpha_enable are part of the identity: the same stride drawn with and without the
+        // cutout is a different vertex layout (one has location 1) and a different fragment stage.
+        if (e.stride == c.stride && e.pos_offset == c.pos_offset && e.topology == c.topology &&
+            e.uv_offset == c.uv_offset && e.alpha_enable == c.alpha_enable) return e.pso;
+    }
+    if (X.curPass >= X.passes.size()) return nullptr;
+
+    VkVertexInputBindingDescription vbd = { 0, c.stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription vad[2] = {};
+    vad[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, c.pos_offset };
+    unsigned vadCount = 1;
+    if (c.alpha_enable) {
+        // The fragment stage tests tex0.a, so the cast pipeline declares the same coordinate set the
+        // scene used. Location 1 in the cast shader, whatever location the FVF gave it.
+        vad[1] = { 1, 0, VK_FORMAT_R32G32_SFLOAT, c.uv_offset };
+        vadCount = 2;
+    }
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &vbd;
+    vin.vertexAttributeDescriptionCount = vadCount; vin.pVertexAttributeDescriptions = vad;
+
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = vk_topology(c.topology);
+
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    // Two-sided: a shadow caster's winding must not decide whether it occludes.
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable = VK_TRUE;
+    dss.depthWriteEnable = VK_TRUE;
+    dss.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = VK_FALSE;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+
+    VkPipelineShaderStageCreateInfo stg[2] = {};
+    stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stg[0].module = X.shCastVs; stg[0].pName = "main";
+    stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stg[1].module = c.alpha_enable ? X.shCastAlphaPs : X.shCastPs;
+    stg[1].pName = "main";
+
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stg;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = c.alpha_enable ? X.shCastAlphaLayout : X.shCastLayout;
+    gpi.renderPass = X.passes[X.curPass].rp;
+    gpi.subpass = 0;
+
+    VkPipeline pso = nullptr;
+    if (!chk("vkCreateGraphicsPipelines(vkshadow cast)",
+             G.vkCreateGraphicsPipelines(dev_(), nullptr, 1, &gpi, nullptr, &pso)))
+        return nullptr;
+    VKShadowCastPSO e; e.stride = c.stride; e.pos_offset = c.pos_offset; e.topology = c.topology;
+    e.uv_offset = c.alpha_enable ? c.uv_offset : 0u; e.alpha_enable = c.alpha_enable; e.pso = pso;
+    X.shCastPSOs.push_back(e);
+    return pso;
+}
+
+VkPipeline shadow_recv_pso()
+{
+    if (X.curPass >= X.passes.size()) return nullptr;
+    if (X.shRecvPSO && X.shRecvPass == X.curPass) return X.shRecvPSO;
+
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable = VK_FALSE;
+    dss.depthWriteEnable = VK_FALSE;
+
+    // Scene colour *= visibility: zero contribution from the new fragment, destination scaled by it.
+    // Diagnostic modes replace the colour instead, so 0.35/0.75/0.5..1 read as plain grey levels.
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = shadow_debug_mode() ? VK_FALSE : VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cba.colorWriteMask = (VkColorComponentFlags)(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                 VK_COLOR_COMPONENT_B_BIT);
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+
+    VkPipelineShaderStageCreateInfo stg[2] = {};
+    stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stg[0].module = X.shRecvVs; stg[0].pName = "main";
+    stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stg[1].module = X.shRecvPs; stg[1].pName = "main";
+
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stg;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = X.shRecvLayout;
+    gpi.renderPass = X.passes[X.curPass].rp;
+    gpi.subpass = 0;
+
+    VkPipeline pso = nullptr;
+    if (!chk("vkCreateGraphicsPipelines(vkshadow recv)",
+             G.vkCreateGraphicsPipelines(dev_(), nullptr, 1, &gpi, nullptr, &pso)))
+        return nullptr;
+    // A format change would invalidate the old pipeline; that does not happen at run time (the scene
+    // mirror's format is fixed), but naming the pass keeps the cache honest if it ever does.
+    X.shRecvPSO = pso;
+    X.shRecvPass = X.curPass;
+    return pso;
+}
+
+bool shadow_update_set(VkImageView shadowView, VkImageView depthView)
+{
+    const unsigned slot = X.slot;
+    if (!X.shSets[slot]) {
+        VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ai.descriptorPool = X.shPool;
+        ai.descriptorSetCount = 1; ai.pSetLayouts = &X.shSetLayout;
+        if (G.vkAllocateDescriptorSets(dev_(), &ai, &X.shSets[slot]) != VK_SUCCESS) return false;
+        X.shSetViews[slot][0] = nullptr;
+        X.shSetViews[slot][1] = nullptr;
+    }
+    if (X.shSetViews[slot][0] == shadowView && X.shSetViews[slot][1] == depthView) return true;
+
+    VkDescriptorImageInfo ii[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        ii[i].sampler = X.shSampler;
+        ii[i].imageView = (i == 0) ? shadowView : depthView;
+        ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    VkWriteDescriptorSet w[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = X.shSets[slot];
+        w[i].dstBinding = (uint32_t)i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[i].pImageInfo = &ii[i];
+    }
+    G.vkUpdateDescriptorSets(dev_(), 2, w, 0, nullptr);
+    X.shSetViews[slot][0] = shadowView;
+    X.shSetViews[slot][1] = depthView;
+    return true;
+}
+
+// The alpha-tested cast pass samples the scene's own tex0. One set per distinct (texture, sampler) pair:
+// a forest is a few textures across hundreds of batches, so the cache turns the whole canopy into a
+// handful of allocations per frame.
+VkDescriptorSet shadow_cast_set(void* tex, void* samp)
+{
+    const unsigned slot = X.slot;
+    for (size_t i = 0; i < X.shCastSets[slot].size(); ++i)
+        if (X.shCastSets[slot][i].tex == tex && X.shCastSets[slot][i].samp == samp)
+            return X.shCastSets[slot][i].set;
+
+    if (!X.shCastPool[slot] || !X.shCastSetLayout) return nullptr;
+    VkDescriptorSet set = nullptr;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = X.shCastPool[slot];
+    ai.descriptorSetCount = 1; ai.pSetLayouts = &X.shCastSetLayout;
+    if (G.vkAllocateDescriptorSets(dev_(), &ai, &set) != VK_SUCCESS) return nullptr;
+
+    VkDescriptorImageInfo ii = {};
+    ii.sampler = samp ? (VkSampler)samp : X.shSampler;
+    ii.imageView = (VkImageView)tex;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w.dstSet = set;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    G.vkUpdateDescriptorSets(dev_(), 1, &w, 0, nullptr);
+
+    VKShadowCastSet e; e.tex = tex; e.samp = samp; e.set = set;
+    X.shCastSets[slot].push_back(e);
+    return set;
+}
+
+// Called from VK_Draw_Submit for a batch that is about to be recorded into the scene. Opaque,
+// depth-writing, world-space triangles are candidates; identity-world batches (terrain, sky, UI) are
+// receivers. Alpha-tested batches are candidates too - the reference records what the scene recorded -
+// but they carry their tex0 and the compare into the cast pass, so a leaf card occludes only where the
+// texture says it is opaque instead of casting a solid quad.
+// GeneralsX @bugfix Qoder 20/10/2026 the native sun pass must not borrow a camera from camera-space
+// geometry. Grass, smudge and point groups bake the camera into their vertices and draw with
+// D3DTS_VIEW = identity. When such a batch happened to be the last one recorded, the fit and the
+// receiver reconstructed the world through that identity view, every lookup landed outside the map and
+// the scene lost all shadows for as long as the effect stayed on screen. Identity means "not a camera",
+// not "a camera at the origin".
+bool vkdraw_no_camera(const float* view, const float* proj)
+{
+    static const float id[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    bool viewIdent = true, projIdent = true;
+    for (int i = 0; i < 16; ++i) {
+        if (fabsf(view[i] - id[i]) > 1e-5f) viewIdent = false;
+        if (fabsf(proj[i] - id[i]) > 1e-5f) projIdent = false;
+    }
+    return viewIdent || projIdent;
+}
+
+void shadow_record_caster(const VKDraw_Submit& s)
+{
+    if (!shadow_env_on() || X.shFailed) return;
+    if (s.ff && vkdraw_no_camera(s.ff->view, s.ff->proj)) return;
+
+    // One line per vertex program (and axis: skin or not) that reaches this recorder, with the state
+    // that decides whether it can cast. A skin batch is CPU-skinned geometry: its vertices are already
+    // in world space even though it is drawn by the fixed-function vertex stage, so it cannot be told
+    // apart from terrain by its world or its program - only by the engine's own batch flag.
+    {
+        static unsigned s_tagSeen[64];
+        static unsigned s_tagN = 0u;
+        const unsigned key = (s.key.vs_tag << 1) | (s.skin_batch ? 1u : 0u);
+        bool seen = false;
+        for (unsigned i = 0; i < s_tagN; ++i) if (s_tagSeen[i] == key) { seen = true; break; }
+        if (!seen && s_tagN < 64u) {
+            s_tagSeen[s_tagN++] = key;
+            const float* w = s.ff ? s.ff->world : nullptr;
+            fprintf(stderr, "[VKSHADOW] tag census: vs=%u ps=%u skin=%u blend=%u zw=%u mask=%u topo=%u attrs=%u "
+                "wpos=(%.2f,%.2f,%.2f) tex0=%p\n",
+                s.key.vs_tag, s.key.ps_tag, s.skin_batch, s.key.blend_enable, s.key.depth_write,
+                s.key.write_mask, s.key.topology, s.attr_count,
+                w ? w[12] : -999.f, w ? w[13] : -999.f, w ? w[14] : -999.f, s.texture_views[0]);
+            fflush(stderr);
+        }
+    }
+    if (s.key.topology != D3D_PT_TRIANGLELIST && s.key.topology != D3D_PT_TRIANGLESTRIP) return;
+    if (s.key.blend_enable || !s.key.depth_write) return;
+    if (!(s.key.write_mask & 0x7u)) return;
+    if (!s.ff || (s.ff->flags[0] & VKFF_FLAG_RHW)) return;
+    if (!s.vk_index_buffer || !s.streams[0].vk_buffer) return;
+    if (X.casters.size() >= 8192) return;
+    // Identity world normally means "already in world space and not an object": terrain, sky, water, UI.
+    // CPU-skinned meshes are the exception - DX8SkinFVFCategoryContainer writes world-space vertices and
+    // declares the identity - so the engine's batch flag, not the vertex program, is what identifies them.
+    static const float s_ident[16] = { 1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1 };
+    const bool skin_verts = (s.skin_batch != 0u);
+    if (!skin_verts
+        && s.ff->world[12] == 0.0f && s.ff->world[13] == 0.0f && s.ff->world[14] == 0.0f) {
+        const unsigned vs = s.key.vs_tag;
+        if (vs != 7u && vs != 9u) return;
+    }
+
+    const VKDraw_Attr* pos = nullptr;
+    for (unsigned i = 0; i < s.attr_count && i < VKDRAW_MAX_ATTRS; ++i)
+        if (s.attrs[i].location == VKDRAW_LOC_POSITION) { pos = &s.attrs[i]; break; }
+    if (!pos || pos->type != 0u || pos->components != 3u) return;
+
+    unsigned alpha_enable = s.key.alpha_test_enable ? 1u : 0u;
+    unsigned uv_offset = 0u, alpha_ref = 0u, alpha_cmp = 7u;
+    if (alpha_enable) {
+        // Without the texture the cutout cannot be reproduced, and a solid card is worse than no shadow.
+        if (!s.texture_views[0]) return;
+        const VKDraw_Attr* uv = nullptr;
+        for (unsigned i = 0; i < s.attr_count && i < VKDRAW_MAX_ATTRS; ++i)
+            if (s.attrs[i].location == VKDRAW_LOC_TEX0) { uv = &s.attrs[i]; break; }
+        if (!uv || uv->type != 0u || uv->components < 2u) return;
+        uv_offset = uv->offset;
+        alpha_ref = s.key.alpha_ref & 0xFFu;
+        const unsigned f = s.key.alpha_cmp;
+        alpha_cmp = (f >= 1u && f <= 8u) ? (f - 1u) : 7u;   // D3DCMPFUNC -> the shader's 0..7
+    }
+
+    VKShadowCaster c = {};
+    c.vb = (VkBuffer)s.streams[0].vk_buffer;
+    c.voff = (VkDeviceSize)s.streams[0].offset;
+    c.stride = s.streams[0].stride;
+    c.ib = (VkBuffer)s.vk_index_buffer;
+    c.ioff = (VkDeviceSize)s.index_offset + (VkDeviceSize)(s.start_index * 2u);
+    c.index_count = vk_index_count_for(s.key.topology, s.polygon_count);
+    c.base_vertex = (int)s.base_vertex;
+    c.pos_offset = pos->offset;
+    c.topology = s.key.topology;
+    // A skin batch's vertices are already world-space; applying the (possibly stale) world transform
+    // twice is what put the shadow somewhere other than under the infantry.
+    memcpy(c.world, skin_verts ? s_ident : s.ff->world, sizeof(c.world));
+    c.tex = s.texture_views[0];
+    c.samp = s.texture_samplers[0];
+    c.uv_offset = uv_offset;
+    c.alpha_enable = alpha_enable;
+    c.alpha_ref = alpha_ref;
+    c.alpha_cmp = alpha_cmp;
+    c.skin = skin_verts ? 1u : 0u;
+    X.casters.push_back(c);
+
+    // Camera-independent ground estimate for the light frustum slab: the average height of the casters
+    // (terrain itself is identity-world and therefore not recorded). A caster far away from the running
+    // estimate is a new world (map change before the explicit reset lands) or an outlier such as a
+    // cliff-top base; re-seed in that case. Blending at 0.5% from the previous map's height made the
+    // sun fit take seconds to follow a load, which read as "no ground shadow after loading".
+    const float z = s.ff->world[14];
+    if (z > -500.0f && z < 2000.0f && z != 0.0f) {
+        if (!X.shGroundInit || fabsf(z - X.shGroundZ) > 700.0f) { X.shGroundZ = z; X.shGroundInit = 1; }
+        else X.shGroundZ = X.shGroundZ * 0.995f + z * 0.005f;
+    }
+}
+
+// GeneralsX @debug Qoder 20/10/2026 periodic-disappearance forensics: the native pass has a dozen exits
+// that all look the same from outside (the scene simply loses its shadows for that frame), and the
+// 300-frame summary cannot name which one fired. This prints one line per frame with the branch that
+// decided the outcome, so a vanish can be matched against the frame it happened on. Off by default.
+// GeneralsX @feature Qoder 22/10/2026: light shadows are opt-in (default OFF) until they have been
+// evaluated; GENERALSX_VK_LIGHTSHADOW=1 turns the strongest light's own map on.
+bool light_shadow_on()
+{
+    if (s_lsEnv < 0) {
+        const char* e = getenv("GENERALSX_VK_LIGHTSHADOW");
+        s_lsEnv = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return s_lsEnv != 0;
+}
+
+bool shadow_trace_on()
+{
+    static const bool on = [] {
+        const char* e = getenv("GENERALSX_VKSHADOW_TRACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+void shadow_trace(const char* why, const char* detail, unsigned extra, int applied, unsigned replayed,
+                  float side, float range)
+{
+    if (!shadow_trace_on()) return;
+    static unsigned n = 0;
+    if (n >= 24000u) return;
+    ++n;
+    fprintf(stderr, "[VKSTRACE] f=%llu slot=%u why=%s casters=%u haveVP=%u extra=%u applied=%d "
+        "replayed=%u side=%.0f range=%.0f ground=%.1f hits=%u cam=(%.1f %.1f %.1f) proj=(%.4f %.4f %.4f) detail=%s\n",
+        X.st.framesBegun, X.slot, why, (unsigned)X.casters.size(), X.shHaveVP, extra, applied,
+        replayed, (double)side, (double)range, (double)X.shGroundZ, X.shLastHits,
+        (double)X.shLastCam[0], (double)X.shLastCam[1], (double)X.shLastCam[2],
+        (double)X.shLastProj[0], (double)X.shLastProj[1], (double)X.shLastProj[2],
+        detail ? detail : "-");
+    fflush(stderr);
+}
+
+} // anon
+
+// ===========================================================================
+// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation
+// ===========================================================================
+namespace {
+
+struct VKVegPush {
+    float vp[16];      // column-major world -> clip
+    float cam[4];      // xyz eye, w time
+    float sun[4];      // xyz direction toward the sun
+    float fog[4];      // rgb fog colour, w fog start
+    float params[4];   // x fog end, y cull distance, z/w reserved
+};
+
+static const unsigned VKVEG_INSTANCE_BYTES = 48u;
+static const unsigned VKVEG_MAX_INSTANCES = 60000u;
+
+bool vkveg_ensure()
+{
+    if (X.veg.failed) return false;
+    if (X.veg.ready) return true;
+    VkDevice dev = dev_();
+    if (!dev) return false;
+
+    VkShaderModuleCreateInfo smvi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smvi.codeSize = sizeof(VKVEG_GRA_VERT_SPV); smvi.pCode = VKVEG_GRA_VERT_SPV;
+    if (!chk("vkCreateShaderModule(vkveg grass vs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.veg.gvs))) { X.veg.failed = true; return false; }
+    smvi.codeSize = sizeof(VKVEG_GRA_FRAG_SPV); smvi.pCode = VKVEG_GRA_FRAG_SPV;
+    if (!chk("vkCreateShaderModule(vkveg grass fs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.veg.gfs))) { X.veg.failed = true; return false; }
+    smvi.codeSize = sizeof(VKVEG_ROCK_VERT_SPV); smvi.pCode = VKVEG_ROCK_VERT_SPV;
+    if (!chk("vkCreateShaderModule(vkveg rock vs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.veg.rvs))) { X.veg.failed = true; return false; }
+    smvi.codeSize = sizeof(VKVEG_ROCK_FRAG_SPV); smvi.pCode = VKVEG_ROCK_FRAG_SPV;
+    if (!chk("vkCreateShaderModule(vkveg rock fs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.veg.rfs))) { X.veg.failed = true; return false; }
+
+    // 128 bytes is the guaranteed push-constant budget and exactly what the block above needs.
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, (uint32_t)sizeof(VKVegPush) };
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (!chk("vkCreatePipelineLayout(vkveg)", G.vkCreatePipelineLayout(dev, &plci, nullptr, &X.veg.layout))) {
+        X.veg.failed = true; return false;
+    }
+
+    X.veg.ready = true;
+    VKWP1_LOG("[VKVEG] ready: instanced blades + stones, %u bytes push constants, cap %u instances",
+        (unsigned)sizeof(VKVegPush), VKVEG_MAX_INSTANCES);
+    return true;
+}
+
+// Both pipelines target the pass that is open for the frame; a change of pass (render resolution,
+// MSAA tier) invalidates them the same way the shadow receiver is invalidated.
+bool vkveg_pipelines()
+{
+    if (!X.veg.ready) return false;
+    VkRenderPass rp = X.passes[X.curPass].rp;
+    if (X.veg.gpipe && X.veg.rpipe && X.veg.pass == rp) return true;
+
+    if (X.veg.gpipe) { G.vkDestroyPipeline(dev_(), X.veg.gpipe, nullptr); X.veg.gpipe = nullptr; }
+    if (X.veg.rpipe) { G.vkDestroyPipeline(dev_(), X.veg.rpipe, nullptr); X.veg.rpipe = nullptr; }
+    X.veg.pass = rp;
+
+    VkVertexInputBindingDescription vib = {};
+    vib.binding = 0; vib.stride = VKVEG_INSTANCE_BYTES; vib.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    VkVertexInputAttributeDescription via[3] = {};
+    via[0] = { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0 };
+    via[1] = { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16 };
+    via[2] = { 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32 };
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &vib;
+    vin.vertexAttributeDescriptionCount = 3; vin.pVertexAttributeDescriptions = via;
+
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = (VkSampleCountFlagBits)X.passes[X.curPass].samples;
+
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable = VK_TRUE;
+    dss.depthWriteEnable = VK_TRUE;
+    dss.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = VK_FALSE;
+    cba.colorWriteMask = (VkColorComponentFlags)(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool rocks = pass == 1;
+        VkPipelineShaderStageCreateInfo stg[2] = {};
+        stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stg[0].module = rocks ? X.veg.rvs : X.veg.gvs;
+        stg[0].pName = "main";
+        stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stg[1].module = rocks ? X.veg.rfs : X.veg.gfs;
+        stg[1].pName = "main";
+
+        VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        ia.topology = rocks ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+        VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        gpi.stageCount = 2; gpi.pStages = stg;
+        gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+        gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+        gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+        gpi.layout = X.veg.layout; gpi.renderPass = rp; gpi.subpass = 0;
+
+        VkPipeline pso = nullptr;
+        if (!chk(rocks ? "vkCreateGraphicsPipelines(vkveg rock)" : "vkCreateGraphicsPipelines(vkveg grass)",
+                 G.vkCreateGraphicsPipelines(dev_(), nullptr, 1, &gpi, nullptr, &pso))) {
+            X.veg.failed = true;
+            return false;
+        }
+        if (rocks) X.veg.rpipe = pso; else X.veg.gpipe = pso;
+    }
+    return true;
+}
+
+bool vkveg_buffer(unsigned slot, unsigned long long bytes)
+{
+    if (slot >= VKGEO_SLOT_COUNT) return false;
+    if (X.veg.buf[slot] && X.veg.cap[slot] >= bytes) return true;
+    if (X.veg.buf[slot]) {
+        free_host_buffer(X.veg.buf[slot], X.veg.mem[slot], &X.veg.map[slot]);
+        X.veg.buf[slot] = nullptr; X.veg.mem[slot] = nullptr; X.veg.cap[slot] = 0;
+    }
+    unsigned long long cap = (bytes + (1ull << 20) - 1ull) & ~((1ull << 20) - 1ull);
+    if (cap < (2ull << 20)) cap = 2ull << 20;
+    if (!make_host_buffer(cap, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          &X.veg.buf[slot], &X.veg.mem[slot], &X.veg.map[slot])) return false;
+    X.veg.cap[slot] = cap;
+    return true;
+}
+
+} // anon
+
+bool VKDraw_LightShadow_Info(float vp[16], float pos_range[4])
+{
+    if (!s_lsValid || !vp || !pos_range) return false;
+    memcpy(vp, s_lsVP, sizeof(s_lsVP));
+    memcpy(pos_range, s_lsPosRange, sizeof(s_lsPosRange));
+    return true;
+}
+
+bool VKDraw_Vegetation_Ready()
+{
+    return VKDraw_Ready() && !X.veg.failed;
+}
+
+bool VKDraw_Vegetation_Draw(const void* grass, unsigned grass_count,
+                            const void* rocks, unsigned rock_count,
+                            const float view_proj[16], const float camera[3], float time_seconds,
+                            const float sun_dir[3], const float fog_color[3],
+                            float fog_start, float fog_end, float cull_distance)
+{
+    if (!VKDraw_Ready() || !X.frameOpen || !X.cmd || !X.inPass) return false;
+    if (!X.depthKey) return false;   // the vegetation pass needs the scene depth attachment
+    if (!grass_count && !rock_count) return false;
+    if ((grass_count && !grass) || (rock_count && !rocks)) return false;
+    if (!vkveg_ensure() || !vkveg_pipelines()) return false;
+
+    if (grass_count >= VKVEG_MAX_INSTANCES) { grass_count = VKVEG_MAX_INSTANCES; rock_count = 0; }
+    if (grass_count + rock_count > VKVEG_MAX_INSTANCES)
+        rock_count = VKVEG_MAX_INSTANCES - grass_count;
+
+    const unsigned long long bytes = (unsigned long long)(grass_count + rock_count) * VKVEG_INSTANCE_BYTES;
+    if (!vkveg_buffer(X.slot, bytes)) return false;
+
+    unsigned char* dst = (unsigned char*)X.veg.map[X.slot];
+    if (grass_count) memcpy(dst, grass, (size_t)grass_count * VKVEG_INSTANCE_BYTES);
+    if (rock_count) memcpy(dst + (size_t)grass_count * VKVEG_INSTANCE_BYTES, rocks,
+                           (size_t)rock_count * VKVEG_INSTANCE_BYTES);
+
+    VKVegPush pc = {};
+    // D3D row-major (v * view * proj) -> GLSL column-major (vp * v).
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            pc.vp[c * 4 + r] = view_proj[r * 4 + c];
+    pc.cam[0] = camera[0]; pc.cam[1] = camera[1]; pc.cam[2] = camera[2]; pc.cam[3] = time_seconds;
+    pc.sun[0] = sun_dir[0]; pc.sun[1] = sun_dir[1]; pc.sun[2] = sun_dir[2]; pc.sun[3] = 0.0f;
+    pc.fog[0] = fog_color[0]; pc.fog[1] = fog_color[1]; pc.fog[2] = fog_color[2]; pc.fog[3] = fog_start;
+    pc.params[0] = fog_end;
+    pc.params[1] = cull_distance > 1.0f ? cull_distance : 1.0f;
+    pc.params[2] = 0.0f; pc.params[3] = 0.0f;
+
+    VkViewport vp = { 0.0f, 0.0f, (float)X.w, (float)X.h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { X.w, X.h } };
+    G.vkCmdSetViewport(X.cmd, 0, 1, &vp);
+    G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+    G.vkCmdPushConstants(X.cmd, X.veg.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                         0, (uint32_t)sizeof(VKVegPush), &pc);
+
+    VkDeviceSize offset = 0;
+    if (grass_count) {
+        G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, X.veg.gpipe);
+        G.vkCmdBindVertexBuffers(X.cmd, 0, 1, &X.veg.buf[X.slot], &offset);
+        G.vkCmdDraw(X.cmd, 12u, grass_count, 0, 0);
+    }
+    if (rock_count) {
+        offset = (VkDeviceSize)grass_count * VKVEG_INSTANCE_BYTES;
+        G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, X.veg.rpipe);
+        G.vkCmdBindVertexBuffers(X.cmd, 0, 1, &X.veg.buf[X.slot], &offset);
+        G.vkCmdDraw(X.cmd, 24u, rock_count, 0, 0);
+    }
+
+    X.veg.draws++;
+    X.veg.instances += grass_count + rock_count;
+    return true;
+}
+
+// GeneralsX @bugfix Qoder 21/10/2026: a new map means a new world. The sun-fit ground estimate and
+// the caster list describe the previous world; keeping the estimate made the fit start at the old
+// terrain height and converge at 0.5% per recorded caster, so the new map rendered without ground
+// shadows for a few seconds. Resources stay; only the per-world frame-window state is cleared.
+void VKDraw_Shadow_Reset()
+{
+    X.shGroundInit = 0;
+    X.shGroundZ = 0.0f;
+    X.shHaveVP = 0;
+    X.shViewport[0] = X.shViewport[1] = X.shViewport[2] = X.shViewport[3] = 0.0f;
+    X.shFitSide = 0.0f;
+    X.shLastHits = 0;
+    X.casters.clear();
+}
+
+bool VKDraw_Shadow_Apply(const float sun_dir[3])
+{
+    if (!VKDraw_Ready() || !X.frameOpen || !X.cmd) {
+        shadow_trace("not-ready", nullptr, (unsigned)(X.shEnvChecked + X.frameOpen), 0, 0u, 0.0f, 0.0f);
+        return false;
+    }
+    if (!shadow_env_on() || !sun_dir) {
+        shadow_trace("env-off", nullptr, (unsigned)(X.shOn + (sun_dir != nullptr)), 0, 0u, 0.0f, 0.0f);
+        return false;
+    }
+    if (X.shFailed) {
+        shadow_trace("sh-failed", nullptr, 0u, 0, 0u, 0.0f, 0.0f);
+        return false;
+    }
+
+    float sun[3] = { sun_dir[0], sun_dir[1], sun_dir[2] };
+    const float sl = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    if (sl < 1e-3f) {
+        shadow_trace("sun-zero", nullptr, (unsigned)(sl * 1000.0f), 0, 0u, 0.0f, 0.0f);
+        return false;
+    }
+    sun[0] /= sl; sun[1] /= sl; sun[2] /= sl;
+
+    if (!X.shHaveVP || X.casters.empty()) {
+        ++X.shFrames;
+        if (X.casters.empty()) ++X.shNoCasterFrames;
+        shadow_trace(X.casters.empty() ? "no-casters" : "no-vp", nullptr, 0u, 0, 0u, 0.0f, 0.0f);
+        X.casters.clear();
+        X.shHaveVP = 0;
+        return false;
+    }
+
+    vk_queue_lock();
+    if (!shadow_ensure()) {
+        shadow_trace("ensure", nullptr, 0u, 0, 0u, 0.0f, 0.0f);
+        vk_queue_unlock();
+        return false;
+    }
+
+    void* const sceneColor = X.colorKey;
+    void* const sceneDepthKey = X.depthKey;
+    const unsigned sceneW = X.w, sceneH = X.h;
+    VKRT_Info depthInfo;
+    if (!sceneColor || !sceneDepthKey || !VKRT_Query(sceneDepthKey, &depthInfo) || !depthInfo.view) {
+        shadow_trace("no-depth", nullptr, (unsigned)(sceneColor != nullptr) + (unsigned)(sceneDepthKey != nullptr),
+                     0, 0u, 0.0f, 0.0f);
+        X.casters.clear();
+        X.shHaveVP = 0;
+        vk_queue_unlock();
+        return false;
+    }
+
+    float lightVP[16];
+    float range = 1.0f, mapWorld = 1.0f;
+    float fitLo[3], fitHi[3];
+    if (!shadow_build_light(sun, X.shView, X.shProj, X.shGroundZ, lightVP, range, mapWorld, fitLo, fitHi)) {
+        shadow_trace("fit", nullptr, 0u, 0, 0u, 0.0f, 0.0f);
+        X.casters.clear();
+        X.shHaveVP = 0;
+        vk_queue_unlock();
+        return false;
+    }
+
+    // Close the scene pass so the map can be rendered; every later pass reopens what it needs.
+    close_pass();
+
+    // Fit report: every recorded caster origin has to fall inside the box (lc in [-1,1] x [-1,1] x
+    // [0,1]); an OUT here means the map misses geometry, while casters all inside but no on-screen
+    // shadow points at the receiver instead.
+    if (X.shFrames < 2ull || (X.shFrames % 600ull) == 0ull) {
+        auto lcOf = [&](const float p[3], float out[3]) {
+            out[0] = lightVP[0] * p[0] + lightVP[4] * p[1] + lightVP[8] * p[2] + lightVP[12];
+            out[1] = lightVP[1] * p[0] + lightVP[5] * p[1] + lightVP[9] * p[2] + lightVP[13];
+            out[2] = lightVP[2] * p[0] + lightVP[6] * p[1] + lightVP[10] * p[2] + lightVP[14];
+        };
+        VKWP1_LOG("[VKSHADOW] fit: side=%.0f range=%.0f ground=%.1f casters=%u "
+                  "lo=(%.0f %.0f %.0f) hi=(%.0f %.0f %.0f) sun=(%.3f %.3f %.3f)",
+            (double)mapWorld, (double)range, (double)X.shGroundZ, (unsigned)X.casters.size(),
+            (double)fitLo[0], (double)fitLo[1], (double)fitLo[2],
+            (double)fitHi[0], (double)fitHi[1], (double)fitHi[2],
+            (double)sun[0], (double)sun[1], (double)sun[2]);
+        const size_t shown = X.casters.size() < 6 ? X.casters.size() : 6;
+        for (size_t i = 0; i < shown; ++i) {
+            const float* w = X.casters[i].world;
+            const float p[3] = { w[12], w[13], w[14] };
+            float lc[3];
+            lcOf(p, lc);
+            const bool out = lc[0] < -1.0f || lc[0] > 1.0f || lc[1] < -1.0f || lc[1] > 1.0f ||
+                             lc[2] < 0.0f || lc[2] > 1.0f;
+            VKWP1_LOG("[VKSHADOW] caster[%u] p=(%.0f %.0f %.0f) lc=(%.3f %.3f %.3f)%s",
+                (unsigned)i, (double)p[0], (double)p[1], (double)p[2],
+                (double)lc[0], (double)lc[1], (double)lc[2], out ? " OUT" : "");
+        }
+    }
+
+    // ---- 1. sun-space depth map -------------------------------------------------
+    X.colorKey = X.shColorKey;
+    X.depthKey = X.shDepthKey;
+    X.w = X.shMapSize; X.h = X.shMapSize;
+    bool ok = open_pass();
+    unsigned replayed = 0, replaySkipped = 0;
+    if (ok) {
+        const float clear[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        vkdraw_clear_locked(1, 1, clear, 1.0f, 0u, nullptr);
+        VkViewport vp = { 0.0f, 0.0f, (float)X.shMapSize, (float)X.shMapSize, 0.0f, 1.0f };
+        VkRect2D sc = { { 0, 0 }, { X.shMapSize, X.shMapSize } };
+        G.vkCmdSetViewport(X.cmd, 0, 1, &vp);
+        G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+
+        struct ShadowPush {
+            float lightVP[16];
+            float world[16];
+            float params[4];   // x = alpha reference (0..255), y = compare 0..7, z = cutout enable
+        } push;
+        memcpy(push.lightVP, lightVP, sizeof(push.lightVP));
+        const VkShaderStageFlags castStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        // GeneralsX @debug Qoder 20/10/2026 mode 13: replay only the CPU-skinned casters, so the map shows
+        // their silhouettes on their own.
+        const bool skinOnly = shadow_debug_mode() == 13;
+        for (size_t i = 0; i < X.casters.size(); ++i) {
+            const VKShadowCaster& c = X.casters[i];
+            if (skinOnly && !c.skin) continue;
+            VkPipeline pso = shadow_cast_pso(c);
+            if (!pso) { ++replaySkipped; continue; }
+            memcpy(push.world, c.world, sizeof(push.world));
+            push.params[0] = (float)c.alpha_ref;
+            push.params[1] = (float)c.alpha_cmp;
+            push.params[2] = c.alpha_enable ? 1.0f : 0.0f;
+            push.params[3] = 0.0f;
+            G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+            if (c.alpha_enable) {
+                VkDescriptorSet texSet = shadow_cast_set(c.tex, c.samp);
+                if (!texSet) { ++replaySkipped; continue; }
+                G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, X.shCastAlphaLayout,
+                                          0, 1, &texSet, 0, nullptr);
+                G.vkCmdPushConstants(X.cmd, X.shCastAlphaLayout, castStages, 0,
+                                     (uint32_t)sizeof(push), &push);
+            } else {
+                G.vkCmdPushConstants(X.cmd, X.shCastLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128u, &push);
+            }
+            G.vkCmdBindVertexBuffers(X.cmd, 0, 1, &c.vb, &c.voff);
+            G.vkCmdBindIndexBuffer(X.cmd, c.ib, c.ioff, VK_INDEX_TYPE_UINT16);
+            G.vkCmdDrawIndexed(X.cmd, c.index_count, 1, 0, c.base_vertex, 0);
+            ++replayed;
+        }
+        close_pass();
+    }
+
+    // ---- 1b. strongest dynamic light's own shadow map -----------------------------
+    // A virtual lamp sits above the published light and looks straight down; the same caster replay
+    // fills a small R32F map with light-space depth. Opt-in (GENERALSX_VK_LIGHTSHADOW=1).
+    s_lsValid = 0;
+    if (s_fpTopValid && light_shadow_on() && replayed) {
+        const float lx = s_fpTopLight[0], ly = s_fpTopLight[1], lz = s_fpTopLight[2];
+        const float lr = (s_fpTopLight[7] > 1.0f) ? s_fpTopLight[7] : 40.0f;
+        const float R = (lr * 1.2f > 40.0f) ? lr * 1.2f : 40.0f;
+        float up = lr * 0.5f;
+        if (up < 20.0f) up = 20.0f;
+        if (up > 120.0f) up = 120.0f;
+        const float lampZ = lz + up;
+        const float ground = X.shGroundZ - 30.0f;
+        const float D = (lampZ - ground > 20.0f) ? (lampZ - ground) : 20.0f;
+        if (VKRT_Alloc_Color_Format(s_lsKey, s_lsSize, s_lsSize, (unsigned)VK_FORMAT_R32_SFLOAT)) {
+            // Row-vector view: x' = x - lx, y' = y - ly, z' = lampZ - z (0 at the virtual lamp).
+            const float view[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  -lx,-ly,lampZ,1 };
+            const float proj[16] = { 1.0f/R,0,0,0,  0,1.0f/R,0,0,  0,0,1.0f/D,0,  0,0,0,1 };
+            shadow_mat_mul(s_lsVP, proj, view);
+            s_lsPosRange[0] = lx; s_lsPosRange[1] = ly; s_lsPosRange[2] = lz; s_lsPosRange[3] = lr;
+
+            X.colorKey = s_lsKey; X.depthKey = X.shDepthKey;
+            X.w = s_lsSize; X.h = s_lsSize;
+            if (open_pass()) {
+                const float clear[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                vkdraw_clear_locked(1, 1, clear, 1.0f, 0u, nullptr);
+                VkViewport vp2 = { 0.0f, 0.0f, (float)s_lsSize, (float)s_lsSize, 0.0f, 1.0f };
+                VkRect2D sc2 = { { 0, 0 }, { s_lsSize, s_lsSize } };
+                G.vkCmdSetViewport(X.cmd, 0, 1, &vp2);
+                G.vkCmdSetScissor(X.cmd, 0, 1, &sc2);
+                struct LightShadowPush {
+                    float lightVP[16];
+                    float world[16];
+                    float params[4];
+                } lpush;
+                memcpy(lpush.lightVP, s_lsVP, sizeof(lpush.lightVP));
+                const VkShaderStageFlags castStages2 = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                unsigned lReplayed = 0;
+                for (size_t i = 0; i < X.casters.size(); ++i) {
+                    const VKShadowCaster& c = X.casters[i];
+                    VkPipeline pso = shadow_cast_pso(c);
+                    if (!pso) continue;
+                    memcpy(lpush.world, c.world, sizeof(lpush.world));
+                    lpush.params[0] = (float)c.alpha_ref;
+                    lpush.params[1] = (float)c.alpha_cmp;
+                    lpush.params[2] = c.alpha_enable ? 1.0f : 0.0f;
+                    lpush.params[3] = 0.0f;
+                    G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+                    if (c.alpha_enable) {
+                        VkDescriptorSet texSet = shadow_cast_set(c.tex, c.samp);
+                        if (!texSet) continue;
+                        G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, X.shCastAlphaLayout,
+                                                  0, 1, &texSet, 0, nullptr);
+                        G.vkCmdPushConstants(X.cmd, X.shCastAlphaLayout, castStages2, 0,
+                                             (uint32_t)sizeof(lpush), &lpush);
+                    } else {
+                        G.vkCmdPushConstants(X.cmd, X.shCastLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128u, &lpush);
+                    }
+                    G.vkCmdBindVertexBuffers(X.cmd, 0, 1, &c.vb, &c.voff);
+                    G.vkCmdBindIndexBuffer(X.cmd, c.ib, c.ioff, VK_INDEX_TYPE_UINT16);
+                    G.vkCmdDrawIndexed(X.cmd, c.index_count, 1, 0, c.base_vertex, 0);
+                    ++lReplayed;
+                }
+                close_pass();
+                s_lsValid = lReplayed ? 1 : 0;
+            }
+        }
+    }
+
+    // ---- 2. screen-space receiver ------------------------------------------------
+    X.colorKey = sceneColor;
+    X.depthKey = nullptr;    // the receiver samples the depth, it must not be an attachment of this pass
+    X.w = sceneW; X.h = sceneH;
+    bool applied = false;
+    const char* recvWhy = ok ? "recv-open" : "cast-open";
+    if (ok && open_pass()) {
+        recvWhy = "recv-pso";
+        VKRT_Info mapInfo;
+        VkPipeline pso = shadow_recv_pso();
+        if (pso) {
+            recvWhy = "recv-map";
+            if (VKRT_Query(X.shColorKey, &mapInfo) && mapInfo.view) {
+                recvWhy = "recv-inverse";
+                float pv[16], invVP[16];
+                shadow_mat_mul(pv, X.shProj, X.shView);
+                if (shadow_mat_inverse(invVP, pv)) {
+                    recvWhy = "recv-set";
+                    if (shadow_update_set((VkImageView)mapInfo.view,
+                                          (VkImageView)(depthInfo.sample_view ? depthInfo.sample_view : depthInfo.view))) {
+                        const float mapSize = (float)X.shMapSize;
+                        const float texelWorld = mapWorld / mapSize;
+                        const float safeRange = range > 1e-3f ? range : 1.0f;
+                        const float lightSize = 0.05f;   // the reference's sun angular size
+                        float searchUV = lightSize * safeRange * 0.35f / mapWorld;
+                        if (searchUV < 2.0f / mapSize) searchUV = 2.0f / mapSize;
+                        if (searchUV > 0.03f) searchUV = 0.03f;
+
+                        struct RecvPush {
+                            float invVP[16];
+                            float lightVP[16];
+                            float params[4];
+                            float viewport[4];
+                            float aux[4];
+                        } push;
+                        memcpy(push.invVP, invVP, sizeof(push.invVP));
+                        memcpy(push.lightVP, lightVP, sizeof(push.lightVP));
+                        memcpy(push.viewport, X.shViewport, sizeof(push.viewport));
+                        push.aux[0] = texelWorld;   // normal-offset step (world units per map texel)
+                        push.aux[1] = safeRange;
+                        push.aux[2] = mapSize;
+                        push.aux[3] = mapWorld;     // box world size, used for the PCSS radius ceilings
+                        push.params[0] = (texelWorld * 2.2f + 0.12f) / safeRange;  // depth bias
+                        push.params[1] = shadow_debug_mode() ? -(float)shadow_debug_mode() : shadow_strength();
+                        push.params[2] = searchUV;
+                        push.params[3] = safeRange * lightSize / mapWorld * shadow_penumbra();  // penumbra scale
+                        VkViewport vp = { 0.0f, 0.0f, (float)sceneW, (float)sceneH, 0.0f, 1.0f };
+                        VkRect2D sc = { { 0, 0 }, { sceneW, sceneH } };
+                        G.vkCmdSetViewport(X.cmd, 0, 1, &vp);
+                        G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+                        G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+                        G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, X.shRecvLayout,
+                                                  0, 1, &X.shSets[X.slot], 0, nullptr);
+                        G.vkCmdPushConstants(X.cmd, X.shRecvLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                             (uint32_t)sizeof(push), &push);
+                        G.vkCmdDraw(X.cmd, 3, 1, 0, 0);
+                        applied = true;
+                        recvWhy = "applied";
+                    }
+                }
+            }
+        }
+        close_pass();
+    }
+
+    // Put the recorder back on the full scene target: the UI and any later batch expect the depth
+    // attachment the frame's earlier draws used.
+    // A caster origin outside the light box is geometry the map cannot see even though the replay
+    // submitted it, so the trace carries in/total next to applied.
+    unsigned inBox = 0u;
+    for (size_t i = 0; i < X.casters.size(); ++i) {
+        const float* w = X.casters[i].world;
+        const float p[3] = { w[12], w[13], w[14] };
+        const float lx = lightVP[0] * p[0] + lightVP[4] * p[1] + lightVP[8] * p[2] + lightVP[12];
+        const float ly = lightVP[1] * p[0] + lightVP[5] * p[1] + lightVP[9] * p[2] + lightVP[13];
+        const float lz = lightVP[2] * p[0] + lightVP[6] * p[1] + lightVP[10] * p[2] + lightVP[14];
+        if (lx >= -1.0f && lx <= 1.0f && ly >= -1.0f && ly <= 1.0f && lz >= 0.0f && lz <= 1.0f) ++inBox;
+    }
+    char traceDetail[64];
+    snprintf(traceDetail, sizeof(traceDetail), "in=%u skipped=%u", inBox, replaySkipped);
+    shadow_trace(recvWhy, traceDetail, 0u, applied ? 1 : 0, replayed, mapWorld, range);
+    X.colorKey = sceneColor;
+    X.depthKey = sceneDepthKey;
+    X.w = sceneW; X.h = sceneH;
+
+    ++X.shFrames;
+    X.shCasterTotal += (unsigned long long)X.casters.size();
+    X.shReplayDraws += replayed;
+    if (X.shFrames - X.shFramesLogged >= 300ull) {
+        X.shFramesLogged = X.shFrames;
+        // Composition of the current frame's list: identity-world entries are the CPU-skinned meshes
+        // (their vertices are already world space), alpha entries are the cutout foliage/fences.
+        unsigned ident = 0u, alpha = 0u;
+        for (size_t i = 0; i < X.casters.size(); ++i) {
+            if (X.casters[i].alpha_enable) ++alpha;
+            const float* w = X.casters[i].world;
+            if (w[12] == 0.0f && w[13] == 0.0f && w[14] == 0.0f) ++ident;
+        }
+        VKWP1_LOG("[VKSHADOW] frames=%llu casters=%llu avg=%.1f replayed=%llu none=%llu range=%.1f side=%.1f "
+                  "ground=%.1f strength=%.2f applied=%d ident=%u alpha=%u",
+            X.shFrames, X.shCasterTotal,
+            (double)X.shCasterTotal / (double)(X.shFrames ? X.shFrames : 1ull),
+            X.shReplayDraws, X.shNoCasterFrames, (double)range, (double)mapWorld,
+            (double)X.shGroundZ, (double)shadow_strength(), applied ? 1 : 0, ident, alpha);
+    }
+    X.casters.clear();
+    X.shHaveVP = 0;
+    vk_queue_unlock();
+    return applied;
 }
 
 // ===========================================================================
@@ -2377,6 +4467,10 @@ bool VKDraw_Begin_Frame()
     X.slot = slot;
     const unsigned long long flabel = X.st.framesBegun + 1ull;
     s_frameDraws = 0;
+    // A frame that never reaches VKDraw_Shadow_Apply (menu, loading screen) must not carry the previous
+    // frame's casters into the next one.
+    X.casters.clear();
+    X.shHaveVP = 0;
     g_vkStepFrame.store(flabel);
     VkFence f = core_()->SlotFence(slot);
     VKSTEP(1);
@@ -2409,10 +4503,12 @@ bool VKDraw_Begin_Frame()
         // pools are per-slot.
         VKSTEP(3);
         if (X.pool[slot]) G.vkResetDescriptorPool(dev_(), X.pool[slot], 0);
+        if (X.shCastPool[slot]) G.vkResetDescriptorPool(dev_(), X.shCastPool[slot], 0);
         VKTRACE("frame %llu: pool reset", flabel);
         VKSTEP(4);
         X.sets[slot].clear();
         X.setIdx[slot].clear();   // R-05: the bucket indexes name the entries that just went away
+        X.shCastSets[slot].clear();
         V11_MARK(v11Pool);
         // One more frame boundary retired, so the backings that were dropped while it was in flight are
         // now old enough that no submitted command buffer can still name them.
@@ -2446,6 +4542,41 @@ bool VKDraw_Begin_Frame()
             X.resizePending = 0;   // re-evaluated by this frame's acquire and present
             ++X.st.framesBegun;
             l10_frame_begin(slot);
+            // GeneralsX @debug Qoder 20/10/2026 three-way A/B: 0 = retail decal/stencil only, 1 = native
+            // only, 2 = both. Decided here so DoShadows() and the native receiver see the same value.
+            static const bool abOn = [] {
+                const char* e = getenv("GENERALSX_VKSHADOW_AB");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            static const unsigned long long abPeriod = [] {
+                const char* a = getenv("GENERALSX_VKSHADOW_ALT");
+                const int v = a ? atoi(a) : 0;
+                return (unsigned long long)(v > 0 ? v : 10);
+            }();
+            X.abOn = abOn;
+            if (abOn) {
+                static const char* const abNames[3] = { "retail-only", "native-only", "both" };
+                static unsigned long long s_abSeg = ~0ull;
+                const unsigned long long abSeg = X.st.framesBegun / abPeriod;
+                const unsigned mode = (unsigned)(abSeg % 3ull);
+                X.abMode = mode;
+                if (abSeg != s_abSeg) {
+                    s_abSeg = abSeg;
+                    fprintf(stderr, "[VKSHADOW] ab segment=%llu frame=%llu mode=%u (%s)\n",
+                        abSeg, X.st.framesBegun, mode, abNames[mode]);
+                    fflush(stderr);
+                }
+                DX8Wrapper::VK_Set_Retail_Shadow_Off(mode == 1u);
+            } else {
+                // Non-A/B runs follow the options row: native on mutes the retail sun shadows, off restores
+                // them. GENERALSX_VKSHADOW=0 also keeps retail alive when QA force-disables the native pass.
+                static const bool qaOff = [] {
+                    const char* e = getenv("GENERALSX_VKSHADOW");
+                    return e != nullptr && atoi(e) == 0;
+                }();
+                const bool nativeOn = DX8Wrapper::VK_Real_Shadow_Enabled() && !qaOff;
+                DX8Wrapper::VK_Set_Retail_Shadow_Off(nativeOn);
+            }
 
             // Every frame starts on the scene target, whatever render target the last one ended on, and
             // the mirrors are standing up here so the end-of-frame blit always has a source.
@@ -2474,10 +4605,30 @@ bool VKDraw_Begin_Frame()
             }
             // The clear the engine asked for before this frame existed belongs to this frame: apply it now,
             // while the scene target is standing and nothing has been drawn into it yet.
-            else if (X.pendingClear) {
-                X.pendingClear = 0;
-                vkdraw_clear_locked(X.pendingClearColor, X.pendingClearZStencil, X.pendingColor,
-                                    X.pendingZ, X.pendingStencil, nullptr);
+            else {
+                static const bool dbgClear = getenv("GENERALSX_VK_FORCECLEAR") != nullptr;
+                if (X.pendingClear) {
+                    X.pendingClear = 0;
+                    vkdraw_clear_locked(X.pendingClearColor, X.pendingClearZStencil, X.pendingColor,
+                                        X.pendingZ, X.pendingStencil, nullptr);
+                    if (dbgClear && flabel < 400ull) {
+                        fprintf(stderr, "[VKCLEAR] f=%llu pending c=%d zs=%d z=%.2f target=%ux%u\n",
+                            flabel, X.pendingClearColor, X.pendingClearZStencil, (double)X.pendingZ, X.w, X.h);
+                        fflush(stderr);
+                    }
+                }
+                // GeneralsX @bugfix Qoder 23/10/2026 fullscreen forensics: re-clear both attachments after
+                // the target has been made current. A frame whose engine clear raced a target resize can
+                // begin with an undefined depth image, and every 3D fragment then fails DEPTH_LEQUAL while
+                // the unlit UI still draws - the exact "battlefield black, GUI lit" signature.
+                if (dbgClear) {
+                    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    vkdraw_clear_locked(1, 1, black, 1.0f, 0, nullptr);
+                    if (flabel < 400ull) {
+                        fprintf(stderr, "[VKCLEAR] f=%llu forced c+z target=%ux%u\n", flabel, X.w, X.h);
+                        fflush(stderr);
+                    }
+                }
             }
             V11_MARK(v11Clear);
             VKTRACE("frame %llu: scene ok", flabel);
@@ -2532,16 +4683,44 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
     if (!open_pass()) { vk_queue_unlock(); ++X.st.drawsSkipped; return false; }
 
     VKDraw_Submit mut = *s;
-    mut.key.rt_format = 0; mut.key.depth_format = 0;
+    mut.key.rt_format = 0; mut.key.depth_format = 0;    // Terrain attribution: tag 118 is emitted by the heightmap pass, but the visible ground may be a
+    // different target. Name the target/viewport for the first few terrain submits so a color test that
+    // never appears can be attributed to "drawn offscreen" instead of "shader ignored".
+    if (mut.key.ps_tag >= 110u && mut.key.ps_tag <= 118u) {
+        static int s_terrainTargetLog = 0;
+        if (s_terrainTargetLog < 10) {
+            ++s_terrainTargetLog;
+            fprintf(stderr, "[TERRTGT] tag=%u color=%p scene=%p depth=%p vp=%d,%d %dx%d target=%ux%u\n",
+                mut.key.ps_tag, X.colorKey, X.sceneColorKey, X.depthKey,
+                (int)mut.viewport[0], (int)mut.viewport[1], (int)mut.viewport[2], (int)mut.viewport[3], X.w, X.h);
+            fflush(stderr);
+        }
+    }
+
     VKRT_Info ci;
     if (!VKRT_Query(X.colorKey, &ci)) { vk_queue_unlock(); ++X.st.drawsSkipped; return false; }
     mut.key.rt_format = ci.format;
     if (X.depthKey) { VKRT_Info di; if (VKRT_Query(X.depthKey, &di)) mut.key.depth_format = di.format; }
 
-    if (X.w != mut.viewport[2] || X.h != mut.viewport[3]) {
-        // A viewport that does not match the target is legal in D3D (partial clears, shadow passes);
-        // clamp to the target so scissor and viewport stay inside the framebuffer.
-        mut.viewport[2] = X.w; mut.viewport[3] = X.h;
+    // GeneralsX @bugfix Qoder 20/10/2026: a viewport smaller than the target is legal in D3D and in
+    // Vulkan, and the in-game tactical view relies on it - the camera viewport is the display minus
+    // the control bar (0,0 2560x1152 inside a 2560x1440 target). Forcing such a viewport to the full
+    // target stretched the 3D world vertically while the CPU-side pick ray and health bars still
+    // mapped pixels over the 1152-high view, so clicks had to land above the rendered unit and bars
+    // floated above it. Only trim what overflows the target, which is the case a stale full-screen
+    // viewport left behind by a shadow or offscreen pass actually needs.
+    if (mut.viewport[0] >= X.w) mut.viewport[0] = 0;
+    if (mut.viewport[1] >= X.h) mut.viewport[1] = 0;
+    if (mut.viewport[2] > X.w - mut.viewport[0]) mut.viewport[2] = X.w - mut.viewport[0];
+    if (mut.viewport[3] > X.h - mut.viewport[1]) mut.viewport[3] = X.h - mut.viewport[1];
+
+    // GeneralsX @feature Qoder 20/10/2026 Forward+: build the tile block once per frame at the first
+    // draw into the scene target. That submit is the point where the game has already published this
+    // frame's point lights (RTS3DScene::doRender) and the camera transforms are the ones the scene
+    // draws with. The block lives in this slot's 64 KiB slice, which the slot fence has made free.
+    if (X.fpBuf && X.fpBuiltFrame != core_()->FrameIndex()
+        && X.colorKey == (void*)X.sceneColorKey && X.depthKey == (void*)X.sceneDepthKey) {
+        fp_build_block(core_()->FrameSlot(), mut.viewport, X.w, X.h);
     }
 
     VkPipeline pso = pso_for(&mut);
@@ -2555,6 +4734,29 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
                     { mut.scissor[2] > mut.scissor[0] ? mut.scissor[2] - mut.scissor[0] : X.w,
                       mut.scissor[3] > mut.scissor[1] ? mut.scissor[3] - mut.scissor[1] : X.h } };
     G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+
+    // GeneralsX @bugfix Qoder 23/10/2026 fullscreen forensics: one line per frame for the first draw into
+    // the scene target. Viewport/scissor/depth/mask decide whether a batch can reach a pixel at all, and
+    // the fullscreen-only black battlefield needs that answer separated from "geometry was never submitted".
+    {
+        static const bool s_subDbg = getenv("GENERALSX_VK_FORCECLEAR") != nullptr;
+        static unsigned long long s_subDbgFrame = ~0ull;
+        if (s_subDbg && s_subDbgFrame != X.st.framesBegun
+            && X.colorKey == (void*)X.sceneColorKey && X.depthKey == (void*)X.sceneDepthKey) {
+            s_subDbgFrame = X.st.framesBegun;
+            if (X.st.framesBegun < 400ull) {
+                fprintf(stderr,
+                    "[VKSUB] f=%llu tag=%u/%u fvf=%08X vp=%d,%d %dx%d sc=%d,%d %dx%d target=%ux%u "
+                    "mask=%u z=%u/%u/%u blend=%u lt=%u\n",
+                    X.st.framesBegun, mut.key.vs_tag, mut.key.ps_tag, mut.key.fvf,
+                    (int)mut.viewport[0], (int)mut.viewport[1], (int)mut.viewport[2], (int)mut.viewport[3],
+                    sc.offset.x, sc.offset.y, (int)sc.extent.width, (int)sc.extent.height, X.w, X.h,
+                    mut.key.write_mask, mut.key.depth_test, mut.key.depth_write, mut.key.depth_cmp,
+                    mut.key.blend_enable, DX8Wrapper::VK_Read_RS(D3DRS_LIGHTING));
+                fflush(stderr);
+            }
+        }
+    }
 
     // LINELOOP has no Vulkan topology and no index-expansion path here. D3D9 has no LINELOOP either
     // (d3d9types.h ends the enum at the fan), so this branch is a guard against a caller inventing one;
@@ -2750,6 +4952,43 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
         }
     }
 
+    // GeneralsX @feature Qoder 20/10/2026 native sun shadow: keep every opaque world-space batch that is
+    // drawn into the scene, so the sun pass can replay it from the light. Batches for other targets
+    // (shadow maps, offscreen RTTs) are not part of this view. The camera matrices are only taken from
+    // world-space batches: the UI that follows the 3D views is RHW and would replace them with identity.
+    if (mut.ff && X.colorKey == (void*)X.sceneColorKey && X.depthKey == (void*)X.sceneDepthKey) {
+        if (!(mut.ff->flags[0] & VKFF_FLAG_RHW)) {
+            if (vkdraw_no_camera(mut.ff->view, mut.ff->proj)) {
+                // Grass/smudge/point batches draw camera-space vertices with an identity view; adopting
+                // them as the scene camera made the receiver unproject into view space (all shadows
+                // dropped while such an effect was last). Name the offender once under the trace env.
+                static unsigned s_identSeen[32];
+                static unsigned s_identN = 0u;
+                const unsigned key = (mut.key.vs_tag << 8) | mut.key.ps_tag;
+                bool seen = false;
+                for (unsigned i = 0; i < s_identN; ++i) if (s_identSeen[i] == key) { seen = true; break; }
+                if (!seen && s_identN < 32u && shadow_trace_on()) {
+                    s_identSeen[s_identN++] = key;
+                    const float* w = mut.ff->world;
+                    fprintf(stderr, "[VKSHADOW] non-camera batch: vs=%u ps=%u fvf=%08X topo=%u world=(%.1f %.1f %.1f)\n",
+                        mut.key.vs_tag, mut.key.ps_tag, mut.key.fvf, mut.key.topology,
+                        (double)w[12], (double)w[13], (double)w[14]);
+                    fflush(stderr);
+                }
+            } else {
+                memcpy(X.shView, mut.ff->view, sizeof(X.shView));
+                memcpy(X.shProj, mut.ff->proj, sizeof(X.shProj));
+                // Same batch, same viewport: this is the rect the camera's depth was rasterized into.
+                X.shViewport[0] = (float)mut.viewport[0];
+                X.shViewport[1] = (float)mut.viewport[1];
+                X.shViewport[2] = (float)mut.viewport[2];
+                X.shViewport[3] = (float)mut.viewport[3];
+                X.shHaveVP = 1;
+            }
+        }
+        shadow_record_caster(mut);
+    }
+
     // Triangle fans are the one primitive D3D9 has and Vulkan does not. The fan's own indices are read
     // back out of its host-visible backing (the lock wrote them, they are still there) and expanded into
     // (0,1,2), (0,2,3), ... in the fan scratch ring, which is why this case binds a different buffer.
@@ -2858,7 +5097,13 @@ bool VK_Draw_User_Primitive_State(unsigned primitive_type, const void* vertex_da
                                     : vk_index_count_for(primitive_type, polygon_count);
     const unsigned long long bytes    = (unsigned long long)vertex_count * stride;
     const unsigned long long idxBytes = (unsigned long long)genCount * 2ull;
-    if (bytes + idxBytes > VKDrawState::SCRATCH_CAP) {
+    // GeneralsX @bugfix Qoder 20/10/2026 BUG-05: the ring advances by the 256-aligned size of each half but
+    // used to wrap-test against the unaligned sum, so a batch that only fitted after padding wrote its
+    // indices at upCur == SCRATCH_CAP - i.e. memcpy past the end of the host mapping (memory corruption,
+    // which the submit-side range guard then refused as bounds=1 but had already performed).
+    const unsigned long long vtxPad = (bytes    + 255ull) & ~255ull;
+    const unsigned long long idxPad = (idxBytes + 255ull) & ~255ull;
+    if (vtxPad + idxPad > VKDrawState::SCRATCH_CAP) {
         ++X.st.drawsSkipped;
         if (X.streamWarns < 4) {
             ++X.streamWarns;
@@ -2869,10 +5114,10 @@ bool VK_Draw_User_Primitive_State(unsigned primitive_type, const void* vertex_da
     }
 
     vk_queue_lock();
-    if (X.upCur + bytes + idxBytes > VKDrawState::SCRATCH_CAP) { X.upCur = 0; ++X.st.ringRotations; }
+    if (X.upCur + vtxPad + idxPad > VKDrawState::SCRATCH_CAP) { X.upCur = 0; ++X.st.ringRotations; }
     const unsigned long long vtxOff = X.upCur;
     memcpy((char*)X.upMap + vtxOff, vertex_data, (size_t)bytes);
-    X.upCur += (bytes + 255ull) & ~255ull;
+    X.upCur += vtxPad;
     const unsigned long long idxOff = X.upCur;
     unsigned short* dst = (unsigned short*)((char*)X.upMap + X.upCur);
     for (unsigned i = 0; i < genCount; ++i) {
@@ -2883,7 +5128,7 @@ bool VK_Draw_User_Primitive_State(unsigned primitive_type, const void* vertex_da
             dst[i] = (unsigned short)i;
         }
     }
-    X.upCur += (idxBytes + 255ull) & ~255ull;
+    X.upCur += idxPad;
     vk_queue_unlock();
 
     VKDraw_Submit s = *state;
@@ -2939,7 +5184,14 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
     const unsigned genCount = isFan ? polygon_count * 3u : vk_index_count_for(primitive_type, polygon_count);
     const unsigned long long bytes    = (unsigned long long)vertex_count * stride;
     const unsigned long long idxBytes = (unsigned long long)genCount * 2ull;
-    if (bytes + idxBytes > VKDrawState::SCRATCH_CAP) {
+    // GeneralsX @bugfix Qoder 20/10/2026 BUG-05: same padding-blind wrap test as the non-indexed path -
+    // the 24 "wedge5 draw refused (1) fvf=00000104 ... off=8388608 cap=8388608" lines of the R-06 sessions
+    // are the sun-shadow occluder sink (stride 24 = sizeof(RHWV)) landing its index half at upCur == cap,
+    // which is a memcpy past the end of the 8 MiB host mapping. The guard refused the batch but the write
+    // had already happened at staging time.
+    const unsigned long long vtxPad = (bytes    + 255ull) & ~255ull;
+    const unsigned long long idxPad = (idxBytes + 255ull) & ~255ull;
+    if (vtxPad + idxPad > VKDrawState::SCRATCH_CAP) {
         ++X.st.drawsSkipped;
         if (X.streamWarns < 4) {
             ++X.streamWarns;
@@ -2950,10 +5202,10 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
     }
 
     vk_queue_lock();
-    if (X.upCur + bytes + idxBytes > VKDrawState::SCRATCH_CAP) { X.upCur = 0; ++X.st.ringRotations; }
+    if (X.upCur + vtxPad + idxPad > VKDrawState::SCRATCH_CAP) { X.upCur = 0; ++X.st.ringRotations; }
     const unsigned long long vtxOff = X.upCur;
     memcpy((char*)X.upMap + vtxOff, (const char*)vertex_data + (size_t)base_vertex * stride, (size_t)bytes);
-    X.upCur += (bytes + 255ull) & ~255ull;
+    X.upCur += vtxPad;
     const unsigned long long idxOff = X.upCur;
     unsigned short* dst = (unsigned short*)((char*)X.upMap + X.upCur);
     const unsigned short* src = (const unsigned short*)index_data;
@@ -2966,7 +5218,7 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
     } else {
         memcpy(dst, src, (size_t)genCount * 2u);
     }
-    X.upCur += (idxBytes + 255ull) & ~255ull;
+    X.upCur += idxPad;
     vk_queue_unlock();
 
     VKDraw_Submit s = *state;
@@ -2988,10 +5240,373 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
 }
 
 // ===========================================================================
+// present-side post pass: FXAA + bloom (VkPost)
+// ===========================================================================
+// GeneralsX @feature Qoder 20/10/2026: in the pure-Vulkan wedge the picture is presented by the blit in
+// End_Frame, so the two effects the player asked for live here rather than in the WW3D post chain: every
+// attachment is 1-sample (no MSAA anywhere), and the retail bloom chain is skipped because its RTT probe
+// needs GetRenderTarget, which the D3D9 stub answers with null. Both are present-side effects, so one
+// full-screen draw reads the scene mirror once and writes the swapchain image, replacing the blit.
+//
+// The pass renders directly into a render pass whose single attachment is the swapchain image (CLEAR,
+// UNDEFINED -> PRESENT_SRC), so the acquire needs no barrier of its own and the present engine gets the
+// layout it expects. Knobs come from DX8Wrapper::VK_Post_* (pushed by W3DDisplay), and both at zero is
+// the plain blit exactly as it was: off is a real state, not a slower equivalent.
+namespace {
+
+struct VKPostState {
+    bool envChecked = false, envOn = true;
+    bool built = false, failed = false;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent = {};
+    VkRenderPass rp = nullptr;
+    std::vector<VkFramebuffer> fbs;
+    std::vector<VkImageView> fbViews;
+    VkDescriptorSetLayout dsl = nullptr;
+    VkPipelineLayout pl = nullptr;
+    VkPipeline pipe = nullptr;
+    VkShaderModule vs = nullptr, fs = nullptr;
+    VkSampler sampler = nullptr;
+    VkDescriptorPool pool = nullptr;
+    VkDescriptorSet sets[VKGEO_SLOT_COUNT] = {};
+    unsigned long long frames = 0, fallbacks = 0;
+};
+VKPostState P;
+
+bool vkpost_env_on()
+{
+    if (!P.envChecked) {
+        P.envChecked = true;
+        char v[8] = {};
+        P.envOn = !(GetEnvironmentVariableA("GENERALSX_VKPOST", v, (DWORD)sizeof(v)) && v[0] == '0');
+    }
+    return P.envOn;
+}
+
+// AO strength / grading toggle: env-gated, so both can be A/B-ed without a rebuild. They also keep the
+// post pass alive on their own - without this a player with bloom and AA off would never see them.
+float vkpost_ao_strength()
+{
+    static float s = -1.0f;
+    if (s < 0.0f) {
+        s = 0.55f;
+        if (const char* a = getenv("GENERALSX_VK_AO")) s = (float)atof(a);
+        if (s < 0.0f) s = 0.0f;
+        if (s > 1.5f) s = 1.5f;
+    }
+    return s;
+}
+
+bool vkpost_grade_on()
+{
+    static int s = -1;
+    if (s < 0) {
+        s = 1;
+        if (const char* g = getenv("GENERALSX_VK_GRADE")) s = (atof(g) > 0.0) ? 1 : 0;
+    }
+    return s != 0;
+}
+
+void vkpost_destroy()
+{
+    VkDevice dev = dev_();
+    if (!dev) return;
+    for (size_t i = 0; i < P.fbs.size(); ++i)
+        if (P.fbs[i]) G.vkDestroyFramebuffer(dev, P.fbs[i], nullptr);
+    P.fbs.clear(); P.fbViews.clear();
+    if (P.pipe) G.vkDestroyPipeline(dev, P.pipe, nullptr);
+    if (P.pl) G.vkDestroyPipelineLayout(dev, P.pl, nullptr);
+    if (P.dsl) G.vkDestroyDescriptorSetLayout(dev, P.dsl, nullptr);
+    if (P.rp) G.vkDestroyRenderPass(dev, P.rp, nullptr);
+    if (P.sampler) G.vkDestroySampler(dev, P.sampler, nullptr);
+    if (P.pool) G.vkDestroyDescriptorPool(dev, P.pool, nullptr);
+    if (P.vs) G.vkDestroyShaderModule(dev, P.vs, nullptr);
+    if (P.fs) G.vkDestroyShaderModule(dev, P.fs, nullptr);
+    P.pipe = nullptr; P.pl = nullptr; P.dsl = nullptr; P.rp = nullptr;
+    P.sampler = nullptr; P.pool = nullptr; P.vs = nullptr; P.fs = nullptr;
+    memset(P.sets, 0, sizeof(P.sets));
+    P.built = false;
+}
+
+bool vkpost_build(VkFormat fmt, VkExtent2D e, unsigned count)
+{
+    VkDevice dev = dev_();
+    if (!dev || !count || !e.width || !e.height) return false;
+
+    // One colour attachment, cleared to opaque black on load - that is what paints the letterbox bars
+    // around the pillarbox rect, exactly like the explicit vkCmdClearColorImage on the blit path.
+    VkAttachmentDescription att = {};
+    att.format = fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ref = {};
+    ref.attachment = 0; ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkSubpassDescription sp = {};
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount = 1; sp.pColorAttachments = &ref;
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    rpci.attachmentCount = 1; rpci.pAttachments = &att;
+    rpci.subpassCount = 1; rpci.pSubpasses = &sp;
+    rpci.dependencyCount = 1; rpci.pDependencies = &dep;
+    if (!chk("vkCreateRenderPass(vkpost)", G.vkCreateRenderPass(dev, &rpci, nullptr, &P.rp))) return false;
+
+    P.fbs.resize(count, nullptr);
+    P.fbViews.resize(count, nullptr);
+    for (unsigned i = 0; i < count; ++i) {
+        VkImageView view = core_()->SwapView(i);
+        if (!view) return false;
+        VkFramebufferCreateInfo fci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        fci.renderPass = P.rp;
+        fci.attachmentCount = 1; fci.pAttachments = &view;
+        fci.width = e.width; fci.height = e.height; fci.layers = 1;
+        if (!chk("vkCreateFramebuffer(vkpost)", G.vkCreateFramebuffer(dev, &fci, nullptr, &P.fbs[i]))) return false;
+        P.fbViews[i] = view;
+    }
+
+    VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smci.codeSize = sizeof(VKPOST_VERT_SPV); smci.pCode = VKPOST_VERT_SPV;
+    if (!chk("vkCreateShaderModule(vkpost vert)", G.vkCreateShaderModule(dev, &smci, nullptr, &P.vs))) return false;
+    smci.codeSize = sizeof(VKPOST_FRAG_SPV); smci.pCode = VKPOST_FRAG_SPV;
+    if (!chk("vkCreateShaderModule(vkpost frag)", G.vkCreateShaderModule(dev, &smci, nullptr, &P.fs))) return false;
+
+    // GeneralsX @feature Qoder 22/10/2026: binding 1 is the scene depth for the contact AO.
+    VkDescriptorSetLayoutBinding binding[2] = {};
+    binding[0].binding = 0;
+    binding[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding[0].descriptorCount = 1;
+    binding[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binding[1].binding = 1;
+    binding[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding[1].descriptorCount = 1;
+    binding[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dlci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dlci.bindingCount = 2; dlci.pBindings = binding;
+    if (!chk("vkCreateDescriptorSetLayout(vkpost)", G.vkCreateDescriptorSetLayout(dev, &dlci, nullptr, &P.dsl)))
+        return false;
+
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128u };   // p0..p2 + inverse projection + debug
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount = 1; plci.pSetLayouts = &P.dsl;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (!chk("vkCreatePipelineLayout(vkpost)", G.vkCreatePipelineLayout(dev, &plci, nullptr, &P.pl))) return false;
+
+    VkDescriptorPoolSize psz = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (uint32_t)VKGEO_SLOT_COUNT * 2u };
+    VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpci.maxSets = (uint32_t)VKGEO_SLOT_COUNT;
+    dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz;
+    if (!chk("vkCreateDescriptorPool(vkpost)", G.vkCreateDescriptorPool(dev, &dpci, nullptr, &P.pool))) return false;
+
+    VkDescriptorSetLayout layouts[VKGEO_SLOT_COUNT] = {};
+    for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) layouts[i] = P.dsl;
+    VkDescriptorSetAllocateInfo dsai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dsai.descriptorPool = P.pool;
+    dsai.descriptorSetCount = (uint32_t)VKGEO_SLOT_COUNT;
+    dsai.pSetLayouts = layouts;
+    if (!chk("vkAllocateDescriptorSets(vkpost)", G.vkAllocateDescriptorSets(dev, &dsai, P.sets))) return false;
+
+    // Clamp at the edges: FXAA and the bloom ring sample outside [0,1] near the border, and wrapping would
+    // pull the opposite edge into the picture. Linear is what the off-screen blit used when it had to
+    // scale; at a 1:1 dst rect the sample lands on texel centres and returns the same bytes.
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = VK_FILTER_LINEAR; sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.0f;
+    if (!chk("vkCreateSampler(vkpost)", G.vkCreateSampler(dev, &sci, nullptr, &P.sampler))) return false;
+
+    VkPipelineShaderStageCreateInfo stg[2] = {};
+    stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stg[0].module = P.vs; stg[0].pName = "main";
+    stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stg[1].module = P.fs; stg[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = VK_FALSE;
+    cba.colorWriteMask = (VkColorComponentFlags)(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stg;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = P.pl; gpi.renderPass = P.rp; gpi.subpass = 0;
+    if (!chk("vkCreateGraphicsPipelines(vkpost)", G.vkCreateGraphicsPipelines(dev, nullptr, 1, &gpi, nullptr, &P.pipe)))
+        return false;
+
+    P.format = fmt; P.extent = e;
+    return true;
+}
+
+// The swapchain changes shape on a resize that already waited the device idle, and its views are recreated
+// with it, so any difference means the cached framebuffers belong to dead images and the whole pass is
+// rebuilt - the same lifetime rule the draw layer's passes use.
+bool vkpost_ensure(VkFormat fmt, VkExtent2D e)
+{
+    if (P.failed) return false;
+    const unsigned count = core_()->SwapImageCount();
+    if (!count) return false;   // no swapchain images yet: not a failure, just nothing to build against
+    bool same = P.built && P.format == fmt && P.extent.width == e.width && P.extent.height == e.height
+             && P.fbs.size() == (size_t)count;
+    if (same) {
+        for (unsigned i = 0; i < count; ++i)
+            if (P.fbViews[i] != core_()->SwapView(i)) { same = false; break; }
+    }
+    if (same) return true;
+
+    vkpost_destroy();
+    if (!vkpost_build(fmt, e, count)) {
+        P.failed = true;
+        vkpost_destroy();
+        VKWP1_LOG("[VKPOST] off: pass creation failed - present keeps the plain blit");
+        return false;
+    }
+    P.built = true;
+    VKWP1_LOG("[VKPOST] ready: %ux%u scene -> %ux%u swapchain, fxaa=%u bloom=%.2f",
+        X.sceneW, X.sceneH, e.width, e.height,
+        DX8Wrapper::VK_Post_AA() ? 1u : 0u, (double)DX8Wrapper::VK_Post_Bloom());
+    return true;
+}
+
+bool vkpost_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigned sceneH,
+                   uint32_t imageIndex, unsigned dx, unsigned dy, unsigned dw, unsigned dh)
+{
+    if (!P.built || imageIndex >= P.fbs.size() || !P.fbs[imageIndex]) return false;
+    if (!sceneView || !sceneW || !sceneH || !dw || !dh) return false;
+
+    VkDescriptorImageInfo dii = {};
+    dii.sampler = P.sampler;
+    dii.imageView = (VkImageView)sceneView;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr[2] = {};
+    wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[0].dstSet = P.sets[X.slot];
+    wr[0].dstBinding = 0;
+    wr[0].descriptorCount = 1;
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[0].pImageInfo = &dii;
+    // The depth binding must always be written; without a scene-depth mirror the scene view stands in
+    // and the AO strength is zeroed below, so the shader never samples it.
+    VkDescriptorImageInfo dai = {};
+    dai.sampler = P.sampler;
+    dai.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    dai.imageView = (VkImageView)sceneView;
+    VKRT_Info dInfo = {};
+    if (X.depthKey != nullptr && VKRT_Query(X.depthKey, &dInfo) && dInfo.is_depth && dInfo.sample_view) {
+        VKRT_Cmd_Transition(X.cmd, X.depthKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+        dai.imageView = (VkImageView)dInfo.sample_view;
+    }
+    wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[1].dstSet = P.sets[X.slot];
+    wr[1].dstBinding = 1;
+    wr[1].descriptorCount = 1;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[1].pImageInfo = &dai;
+    G.vkUpdateDescriptorSets(dev_(), 2, wr, 0, nullptr);
+    {
+        static int s_postProbe = 0;
+        if (s_postProbe < 3) {
+            ++s_postProbe;
+            fprintf(stderr, "[VKPOST] depth bind: key=%p query=%d isDepth=%d sampleView=%p (scene %ux%u)\n",
+                X.depthKey, dInfo.view ? 1 : 0, dInfo.is_depth,
+                dInfo.sample_view, sceneW, sceneH);
+            fflush(stderr);
+        }
+    }
+
+    VkClearValue clr = {};
+    clr.color.float32[3] = 1.0f;
+    VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rbi.renderPass = P.rp;
+    rbi.framebuffer = P.fbs[imageIndex];
+    rbi.renderArea = { { 0, 0 }, { P.extent.width, P.extent.height } };
+    rbi.clearValueCount = 1; rbi.pClearValues = &clr;
+    G.vkCmdBeginRenderPass(X.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport vp = { (float)dx, (float)dy, (float)dw, (float)dh, 0.0f, 1.0f };
+    G.vkCmdSetViewport(X.cmd, 0, 1, &vp);
+    VkRect2D sc = { { (int32_t)dx, (int32_t)dy }, { dw, dh } };
+    G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+    G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pipe);
+    G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl, 0, 1, &P.sets[X.slot], 0, nullptr);
+
+    // p0 = (bloom gain, 1/sceneW, 1/sceneH, fxaa on); p1 = (threshold, radius in scene texels, knee, unused).
+    // The gain is the Options.ini BloomIntensity (0..1), so the slider keeps its retail meaning; the
+    // threshold sits above mid-grey so only genuinely bright pixels halo.
+    // AO / grading knobs: env-gated so both can be A/B-ed without a rebuild.
+    const float aoStrength = vkpost_ao_strength();
+    const float gradeOn = vkpost_grade_on() ? 1.0f : 0.0f;
+    // No scene-depth mirror means no AO; the dummy binding above would read as colour.
+    const bool haveAoDepth = dInfo.is_depth && dInfo.sample_view;
+    Matrix4x4 projM;
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, projM);
+    const Matrix4x4 invProjM = projM.Inverse();
+    const float aoScale = fabsf(projM[1].Y) * 0.5f * (float)sceneH;
+    float aoDebug = 0.0f;
+    if (const char* dbg = getenv("GENERALSX_VK_AO_DEBUG")) aoDebug = (atof(dbg) > 0.0) ? 1.0f : 0.0f;
+    float pc[32] = {
+        DX8Wrapper::VK_Post_Bloom(),
+        sceneW ? 1.0f / (float)sceneW : 0.0f,
+        sceneH ? 1.0f / (float)sceneH : 0.0f,
+        DX8Wrapper::VK_Post_AA() ? 1.0f : 0.0f,
+        0.62f, 10.0f, 0.18f, haveAoDepth ? aoStrength : 0.0f,
+        gradeOn, aoScale, 1.06f, 1.03f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        aoDebug, 0.0f, 0.0f, 0.0f
+    };
+    for (int r = 0; r < 4; ++r) {
+        pc[12 + r * 4 + 0] = invProjM[r].X;
+        pc[12 + r * 4 + 1] = invProjM[r].Y;
+        pc[12 + r * 4 + 2] = invProjM[r].Z;
+        pc[12 + r * 4 + 3] = invProjM[r].W;
+    }
+    G.vkCmdPushConstants(X.cmd, P.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, (uint32_t)sizeof(pc), pc);
+    G.vkCmdDraw(X.cmd, 3, 1, 0, 0);
+    G.vkCmdEndRenderPass(X.cmd);
+    return true;
+}
+
+} // anon
+
+// ===========================================================================
 // public: end frame, present, stats
 // ===========================================================================
 void VKDraw_End_Frame()
 {
+    VK_Forward_End_Frame();
     if (!X.frameOpen || !X.cmd) return;
     VKDraw_UsScope scUs(s_vkdrawEndUs);
     // GeneralsX @feature Qoder 19/10/2026 R-02 support: the isolated single-frame pure-white VKLUMA
@@ -3009,12 +5624,12 @@ void VKDraw_End_Frame()
     close_pass();
     VKTRACE("frame %llu: end pass closed", X.st.framesBegun);
 
-    // The scene colour mirror is what the player sees: it leaves the pass in SHADER_READ_ONLY and a blit
-    // source has to be TRANSFER_SRC, which is an explicit barrier this layer owns. Begin_Frame guarantees
-    // the mirror exists, so a missing one here means the mirror layer was torn down underneath us.
+    // The scene colour mirror is what the player sees. It leaves the pass in SHADER_READ_ONLY, and which
+    // layout it needs next depends on the path below: the post pass samples it as a texture, the blit and
+    // the forensic copies read it as TRANSFER_SRC. Begin_Frame guarantees the mirror exists, so a missing
+    // one here means the mirror layer was torn down underneath us.
     VKRT_Info scene = {};
     const bool haveScene = VKRT_Query(X.sceneColorKey, &scene) && scene.image;
-    if (haveScene) VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_TRANSFER_SRC);
 
     if (haveScene) {
         uint32_t img = 0;
@@ -3037,26 +5652,6 @@ void VKDraw_End_Frame()
             const VkImage dst = core_()->SwapImage(img);
             const VkExtent2D e = core_()->Extent();
 
-            // The swapchain image's layout is not tracked by the render-target state machine (it is not a
-            // mirror), so these two barriers are recorded against the layouts the present chain itself owns.
-            VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.image = dst;
-            toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &toDst);
-
-            // Black first, always: UNDEFINED on entry means the area the blit does not cover would otherwise
-            // show whatever the previous swapchain image held, and the letterbox bars are exactly that area.
-            VkClearColorValue black = {};
-            black.float32[3] = 1.0f;
-            VkImageSubresourceRange whole = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            G.vkCmdClearColorImage(X.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1u, &whole);
-
             // Destination is the pillarbox fit rect when the facade published one, clamped into the image;
             // no rect means the picture fills the window, which is the common case.
             unsigned dx = X.rectW ? X.rectX : 0u;
@@ -3066,40 +5661,104 @@ void VKDraw_End_Frame()
             if (dx + dw > e.width)  dw = e.width > dx ? e.width - dx : 1u;
             if (dy + dh > e.height) dh = e.height > dy ? e.height - dy : 1u;
 
-            VkImageBlit region = {};
-            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.srcOffsets[0] = { 0, 0, 0 };
-            region.srcOffsets[1] = { (int32_t)scene.width, (int32_t)scene.height, 1 };
-            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.dstOffsets[0] = { (int32_t)dx, (int32_t)dy, 1 };
-            region.dstOffsets[1] = { (int32_t)(dx + dw), (int32_t)(dy + dh), 1 };
-            // The D3D path picked POINT for a 1:1 copy and LINEAR when it had to scale, so the blit filter
-            // follows the same rule and a non-integer render resolution does not turn into a mosaic.
-            const bool exactSize = (dw == scene.width && dh == scene.height && dx == 0u && dy == 0u);
-            // vkCmd* entry points return void, so the blit is recorded unconditionally and counted; a failure
-            // here surfaces as the validation layer or the following submit rather than a VkResult.
-            VKSTEP(22);
-            G.vkCmdBlitImage(X.cmd, (VkImage)scene.image,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &region, exactSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
-            ++X.st.sceneCopies;
-            // The wedge-7 scene sampler rides the same read: the blit above left the scene image in
-            // TRANSFER_SRC_OPTIMAL, so a few copies out of it need no barrier of their own.
-            VKCore_Luma_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot);
-            VKCore_Shot_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot, X.st.framesBegun + 1ull);
-            VKTRACE("frame %llu: blit+luma recorded", X.st.framesBegun);
+            // GeneralsX @feature Qoder 20/10/2026 present-side post: when either knob is on, one full-screen
+            // draw samples the scene mirror and writes the swapchain image itself, replacing the copy below.
+            // Everything it needs already exists at this point, and any failure leaves the blit as the whole
+            // path - the fallback is the behaviour the game shipped with, not a degraded variant of it.
+            bool postDone = false;
+            const bool wantPost = vkpost_env_on()
+                && (DX8Wrapper::VK_Post_Bloom() > 0.0001f || DX8Wrapper::VK_Post_AA()
+                    || vkpost_ao_strength() > 0.0f || vkpost_grade_on());
+            if (wantPost && vkpost_ensure(core_()->SwapFormat(), e)) {
+                VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+                if (vkpost_render((VkImage)scene.image, scene.view, scene.width, scene.height,
+                                  img, dx, dy, dw, dh)) {
+                    postDone = true;
+                    ++P.frames;
+                    if (P.frames <= 3ull || (P.frames % 600ull) == 0ull) {
+                        VKWP1_LOG("[VKPOST] frame %llu: fxaa=%u bloom=%.2f scene=%ux%u dst=%u,%u %ux%u",
+                            X.st.framesBegun, DX8Wrapper::VK_Post_AA() ? 1u : 0u,
+                            (double)DX8Wrapper::VK_Post_Bloom(), scene.width, scene.height, dx, dy, dw, dh);
+                    }
+                    // Luma and the forensic shot are copies out of the scene and both name the source
+                    // layout themselves, so put the image back where those copies expect it.
+                    VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_TRANSFER_SRC);
+                    VKCore_Luma_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot);
+                    // GENERALSX_VKSHOT_POST=1 captures the post-processed swapchain image instead of the
+                    // scene mirror; the present-side effects are invisible to the scene shot.
+                    static const bool s_shotPost = (getenv("GENERALSX_VKSHOT_POST") != nullptr)
+                        && (atoi(getenv("GENERALSX_VKSHOT_POST")) != 0);
+                    if (s_shotPost)
+                        VKCore_Shot_RecordSwap(X.cmd, (void*)dst, e.width, e.height, X.slot, X.st.framesBegun + 1ull);
+                    else
+                        VKCore_Shot_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot, X.st.framesBegun + 1ull);
+                    VKTRACE("frame %llu: post+luma recorded", X.st.framesBegun);
+                } else {
+                    ++P.fallbacks;
+                    if (P.fallbacks <= 4ull)
+                        VKWP1_LOG("[VKPOST] frame %llu: render refused - blitting instead", X.st.framesBegun);
+                }
+            }
 
-            VkImageMemoryBarrier toPresent = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toPresent.dstAccessMask = 0;
-            toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toPresent.image = dst;
-            toPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+            if (!postDone) {
+                // The scene leaves the last pass in SHADER_READ_ONLY; a blit source has to be TRANSFER_SRC.
+                VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_TRANSFER_SRC);
+
+                // The swapchain image's layout is not tracked by the render-target state machine (it is not a
+                // mirror), so these two barriers are recorded against the layouts the present chain itself owns.
+                VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDst.image = dst;
+                toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+                // Black first, always: UNDEFINED on entry means the area the blit does not cover would otherwise
+                // show whatever the previous swapchain image held, and the letterbox bars are exactly that area.
+                VkClearColorValue black = {};
+                black.float32[3] = 1.0f;
+                VkImageSubresourceRange whole = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                G.vkCmdClearColorImage(X.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1u, &whole);
+
+                VkImageBlit region = {};
+                region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                region.srcOffsets[0] = { 0, 0, 0 };
+                region.srcOffsets[1] = { (int32_t)scene.width, (int32_t)scene.height, 1 };
+                region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                region.dstOffsets[0] = { (int32_t)dx, (int32_t)dy, 1 };
+                region.dstOffsets[1] = { (int32_t)(dx + dw), (int32_t)(dy + dh), 1 };
+                // The D3D path picked POINT for a 1:1 copy and LINEAR when it had to scale, so the blit filter
+                // follows the same rule and a non-integer render resolution does not turn into a mosaic.
+                const bool exactSize = (dw == scene.width && dh == scene.height && dx == 0u && dy == 0u);
+                // vkCmd* entry points return void, so the blit is recorded unconditionally and counted; a failure
+                // here surfaces as the validation layer or the following submit rather than a VkResult.
+                VKSTEP(22);
+                G.vkCmdBlitImage(X.cmd, (VkImage)scene.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &region, exactSize ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                ++X.st.sceneCopies;
+                // The wedge-7 scene sampler rides the same read: the blit above left the scene image in
+                // TRANSFER_SRC_OPTIMAL, so a few copies out of it need no barrier of their own.
+                VKCore_Luma_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot);
+                VKCore_Shot_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot, X.st.framesBegun + 1ull);
+                VKTRACE("frame %llu: blit+luma recorded", X.st.framesBegun);
+
+                VkImageMemoryBarrier toPresent = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toPresent.dstAccessMask = 0;
+                toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toPresent.image = dst;
+                toPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+            }
         } else {
             // No image acquired, so nothing to present and nothing to wait on: the command buffer still
             // gets submitted below so the slot's fence is signaled and the NEXT frame cannot deadlock on it.
@@ -3138,7 +5797,10 @@ bool VKDraw_Present()
     const uint32_t slot = X.slot;
     const VkCommandBuffer cmd = core_()->SlotCmd(slot);
     const VkFence f = core_()->SlotFence(slot);
-    const VkPipelineStageFlags waitAt = VK_PIPELINE_STAGE_TRANSFER_BIT;   // the blit is the wait's purpose
+    // The wait covers both present paths: the blit writes in the transfer stage, the post pass writes in
+    // the colour-attachment stage. Naming both is cheap and lets the semaphore gate whichever ran.
+    const VkPipelineStageFlags waitAt = (VkPipelineStageFlags)(VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     const VkSemaphore done = core_()->SlotRenderingDone(slot);
     const VkSemaphore avail = core_()->SlotImageAvailable(slot);
 

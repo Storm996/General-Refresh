@@ -222,6 +222,11 @@ protected:
 	// in the sound engine
 	std::list<PlayingAudio *> m_stoppedAudio;
 
+	// GeneralsX @bugfix Qoder 22/10/2026 Owner of the uninterruptible-speech flag. The flag lives
+	// in AudioManager and is global, so only the stream that set it may clear it; otherwise a short
+	// overlapping voice ending would unlock preemption and cut a long mission line.
+	PlayingAudio *m_disallowSpeechPlaying;
+
 	void *m_binkHandle;
 
 #if defined(_DEBUG) || defined(_INTERNAL)

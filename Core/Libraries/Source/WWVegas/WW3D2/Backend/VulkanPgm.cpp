@@ -25,9 +25,8 @@ namespace {
 #define VKPGM_HASH_KBLOOMCOMPOSITESHADER  0xAA1457757ABAC685ULL   // kBloomComposite  (PS, 150 B)
 #define VKPGM_HASH_KBLOOMGAMMACOPYSHADER  0xB5043807E0131D16ULL   // kBloomGammaCopy  (PS, 182 B)
 
-// Live demo pair. The dot3 pair above is the VS/PS translation reference but is never mounted any more
-// (DX8NormalMap::Apply serves only the multi-light family since P3); these are the shaders the draw path
-// actually selects today, so they are the ones that can produce a real wedge-8 draw.
+// Live pair. The dot3 pair above is kept only as a VS/PS translation reference; these GN shaders are
+// what the draw path actually selects today, so they are the ones that can produce a real wedge-8 draw.
 #define VKPGM_HASH_KVERTEXSHADERGN_NUV1   0x84A871F637DFD531ULL   // kVertexShaderGN_NUV1 (VS, 647 B)
 #define VKPGM_HASH_KVERTEXSHADERGN_NUV2   0x7C5E9CD2C8697F14ULL   // kVertexShaderGN_NUV2 (VS, 671 B)
 #define VKPGM_HASH_KPIXELSHADERGN         0x0AC233A339FF52F2ULL   // kPixelShaderGN       (PS, 1664 B)

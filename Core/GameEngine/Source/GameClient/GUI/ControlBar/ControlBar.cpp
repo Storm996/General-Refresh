@@ -77,6 +77,7 @@
 #include "GameClient/GadgetStaticText.h"
 #include "GameClient/GadgetTextEntry.h"
 #include "GameClient/InGameUI.h"
+#include "GameClient/RightSidebar.h"
 #include "GameClient/WindowVideoManager.h"
 #include "GameClient/ControlBarResizer.h"
 #include "GameClient/GadgetListBox.h"
@@ -162,6 +163,33 @@ void ControlBar::markUIDirty()
 	}
 
 #endif
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature Qoder 22/10/2026 RA3-style right sidebar production focus.
+void ControlBar::setProductionFocus( ObjectID objectID )
+{
+	m_productionFocusObjectID = objectID;
+	markUIDirty();
+}
+
+//-------------------------------------------------------------------------------------------------
+void ControlBar::clearProductionFocus()
+{
+	if( m_productionFocusObjectID != INVALID_ID )
+	{
+		m_productionFocusObjectID = INVALID_ID;
+		markUIDirty();
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+GameWindow *ControlBar::getCommandWindowForSidebar( Int index ) const
+{
+	if( index < 0 || index >= MAX_COMMANDS_PER_SET )
+		return nullptr;
+
+	return m_commandWindows[ index ];
 }
 
 Player* ControlBar::getCurrentlyViewedPlayer()
@@ -952,6 +980,7 @@ ControlBar::ControlBar()
 	m_rightHUDUnitSelectParent = nullptr;
 	m_communicatorButton = nullptr;
 	m_currentSelectedDrawable = nullptr;
+	m_productionFocusObjectID = INVALID_ID;
 	m_currContext = CB_CONTEXT_NONE;
 	// GeneralsX @feature w1semannn 11/10/2026 Top-left composition panel windows are built lazily; start null.
 	m_compPanel = nullptr;
@@ -1360,6 +1389,7 @@ void ControlBar::reset()
 	m_isObserverCommandBar = FALSE; // reset us to use a normal command bar
 	m_observerLookAtPlayer = nullptr;
 	m_observedPlayer = nullptr;
+	m_productionFocusObjectID = INVALID_ID;
 
 	if(m_buildToolTipLayout)
 		m_buildToolTipLayout->hide(TRUE);
@@ -1439,6 +1469,9 @@ void ControlBar::update()
 	if (TheGlobalData->m_headless)
 		return;
 	getStarImage();
+	// GeneralsX @feature Qoder 22/10/2026 Keep the optional right-side RA3 bar in sync with the
+	// context-sensitive command windows populated by this subsystem.
+	RightSidebarUpdate();
 	updateRadarAttackGlow();
 	if(m_controlBarSchemeManager)
 		m_controlBarSchemeManager->update();
@@ -1673,6 +1706,10 @@ void ControlBar::onDrawableSelected( Drawable *draw )
 	// set a dirty flag so next time we update we can reconstruct the UI
 	markUIDirty();
 
+	// GeneralsX @feature Qoder 22/10/2026 A real world selection takes control back from the
+	// right-side production focus. The sidebar re-establishes focus when a tab is clicked.
+	m_productionFocusObjectID = INVALID_ID;
+
 	// cancel any pending GUI commands
 	TheInGameUI->setGUICommand( nullptr );
 
@@ -1794,6 +1831,28 @@ void ControlBar::evaluateContextUI()
 
 	// erase any current state of the GUI by switching out to the empty context
 	switchToContext( CB_CONTEXT_NONE, nullptr );
+
+	// GeneralsX @feature Qoder 22/10/2026 RA3-style right sidebar: when the player picked a
+	// production tab, drive the command bar from that producer without touching world selection.
+	if( m_productionFocusObjectID != INVALID_ID )
+	{
+		Object *focusObj = TheGameLogic ? TheGameLogic->findObjectByID( m_productionFocusObjectID ) : nullptr;
+		Player *localPlayer = ThePlayerList ? ThePlayerList->getLocalPlayer() : nullptr;
+		if( focusObj && localPlayer && focusObj->getControllingPlayer() == localPlayer &&
+				!focusObj->isEffectivelyDead() &&
+				!focusObj->testStatus( OBJECT_STATUS_UNDER_CONSTRUCTION ) &&
+				( focusObj->getProductionUpdateInterface() != nullptr || focusObj->isKindOf( KINDOF_DOZER ) ) )
+		{
+			Drawable *focusDraw = focusObj->getDrawable();
+			if( focusDraw )
+			{
+				switchToContext( CB_CONTEXT_COMMAND, focusDraw );
+				return;
+			}
+		}
+
+		m_productionFocusObjectID = INVALID_ID;
+	}
 
 	// sanity, nothing selected
 	if( TheInGameUI->getSelectCount() == 0 )

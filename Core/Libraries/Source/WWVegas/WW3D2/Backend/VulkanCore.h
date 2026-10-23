@@ -202,6 +202,7 @@ void VKCore_Luma_Poll(unsigned slot);
 // like "shot A white, shot B normal" becomes a machine-diffable time series. No-op unless
 // GENERALSX_VKSHOT=1. The queue lock is re-entrant, so both may sit inside a locked frame section.
 void VKCore_Shot_Record(void* cmd, void* sceneImage, unsigned w, unsigned h, unsigned slot, unsigned long long frame);
+void VKCore_Shot_RecordSwap(void* cmd, void* swapImage, unsigned w, unsigned h, unsigned slot, unsigned long long frame);
 void VKCore_Shot_Poll(unsigned slot);
 
 // GeneralsX @bugfix Qoder 19/10/2026 R-02: the present-chain frame counter, so censuses raised from the

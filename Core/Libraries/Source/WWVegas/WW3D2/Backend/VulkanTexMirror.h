@@ -24,4 +24,14 @@ bool VKTex_Mirror_D3D_Texture(void* d3d_texture);
 // hands over its staging texture instead of the destination pointer.
 bool VKTex_Mirror_Texture_As(void* key, void* source_texture, unsigned levels);
 
+// GeneralsX @bugfix Qoder 21/10/2026 SHADOWRT: copy a live render-target mirror into a texture
+// mirror on the GPU. The projected-shadow bake reads the shared shadow render target back through
+// IDirect3DDevice9::GetRenderTargetData, whose pure-Vulkan stub deliberately returns CPU zeros (the
+// RT content lives in the VkImage), so every baked shadow texture mirrored black and the decals
+// multiplied the terrain to a fixed black square. CPU staging cannot be used here because the bake
+// is already recorded in the VkImage and a locked surface would only see the empty stub store.
+bool VKTex_Copy_RT_To_Texture(void* dst_texture, void* src_render_target,
+                              unsigned width, unsigned height);
+
+
 #endif // GENERALSX_VULKANTEXMIRROR_H

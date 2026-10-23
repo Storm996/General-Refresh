@@ -43,7 +43,6 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "d3dx9math.h"
 #include "Common/GlobalData.h"
-#include "Common/OptionPreferences.h"	// GeneralsX @feature 10/10/2026 shadow S1/S2 knobs (Options.ini, outside m_iniCRC)
 #include "W3DDevice/GameClient/W3DVolumetricShadow.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
@@ -73,18 +72,24 @@ void PrepareShadows()
 void DoShadows(RenderInfoClass & rinfo, Bool stencilPass)
 {
 	//USE_PERF_TIMER(shadowsRender)
+
 	shadowCameraFrustum=&rinfo.Camera.Get_Frustum();
 	Int projectionCount=0;
 
+	// GeneralsX @feature Qoder 20/10/2026: the options-page "ShadowMap" row owns the sun shadow. When it
+	// is on, VK_Retail_Shadow_Off() mutes both retail managers and the native Vulkan pass draws the sun
+	// instead. The end-of-frame reset below still runs so the shadow scene flag does not stick.
+	const Bool retailOff = DX8Wrapper::VK_Retail_Shadow_Off();
+
 	//Projected shadows render first because they may fill the stencil buffer
 	//which will be used by the shadow volumes
-	if (stencilPass == FALSE  && TheW3DProjectedShadowManager)
+	if (stencilPass == FALSE  && TheW3DProjectedShadowManager && !retailOff)
 	{
 			if (TheW3DShadowManager->isShadowScene())
 				projectionCount=TheW3DProjectedShadowManager->renderShadows(rinfo);
 	}
 
-	if (stencilPass == TRUE && TheW3DVolumetricShadowManager)
+	if (stencilPass == TRUE && TheW3DVolumetricShadowManager && !retailOff)
 	{
 
 //		TheW3DShadowManager->loadTerrainShadows();
@@ -104,50 +109,13 @@ W3DShadowManager::W3DShadowManager()
 	DEBUG_ASSERTCRASH(TheW3DVolumetricShadowManager == nullptr && TheW3DProjectedShadowManager == nullptr,
 		("Creating new shadow managers without deleting old ones"));
 
+	m_shadowColor = 0x7fa0a0a0;
 	m_isShadowScene = FALSE;
 	m_stencilShadowMask = 0;	//all bits can be used for storing shadows.
 
-	// GeneralsX @feature 10/10/2026 Shadow S1: density and tint are now parameterized.  This manager
-	// is constructed once, so read Options.ini here and cache it - the volumetric shadow color below
-	// and the projector intensity/tint in W3DProjectedShadow::init() both consume the cached values.
-	{
-		OptionPreferences pref;
-		Real projected = pref.getShadowProjectedIntensity() * 0.01f;
-		Real volumetric = pref.getShadowVolumetricIntensity() * 0.01f;
-		Real tint[3];
-		pref.getShadowTint(&tint[0], &tint[1], &tint[2]);
-
-		m_shadowProjectedIntensity = projected;
-		m_shadowTint[0] = tint[0];
-		m_shadowTint[1] = tint[1];
-		m_shadowTint[2] = tint[2];
-
-		// m_shadowColor is only consumed by the volumetric shadow fullscreen quad (SRCBLEND_DESTCOLOR),
-		// whose semantics are a multiplier, so what we compute here is how much brightness a covered
-		// pixel keeps.  That blend ignores alpha, but we keep the original 0x7f so the byte layout does
-		// not change in a way nobody asked for.
-		Real keep = 1.0f - volumetric;
-		UnsignedInt chan[3];
-		for (Int i = 0; i < 3; ++i)
-		{
-			Real v = 255.0f * keep * tint[i];
-			if (v < 0.0f)
-				v = 0.0f;
-			if (v > 255.0f)
-				v = 255.0f;
-			chan[i] = (UnsignedInt)(v + 0.5f);
-		}
-		m_shadowColor = 0x7f000000 | (chan[0] << 16) | (chan[1] << 8) | chan[2];
-
-		// The defaults (25/22/880,1000,1150) compute to 0x7fafc7e5 against the original 0x7fa0a0a0:
-		// noticeably lighter and clearly cold, which is the point - the first landing at 35/30 measured
-		// only a handful of 8-bit steps and was indistinguishable on screen.  DEBUG_LOG is compiled out
-		// of release builds, so the acceptance check has to read stderr.
-		fprintf(stderr, "[SHADOWS] proj=%.2f vol=%.2f tint=%.3f/%.3f/%.3f rt=%d\n",
-			m_shadowProjectedIntensity, volumetric, tint[0], tint[1], tint[2],
-			pref.getShadowMapResolution());
-		fflush(stderr);
-	}
+	// GeneralsX @refactor Qoder 20/10/2026: the retail path is fixed again. Density and tint no longer
+	// come from Options.ini - those two rows now drive the native sun shadow, and the retail managers
+	// keep the original constants so this path renders exactly like the retail game.
 
 	Vector3 lightRay(-TheGlobalData->m_terrainLightPos[0].x,
 		-TheGlobalData->m_terrainLightPos[0].y, -TheGlobalData->m_terrainLightPos[0].z);

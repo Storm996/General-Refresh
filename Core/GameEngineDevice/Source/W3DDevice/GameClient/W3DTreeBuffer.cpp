@@ -56,11 +56,14 @@ enum
 //-----------------------------------------------------------------------------
 
 #include "W3DDevice/GameClient/W3DTreeBuffer.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
+#include "W3DDevice/GameClient/W3DTreeAlias.h"
 
 #include <cstdlib>   // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: getenv for GENERALSX_TREE30 opt-out
 #include <cstring>   // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: strcmp for the opt-out compare
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
+#include "WW3D2/Backend/VulkanPgm.h"	// GeneralsX @feature Qoder 22/10/2026: enable the translated tree PS on pure Vulkan
 #include "Common/FramePacer.h"
 #include "Common/GameUtility.h"
 #include "Common/MapReaderWriterInfo.h"
@@ -90,6 +93,7 @@ enum
 // GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: converge the procedural tree atlas into the
 // Vulkan texture mirror (unconditional: the symbol is a no-op unless the win64vk Vulkan core is up).
 #include "WW3D2/Backend/VulkanTexMirror.h"
+#include "WW3D2/Backend/VulkanGeo.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "d3dx9tex.h"
@@ -98,11 +102,33 @@ enum
 // If TEST_AND_BLEND is defined, it will do an alpha test and blend.  Otherwise just alpha test. jba. [5/30/2003]
 #define dontTEST_AND_BLEND 1
 
-#define USE_STATIC 1
+// GeneralsX @bugfix Qoder 21/10/2026: T10 raised MAX_BUFFERS to 8. The DEFAULT-pool
+// static buffers go through the wrapper's shadow-lock path, and under the pure-Vulkan
+// backend the lock for the later buffers returned a non-writable mapping; the index fill
+// then wrote through a bad pointer (AV at *curIb++ = ... in loadTreesInVertexAndIndexBuffers).
+// Use the dynamic path the rest of the geometry already uses.
+//#define USE_STATIC 1
+
+// GeneralsX @bugfix Qoder 22/10/2026 TREEATLAS: every 256px tile gets a replicated gutter of 16
+// texels. Tree textures are cutout masks packed edge to edge, so any bilinear or mip tap outside a
+// tile used to read the neighbouring tree: at runtime that shows up as small torn/stretched leaf
+// fragments that flicker as the sampled mip changes with the camera. Replicating the tile's own edge
+// pixels into the gutter keeps those taps inside the same tree.
+#define TREE_ATLAS_GUTTER 16
+#define TREE_ATLAS_SLOT (TILE_PIXEL_EXTENT + 2 * TREE_ATLAS_GUTTER)
+
+// GeneralsX @bugfix Qoder 22/10/2026 TREEATLAS: the atlas keeps only 5 mip levels (down to 16px per
+// tile). Beyond that a mip texel covers a whole tile, its box-averaged coverage (a cutout tree is
+// 38-50% alpha) crosses the 0x60 alpha-test reference for every texel, and each distant card becomes
+// an opaque square. The chain is generated on the CPU (D3DX filtering is unreliable under the Vulkan
+// D3D9 stub) with box-averaged, alpha-weighted colour and alpha.
+#define TREE_ATLAS_MIP_LEVELS MIP_LEVELS_5
 
 #define END_OF_PARTITION (-1)
 
 #define DELETED_TREE_TYPE (-2)
+
+
 
 /******************************************************************************
 						W3DTreeTextureClass
@@ -119,8 +145,27 @@ texture of the desired height and mip level. */
 //=============================================================================
 W3DTreeBuffer::W3DTreeTextureClass::W3DTreeTextureClass(unsigned width, unsigned height) :
 	TextureClass(width, height,
-		WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_ALL )
+		WW3D_FORMAT_A8R8G8B8, TREE_ATLAS_MIP_LEVELS )
 {
+}
+
+// Copy the tile's edge pixels out into its gutter (corners clamp to the corner texel).
+static void treeAtlasReplicateGutter(unsigned* base, int pitchPixels, int x0, int y0, int inner, int gutter)
+{
+	for (int dy = -gutter; dy < inner + gutter; ++dy) {
+		int sy = dy;
+		if (sy < 0) sy = 0;
+		else if (sy >= inner) sy = inner - 1;
+		unsigned* dstRow = base + (size_t)(y0 + dy) * pitchPixels + x0;
+		const unsigned* srcRow = base + (size_t)(y0 + sy) * pitchPixels + x0;
+		for (int dx = -gutter; dx < inner + gutter; ++dx) {
+			if (dx >= 0 && dx < inner) continue;	// interior already holds the tile
+			int sx = dx;
+			if (sx < 0) sx = 0;
+			else if (sx >= inner) sx = inner - 1;
+			dstRow[dx] = srcRow[sx];
+		}
+	}
 }
 
 //=============================================================================
@@ -189,13 +234,112 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 					pBGR +=TILE_BYTES_PER_PIXEL;
 				}
 			}
+			// GeneralsX @bugfix Qoder 22/10/2026 TREEATLAS: keep tiles from bleeding into each
+			// other when sampled with bilinear/mip filtering (see TREE_ATLAS_GUTTER).
+			treeAtlasReplicateGutter((unsigned*)locked_rect.pBits, (int)(locked_rect.Pitch / sizeof(unsigned)),
+				position.x, position.y, tilePixelExtent, TREE_ATLAS_GUTTER);
 		}
 
 	}
+	// GeneralsX @debug Qoder 20/10/2026 TREEATLAS: one bounded census of the atlas alpha, taken while
+	// the level-0 lock still holds the bytes the game just filled. A tree card needs 0/255 alpha; an
+	// all-127 atlas (or a 24-bit source promoted to 255) cannot be cut out by the FF alpha test.
+	{
+		static int s_atlasCensus = 0;
+		if (s_atlasCensus < 2 && surface_desc.Format == D3DFMT_A8R8G8B8) {
+			unsigned a0 = 0, a127 = 0, a255 = 0, amid = 0;
+			unsigned amin = 255, amax = 0;
+			unsigned rgbNonZero = 0;
+			for (unsigned yy = 0; yy < surface_desc.Height; ++yy) {
+				const unsigned* row = (const unsigned*)((const unsigned char*)locked_rect.pBits + (size_t)yy * locked_rect.Pitch);
+				for (unsigned xx = 0; xx < surface_desc.Width; ++xx) {
+					const unsigned v = row[xx];
+					if (v & 0x00FFFFFFu) ++rgbNonZero;
+					const unsigned a = (v >> 24) & 0xFFu;
+					if (a == 0) ++a0; else if (a == 127) ++a127; else if (a == 255) ++a255; else ++amid;
+					if (a < amin) amin = a;
+					if (a > amax) amax = a;
+				}
+			}
+			++s_atlasCensus;
+			fprintf(stderr, "[TREEATLAS] atlas %ux%u rgb=%u a0=%u a127=%u amid=%u a255=%u amin=%u amax=%u\n",
+				(unsigned)surface_desc.Width, (unsigned)surface_desc.Height, rgbNonZero, a0, a127, amid, a255, amin, amax);
+			fflush(stderr);
+		}
+	}
 	DX8_ErrorCode(surface_level->UnlockRect());
 	surface_level->Release();
-	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, (UINT)0, D3DX_FILTER_BOX));
-	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the procedurally-built tree atlas.
+	// CPU mip chain. D3DXFilterTexture is not a reliable path under the pure-Vulkan D3D9 stub: the
+	// generated mips could stay uninitialised, and the far tree then sampled garbage alpha (opaque
+	// squares / flicker). Build the chain here: box-average RGB weighted by alpha and average alpha
+	// itself, so the 0x60 alpha test keeps seeing the same leaf coverage at every mip. Binarising each
+	// mip against "all four sub-texels >= 0x60" (the previous rule) shrank a 64px bush tile to zero by
+	// mip 2, which is exactly why the small shrubs popped and left torn fragments while the camera
+	// moved. The chain stops at TREE_ATLAS_MIP_LEVELS: a coarser mip averages a whole tile, and a
+	// cutout tree's tile is more than 37% opaque, so every texel would pass the alpha test and each
+	// distant card would become the opaque square this bug report started from.
+	{
+		IDirect3DTexture9* tex = Peek_D3D_Texture();
+		const UINT levels = tex ? tex->GetLevelCount() : 0;
+		if (levels > 1 && surface_desc.Format == D3DFMT_A8R8G8B8) {
+			for (UINT level = 1; level < levels; ++level) {
+				IDirect3DSurface9* src = nullptr; IDirect3DSurface9* dst = nullptr;
+				D3DLOCKED_RECT slr, dlr; D3DSURFACE_DESC sd, dd;
+				if (FAILED(tex->GetSurfaceLevel(level - 1, &src)) || !src) break;
+				if (FAILED(tex->GetSurfaceLevel(level, &dst)) || !dst) { src->Release(); break; }
+				bool ok = SUCCEEDED(src->GetDesc(&sd)) && SUCCEEDED(dst->GetDesc(&dd))
+					&& SUCCEEDED(src->LockRect(&slr, nullptr, D3DLOCK_READONLY))
+					&& SUCCEEDED(dst->LockRect(&dlr, nullptr, 0));
+				if (ok) {
+					for (UINT y = 0; y < dd.Height; ++y) {
+						unsigned* drow = (unsigned*)((unsigned char*)dlr.pBits + (size_t)y * dlr.Pitch);
+						const UINT sy0 = y * 2u, sy1 = (sd.Height > sy0 + 1u) ? sy0 + 1u : sy0;
+						const unsigned* s0 = (const unsigned*)((const unsigned char*)slr.pBits + (size_t)sy0 * slr.Pitch);
+						const unsigned* s1 = (const unsigned*)((const unsigned char*)slr.pBits + (size_t)sy1 * slr.Pitch);
+						for (UINT x = 0; x < dd.Width; ++x) {
+							const UINT sx0 = x * 2u, sx1 = (sd.Width > sx0 + 1u) ? sx0 + 1u : sx0;
+							const unsigned p00 = s0[sx0], p01 = s0[sx1], p10 = s1[sx0], p11 = s1[sx1];
+							const unsigned a00 = (p00 >> 24) & 0xFFu, a01 = (p01 >> 24) & 0xFFu;
+							const unsigned a10 = (p10 >> 24) & 0xFFu, a11 = (p11 >> 24) & 0xFFu;
+							const unsigned asum = a00 + a01 + a10 + a11;
+							unsigned r = 0, g = 0, b = 0;
+							if (asum)
+							{
+								// Alpha-weighted colour: transparent texels must not darken leaf edges.
+								r = (((p00 >> 16) & 0xFFu) * a00 + ((p01 >> 16) & 0xFFu) * a01 +
+									((p10 >> 16) & 0xFFu) * a10 + ((p11 >> 16) & 0xFFu) * a11 + asum / 2u) / asum;
+								g = (((p00 >> 8) & 0xFFu) * a00 + ((p01 >> 8) & 0xFFu) * a01 +
+									((p10 >> 8) & 0xFFu) * a10 + ((p11 >> 8) & 0xFFu) * a11 + asum / 2u) / asum;
+								b = ((p00 & 0xFFu) * a00 + (p01 & 0xFFu) * a01 +
+									(p10 & 0xFFu) * a10 + (p11 & 0xFFu) * a11 + asum / 2u) / asum;
+							}
+							const unsigned a = (asum + 2u) >> 2;
+							drow[x] = (a << 24) | (r << 16) | (g << 8) | b;
+						}
+					}
+					dst->UnlockRect();
+					src->UnlockRect();
+				}
+				dst->Release();
+				src->Release();
+				if (!ok) break;
+			}
+			static int s_mipLog = 0;
+			if (s_mipLog < 2) {
+				++s_mipLog;
+				fprintf(stderr, "[TREEMIP] CPU-generated %u atlas mip levels (alpha-averaged, +%dpx gutters)\n",
+					levels, TREE_ATLAS_GUTTER);
+				fflush(stderr);
+			}
+		} else {
+			DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), nullptr, (UINT)0, D3DX_FILTER_BOX));
+		}
+	}	// GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: mirror the procedurally-built tree atlas.
+	// The mips were filled after the level-0 hash source was filled; drop any earlier mirror entry so
+	// the upload cannot take the unchanged-content early-out and keep stale mips.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	VKTex_Drop((void*)Peek_D3D_Texture());
+#endif
 	VKTex_Mirror_D3D_Texture(Peek_D3D_Texture());
 	if (WW3D::Get_Texture_Reduction()) {
 		DX8_ErrorCode(Peek_D3D_Texture()->SetLOD((DWORD)WW3D::Get_Texture_Reduction()));
@@ -468,6 +612,95 @@ public:
 };
 
 //=============================================================================
+// GeneralsX @feature T10 21/10/2026: original tree type -> GX RTS asset
+//=============================================================================
+static Bool treeFileExists(const char *path)
+{
+	if (!TheFileSystem || !path) {
+		return TRUE;
+	}
+	File *f = TheFileSystem->openFile(path, File::READ | File::BINARY);
+	if (f) {
+		f->close();
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static Bool treeTextureExists(const char *name)
+{
+	if (!name) return FALSE;
+	char path[_MAX_PATH];
+	snprintf(path, ARRAY_SIZE(path), "%s%s", TERRAIN_TGA_DIR_PATH, name);
+	if (treeFileExists(path)) return TRUE;
+	snprintf(path, ARRAY_SIZE(path), "%s%s", TGA_DIR_PATH, name);
+	return treeFileExists(path);
+}
+
+static Bool treeModelExists(const char *name)
+{
+	if (!name) return FALSE;
+	char path[_MAX_PATH];
+	snprintf(path, ARRAY_SIZE(path), "Art\W3D\%s.w3d", name);
+	return treeFileExists(path);
+}
+
+struct TreeResolvedNameCache
+{
+	char from[64];
+	char model[64];
+	char texture[64];
+};
+static TreeResolvedNameCache s_resolvedNames[256];
+static Int s_resolvedNameCount = 0;
+
+static void resolveTreeNames(const W3DTreeDrawModuleData *data, AsciiString &model, AsciiString &texture)
+{
+	const char *origModel = data->m_modelName.str();
+	const char *origTexture = data->m_textureName.str();
+	for (Int i = 0; i < s_resolvedNameCount; ++i) {
+		if (W3DTreeAliasCaseCmp(origModel, s_resolvedNames[i].from) == 0) {
+			model = s_resolvedNames[i].model;
+			texture = s_resolvedNames[i].texture;
+			return;
+		}
+	}
+
+	const char *resolvedModel = W3DTreeAliasResolve(origModel);
+	const char *resolvedTexture = W3DTreeAliasResolveModelTexture(origModel);
+	if (resolvedTexture == nullptr) {
+		resolvedTexture = origTexture;
+	}
+	Bool aliased = (resolvedModel != origModel);
+	if (aliased && (!treeModelExists(resolvedModel) || !treeTextureExists(resolvedTexture))) {
+		static Int s_missingLog = 0;
+		if (s_missingLog++ < 24) {
+			fprintf(stderr, "[TREEALIAS] MISSING %s / %s, fallback %s / %s\n",
+				resolvedModel, resolvedTexture, origModel, origTexture);
+			fflush(stderr);
+		}
+		resolvedModel = origModel;
+		resolvedTexture = origTexture;
+		aliased = FALSE;
+	}
+	if (aliased) {
+		static Int s_aliasLog = 0;
+		if (s_aliasLog++ < 48) {
+			fprintf(stderr, "[TREEALIAS] %s -> %s / %s\n", origModel, resolvedModel, resolvedTexture);
+			fflush(stderr);
+		}
+	}
+	if (s_resolvedNameCount < (Int)ARRAY_SIZE(s_resolvedNames)) {
+		TreeResolvedNameCache &entry = s_resolvedNames[s_resolvedNameCount++];
+		strlcpy(entry.from, origModel, sizeof(entry.from));
+		strlcpy(entry.model, resolvedModel, sizeof(entry.model));
+		strlcpy(entry.texture, resolvedTexture, sizeof(entry.texture));
+	}
+	model = resolvedModel;
+	texture = resolvedTexture;
+}
+
+//=============================================================================
 // W3DTreeBuffer::updateTexture
 //=============================================================================
 /** Creates a new texture. */
@@ -475,11 +708,13 @@ public:
 void W3DTreeBuffer::updateTexture()
 {
 
-	const Int MAX_TEX_WIDTH = 2048;
+	// GeneralsX @bugfix Qoder 22/10/2026 TREEATLAS: 4096 wide so the 16px-per-tile gutters do not
+	// reduce how many tree sheets a map can keep in one atlas (2048 / 288px slots = 7x7 tiles).
+	const Int MAX_TEX_WIDTH = 4096;
 
 	Int i, j;
 	Int maxHeight = 0;
-	const Int maxTilesPerRow = MAX_TEX_WIDTH/(TILE_PIXEL_EXTENT);
+	const Int maxTilesPerRow = MAX_TEX_WIDTH/TREE_ATLAS_SLOT;
 
 	REF_PTR_RELEASE(m_treeTexture);
 
@@ -499,10 +734,10 @@ void W3DTreeBuffer::updateTexture()
 	for (i=0; i<m_numTreeTypes; i++) {
 		char texturePath[ _MAX_PATH ];
 		m_treeTypes[i].m_numTiles = 0;
-		snprintf( texturePath, ARRAY_SIZE(texturePath), "%s%s", TERRAIN_TGA_DIR_PATH, m_treeTypes[i].m_data->m_textureName.str() );
+		snprintf( texturePath, ARRAY_SIZE(texturePath), "%s%s", TERRAIN_TGA_DIR_PATH, m_treeTypes[i].m_textureName.str() );
 		theFile = TheFileSystem->openFile( texturePath, File::READ|File::BINARY);
 		if (theFile==nullptr) {
-			snprintf( texturePath, ARRAY_SIZE(texturePath), "%s%s", TGA_DIR_PATH, m_treeTypes[i].m_data->m_textureName.str() );
+			snprintf( texturePath, ARRAY_SIZE(texturePath), "%s%s", TGA_DIR_PATH, m_treeTypes[i].m_textureName.str() );
 			theFile = TheFileSystem->openFile( texturePath, File::READ|File::BINARY);
 		}
 		if (theFile != nullptr) {
@@ -520,7 +755,7 @@ void W3DTreeBuffer::updateTexture()
 			}
 			Bool texFound = false;
 			for	(j=0; j<i; j++) {
-				if (m_treeTypes[j].m_data->m_textureName.compareNoCase(m_treeTypes[i].m_data->m_textureName)==0) {
+				if (m_treeTypes[j].m_textureName.compareNoCase(m_treeTypes[i].m_textureName)==0) {
 					m_treeTypes[i].m_firstTile = 0;
 					m_treeTypes[i].m_tileWidth = width;
 					m_treeTypes[i].m_numTiles = 0;
@@ -547,7 +782,7 @@ void W3DTreeBuffer::updateTexture()
 			}
 			theFile->close();
 		} else {
-			DEBUG_CRASH(("Could not find texture %s", m_treeTypes[i].m_data->m_textureName.str()));
+			DEBUG_CRASH(("Could not find texture %s", m_treeTypes[i].m_textureName.str()));
 			m_treeTypes[i].m_firstTile = 0;
 			m_treeTypes[i].m_tileWidth = 0;
 			m_treeTypes[i].m_numTiles = 0;
@@ -559,7 +794,11 @@ void W3DTreeBuffer::updateTexture()
 		tmpWidth*=2;
 	}
 	Int tilesPerRow = tmpWidth;
-	m_textureWidth = tmpWidth*TILE_PIXEL_EXTENT;
+	m_textureWidth = tmpWidth*TREE_ATLAS_SLOT;
+
+	fprintf(stderr, "[TREEATLAS] build tiles=%d tmpWidth=%d width=%d TILE=%d MAX=%d\n",
+		m_numTiles, tmpWidth, m_textureWidth, (int)TILE_PIXEL_EXTENT, (int)MAX_TEX_WIDTH);
+	fflush(stderr);
 
 	if (m_textureWidth>MAX_TEX_WIDTH) {
 		m_textureWidth = 64;
@@ -567,6 +806,8 @@ void W3DTreeBuffer::updateTexture()
 		if (m_treeTexture==nullptr) {
 			m_treeTexture = new TextureClass("missing.tga");
 		}
+		fprintf(stderr, "[TREEATLAS] FALLBACK to missing.tga: tile grid exceeds MAX_TEX_WIDTH\n");
+		fflush(stderr);
 		DEBUG_CRASH(("Too many trees in a scene."));
 		return;
 	}
@@ -587,7 +828,7 @@ void W3DTreeBuffer::updateTexture()
 			if (width != tileWidth) continue;
 			Bool texFound = false;
 			for	(i=0; i<texClass; i++) {
-				if (m_treeTypes[i].m_data->m_textureName.compareNoCase(m_treeTypes[texClass].m_data->m_textureName)==0) {
+				if (m_treeTypes[i].m_textureName.compareNoCase(m_treeTypes[texClass].m_textureName)==0) {
 					m_treeTypes[texClass].m_textureOrigin.x = m_treeTypes[i].m_textureOrigin.x;
 					m_treeTypes[texClass].m_textureOrigin.y = m_treeTypes[i].m_textureOrigin.y;
 					texFound = true;
@@ -623,19 +864,19 @@ void W3DTreeBuffer::updateTexture()
 				continue;
 			}
 
-			Int xOrigin = column*(TILE_PIXEL_EXTENT);
-			Int yOrigin = row*(TILE_PIXEL_EXTENT);
+			Int xOrigin = column*(TREE_ATLAS_SLOT);
+			Int yOrigin = row*(TREE_ATLAS_SLOT);
 			m_treeTypes[texClass].m_textureOrigin.x = xOrigin;
 			m_treeTypes[texClass].m_textureOrigin.y = yOrigin;
-			Int classHeight = yOrigin + width*TILE_PIXEL_EXTENT;
+			Int classHeight = yOrigin + width*TREE_ATLAS_SLOT;
 			if (maxHeight < classHeight) maxHeight = classHeight;
 
 			for (i=0; i<width; i++) {
 				for (j=0; j<width; j++) {
 					availableGrid[row+j][column+i] = false;
 					Int baseNdx = m_treeTypes[texClass].m_firstTile + i + j*width;
-					Int x = xOrigin + i*TILE_PIXEL_EXTENT;
-					Int y = yOrigin + ((width-j)-1)*TILE_PIXEL_EXTENT;
+					Int x = xOrigin + i*TREE_ATLAS_SLOT + TREE_ATLAS_GUTTER;
+					Int y = yOrigin + ((width-j)-1)*TREE_ATLAS_SLOT + TREE_ATLAS_GUTTER;
 					m_sourceTiles[baseNdx]->m_tileLocationInTexture.x = x;
 					m_sourceTiles[baseNdx]->m_tileLocationInTexture.y = y;
 				}
@@ -647,6 +888,10 @@ void W3DTreeBuffer::updateTexture()
 	m_textureHeight = tex->update(this);
 
 	m_treeTexture = tex;
+	fprintf(stderr, "[TREEATLAS] built %ux%u from %d tiles (texture=%s)\n",
+		(unsigned)m_textureWidth, (unsigned)m_textureHeight, m_numTiles,
+		(const char*)m_treeTexture->Get_Texture_Name());
+	fflush(stderr);
 
 	for (i=0; i<m_numTiles; i++) {
 		REF_PTR_RELEASE (m_sourceTiles[i]);
@@ -754,7 +999,7 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 	m_anythingChanged = false;
 	Int curTree=0;
 	Int bNdx;
-	const GlobalData::TerrainLighting *objectLighting = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay];
+	const GlobalData::TerrainLighting *objectLighting = TheGlobalData->m_terrainObjectsLighting[W3DDisplay::getRenderTimeOfDay()];
 	for (bNdx=0; bNdx<MAX_BUFFERS; bNdx++) {
 		m_curNumTreeVertices[bNdx] = 0;
 		m_curNumTreeIndices[bNdx] = 0;
@@ -773,6 +1018,12 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 	#endif
 		vb=(VertexFormatXYZNDUV1*)lockVtxBuffer.Get_Vertex_Array();
 		ib = lockIdxBuffer.Get_Index_Array();
+		if (vb == nullptr || ib == nullptr) {
+			// A failed/degenerate lock must not turn into a write through a bad pointer.
+			fprintf(stderr, "[TREEBUF] lock failed for buffer %d (vb=%p ib=%p)\n", bNdx, (void*)vb, (void*)ib);
+			fflush(stderr);
+			break;
+		}
 		// Add to the index buffer & vertex buffer.
 		Vector2 lookAtVector(m_cameraLookAtVector.X, m_cameraLookAtVector.Y);
 		lookAtVector.Normalize();
@@ -787,8 +1038,8 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 
 		for ( ;curTree<m_numTrees;curTree++) {
 			Int type = m_trees[curTree].treeType;
-			if (type<0 || m_treeTypes[type].m_mesh == nullptr) {
-				continue; // Deleted tree or missing mesh. [6/9/2003]
+			if (type<0 || type>=MAX_TYPES || m_treeTypes[type].m_mesh == nullptr) {
+				continue; // Deleted tree, out-of-range type, or missing mesh.
 			}
 			if (!m_trees[curTree].visible) continue;
 			Real scale = m_trees[curTree].scale;
@@ -853,17 +1104,12 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 				diffuse = doLighting(&normal, objectLighting, &emissive, 0xFFFFFFFF, 1.0f);
 			}
 
-			Real Uscale = m_treeTypes[type].m_tileWidth * (Real)TILE_PIXEL_EXTENT / (Real)m_textureWidth;
-			Real Vscale = m_treeTypes[type].m_tileWidth * (Real)TILE_PIXEL_EXTENT / (Real)m_textureHeight;
-			Real UOffset = m_treeTypes[type].m_textureOrigin.x/(Real)m_textureWidth;
-			Real VOffset = m_treeTypes[type].m_textureOrigin.y/(Real)m_textureHeight;
-			if (m_treeTypes[type].m_halfTile) {
-				Uscale *= 0.5f;
-				Vscale *= 0.5f;
-				VOffset += (TILE_PIXEL_EXTENT/2) / (Real)m_textureHeight;
-			}
+			const Int blockTiles = m_treeTypes[type].m_tileWidth;
+			const Int slotExtent = TREE_ATLAS_SLOT;
 			for (i=0; i<numVertex; i++) {
 				if (m_curNumTreeVertices[bNdx] >= MAX_TREE_VERTEX)
+					break;
+				if (curVb >= vb + MAX_TREE_VERTEX)
 					break;
 
 				// Update the uv values.  The W3D models each have their own texture, and
@@ -878,8 +1124,28 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 				if (V>1.0f) V=1.0f;
 				if (V<0.0f) V=0.0f;
 
-				curVb->u1 = U*Uscale + UOffset;
-				curVb->v1 = V*Vscale + VOffset;
+				// GeneralsX @bugfix Qoder 22/10/2026 TREEATLAS: resolve the authored UV to its tile
+				// first, then re-map inside that tile's gutter slot. A plain linear scale across the
+				// block (the retail formula) cannot respect the gutters inserted between tiles.
+				// Block-local pixel coordinates (origin-free), preserving the retail span: a half
+				// tile row only uses the upper half of the sheet and starts half a tile down.
+				const Real halfScale = m_treeTypes[type].m_halfTile ? 0.5f : 1.0f;
+				const Real vBias = m_treeTypes[type].m_halfTile ? (Real)TILE_PIXEL_EXTENT * 0.5f : 0.0f;
+				Real uPix = U * (Real)blockTiles * (Real)TILE_PIXEL_EXTENT * halfScale;
+				Real vPix = V * (Real)blockTiles * (Real)TILE_PIXEL_EXTENT * halfScale + vBias;
+				Int uTile = REAL_TO_INT_FLOOR(uPix / (Real)TILE_PIXEL_EXTENT);
+				Int vTile = REAL_TO_INT_FLOOR(vPix / (Real)TILE_PIXEL_EXTENT);
+				if (uTile < 0) uTile = 0; else if (uTile >= blockTiles) uTile = blockTiles - 1;
+				if (vTile < 0) vTile = 0; else if (vTile >= blockTiles) vTile = blockTiles - 1;
+				Real uFrac = uPix / (Real)TILE_PIXEL_EXTENT - (Real)uTile;
+				Real vFrac = vPix / (Real)TILE_PIXEL_EXTENT - (Real)vTile;
+				if (uFrac < 0.0f) uFrac = 0.0f; else if (uFrac > 1.0f) uFrac = 1.0f;
+				if (vFrac < 0.0f) vFrac = 0.0f; else if (vFrac > 1.0f) vFrac = 1.0f;
+
+				curVb->u1 = ((Real)(m_treeTypes[type].m_textureOrigin.x + uTile*slotExtent + TREE_ATLAS_GUTTER)
+					+ 0.5f + uFrac * (Real)(TILE_PIXEL_EXTENT - 1)) / (Real)m_textureWidth;
+				curVb->v1 = ((Real)(m_treeTypes[type].m_textureOrigin.y + vTile*slotExtent + TREE_ATLAS_GUTTER)
+					+ 0.5f + vFrac * (Real)(TILE_PIXEL_EXTENT - 1)) / (Real)m_textureHeight;
 				Real x = pVert[i].X;
 				Real y = pVert[i].Y;
 
@@ -926,6 +1192,17 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 					}
 					curVb->diffuse = doLighting(&normal, objectLighting, &emissive,
 														vertexDiffuse, 1.0f);
+					{
+						static int s_vtxLog = 0;
+						if (s_vtxLog < 3) {
+							++s_vtxLog;
+							fprintf(stderr, "[TREEVTX] diffuse=%08X tod=%d objLight=%p amb=(%d,%d,%d) dif=(%d,%d,%d)\n",
+								curVb->diffuse, (int)TheGlobalData->m_timeOfDay, (const void*)objectLighting,
+								(int)objectLighting[0].ambient.red, (int)objectLighting[0].ambient.green, (int)objectLighting[0].ambient.blue,
+								(int)objectLighting[0].diffuse.red, (int)objectLighting[0].diffuse.green, (int)objectLighting[0].diffuse.blue);
+							fflush(stderr);
+						}
+					}
 				} else {
 					curVb->diffuse = diffuse;
 				}
@@ -936,10 +1213,36 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 			for (i=0; i<numIndex; i++) {
 				if (m_curNumTreeIndices[bNdx]+4 > MAX_TREE_INDEX)
 					break;
+				if (curIb + 3 > ib + MAX_TREE_INDEX + 4)
+					break;
 				*curIb++ = startVertex + pPoly[i].I;
 				*curIb++ = startVertex + pPoly[i].J;
 				*curIb++ = startVertex + pPoly[i].K;
 				m_curNumTreeIndices[bNdx]+=3;
+			}
+		}
+	}
+
+	// GeneralsX @debug T10 21/10/2026: report capacity, so a missing tree is not
+	// mistaken for an alias/asset failure.
+	{
+		static Int s_layoutLog = 0;
+		if (s_layoutLog++ < 12) {
+			Int usedVerts = 0, usedIndices = 0, usedBuffers = 0;
+			for (Int b = 0; b < MAX_BUFFERS; ++b) {
+				usedVerts += m_curNumTreeVertices[b];
+				usedIndices += m_curNumTreeIndices[b];
+				if (m_curNumTreeIndices[b] > 0) ++usedBuffers;
+			}
+			fprintf(stderr, "[TREEBUF] placed=%d/%d types=%d buffers=%d/%d verts=%d/%d indices=%d/%d\n",
+				curTree, m_numTrees, m_numTreeTypes, usedBuffers, (int)MAX_BUFFERS,
+				usedVerts, (int)(MAX_BUFFERS * MAX_TREE_VERTEX),
+				usedIndices, (int)(MAX_BUFFERS * MAX_TREE_INDEX));
+			fflush(stderr);
+			if (curTree < m_numTrees) {
+				fprintf(stderr, "[TREEBUF] OVERFLOW remaining=%d trees (raise MAX_BUFFERS or lower RTS LOD)\n",
+					m_numTrees - curTree);
+				fflush(stderr);
 			}
 		}
 	}
@@ -1214,14 +1517,21 @@ void W3DTreeBuffer::allocateTreeBuffers()
 		// GeneralsX @bugfix PS3.0 batch22 14/10/2026: default off with the rest of the batch-8
 		// surface HLSL family (user blocky-ground verdict); GENERALSX_TREE30=1 opts back in and
 		// still requires the TERRAIN30 fog shaders to be active.
-		bool tree30On = false;
+		// GeneralsX @feature Qoder 22/10/2026: on the pure-Vulkan build the translated twin (tag 121,
+		// pgm_b1_tree.frag) carries the Forward+ point lights, so enable it by default there. On D3D9 the
+		// registry is off and the old batch22 default stays (opt-in only). The env still wins for A/B.
+		bool tree30On = VKPgm_On();
 		const char* tenv = getenv("GENERALSX_TREE30");
-		if (tenv != nullptr && *tenv != 0 && strcmp(tenv, "0") != 0) tree30On = true;
+		if (tenv != nullptr && *tenv != 0) tree30On = (strcmp(tenv, "0") != 0);
 		if (tree30On && W3DShaderManager::arePerPixelFogShadersActive())
 		{
 			const char* prof = nullptr;
 			const HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kTreePS30, false, "[TREE30]", &prof, (void**)&s_treeHlslPS);
-			if (SUCCEEDED(hr) && s_treeHlslPS != nullptr)
+			// Only keep the handle when the draw facade can translate it; an untranslated custom PS
+			// would take over the batch and leave the trees undrawn under VKPRESENT.
+			const bool translated = s_treeHlslPS != nullptr &&
+				VKPgm_Tag_For_Handle((void*)s_treeHlslPS, 1) != 0;
+			if (SUCCEEDED(hr) && translated)
 			{
 				fprintf(stderr, "[TREE30] HLSL tree haze pixel shader installed profile=%s\n", prof ? prof : "?");
 				fflush(stderr);
@@ -1340,11 +1650,22 @@ Int W3DTreeBuffer::addTreeType(const W3DTreeDrawModuleData *data)
 	m_needToUpdateTexture = true;
 
 	m_treeTypes[m_numTreeTypes].m_mesh = nullptr;
+	AsciiString resolvedModel;
+	AsciiString resolvedTexture;
+	resolveTreeNames(data, resolvedModel, resolvedTexture);
+	m_treeTypes[m_numTreeTypes].m_modelName = resolvedModel;
+	m_treeTypes[m_numTreeTypes].m_textureName = resolvedTexture;
+	static Int s_typeLog = 0;
+	if (s_typeLog++ < 48) {
+		fprintf(stderr, "[TREETYPE] model=%s texture=%s original=%s%s\n",
+			resolvedModel.str(), resolvedTexture.str(), data->m_modelName.str());
+		fflush(stderr);
+	}
 
-	RenderObjClass *robj=WW3DAssetManager::Get_Instance()->Create_Render_Obj(data->m_modelName.str());
+	RenderObjClass *robj=WW3DAssetManager::Get_Instance()->Create_Render_Obj(resolvedModel.str());
 
 	if (robj==nullptr) {
-		DEBUG_CRASH(("Unable to find model for tree %s", data->m_modelName.str()));
+		DEBUG_CRASH(("Unable to find model for tree %s", resolvedModel.str()));
 		return 0;
 	}
 	AABoxClass box;
@@ -1363,7 +1684,7 @@ Int W3DTreeBuffer::addTreeType(const W3DTreeDrawModuleData *data)
 		m_treeTypes[m_numTreeTypes].m_mesh = (MeshClass*)robj;
 
 	if (m_treeTypes[m_numTreeTypes].m_mesh==nullptr) {
-		DEBUG_CRASH(("Tree %s is not simple mesh. Tell artist to re-export. Don't Ignore!!!", data->m_modelName.str()));
+		DEBUG_CRASH(("Tree %s is not simple mesh. Tell artist to re-export. Don't Ignore!!!", resolvedModel.str()));
 		return 0;
 	}
 
@@ -1400,9 +1721,12 @@ void W3DTreeBuffer::addTree(DrawableID id, Coord3D location, Real scale, Real an
 	}
 	Int treeType = DELETED_TREE_TYPE;
 	Int i;
+	AsciiString resolvedModel;
+	AsciiString resolvedTexture;
+	resolveTreeNames(data, resolvedModel, resolvedTexture);
 	for (i=0; i<m_numTreeTypes; i++) {
-		if (m_treeTypes[i].m_data->m_modelName.compareNoCase(data->m_modelName)==0 &&
-				m_treeTypes[i].m_data->m_textureName.compareNoCase(data->m_textureName)==0) {
+		if (m_treeTypes[i].m_modelName.compareNoCase(resolvedModel)==0 &&
+				m_treeTypes[i].m_textureName.compareNoCase(resolvedTexture)==0) {
 			treeType = i;
 			break;
 		}
@@ -1716,6 +2040,20 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	DX8Wrapper::Set_Texture(1,nullptr);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, 1);
+	// GeneralsX @bugfix Qoder 21/10/2026 TREEALPHA: force the detailAlphaShader's exact raster state.
+	// The projected-shadow decal drawn immediately before this pass leaves D3DRS_SRCBLEND=ZERO and
+	// DSTBLEND=SRCCOLOR. ShaderClass::Apply only rewrites the blend/alpha-test bits when its cached
+	// shader bits changed, so a tree batch that follows another tree batch can keep that decal blend:
+	// leaves then multiply the terrain/destination (black silhouettes after a cutscene) and the
+	// transparent atlas background shows as whole cards. The appended tree state also matches the
+	// shaders' CULL_MODE_DISABLE, which the shared state shadow otherwise leaves culled.
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_ONE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHATESTENABLE, TRUE);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF, 0x60);
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 	// Draw all the trees.
 	DX8Wrapper::Apply_Render_State_Changes();
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: capture the shroud bind result - the TREE30 HLSL
@@ -1723,6 +2061,43 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	// trees to black; the path falls back to plain fixed-function rendering in that case.
 	Int shroudBound = W3DShaderManager::setShroudTex(1);
 	DX8Wrapper::Apply_Render_State_Changes();
+	{
+		// GeneralsX @debug Qoder 21/10/2026 TREEALPHA: isolate the stage-1 shroud modulation. If the
+		// trees turn green with the shroud colour op bypassed, the black is the shroud sample/mask,
+		// not the atlas or the vertex tint. Also used as the automatic fallback when the shroud has no
+		// live source (an uninitialised destination is black, which blackened every tree).
+		static const bool s_noShroud = (getenv("GENERALSX_TREE_NO_SHROUD") != nullptr)
+			&& (atoi(getenv("GENERALSX_TREE_NO_SHROUD")) != 0);
+		if (s_noShroud || !shroudBound) {
+			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+			DX8Wrapper::Apply_Render_State_Changes();
+		}
+	}
+	{
+		static int s_drawProbe = 0;
+		if (s_drawProbe < 4 && m_treeTexture != nullptr) {
+			++s_drawProbe;
+			fprintf(stderr, "[TREEDRAW] tex=%s at=%u func=%u ref=%u sb=%u db=%u shroud=%d "
+				"aop0=%u a10=%u a20=%u aop1=%u a11=%u a21=%u cop0=%u tci1=%u ttff1=%u\n",
+				(const char*)m_treeTexture->Get_Texture_Name(),
+				DX8Wrapper::VK_Read_RS(D3DRS_ALPHATESTENABLE),
+				DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC),
+				DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF),
+				DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND),
+				DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND), shroudBound,
+				DX8Wrapper::VK_Read_TSS(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE),
+				DX8Wrapper::VK_Read_TSS(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+				DX8Wrapper::VK_Read_TSS(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE),
+				DX8Wrapper::VK_Read_TSS(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE),
+				DX8Wrapper::VK_Read_TSS(1, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+				DX8Wrapper::VK_Read_TSS(1, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE),
+				DX8Wrapper::VK_Read_TSS(0, D3DTSS_COLOROP, D3DTOP_DISABLE),
+				DX8Wrapper::VK_Read_TSS(1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU),
+				DX8Wrapper::VK_Read_TSS(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE));
+			fflush(stderr);
+		}
+	}
 
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE when this call bound the TREE30 HLSL pixel
 	// shader; the cleanup below then also drops the stage-2 depth relay so it cannot leak.

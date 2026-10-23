@@ -117,6 +117,9 @@
 #include "assetstatus.h"
 #include "ringobj.h"
 #include "sphereobj.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "Backend/VulkanGeo.h"	// VKDiag_Log_Mirror_State: cross-match live-mirror snapshot
+#endif
 
 #include "shdlib.h"
 
@@ -494,6 +497,13 @@ void WW3DAssetManager::Release_Unused_Assets()
 	// and remove them from our lists.
 	Release_Unused_Textures();
 	Release_Unused_Font3DDatas();
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 21/10/2026 multi-match forensics: W3DDisplay::reset calls this once per
+	// game reset, i.e. after the previous match stopped rendering and before the next map loads. The
+	// line is the snapshot that tells a real asset leak from a stale budget: live mirror bytes and
+	// images, budget skips and the stub live-object table occupancy in one place.
+	VKDiag_Log_Mirror_State("Release_Unused_Assets");
+#endif
 }
 
 /***********************************************************************************************

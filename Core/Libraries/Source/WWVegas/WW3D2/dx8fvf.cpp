@@ -40,6 +40,8 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "dx8fvf.h"
+#include <cstdio>
+#include <cstdlib>
 #include "WWLib/wwstring.h"
 #include <d3dx9core.h>
 
@@ -80,10 +82,36 @@ FVFInfoClass::FVFInfoClass(unsigned FVF_)
 	{
 		texcoord_offset[i]=texcoord_offset[i-1];
 
-		if ((int(FVF)&D3DFVF_TEXCOORDSIZE1(i-1))==D3DFVF_TEXCOORDSIZE1(i-1)) texcoord_offset[i]+=sizeof(float);
-		else if ((int(FVF)&D3DFVF_TEXCOORDSIZE2(i-1))==D3DFVF_TEXCOORDSIZE2(i-1)) texcoord_offset[i]+=2*sizeof(float);
-		else if ((int(FVF)&D3DFVF_TEXCOORDSIZE3(i-1))==D3DFVF_TEXCOORDSIZE3(i-1)) texcoord_offset[i]+=3*sizeof(float);
-		else if ((int(FVF)&D3DFVF_TEXCOORDSIZE4(i-1))==D3DFVF_TEXCOORDSIZE4(i-1)) texcoord_offset[i]+=4*sizeof(float);
+		// GeneralsX @bugfix Qoder 22/10/2026: D3DFVF_TEXCOORDSIZE2(index) expands to
+		// D3DFVF_TEXTUREFORMAT2 == 0, so the old chain's "(FVF & 0) == 0" test was always true and every
+		// texcoord advanced by two floats. An XYZNDUV1TG3 vertex therefore reported tex2/tex3 at 44/52
+		// instead of 48/60: the tangent/binormal/pad writes overlapped, the shader's T lost its z, B lost
+		// its z, and normal-mapped barrels shaded by the vertex frame instead of by the texture. Read the
+		// real two-bit format from bit 16 + 2*index (0 = 2 floats, 1 = 3, 2 = 4, 3 = 1), the same field
+		// the Vulkan attribute table already decodes in dx8wrapper.cpp.
+		const unsigned size_bits = (FVF >> (16u + 2u * (i - 1u))) & 0x3u;
+		const unsigned comps = (size_bits == D3DFVF_TEXTUREFORMAT1) ? 1u
+			: (size_bits == D3DFVF_TEXTUREFORMAT2) ? 2u
+			: (size_bits == D3DFVF_TEXTUREFORMAT3) ? 3u : 4u;
+		texcoord_offset[i] += comps * sizeof(float);
+	}
+
+	// GeneralsX @debug Qoder 22/10/2026: proof line for the tangent layout. Enable with
+	// GENERALSX_FVF_LOG=1; TG3 must report size=72 and tex=(28,36,48,60).
+	if (FVF == DX8_FVF_XYZNDUV1TG3)
+	{
+		static int s_log = -1;
+		if (s_log < 0)
+		{
+			const char* e = getenv("GENERALSX_FVF_LOG");
+			s_log = (e != nullptr && *e != 0 && *e != '0') ? 1 : 0;
+		}
+		if (s_log == 1)
+		{
+			fprintf(stderr, "[FVF] TG3 size=%u tex=(%u,%u,%u,%u)\n",
+				fvf_size, texcoord_offset[0], texcoord_offset[1], texcoord_offset[2], texcoord_offset[3]);
+			fflush(stderr);
+		}
 	}
 }
 

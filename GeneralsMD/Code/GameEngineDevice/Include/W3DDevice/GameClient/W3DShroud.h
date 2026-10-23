@@ -82,6 +82,10 @@ public:
 	void init(WorldHeightMap *pMap, Real worldCellSizeX, Real worldCellSizeY);
 	void reset();
 	TextureClass *getShroudTexture() { return m_pDstTexture;}	//<return shroud projection texture.
+	// GeneralsX @bugfix Qoder 21/10/2026: a destination exists before the map's shroud source does, and
+	// an uninitialised DEFAULT texture is black. Consumers must not modulate by it until both ends are
+	// live, or every tree turns black on a map whose shroud has not been initialised yet.
+	Bool isTextureReady() const { return m_pSrcTexture != nullptr && m_pDstTexture != nullptr && m_dstValid; }
 	void ReleaseResources();	///<release resources that can't survive D3D device reset.
 	Bool ReAcquireResources();	///<allocate resources that can't survive D3D device reset.
 	void fillShroudData(W3DShroudLevel level);	///<sets the state of the current shroud to some constant value
@@ -112,6 +116,14 @@ protected:
 	TextureClass *m_pDstTexture;			///<stores vidmem copy of visible shroud.
 	Int m_dstTextureWidth;					///<dimensions of m_pDstTexture
 	Int m_dstTextureHeight;					///<dimensions of m_pDstTexture
+	// GeneralsX @bugfix Qoder 21/10/2026: CPU mirror of the destination shroud texture. The per-rect
+	// _Copy_DX8_Rects updates only touch the DEFAULT-pool D3D texture, which the Vulkan layer cannot
+	// lock; without this shadow the keyed VkImage stayed black and the tree shader's stage-1 shroud
+	// modulation multiplied every tree to black.
+	UnsignedByte *m_dstShadow;
+	Int m_dstShadowW;
+	Int m_dstShadowH;
+	Bool m_dstValid;						///<at least one shroud render has filled the destination texture
 	TextureFilterClass::FilterType m_shroudFilter;
 	Real m_drawOriginX;
 	Real m_drawOriginY;

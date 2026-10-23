@@ -926,13 +926,42 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	DX8Wrapper::Set_Shader(Shader);
 	DX8Wrapper::Set_Texture(0,Texture);
 
+	// GeneralsX @bugfix Qoder 22/10/2026 effect stage-combiner leak: the retail stencil-volume pass
+	// (W3DVolumetricShadow) writes stage0 COLOROP=SELECTARG2, ALPHAOP=DISABLE and disables stage1.
+	// ShaderClass::Apply only re-asserts blend/alpha-test, not the combiners, so billboard particles
+	// flushed after that pass sampled no texture (upper explosion fireball vanished) while the
+	// ground-aligned shockwave, drawn earlier, stayed visible. Restore the sprite contract explicitly:
+	// stage0 = MODULATE(TEXTURE, DIFFUSE) for both colour and alpha, every higher stage disabled.
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+	if (DX8Wrapper::Get_Current_Caps())
+	{
+		const int maxStages = DX8Wrapper::Get_Current_Caps()->Get_Max_Textures_Per_Pass();
+		for (int s = 1; s < maxStages; ++s)
+		{
+			DX8Wrapper::Set_DX8_Texture_Stage_State(s, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			DX8Wrapper::Set_DX8_Texture_Stage_State(s, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+		}
+	}
+
 	// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 	// TheSuperHackers @bugfix stephanmeesters 30/06/2026 However, do not apply sorting to ground-aligned particles.
 	// This improves performance and resolves rendering artifacts caused by clipping between ground-aligned particles and billboard particles.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @bugfix Qoder 22/10/2026: the Vulkan sorting flush is still dropping billboard-only
+	// batches (the upper explosion fireball dies there while the ground-aligned shockwave, drawn
+	// immediately, survives). Until the sorting pass is proven, keep particles on the immediate path.
+	const bool sort = false;
+#else
 	const bool sort = Billboard &&
 	                  Shader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO &&
 	                  Shader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE &&
 	                  WW3D::Is_Sorting_Enabled();
+#endif
 
 	IndexBufferClass *indexbuffer;
 	int	verticesperprimitive;/// lorenzen fixed
@@ -1859,7 +1888,12 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 		// TheSuperHackers @info Volumetric particles, both billboarded and ground-aligned, must have sorting enabled to
 		// ensure accurate alpha-blending because these particles have stacked layers that don't face the camera straight on.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @bugfix Qoder 22/10/2026: same immediate-path workaround as the flat point group above.
+		const bool sort = false;
+#else
 		const bool sort = (Shader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) && (Shader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) && (WW3D::Is_Sorting_Enabled());
+#endif
 
 		IndexBufferClass *indexbuffer;
 		int	verticesperprimitive;/// lorenzen fixed

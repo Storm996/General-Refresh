@@ -487,16 +487,26 @@ static void loadBaseGeneralsAssetsForZH(TBigFileSystem* fileSystem, const AsciiS
 	}
 
 	if (zhAssetDirectory.isNotEmpty()) {
-		AsciiString siblingGenerals = zhAssetDirectory;
-		siblingGenerals.concat("/../Generals");
-		if (tryLoadBigFiles(fileSystem, siblingGenerals, "default-sibling-generals", FALSE, FALSE)) {
-			return;
-		}
-
-		AsciiString steamGenerals = zhAssetDirectory;
-		steamGenerals.concat("/ZH_Generals");
-		if (tryLoadBigFiles(fileSystem, steamGenerals, "default-zh-generals", FALSE, FALSE)) {
-			return;
+		// GeneralsX @bugfix Qoder 22/10/2026 Standard EA/GOG installs put the base game next to
+		// Zero Hour as "Command and Conquer Generals", not "Generals". The old single sibling
+		// guess missed every such install, so base-only assets (exscorch01.dds, shadowi.dds,
+		// exshockwav.dds ...) silently fell back to MissingTexture - the black scorch squares.
+		static const char* kBaseSiblingSuffixes[] = {
+			"/../Command and Conquer Generals",
+			"/../Generals",
+			"/ZH_Generals",
+		};
+		static const char* kBaseSiblingTags[] = {
+			"default-sibling-generals",
+			"default-sibling-generals-short",
+			"default-zh-generals",
+		};
+		for (UnsignedInt i = 0; i < ARRAY_SIZE(kBaseSiblingSuffixes); ++i) {
+			AsciiString candidate = zhAssetDirectory;
+			candidate.concat(kBaseSiblingSuffixes[i]);
+			if (tryLoadBigFiles(fileSystem, candidate, kBaseSiblingTags[i], FALSE, FALSE)) {
+				return;
+			}
 		}
 	}
 }

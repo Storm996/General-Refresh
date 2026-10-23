@@ -803,6 +803,10 @@ VKD3DDevice::VKD3DDevice(HWND hwnd, const D3DPRESENT_PARAMETERS &pp, DWORD behav
     m_hwnd = hwnd;
     m_pp = pp;
     m_behaviorFlags = behaviorFlags;
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: this device is the only backend that can name the objects its
+    // resources are, so it hands the mirror tables the identity hook before any texture exists. Off this
+    // path (d3d9/DXVK driver) the hook stays unset and the tables keep today's pointer-keyed behaviour.
+    VK_Set_Mirror_Identity_Fn(&VKD3D_Mirror_Identify);
     ::ZeroMemory(m_rs, sizeof(m_rs));
     ::ZeroMemory(m_tss, sizeof(m_tss));
     ::ZeroMemory(m_samp, sizeof(m_samp));
@@ -949,6 +953,171 @@ static void stub_log_unknown_format(D3DFORMAT fmt)
     }
 }
 
+// ---- R-07: live-object identity for the mirror tables ------------------------------------------
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: the Vulkan mirror tables key everything by the raw D3D object
+// pointer, and this process recycles those addresses. A texture created on the pointer of a dead one used
+// to sample the dead texture's image (unit skins flattened onto the terrain, ocean tiles answering with
+// seafloor), and shape equality could not tell the two apart because the pair often is the same size and
+// format. The VulkanCore side asks this layer who owns a pointer now, through a token no allocator can hand
+// out twice. Every stub texture and surface registers here at construction and unregisters at destruction,
+// so the answer also says "nobody" (0), which retires a mirror left behind by an object whose destructor
+// never ran - the failure mode wedge 9.J2d documented (a stub found alive at one call and vtable-cleared at
+// the next, with no destructor of ours in between).
+//
+// Fixed open-addressed table, tombstone on remove: thousands of objects, one lookup per texture slot per
+// submitted batch, and no allocation in the draw path. The critical section is never held while VulkanCore
+// is entered (callers copy the answer out first), so it cannot order against the shared queue lock.
+namespace {
+
+struct VKStubLiveRow {
+    void*            obj;
+    unsigned long long ident;
+    unsigned char    kind;   // 1 = texture, 2 = surface
+    unsigned char    used;   // slot was once occupied (tombstone keeps the probe chain)
+};
+
+// GeneralsX @bugfix Qoder 21/10/2026 multi-match exhaustion: 8192 slots is smaller than the live set
+// of one campaign map plus the menu (every texture and every surface view registers here). When the
+// table filled, vk_live_add silently stopped inserting, so the address-reuse guard degraded to 0 and
+// VKD3D_Push_Mirror could no longer name the object - a missing mirror stayed white. 64K rows cost
+// ~1.5 MiB of BSS and keep the table out of the map-load peak; a full insert is now logged.
+const unsigned VK_LIVE_SLOTS = 65536u;   // power of two
+VKStubLiveRow g_liveTable[VK_LIVE_SLOTS];
+CRITICAL_SECTION g_liveCS;
+bool g_liveCSMade = false;
+unsigned long long g_liveIdentNext = 0ull;
+unsigned long long g_vkLiveInsertFails = 0ull;
+
+unsigned vk_live_slot(void* obj)
+{
+    unsigned long long h = (unsigned long long)(uintptr_t) obj;
+    h ^= h >> 16; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+    return (unsigned)(h & (VK_LIVE_SLOTS - 1u));
+}
+
+void vk_live_ensure_cs()
+{
+    if (!g_liveCSMade) { InitializeCriticalSection(&g_liveCS); g_liveCSMade = true; }
+}
+
+void vk_live_add(void* obj, unsigned char kind, unsigned long long* outIdent)
+{
+    vk_live_ensure_cs();
+    EnterCriticalSection(&g_liveCS);
+    const unsigned long long ident = ++g_liveIdentNext;
+    unsigned i = vk_live_slot(obj);
+    bool inserted = false;
+    for (unsigned n = 0; n < VK_LIVE_SLOTS; ++n) {
+        VKStubLiveRow& r = g_liveTable[i];
+        if (!r.used || !r.obj) {
+            r.obj = obj; r.ident = ident; r.kind = kind; r.used = 1;
+            inserted = true;
+            break;
+        }
+        i = (i + 1u) & (VK_LIVE_SLOTS - 1u);
+    }
+    if (!inserted) {
+        // GeneralsX @bugfix Qoder 21/10/2026: a full table used to fail silently, which is worse than
+        // the leak it hides - the object becomes unnameable and every mirror miss for it turns white.
+        ++g_vkLiveInsertFails;
+        if (g_vkLiveInsertFails == 1ull || (g_vkLiveInsertFails & 4095ull) == 0ull) {
+            fprintf(stderr, "[VKLIVE] table full (%u slots): obj=%p kind=%u cannot be identified; failures=%llu\n",
+                VK_LIVE_SLOTS, obj, (unsigned)kind, g_vkLiveInsertFails);
+            fflush(stderr);
+        }
+    }
+    LeaveCriticalSection(&g_liveCS);
+    if (outIdent) *outIdent = ident;
+}
+
+void vk_live_remove(void* obj)
+{
+    if (!g_liveCSMade) return;
+    EnterCriticalSection(&g_liveCS);
+    unsigned i = vk_live_slot(obj);
+    for (unsigned n = 0; n < VK_LIVE_SLOTS; ++n) {
+        VKStubLiveRow& r = g_liveTable[i];
+        // GeneralsX @bugfix Qoder 20/10/2026 R-07 tombstone chain: a removed row keeps used=1 so the
+        // probe chain stays intact, but it is a hole, not an end - breaking here made every live object
+        // that had collided past a freed one invisible to the lookup below. Only a never-occupied slot
+        // ends the chain.
+        if (!r.used) break;
+        if (r.obj == obj) { r.obj = nullptr; r.ident = 0ull; break; }
+        i = (i + 1u) & (VK_LIVE_SLOTS - 1u);
+    }
+    LeaveCriticalSection(&g_liveCS);
+}
+
+unsigned vk_live_kind(void* obj, unsigned long long* outIdent)
+{
+    if (!g_liveCSMade || !obj) return 0u;
+    EnterCriticalSection(&g_liveCS);
+    unsigned kind = 0u;
+    unsigned long long ident = 0ull;
+    unsigned i = vk_live_slot(obj);
+    for (unsigned n = 0; n < VK_LIVE_SLOTS; ++n) {
+        const VKStubLiveRow& r = g_liveTable[i];
+        if (!r.used) break;                          // never occupied: chain ends here, not at a tombstone
+        if (r.obj == obj) { kind = r.kind; ident = r.ident; break; }
+        i = (i + 1u) & (VK_LIVE_SLOTS - 1u);
+    }
+    LeaveCriticalSection(&g_liveCS);
+    if (outIdent) *outIdent = ident;
+    return kind;
+}
+
+} // anon
+
+unsigned long long VKD3D_Mirror_Identify(void* key)
+{
+    unsigned long long ident = 0ull;
+    vk_live_kind(key, &ident);
+    return ident;
+}
+
+// GeneralsX @feature Qoder 21/10/2026: occupancy snapshot for the cross-match resource log. Counts
+// live textures + surfaces only (tombstones keep used=1 but obj=null), plus the first/aggregate
+// insert failures, so a table that quietly filled is visible in the same line as the mirror budget.
+void VKD3D_Live_Stats(unsigned* used, unsigned* cap, unsigned long long* insertFailures)
+{
+    unsigned count = 0u;
+    if (g_liveCSMade) {
+        EnterCriticalSection(&g_liveCS);
+        for (unsigned i = 0; i < VK_LIVE_SLOTS; ++i) {
+            if (g_liveTable[i].used && g_liveTable[i].obj) ++count;
+        }
+        LeaveCriticalSection(&g_liveCS);
+    }
+    if (used) *used = count;
+    if (cap) *cap = VK_LIVE_SLOTS;
+    if (insertFailures) *insertFailures = g_vkLiveInsertFails;
+}
+
+// Feed a live stub object's own CPU store into its Vulkan mirror. The draw path calls this the frame it
+// resolves a texture slot to nothing - the object is alive and holds the bytes, only the upload never
+// happened (or the mirror it had was just retired as an orphan). This is the same convergence the device
+// copy movers reach through mirror_to_vulkan, keyed off the bind instead of off a copy.
+bool VKD3D_Push_Mirror(void* key)
+{
+    if (!key || !VK_NOD3D_Enabled() || !VKTex_Ready()) return false;
+    unsigned long long ident = 0ull;
+    const unsigned kind = vk_live_kind(key, &ident);
+    if (kind == 1u) {
+        VKD3DTexture* t = static_cast<VKD3DTexture*>(key);
+        if (!t->level_bits(0)) return false;   // nobody ever wrote it: uploading zeroed bytes is not a feed
+        t->mirror_to_vulkan();
+        return true;
+    }
+    if (kind == 2u) {
+        VKD3DSurface* s = static_cast<VKD3DSurface*>(key);
+        VKD3DTexture* t = s->texture_view();
+        if (!t || !t->level_bits(0)) return false;
+        t->mirror_to_vulkan();
+        return true;
+    }
+    return false;
+}
+
 VKD3DSurface::VKD3DSurface(VKD3DDevice *dev, const D3DSURFACE_DESC &desc, IUnknown *container)
 {
     m_dev = dev;
@@ -959,11 +1128,18 @@ VKD3DSurface::VKD3DSurface(VKD3DDevice *dev, const D3DSURFACE_DESC &desc, IUnkno
     m_pitch = 0;
     m_tex = nullptr;
     m_texLevel = 0;
+    vk_live_add(this, 2, nullptr);
     if (m_container) m_container->AddRef();
 }
 
 VKD3DSurface::~VKD3DSurface()
 {
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: forget this pointer in both mirror tables before the address
+    // goes back to the allocator. A raw surface is an RT key when its container is not a texture (the sun
+    // shadow map's D24S8), so the render-target table needs the same death hook the texture table always had.
+    VKTex_Drop(this);
+    VKRT_Drop(this);
+    vk_live_remove(this);
     // A level view owns no bytes; the texture's store outlives every view of it.
     if (!m_tex) vk_stub_store_free(m_region, m_bits);
     if (m_container) m_container->Release();
@@ -1019,6 +1195,10 @@ VKD3DTexture::VKD3DTexture(VKD3DDevice *dev, UINT width, UINT height, UINT level
         }
     }
     for (unsigned i = 0; i < 16; ++i) { m_store[i].bits = nullptr; m_store[i].pitch = 0; m_store[i].region = nullptr; m_store[i].written = 0; }
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: claim this address in the live table. The mirror entries the
+    // loader is about to build are stamped with this object's token, so a later owner of the same pointer
+    // cannot inherit them.
+    vk_live_add(this, 1, nullptr);
 }
 
 VKD3DTexture::~VKD3DTexture()
@@ -1028,6 +1208,11 @@ VKD3DTexture::~VKD3DTexture()
     // owner is sampled through the dead texture's image - which is how the sun shadow map inherited
     // tsmorningw_nm.tga's mirror and the terrain receiver went black. Drop it here, at the real death.
     VKTex_Drop(this);
+    // GeneralsX @bugfix Qoder 20/10/2026 R-07: an engine render target IS a texture (Create_Render_Target
+    // and the shadow map both come through here), and the render-target table had no death hook. Drop it,
+    // then leave the live table so the next owner of this address is a stranger to both.
+    VKRT_Drop(this);
+    vk_live_remove(this);
     for (unsigned i = 0; i < 16; ++i) vk_stub_store_free(m_store[i].region, m_store[i].bits);
 }
 

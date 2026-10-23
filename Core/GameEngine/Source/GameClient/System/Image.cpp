@@ -87,11 +87,43 @@ void Image::parseImageCoords( INI* ini, void *instance, void *store, const void*
 	{
 		uvCoords.lo.x /= (Real)textureSize->x;
 		uvCoords.hi.x /= (Real)textureSize->x;
+
+		// GeneralsX @bugfix Qoder 21/10/2026: sample texel centres, not atlas cell edges. A mapped
+		// image used to keep Left/W..Right/W as its UV, so linear filtering of a tiled button strip
+		// blended the last opaque texel with the transparent padding cell next to the atlas rect and
+		// drew a 1px seam at every tile boundary (the 10px Buttons-Middle pieces). The font atlas
+		// already insets its block UV; do the same for every mapped image. A one-texel image has no
+		// span left after the inset, so it collapses to its own centre.
+		const Real insetX = 0.5f / (Real)textureSize->x;
+		if( uvCoords.hi.x - uvCoords.lo.x > 2.0f * insetX )
+		{
+			uvCoords.lo.x += insetX;
+			uvCoords.hi.x -= insetX;
+		}
+		else
+		{
+			const Real centreX = (uvCoords.lo.x + uvCoords.hi.x) * 0.5f;
+			uvCoords.lo.x = centreX;
+			uvCoords.hi.x = centreX;
+		}
 	}
 	if( textureSize->y )
 	{
 		uvCoords.lo.y /= (Real)textureSize->y;
 		uvCoords.hi.y /= (Real)textureSize->y;
+
+		const Real insetY = 0.5f / (Real)textureSize->y;
+		if( uvCoords.hi.y - uvCoords.lo.y > 2.0f * insetY )
+		{
+			uvCoords.lo.y += insetY;
+			uvCoords.hi.y -= insetY;
+		}
+		else
+		{
+			const Real centreY = (uvCoords.lo.y + uvCoords.hi.y) * 0.5f;
+			uvCoords.lo.y = centreY;
+			uvCoords.hi.y = centreY;
+		}
 	}
 
 	// store the uv coords

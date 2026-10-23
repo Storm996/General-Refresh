@@ -139,13 +139,9 @@ public:
 	// GeneralsX @feature 10/10/2026 Shadow system S1/S2 knobs.  These live only in the per-user
 	// Options.ini, so they are never folded into m_iniCRC and cannot break replays or LAN matching;
 	// missing keys fall back to the engine defaults.
-	Real getShadowProjectedIntensity() const;					///< 0-100 percent, projected shadow darkening (default 25, the original code was hard-coded 40)
-	Real getShadowVolumetricIntensity() const;				///< 0-100 percent, volumetric shadow darkening (default 22, the original was about 37.3)
-	void getShadowTint(Real *r, Real *g, Real *b) const;		///< "R G B" in permille (default "880 1000 1150"), returned as three per-channel multipliers
+	Real getShadowProjectedIntensity() const;					///< 0-100 percent, native sun-shadow darkening (default 25)
+	Real getShadowVolumetricIntensity() const;				///< 0-100 percent, native sun-shadow penumbra scale (default 22)
 	Int getShadowMapResolution() const;							///< shadow map edge length, one of 512/768/1024/2048, default 768
-	// GeneralsX @feature PS3.0 T2 13/10/2026 Shadow S-family: projected-shadow softening level,
-	// 0 = sharp (retail behavior, the default), 1-3 = gaussian blur radius in texels per pass.
-	Int getShadowSoftening() const;
 	// GeneralsX @feature 13/10/2026 PS3.0 lighting knobs from 引擎改造/设置参数交接说明.md.  All of
 	// them persist as integer ticks in the Options.ini S-family (never folded into m_iniCRC, so
 	// replays and LAN matching are safe); the GENERALSX_* environment variables keep overriding
@@ -155,9 +151,10 @@ public:
 	// RoughnessMapping, 0 = off (default) / 1 = M1 roughness Blinn / 2 = M2 GGX; the GENERALSX_PBR
 	// env still wins outright so scripted A/B runs never touch the user's file.
 	Int getPBRMode() const;
+	Int getForwardPlusMode() const;		///< 0 off, 1 2D tiles, 2 3D clusters (env GENERALSX_VK_FORWARDPLUS_MODE wins)
+	Int getForwardLightBudget() const;	///< 32..256 global point-light cap (env GENERALSX_VK_FP_BUDGET wins)
 	Real getBloomIntensity() const;				///< tick 0-100 stored, returned 0.0-1.0; env GENERALSX_BLOOM_INTENSITY wins outright (default 0.35)
-	Bool getMultiLightEnabled() const;			///< PS3.0 P3 follow-up: always ON, the ini key and the menu row are gone; env GENERALSX_MULTILIGHT=0 is the only way down
-	Bool getShadowMapEnabled() const;			///< any GENERALSX_SHADOWMAP with atoi>0 forces ON / =0 forces OFF, else ini ShadowMap (default OFF)
+	Bool getShadowMapEnabled() const;			///< options-page "real shadow" switch: ON = native Vulkan sun shadow (retail decal/stencil muted), OFF = retail fallback; env GENERALSX_SHADOWMAP overrides, else ini ShadowMap (default ON)
 	Int getShadowMapIntensity() const;			///< 0-100 percent; env GENERALSX_SHADOWMAP_INT wins when set (default 55)
 	Int getSunShadowMapResolution() const;		///< one of 256/512/1024, snap-up (default 1024)
 	Int getPresentInterval() const;				///< GeneralsX @feature PS3.0-P3-25a vsync ticks 0..3; env GENERALSX_SWAPINTERVAL wins, else ini VSync (default 1 = on). Restart to take effect.
@@ -167,7 +164,6 @@ public:
 	Bool getLightPulseEnabled() const;			///< 4A explosion/muzzle dynamic light pulses; env GENERALSX_LIGHTPULSE wins, else ini LightPulseEffect (default ON)
 	Bool getLampLightEnabled() const;			///< 4B building lamps; env GENERALSX_LAMPLIGHT wins, else ini LampLightEffect (default ON)
 	Int getLampLightIntensity() const;			///< 4F lamp brightness gain; tick 0-200 stored, 100 = 1.0x; env GENERALSX_LAMP_INT (float) wins (default 60 = 0.6x)
-	Bool getPBRMLEnabled() const;				///< 4C GGX multi-light specular; env GENERALSX_PBRML ("0" forces off) wins, else ini PBRMultiLight (default ON)
 	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: the P3-14 distance haze gets its
 	// own page rows. ini DistanceHaze (0/1, default ON) + DistanceHazeIntensity (ticks 0-100 = the
 	// 0.0-1.0 blend strength, default 60); env GENERALSX_GNFOG (float 0..1) wins over both so QA legs
@@ -175,15 +171,15 @@ public:
 	Bool getDistanceHazeEnabled() const;
 	Int getDistanceHazeIntensity() const;		///< 0-100 percent haze blend at the far end of the ramp.
 	Int getTodPreview() const;					///< 4C time-of-day preview 0 = follow the map, 1..4 force a slot; env GENERALSX_TOD_OVERRIDE wins, else ini TimeOfDayPreview
-	// GeneralsX @feature PS3.0 L2.2 17/10/2026: HLSL terrain trio (TERRAIN30) opt-in from the Graphics
-	// Options page; env GENERALSX_TERRAIN30 keeps winning for QA legs, else ini Terrain30Shading
-	// (default OFF = retail FF/.pso parity, the batch22 verdict). Restart to re-install the trio.
+	// GeneralsX @feature PS3.0 L2.2 17/10/2026: HLSL terrain trio (TERRAIN30). Since the 20/10/2026 merge
+	// this is no longer a page row; env GENERALSX_TERRAIN30 keeps winning for QA legs, else the legacy ini
+	// key Terrain30Shading (default OFF = retail FF/.pso parity, the batch22 verdict).
 	Bool getTerrain30Shading() const;
-	// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal child switch (B5 slot).
-	// env GENERALSX_TERRAIN_PPL wins for QA legs, else ini TerrainPerPixel (factory default OFF = the L2.1
-	// NM trio parity). CHILD of Terrain30Shading: it never arms anything on its own - the HLSL terrain trio
-	// must already be opted in (batch22 retail-parity red line, default untouched). Restart (terrain shader
-	// re-init) to take effect, same convention as the parent row.
+	// GeneralsX @feature Qoder 17/10/2026 PS3.0 T0 P4: terrain per-pixel macro-normal switch, now the single
+	// terrain row on the Graphics Options page. env GENERALSX_TERRAIN_PPL wins for QA legs, else ini
+	// TerrainPerPixel (factory default OFF = the L2.1 NM trio parity). Turning it on also arms the ps_3_0/NM
+	// leg that the retired "现代地形光影" parent row used to carry, so it never needs another switch.
+	// Restart (terrain shader re-init) to take effect.
 	Bool getTerrainPerPixel() const;
 	// GeneralsX @feature Qoder 17/10/2026: per-pixel lighting master switch (the DX8GeomNormal pass)
 	// from the Graphics Options page row "逐像素光照". env GENERALSX_GEOMNORMAL keeps winning for QA legs

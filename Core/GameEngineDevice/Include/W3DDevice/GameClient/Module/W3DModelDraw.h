@@ -535,10 +535,20 @@ private:
 	const LampSet*					m_lampSet;										///< cached lookup result, nullptr = none for this object
 	Bool									m_lampSetResolved;								///< lazy lookup already attempted (avoids a hash lookup every frame)
 	std::vector<W3DDynamicLight*>		m_lampLights;										///< one held pool light per LampSet entry (nullptr = not yet acquired)
+	std::vector<W3DDynamicLight*>		m_lampWashLights;									///< night-only low light per lamp: ground/bounce wash so walls and the yard are lit
+	W3DDynamicLight*				m_structureLight;								///< night fallback light for structures with no authored LampList
+	std::vector<W3DDynamicLight*>		m_perimeterLights;								///< 4 mid-height lights around very large structures (cooling towers, hangars)
 	Real									m_lampFlickerPhase;							///< per-instance random phase so lamps don't blink in sync
+	W3DDynamicLight*				m_headlightLight;								///< pooled forward light for night driving (render-side only)
 
 	void updateLamps(const Matrix3D& worldMtx);		///< acquire/refresh held lamps; called from doDrawModule each render frame
 	void releaseLamps();									///< fade out and drop all held pool lights (dtor + when effectively hidden)
+	void updateHeadlights(const Matrix3D& worldMtx);	///< night headlight for ground vehicles (render-side only)
+	void releaseHeadlights();							///< fade the headlight when it should no longer be on
+	void updateStructureLight(const Matrix3D& worldMtx, Real modelRadius);	///< fallback light for structures without LampList data
+	void releaseStructureLight();
+	void updatePerimeterLights(const Matrix3D& worldMtx, Real modelRadius);	///< mid-height ring for very large structures
+	void releasePerimeterLights();
 
 	void adjustAnimation(const ModelConditionInfo* prevState, Real prevAnimFraction);
 	Real getCurrentAnimFraction() const;

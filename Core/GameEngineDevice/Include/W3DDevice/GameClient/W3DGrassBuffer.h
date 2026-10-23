@@ -45,6 +45,16 @@ public:
 		unsigned long colorTip;    // lit tip vertex color
 	};
 
+	// GeneralsX @feature Qoder 21/10/2026 stone candidate (Vulkan instanced stones).
+	struct GrassRock
+	{
+		Real x, y, z;          // world-space base centre
+		Real scale;            // world-unit radius
+		Real rotX, rotY, rotZ; // euler rotation (radians)
+		Real variant;          // shape/aspect variant 0..1
+		Real r, g, b;          // base tint
+	};
+
 	W3DGrassBuffer();
 	virtual ~W3DGrassBuffer();
 
@@ -71,6 +81,8 @@ protected:
 	void rebuildFullField();
 	/// Per-frame: extract the visible, distance-LOD'd subset from m_allClumps.
 	void filterVisible();
+	/// GeneralsX @feature Qoder 21/10/2026: fill the GPU instance streams from the visible slice.
+	void buildVkInstances();
 	/// Push one clump (2 crossed quads worth of vertices) into the vertex stream. Corners are
 	/// transformed world -> view space with the camera view matrix (W3DSnow convention).
 	void emitClumpQuads(struct VertexFormatXYZNDUV2 *&verts, const Matrix3D &view) const;
@@ -80,6 +92,10 @@ protected:
 
 	std::vector<GrassClump> m_clumps;        // per-frame visible subset (built from m_allClumps)
 	std::vector<GrassClump> m_allClumps;     // full-map candidate set (scanned once per map)
+	std::vector<GrassRock>  m_allRocks;      // full-map stone candidates
+	std::vector<GrassRock>  m_rocks;         // per-frame visible stone subset
+	std::vector<float>      m_grassInst;     // 12 floats per blade instance (Vulkan path)
+	std::vector<float>      m_rockInst;      // 12 floats per stone instance
 	Int  m_builtSig;                         // map signature m_allClumps was scanned for (-1 = none)
 	Int  m_quadCount;                        // quads currently cached (m_clumps * 2)
 	Bool m_enabled;

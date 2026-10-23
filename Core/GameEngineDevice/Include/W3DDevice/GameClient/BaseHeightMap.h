@@ -71,8 +71,11 @@ class W3DDynamicLight;
 
 #define DO_ROADS 1
 
-#define VERTEX_FORMAT VertexFormatXYZDUV2
-#define DX8_VERTEX_FORMAT DX8_FVF_XYZDUV2
+// GeneralsX @bugfix Qoder 21/10/2026: carry the terrain normal in the vertex stream so the
+// per-pixel terrain shader can light with the interpolated vertex normal instead of the
+// per-triangle face normal reconstructed from depth (which drew flat diamond facets).
+#define VERTEX_FORMAT VertexFormatXYZNDUV2
+#define DX8_VERTEX_FORMAT DX8_FVF_XYZNDUV2
 
 /// Custom render object that draws the heightmap and handles intersection tests.
 /**

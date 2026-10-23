@@ -2150,7 +2150,7 @@ Matrix4x4 matProj, matView, matWW3D;
 		float sunUV[2] = { 0.55f, -0.35f };
 		if (TheGlobalData)
 		{
-			const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+			const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[W3DDisplay::getRenderTimeOfDay()][0];
 			Vector3 Lw(-sl.lightPos.x, -sl.lightPos.y, -sl.lightPos.z);
 			Matrix4x4 viewM;
 			DX8Wrapper::Get_Transform(D3DTS_VIEW, viewM);
@@ -2215,7 +2215,7 @@ Matrix4x4 matProj, matView, matWW3D;
 			}
 			if (tintOn && TheGlobalData)
 			{
-				const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay][0];
+				const GlobalData::TerrainLighting& sl = TheGlobalData->m_terrainObjectsLighting[W3DDisplay::getRenderTimeOfDay()][0];
 				Real warmR = 0.55f + sl.diffuse.red * 0.45f;
 				Real warmG = 0.60f + sl.diffuse.green * 0.40f;
 				Real warmB = 0.62f + sl.diffuse.blue * 0.30f;

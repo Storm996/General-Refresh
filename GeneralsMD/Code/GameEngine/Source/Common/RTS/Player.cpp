@@ -62,6 +62,7 @@
 #include "Common/Radar.h"
 #include "Common/ResourceGatheringManager.h"
 #include "Common/Team.h"
+#include "GameLogic/AICampaignPlayer.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
 #include "Common/TunnelTracker.h"
@@ -795,8 +796,38 @@ void Player::setPlayerType(PlayerType t, Bool skirmish)
 					break;
 			}
 		} else {
-			// create AIPlayer and attach to this Player
-			m_ai = newInstance(AIPlayer)( this );
+			// GeneralsX @feature campaign-ai 22/10/2026
+			// NX campaign maps keep their hand-placed base/build list, so they cannot
+			// use AISkirmishPlayer (adjustBuildList would destroy and reposition the
+			// command center).  Use AICampaignPlayer for the primary enemy only; it is
+			// an AIPlayer plus an autonomous commander tick.  Retail maps and QA slot
+			// names (player0/player1) keep plain AIPlayer.
+			Bool nxEnemy = false;
+			if( getenv( "GENERALSX_CAMPAIGN_AI" ) &&
+				TheGlobalData && strstr( TheGlobalData->m_mapName.str(), "NX_" ) )
+			{
+				const char *nm = m_playerName.str();
+				nxEnemy = ( !skirmish &&
+					( strcmp( nm, "Enemy" ) == 0 || strcmp( nm, "GLA_Enemy" ) == 0 ) );
+			}
+			if( getenv( "GENERALSX_NO_CAMPAIGN_AI" ) )
+				nxEnemy = false;
+			if( nxEnemy )
+			{
+				m_ai = newInstance( AICampaignPlayer )( this );
+				fprintf( stderr, "[NXAI] side=%s -> AICampaignPlayer\n", m_playerName.str() );
+				fflush( stderr );
+				if( FILE *nxLog = fopen( "_nx_guard.log", "a" ) )
+				{
+					fprintf( nxLog, "[NXAI] side=%s -> AICampaignPlayer\n", m_playerName.str() );
+					fclose( nxLog );
+				}
+			}
+			else
+			{
+				// create AIPlayer and attach to this Player
+				m_ai = newInstance(AIPlayer)( this );
+			}
 		}
 
 		// GeneralsX @feature ai-upgrade 14/10/2026 Dispatch forensic line: proves which driver
@@ -878,6 +909,7 @@ void Player::initFromDict(const Dict* d)
 
 	}
 
+
 	if (d->getBool(TheKey_playerIsHuman) || forceHuman)
 	{
 		setPlayerType(PLAYER_HUMAN, false);
@@ -948,6 +980,7 @@ void Player::initFromDict(const Dict* d)
 		setAIStyle(style);
 
 		setPlayerType(PLAYER_COMPUTER, skirmish);
+
 	}
 	if (skirmish) {
 		// Copy and qualify scripts, and teams.

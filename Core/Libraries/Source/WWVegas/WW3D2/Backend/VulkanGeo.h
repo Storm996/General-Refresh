@@ -99,6 +99,10 @@ void VKRT_Run_Probe();
 struct VKRT_Info {
     void*    image;      // VkImage
     void*    view;       // VkImageView (color / depth aspect as created)
+    // Sampling view: identical to 'view' for color, but DEPTH-only for a depth format that also carries
+    // stencil. Vulkan forbids a SAMPLED_IMAGE view from naming both aspects, and a combined D24S8 view
+    // silently reads back 0 on some drivers - which made the sun receiver reconstruct garbage.
+    void*    sample_view;
     unsigned format;     // VkFormat
     unsigned width, height, levels;
     int      layout;     // VKRT_Layout id, not a VkImageLayout
@@ -138,6 +142,37 @@ bool VKTex_Query(void* key, VKTex_Info* out);
 // was created at the pointer of a dead normal map and inherited its upload mirror, which then shadowed
 // the render-target mirror in every sampled lookup. The owner must delete its mirror when it dies.
 void VKTex_Drop(void* key);
+
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: mirror identity, the general form of the drop above. Both
+// mirror tables answer lookups by raw D3D object pointer, and the allocator hands a freed pointer to the
+// next object it creates. Shape equality cannot tell that reuse apart from a genuine in-place CPU update,
+// because a recycled 256x256 DXT1 lands on a 256x256 DXT1: the new owner then samples the dead texture's
+// texels (unit skins stamped flat onto the terrain, ocean tiles answering with seafloor). The backend that
+// owns the object's lifetime answers this with a token no allocator can hand out twice, and each table
+// keeps the token of the object that built the image; a mirror whose token is not the live object's is
+// retired on the spot and the caller sees a miss instead of a ghost. Registered by the no-d3d9 stub, the
+// only backend that can name its own objects; leaving it unset keeps today's behaviour on the d3d9/DXVK
+// path, where the pointer belongs to someone else and 0 matches the 0 every entry was built with.
+typedef unsigned long long (*VKMirror_Identify)(void* key);
+void VK_Set_Mirror_Identity_Fn(VKMirror_Identify fn);
+
+// GeneralsX @bugfix Qoder 20/10/2026 R-07: the same drop for the render-target table. Its keys are engine
+// render targets (the shadow map, the screen-filter RTT pair), and W3DShaderManager::init re-creates that
+// pair at the same extent and format on every height-map rebuild, so the shape guard never fires and the
+// new target inherits the old one's image. There was no entry point to forget a key; this is it.
+void VKRT_Drop(void* key);
+
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @feature Qoder 21/10/2026 multi-match forensics: one release-visible line with the LIVE
+// mirror tables (images and bytes), upload/create counters, budget skips and stub-object table
+// occupancy. Called at asset-release time (each game reset), so two consecutive matches show whether
+// the previous map really left memory behind or whether only the budget accounting was lying.
+void VKDiag_Log_Mirror_State(const char* why);
+
+// Occupancy of the stub's live-object identity table (textures + surfaces). Implemented next to the
+// table in VKD3DStubImpl.cpp; the counter also catches a full-table insert, which used to be silent.
+void VKD3D_Live_Stats(unsigned* used, unsigned* cap, unsigned long long* insertFailures);
+#endif
 
 // ---- wedge 5: geometry backing --------------------------------------------------------
 // Wedge 3.1's single shared 64 MiB bump ring proved the host-write path, but a ring that hands every

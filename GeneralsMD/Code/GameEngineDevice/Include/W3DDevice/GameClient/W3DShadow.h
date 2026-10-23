@@ -47,11 +47,6 @@ public:
 	void removeAllShadows(); ///< Remove all shadows.
 	void setShadowColor(UnsignedInt color) { m_shadowColor=color;}	///<sets the shadow color and alpha, value in ARGB format.
 	UnsignedInt getShadowColor() { return m_shadowColor;}	///<gets the shadow color and alpha, value in ARGB format.
-	// GeneralsX @feature 10/10/2026 Shadow S1: projected shadow density and the shadow tint are read
-	// once from Options.ini at construction and cached here, so individual shadow instances never
-	// have to parse the config file.
-	Real getShadowProjectedIntensity() { return m_shadowProjectedIntensity;}	///< projected darkening, 0-1, fed straight into TexProjectClass::Set_Intensity.
-	Real getShadowTint(Int channel) { return m_shadowTint[channel];}	///< 0=R 1=G 2=B, per-channel multipliers.
 	void setLightPosition(Int lightIndex, Real x, Real y, Real z);	///<sets the position of a specific light source.
 	void setTimeOfDay(TimeOfDay tod);
 	void invalidateCachedLightPositions();	///<forces shadow volumes to update regardless of last lightposition
@@ -69,9 +64,6 @@ protected:
 
 		Bool	m_isShadowScene;	///<flag if current scene needs shadows.  No shadows on pre-pass and 2D.
 		UnsignedInt m_shadowColor;	///<color and alpha for all shadows in scene.
-		// GeneralsX @feature 10/10/2026 shadow S1 cached values (from OptionPreferences).
-		Real m_shadowProjectedIntensity;	///< projected shadow darkening, 0-1.
-		Real m_shadowTint[3];							///< per-channel multipliers of the shadow color, 1.0 = no shift.
 		Int m_stencilShadowMask;
 };
 

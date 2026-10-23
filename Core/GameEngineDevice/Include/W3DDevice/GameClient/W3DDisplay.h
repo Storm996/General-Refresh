@@ -90,6 +90,10 @@ public:
 																 UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime//, Bool donut = FALSE
 																 ) override;
 	virtual void setTimeOfDay ( TimeOfDay tod ) override;
+	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: the TOD actually used by the renderer (after the
+	// Options TimeOfDayPreview / GENERALSX_TOD_OVERRIDE remap). Presentation-side tables that live in
+	// GlobalData (tree/prop object lighting) must index with this, not the logic TOD.
+	static TimeOfDay getRenderTimeOfDay();
 	// GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: forward the options-page value to
 	// the shader manager, which owns the live haze state and re-pushes the ramp (see Display.h).
 	virtual void setDistanceHaze ( Bool enabled, Real strength01 ) override;
@@ -98,6 +102,7 @@ public:
 	// strength without a restart.
 	virtual void setLightPulseEnabled ( Bool enabled ) override;
 	virtual void setBloomIntensity ( Real intensity01 ) override;
+	virtual void setAntiAliasLevel ( Int level ) override;
 	virtual void setShadowMapStrength ( Real strength01 ) override;
 
 	/// draw a line on the display in screen coordinates

@@ -34,9 +34,12 @@
 // disappears. The mounters therefore have to decline such a pair up front and leave the batch on the
 // fixed pipeline (which the Vulkan FF stages do draw). This is not a feature switch: every translated
 // pair still mounts, and the decline lifts automatically as each family's translation lands.
+// GeneralsX @build Qoder 22/10/2026 VulkanPgm.cpp is compiled into ww3d2 unconditionally; the
+// handle->tag query below must see its declaration even when SAGE_USE_VULKAN_CORE is off.
+#include "Backend/VulkanPgm.h"
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 #include "Backend/VulkanCore.h"
-#include "Backend/VulkanPgm.h"
+#include "Backend/VulkanForward.h"
 #endif
 
 namespace
@@ -71,7 +74,7 @@ namespace
 // The engine's ambient is a flat constant; multiplying an ambient*hemiscale tint by the WORLD-up
 // component of the pixel normal (W3D is Z-up - see DX8NormalMap's g_FallbackDir) lifts sky-facing
 // surfaces and leaves downward faces on the plain ambient, so shadowed ground no longer reads as
-// the same value as an upward-lit wall. Uploaded as the GN-family PS c16 / ML PS c8 hemi rgb.
+// the same value as an upward-lit wall. Uploaded as the GN-family PS c16 hemi rgb.
 // READ ONCE per process; GENERALSX_HEMI=0 restores the flat-ambient look bit-for-bit.
 // GeneralsX @tweak Qoder 17/10/2026 P0 of the per-pixel master switch (光影T0阶段/调研/
 // 2026-10-17_逐像素光照总闸_施工调研.md): 0.35 was the showcase value and, together with the
@@ -92,7 +95,7 @@ static float Hemi_Ambient_K()
 }
 
 // GeneralsX @feature PS3.0-P3-14 14/10/2026: per-pixel distance fog for the GN family
-// (PS c25/c26) and the multi-light dot3 path (PS c9/c10). WW3D2 must not read the game
+// (PS c25/c26). WW3D2 must not read the game
 // layer's GlobalData, so the display layer injects the pair through DX8NormalMap::Set_Fog
 // (same layering precedent as Set_Sun_Shadow). colorStrength.w == 0 keeps every pixel
 // bit-for-bit identical to the pre-fog shader (lerp with t=0). File-scope so both
@@ -108,26 +111,6 @@ namespace DX8NormalMap
 	static bool     g_Enabled = false;      // rule: default OFF
 	static float    g_Strength = 0.8f;      // per-pixel perturbation strength
 
-	// GeneralsX @feature PS3.0 T5 13/10/2026 multi-light pair + kill switch (env read once).
-	static UINT_PTR g_VS_ML = 0;
-	static UINT_PTR g_PS_ML = 0;
-
-	void Install_ML(UINT_PTR vs_handle, UINT_PTR ps_handle)
-	{
-		g_VS_ML = vs_handle;
-		g_PS_ML = ps_handle;
-	}
-
-	static bool ML_Enabled()
-	{
-		static int cached = -1;
-		if (cached < 0) {
-			const char* ev = getenv("GENERALSX_MULTILIGHT");
-			cached = (ev != nullptr && strcmp(ev, "0") == 0) ? 0 : 1;
-		}
-		return cached == 1 && g_VS_ML != 0 && g_PS_ML != 0;
-	}
-
 	// GeneralsX @feature PS3.0-P4-1 15/10/2026 roughness/metalness (PBR) variant for the dot3
 	// single-light path (光影三阶段/粗糙度引擎承接工作清单.md M1+M2).  The pair is compiled by the
 	// device layer and carries the SAME VS constant layout as g_VS/g_PS (c0..c3 WVP, c4 model-space
@@ -136,8 +119,7 @@ namespace DX8NormalMap
 	//   0 = off (this pair never mounts), 1 = M1 roughness-driven Blinn, 2 = M2 GGX metallic-roughness.
 	// Mounting additionally requires the diffuse to have a companion _rp texture; without one, without
 	// handles, or without GENERALSX_PBR=1/2 in the process environment, the single-light path runs
-	// bit-for-bit - zero regression.  The ML branch keeps priority: a mesh with live point lights
-	// uses g_VS_ML/g_PS_ML exactly as before (the ML shader has no rp support by design).
+	// bit-for-bit - zero regression.
 	static UINT_PTR g_VS_PBR = 0;
 	static UINT_PTR g_PS_PBR = 0;
 
@@ -192,40 +174,6 @@ namespace DX8NormalMap
 		fprintf(stderr, "[PBR] variant pair installed vs=%p ps=%p mode=%d\n",
 			(void*)vs_handle, (void*)ps_handle, PBR_Mode());
 		fflush(stderr);
-	}
-
-	// GeneralsX @feature PS3.0 4C 16/10/2026 GGX multi-light pair (see dx8normalmap.h).  PS-only:
-	// the branch reuses g_VS_ML, so Install_ML must have run (it does - the device layer installs
-	// the ML pair first).  Failure/absence leaves g_PS_PBRML at 0 and the plain ML path runs.
-	static UINT_PTR g_PS_PBRML = 0;
-
-	void Install_PBRML(UINT_PTR ps_handle)
-	{
-		g_PS_PBRML = ps_handle;
-		fprintf(stderr, "[PBRML] GGX multi-light PS installed ps=%p\n", (void*)ps_handle);
-		fflush(stderr);
-	}
-
-	// GeneralsX @feature PS3.0 4E 17/10/2026: user-facing mount toggle. The device layer injects
-	// Set_PBRML_Enabled once at shader install (OptionPreferences::getPBRMLEnabled) and the options
-	// menu re-arms it live through gameOptionApply_PBRML, so switching takes effect on the next
-	// Apply pass without a restart. The GENERALSX_PBRML env still wins outright (4C QA legs).
-	static int g_PBRML_UserEnabled = 1;
-
-	void Set_PBRML_Enabled(int on)
-	{
-		g_PBRML_UserEnabled = on ? 1 : 0;
-	}
-
-	static bool PBRML_Enabled()
-	{
-		static int cached = -1;
-		if (cached < 0) {
-			const char* ev = getenv("GENERALSX_PBRML");
-			cached = (ev != nullptr && *ev != 0) ? ((strcmp(ev, "0") == 0) ? 0 : 1) : 2;
-		}
-		const bool on = (cached == 2) ? (g_PBRML_UserEnabled != 0) : (cached == 1);
-		return on && g_PS_PBRML != 0 && g_VS_ML != 0;
 	}
 
 	// GeneralsX @feature T3-0 P1: global sun fallback (direction TOWARD the light source - same
@@ -464,7 +412,12 @@ namespace DX8NormalMap
 		base[i] = 0;
 		char* dot = strrchr(base, '.');
 		if (dot != nullptr) *dot = 0;
-		if (Is_TeamColor_Skin(base)) { g_NmCache.Put(raw, nullptr); return nullptr; }   // #68: house-colour skins keep the fixed pipeline
+		// GeneralsX @tweak Qoder 20/10/2026 TEMP EXPERIMENT: the #68 team-colour rejection below is
+		// commented out (normally house-colour skins - names starting with "zhcd" or containing
+		// "housecolor" - are refused a _nm companion so they keep the fixed pipeline). Temporary
+		// local test only; the rejection is a class-level asset contract from 16/10/2026 (#68) and is
+		// EXPECTED to come back - do not ship this state.
+		// if (Is_TeamColor_Skin(base)) { g_NmCache.Put(raw, nullptr); return nullptr; }   // #68: house-colour skins keep the fixed pipeline
 		const int baseLen = (int)strlen(base);
 		if (baseLen >= 3 && strcmp(base + baseLen - 3, "_nm") == 0) return nullptr;
 		if (baseLen >= 6 && strcmp(base + baseLen - 6, "_nm_ai") == 0) return nullptr;
@@ -617,330 +570,6 @@ namespace DX8NormalMap
 		fflush(stderr);
 	}
 
-	bool Apply(const Matrix3D& world, LightEnvironmentClass* lenv, TextureClass* diffuse)
-	{
-		// GeneralsX @bugfix Qoder 11/10/2026 T3-0: lenv may be NULL on battlefield objects (they
-		// rely on the global sun) - the single-light paths used the fallback light then, and the old
-		// null guard that rejected it caused the NULL/non-NULL "texture swap" flicker. Under P3 the
-		// only remaining consumer (ML) genuinely NEEDS the lenv, so null declines below - the merged
-		// base handles the global-sun meshes.
-		if (diffuse == nullptr) {
-			return false;
-		}
-		// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): Apply now serves ONLY the multi-light
-		// (ML) family - the 兼容层 the 光影T0阶段 research doc keeps untouched this round ("多光源（现有），
-		// 本期不动"). The legacy single-light DOT3 Blinn and PBR roughness mounts that used to sit at the
-		// tail of this function are superseded by the merged base pair in DX8GeomNormal::Apply (同一套底座
-		// 方程 + _nm/_rp 作为分支), so every mesh without point lights now falls through to gate 2. The ML
-		// path itself is bit-for-bit intact: same handles, same uploads, same PBRML sub-branch.
-		if (!Ready_To_Render() || !ML_Enabled()) {
-			Log_Bench_Path("reject:ml-off", diffuse, nullptr, nullptr);   // GeneralsX @feature PS3.0-#76
-			return false;
-		}
-		// ML exists to shade POINT lights per pixel; a mesh with no light environment (global sun only)
-		// has none by definition, and an nm-less mesh cannot use the world-TBN pair at all.
-		if (lenv == nullptr) return false;
-		TextureClass* nm = Find_Companion_Normal(diffuse);
-		if (nm == nullptr) {
-			Log_Bench_Path("reject:no-normalmap", diffuse, nm, nullptr);   // GeneralsX @feature PS3.0-#76
-			return false;
-		}
-		TextureClass* rp = RP_Ready() ? Find_Companion_RP(diffuse) : nullptr;
-
-		// --- WVP for the custom vertex shader ---
-		// Mirror the proven water-shader convention (W3DWater.cpp): read view/proj in raw DX8
-		// format via _Get_DX8_Transform, build world in the same format, multiply W*V*P, then
-		// transpose once before loading into VS constants c0..c3. Using Get_Transform (Westwood
-		// row-vector) here produced a WVP whose w-term lost the translation contribution and
-		// flipped sign, so the perspective divide flung vertices to infinity (radial lines).
-		Matrix4x4 view;
-		Matrix4x4 proj;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, view);
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, proj);
-
-		Matrix4x4 wm(world);                 // Westwood format (also used for lighting below)
-		Matrix4x4 wmDx8 = wm.Transpose();     // convert to DX8 format to match view/proj
-		Matrix4x4 wvp = wmDx8 * view;
-		wvp = wvp * proj;
-		wvp = wvp.Transpose();                 // VS constants need the transpose
-
-		const float* s = reinterpret_cast<const float*>(&wvp);
-		DX8Wrapper::Set_Vertex_Shader_Constant(0, s, 4);   // c0..c3 = WVP
-
-		// --- key light direction: ALWAYS the global sun (injected by W3DDisplay::setTimeOfDay),
-		// so dot3 lighting matches the projected-shadow direction for every mesh. Some units
-		// carry a per-mesh light environment whose direction disagrees with the global sun
-		// (the listening truck read bright on its shadowed side) - ignore it for direction,
-		// keep it for ambient only.
-		const Vector3& lw = g_FallbackDir;
-
-		// GeneralsX @tweak Qoder 11/10/2026 T3-0: the light now feeds the VS as a MODEL-SPACE
-		// direction (c4) and the VS rotates it per-vertex into tangent space via the TBN basis
-		// (v4/v5/v1 -> oD1). Faces therefore shade differently (roof bright, walls dark) instead
-		// of one constant tangent-space light making every face the same flat darkness.
-		const bool showcase = Showcase_On();
-		Vector3 Lw = lw;
-		{
-			float dl2 = sqrtf(Lw.X * Lw.X + Lw.Y * Lw.Y + Lw.Z * Lw.Z);
-			if (dl2 > 1e-6f) { Lw.X /= dl2; Lw.Y /= dl2; Lw.Z /= dl2; }
-		}
-
-		// GeneralsX @bugfix PS3.0-#76b 16/10/2026: world -> model is Inverse_Rotate_Vector(wm, Lw).
-		// Matrix4x4 stores Vector4 Row[4] (row-major, stride 4) and wmDx8 = wm.Transpose(), so
-		// wmDx8[r][c] lives at flat[4r + c] and Lm[r] = sum_c wmDx8[r][c] * Lw[c] is the ROW step.
-		// The old column step (m[0],m[4],m[8]) summed wmDx8[c][r] = wm[r][c], i.e. Rotate_Vector --
-		// model -> world -- so every mesh's own placement rotation doubled into the light direction
-		// (2-theta error). What that predicts, and how to falsify it: a mesh at theta = 0 or 180 deg
-		// keeps the right lit face (2*theta is a full turn), a mesh at 90/270 deg reads lit from the
-		// opposite side, and rotating an already-wrong building by 90 deg must flip its shading by
-		// 180 deg. That is the mechanism behind the reported "some buildings wrong, some right";
-		// the four-plant {1,3}/{2,4} grouping is this code's explanation of the user's report, not a
-		// re-measurement on this build.
-		const float* m = reinterpret_cast<const float*>(&wmDx8);
-		Vector4 c4;
-		c4.X = m[0] * Lw.X + m[1] * Lw.Y + m[2] * Lw.Z;
-		c4.Y = m[4] * Lw.X + m[5] * Lw.Y + m[6] * Lw.Z;
-		c4.Z = m[8] * Lw.X + m[9] * Lw.Y + m[10] * Lw.Z;
-		c4.W = 1.0f;
-		DX8Wrapper::Set_Vertex_Shader_Constant(4, &c4, 1);   // c4 = model-space light (VS rotates via TBN)
-
-		// GeneralsX @feature PS3.0 T1 13/10/2026 Blinn-Phong eye vector. The camera's +Z axis in world
-		// space (the camera looks down its own -Z) is COLUMN 2 of the raw DX8 view matrix, so the eye
-		// extraction below uses the column step flat[r + 4c] with c=2: vm[2], vm[6], vm[10]. Reading a
-		// column of the DX8 matrix is what pulls a world axis out of it, because Set_Transform(D3DTS_VIEW)
-		// stored the Westwood view already transposed and _Get_DX8_Transform hands that back untransposed.
-		// (Comment corrected in #76b: this used to claim "the same pattern the light above uses" - after
-		// #76b the world -> model rotates are ROW steps, only this view-axis pull is a COLUMN step.)
-		// The world eye is then rotated into model space exactly like c4 and fed to the VS as c5, where
-		// it joins the light to form the half-vector sum.
-		const float* vm = reinterpret_cast<const float*>(&view);
-		Vector3 Ew(vm[2], vm[6], vm[10]);
-		{
-			float el2 = sqrtf(Ew.X * Ew.X + Ew.Y * Ew.Y + Ew.Z * Ew.Z);
-			if (el2 > 1e-6f) { Ew.X /= el2; Ew.Y /= el2; Ew.Z /= el2; }
-			else { Ew = Vector3(0.0f, 0.0f, 1.0f); }   // degenerate view matrix: headlight fallback
-		}
-		Vector4 c5eye;
-		// GeneralsX @bugfix PS3.0-#76b: row step (world -> model), same fix as c4 above.
-		c5eye.X = m[0] * Ew.X + m[1] * Ew.Y + m[2] * Ew.Z;
-		c5eye.Y = m[4] * Ew.X + m[5] * Ew.Y + m[6] * Ew.Z;
-		c5eye.Z = m[8] * Ew.X + m[9] * Ew.Y + m[10] * Ew.Z;
-		c5eye.W = 1.0f;
-		DX8Wrapper::Set_Vertex_Shader_Constant(5, &c5eye, 1); // c5 = model-space eye direction
-
-		// GeneralsX @feature PS3.0 L1 13/10/2026 sky fill for the dot3 single-light path. The fill
-		// rotates world->model exactly like the key light (c4) and leaves the VS as TEXCOORD3 via
-		// c9; its premultiplied color lands in PS c7. When the display layer never injected a fill
-		// (color == 0), c7 is black and the extra lambert term is a numerical no-op. The ML branch
-		// below keeps its own layout and is intentionally fill-free (point lights dominate there).
-		Vector3 Fw = g_FillDir;
-		{
-			float fl2 = sqrtf(Fw.X * Fw.X + Fw.Y * Fw.Y + Fw.Z * Fw.Z);
-			if (fl2 > 1e-6f) { Fw.X /= fl2; Fw.Y /= fl2; Fw.Z /= fl2; }
-			else { Fw = Vector3(0.0f, 0.0f, 0.0f); }
-		}
-		Vector4 c9fill;
-		// GeneralsX @bugfix PS3.0-#76b: row step (world -> model), same fix as c4 above.
-		c9fill.X = m[0] * Fw.X + m[1] * Fw.Y + m[2] * Fw.Z;
-		c9fill.Y = m[4] * Fw.X + m[5] * Fw.Y + m[6] * Fw.Z;
-		c9fill.Z = m[8] * Fw.X + m[9] * Fw.Y + m[10] * Fw.Z;
-		c9fill.W = 1.0f;
-		DX8Wrapper::Set_Vertex_Shader_Constant(9, &c9fill, 1);  // c9 = model-space fill direction
-
-		// --- PS constants: c1 = sun gain (fixed), c2 = ambient, c3 = bump deviation, c5 = flat normal for NOSTAGE1 diag ---
-		Vector4 c5(0.0f, 0.0f, 1.0f, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(5, &c5, 1);
-
-		const Vector3& amb = (lenv != nullptr) ? lenv->Get_Equivalent_Ambient() : g_FallbackAmbient;
-		// GeneralsX @feature PS3.0-#75 16/10/2026: render-time sun probe for this batch.
-		{
-			const char* tname = (diffuse != nullptr) ? (const char*)diffuse->Get_Texture_Name() : nullptr;
-			log_sun_once("DOT3", tname, Lw, amb);
-		}
-		float ambient = (amb.X + amb.Y + amb.Z) * (1.0f / 3.0f);
-		Vector3 ambColor(ambient, ambient, ambient);
-		// GeneralsX @bugfix PS3.0 #69 15/10/2026: the options-menu "normal strength" slider was wired
-		// to PS c1, which the shaders multiply onto the SUN lambert term (col = base*(ndl*c1 + ambient…))
-		// — so the bump slider was really a brightness knob and cranking it blew the buildings out.
-		// c1 is now the fixed calibrated sun gain (0.8 = the shipped default slider value, so every A/B
-		// photo stays reproducible); the slider drives the actual bump deviation c3.x instead, scaled so
-		// the old default 0.8 reproduces the previous hard-coded xyScale 2.5 exactly (0 -> flat, 2 -> 6.25).
-		const float lightGain = 0.8f;
-		float bumpK = g_Strength * 3.125f;
-		if (bumpK < 0.0f) bumpK = 0.0f;
-		if (showcase) {
-			// GeneralsX @tweak Qoder 11/10/2026 T3-0: the exaggerated showcase params are gone;
-			// they caused the harsh light/dark cliff on low-poly faces (near-black backfaces +
-			// 2.2x frontfaces + ultra-oblique light). The showcase flag now only bumps strength
-			// slightly and keeps the REAL sun direction + REAL ambient, so rotation no longer
-			// snaps faces between black and blown-out.
-			bumpK = 0.9f * 3.125f;
-		}
-		Vector4 sc(lightGain, 0.0f, 0.0f, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(1, &sc, 1);          // c1 = fixed sun gain (slider no longer rides it)
-		Vector4 ac(ambColor.X, ambColor.Y, ambColor.Z, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(2, &ac, 1);          // c2 = ambient
-
-		// GeneralsX @feature PS3.0 L1 13/10/2026: c7 = fill color for the second lambert term
-		// (pairs with the VS c9 -> TEXCOORD3 fill direction above). Black = feature off.
-		Vector4 fc7(g_FillColor.X, g_FillColor.Y, g_FillColor.Z, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(7, &fc7, 1);         // c7 = fill color
-		// GeneralsX @tweak PS3.0 #69 15/10/2026: c3.x (the tangent-space xy deviation, i.e. the REAL
-		// bump strength the shader applies to the normal map) now comes from the options slider via
-		// bumpK instead of the old hard-coded 2.5; default slider 0.8 maps to the same 2.5.
-		Vector4 bs(bumpK, 0.0f, 1.0f, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(3, &bs, 1);          // c3 = xy exaggeration k, z passthrough
-
-		// GeneralsX @feature PS3.0 T1 13/10/2026: c6 = (specPow, specIntensity, -, -) for the Blinn-Phong
-		// term in the main dot3 PS. Subtle by default (a moving highlight along bump edges, not a second
-		// sun); QA knobs GENERALSX_NORMALMAP_SPEC (intensity) / GENERALSX_NORMALMAP_SPECPOWER.
-		{
-			static float specPow = -1.0f;
-			static float specInt = -1.0f;
-			if (specPow < 0.0f) {
-				specPow = 24.0f;
-				specInt = 0.12f;
-				const char* evPow = getenv("GENERALSX_NORMALMAP_SPECPOWER");
-				if (evPow != nullptr && *evPow != 0) specPow = (float)atof(evPow);
-				const char* evInt = getenv("GENERALSX_NORMALMAP_SPEC");
-				if (evInt != nullptr && *evInt != 0) specInt = (float)atof(evInt);
-				if (specPow < 1.0f) specPow = 1.0f;
-				if (specInt < 0.0f) specInt = 0.0f;
-			}
-			Vector4 sc6(specPow, specInt, 0.0f, 0.0f);
-			DX8Wrapper::Set_Pixel_Shader_Constant(6, &sc6, 1);
-		}
-
-		// --- bind textures / switch shaders ---
-		// GeneralsX @feature PS3.0 T5 13/10/2026 multi-light branch: when this mesh's light
-		// environment actually carries point lights (crates fire, superweapon blasts, lamp posts)
-		// and the device layer installed the ML pair, bind that - the PS loops over up to eight
-		// lights per pixel with radius falloff.  GeneralsX @feature Qoder 17/10/2026 P3: this is now
-		// the ONLY mount path here (the nm/lenv/ML guards above pre-checked it); a mesh with no point
-		// lights collects mlCount 0 and falls through to the merged base in gate 2.
-		if (nm != nullptr && lenv != nullptr && ML_Enabled())
-		{
-			// GeneralsX @feature PS3.0-P3-18 14/10/2026: the collection cap follows the engine's
-			// widened MAX_LIGHTS (4 -> 8); the ML PS loop and mlights[16] (c17..c32) match.
-			Vector4 mlLights[16];
-			int mlCount = 0;
-			const int total = lenv->Get_Light_Count();
-			for (int i = 0; i < total && mlCount < 8; ++i)
-			{
-				if (!lenv->isPointLight(i)) continue;
-				const Vector3& c = lenv->getPointCenter(i);
-				const Vector3& d = lenv->getPointDiffuse(i);
-				mlLights[mlCount * 2]     = Vector4(c.X, c.Y, c.Z, lenv->getPointIrad(i));
-				mlLights[mlCount * 2 + 1] = Vector4(d.X, d.Y, d.Z, lenv->getPointOrad(i));
-				++mlCount;
-			}
-
-			if (mlCount > 0)
-			{
-				// GeneralsX @feature PS3.0 T5 13/10/2026: one-shot proof the multi-light branch is
-				// actually taken at runtime (a mesh with a point light in its environment mounted the
-				// ML VS/PS pair). Silent otherwise; A/B delta only shows when lights touch NM meshes.
-				static int s_mlMounted = 0;
-				if (s_mlMounted < 5)
-				{
-					++s_mlMounted;
-					fprintf(stderr, "[ML] multi-light branch mounted: %d point light(s) on this mesh\n", mlCount);
-					fflush(stderr);
-				}
-				// GeneralsX @bugfix PS3.0-#76b 16/10/2026: the ML VS (kVertexShaderML) builds its world
-				// position and world TBN by dot-ing the object vectors with c7/c8/c9 only - the 4-wide
-				// upload below does reserve c10, but no ML shader line reads it - and the shader-constant
-				// convention that matches the (proven) WVP upload is "dot with a WESTWOOD ROW":
-				// dot(pos4, wm.Row r) = Transform_Vector (object -> world; POSITION arrives as float4
-				// with w = 1, which is why the translation rides in the .w of c7..c9 and a 4th row is
-				// not needed) and dot(normal, wm.Row r) = Rotate_Vector.
-				// The old upload sent wmDx8 rows (= wm columns): the world position lost its translation
-				// (wm row 3 is (0,0,0,1), so wmDx8 row r has .w = wm[3][r] = 0 for r < 3) and rotated by
-				// -theta, and the world TBN flipped the same way the GN c4..c6 upload did. Same
-				// transposition family as the c4/c5/c9 fix above.
-				const float* wmRows = reinterpret_cast<const float*>(&wm);
-				DX8Wrapper::Set_Vertex_Shader_Constant(7, wmRows, 4);
-				// PS c4/c5 = WORLD-space sun/eye (the single-light pair uses model-space VS copies).
-				Vector4 sunWorld(Lw.X, Lw.Y, Lw.Z, 0.0f);
-				DX8Wrapper::Set_Pixel_Shader_Constant(4, &sunWorld, 1);
-				Vector4 eyeWorld(Ew.X, Ew.Y, Ew.Z, 0.0f);
-				DX8Wrapper::Set_Pixel_Shader_Constant(5, &eyeWorld, 1);
-				Vector4 cnt((float)mlCount, 0.0f, 0.0f, 0.0f);
-				DX8Wrapper::Set_Pixel_Shader_Constant(16, &cnt, 1);
-				DX8Wrapper::Set_Pixel_Shader_Constant(17, &mlLights[0], 16);   // 8 pairs, c17..c32
-				// GeneralsX @feature PS3.0-P3-12 14/10/2026: ML PS reads c8 = hemi ambient rgb,
-				// multiplied by the world-up component of the perturbed normal (n.z, W3D Z-up).
-				// ambColor is the same scalar ambient the dot3 path already uses for c2.
-				{
-					const float hk = Hemi_Ambient_K();
-					Vector4 hemi(ambColor.X * hk, ambColor.Y * hk, ambColor.Z * hk, 0.0f);
-					DX8Wrapper::Set_Pixel_Shader_Constant(8, &hemi, 1);        // c8 = hemi ambient
-				}
-				// GeneralsX @feature PS3.0-P3-14 14/10/2026: c9/c10 = eye-depth fog ramp (see file-scope
-				// g_Fog*). strength w=0 (the default until the display layer injects) is a shader no-op.
-				DX8Wrapper::Set_Pixel_Shader_Constant(9, &g_FogColorStrength, 1);
-				DX8Wrapper::Set_Pixel_Shader_Constant(10, &g_FogRamp, 1);
-
-				// GeneralsX @feature PS3.0 4C 16/10/2026: GGX multi-light upgrade.  With PBR mode 2
-				// armed, an _rp companion present and the PBRML PS installed, shade this lit mesh with
-				// the GGX lobe for the sun AND every collected point light instead of the Blinn ML path
-				// (which used to swallow the PBR look whenever any lamp/explosion touched the mesh).
-				// c11 = (mode, LI, ENV, wetness) mirrors the single-light PBR c8 contract in a free register.
-				const bool pbrml = (PBR_Mode() == 2 && PBRML_Enabled() && rp != nullptr);
-				// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 8: same capability gate as the
-				// GN mounter. The constants above are inert to the fixed pipeline; the textures and
-				// shader handles below are not, so decline before touching them.
-				if (!vkPairTranslated(g_VS_ML, pbrml ? g_PS_PBRML : g_PS_ML,
-						pbrml ? "PBRML" : "ML")) return false;
-				if (pbrml)
-				{
-					static int s_pbrmlMounted = 0;
-					if (s_pbrmlMounted < 5)
-					{
-						++s_pbrmlMounted;
-						fprintf(stderr, "[PBRML] GGX multi-light mounted: %d point light(s) on diffuse='%s'\n",
-							mlCount, (const char*)diffuse->Get_Texture_Name());
-						fflush(stderr);
-					}
-					const Vector4 c11pbr((float)PBR_Mode(), PBR_LI(), PBR_ENV(), g_Wetness);
-					DX8Wrapper::Set_Pixel_Shader_Constant(11, &c11pbr, 1);
-					DX8Wrapper::Set_Texture(2, rp);
-				}
-
-				Log_Bench_Path(pbrml ? "mount:PBRML" : "mount:ML", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-				DX8Wrapper::Set_Texture(1, nm);
-				DX8Wrapper::Set_Vertex_Shader(g_VS_ML);
-				DX8Wrapper::Set_Pixel_Shader(pbrml ? g_PS_PBRML : g_PS_ML);
-				return true;
-			}
-		}
-
-		// GeneralsX @feature Qoder 17/10/2026 P3: the legacy PBR (roughness single-light) and DOT3
-		// (Blinn single-light) mounts that used to live here are GONE - the merged pair in
-		// DX8GeomNormal::Apply is the single base now (调研 §2: 一个底座 PS + 两个可选采样层). This point
-		// is reached only when the ML branch above declined (no point lights collected), and returning
-		// false leaves state untouched so gate 2 can mount the merged pair on the same batch.
-		Log_Bench_Path("fall-through:gn-merged", diffuse, nm, rp);   // GeneralsX @feature PS3.0-#76
-		return false;
-	}
-
-	void Restore(UINT_PTR fvf)
-	{
-		DX8Wrapper::Set_Pixel_Shader(0);
-		// GeneralsX @bugfix Qoder 12/10/2026 - D3D9 keeps the vertex shader bound across SetFVF
-		// (measured on native d3d9 and DXVK 2.6), unlike D3D8 where the FVF/shader handle were one
-		// slot. Without this the dot3 vertex shader stayed installed for the next batch, whose
-		// stale c0..c3 WVP / c4 light constants distorted its vertices.
-		DX8Wrapper::Set_Vertex_Shader(0);
-		// GeneralsX @build d3d9 port 11/10/2026 - D3D9 splits FVF from shader binding: the
-		// fixed-pipeline format must go through Set_Vertex_FVF (SetFVF), not Set_Vertex_Shader.
-		DX8Wrapper::Set_Vertex_FVF((DWORD)fvf);
-		DX8Wrapper::Set_Texture(1, nullptr);
-		// GeneralsX @feature PS3.0-P4-1 15/10/2026: unbind the rp companion stage too (no-op when the
-		// plain single-light pair ran), so the wrapper cache can never hand a stale _rp to a later
-		// multi-stage material - same precedent as the GN sun-shadow stage2 unbind.
-		DX8Wrapper::Set_Texture(2, nullptr);
-	}
 }
 
 //=============================================================================
@@ -975,7 +604,7 @@ namespace DX8GeomNormal
 	// layout - rigid bump meshes and tangent skin batches both submit DX8_FVF_XYZNDUV1TG3, and both are
 	// served by ONE program that IS the plain GN lighting equation plus two optional sampling branches
 	// (s1 _nm bump, s3 _rp roughness) and the GNS sun-shadow branch (s2). This is what retires the
-	// parallel DOT3/PBR single-light families (DX8NormalMap::Apply keeps only ML, per 本期不动).
+	// parallel DOT3/PBR single-light families; the Vulkan GN pair owns point lights now.
 	// 0 handles = every TG3 batch declines and stays on the fixed pipeline.
 	static UINT_PTR g_VS_MERGED = 0;
 	static UINT_PTR g_PS_MERGED = 0;
@@ -1233,7 +862,7 @@ namespace DX8GeomNormal
 		// leaves the batch untouched for the fixed pipeline.
 		if (!vkPairTranslated(vs, psSel, merged ? "GNMerged" : (skinBatch ? "GNSkin" : "GN"))) return false;
 
-		// Same WVP convention as DX8NormalMap::Apply (raw DX8 transforms, transpose once);
+		// Same WVP convention as the old dot3 path (raw DX8 transforms, transpose once);
 		// see the water-shader precedent comment there.
 		Matrix4x4 view;
 		Matrix4x4 proj;
@@ -1259,6 +888,11 @@ namespace DX8GeomNormal
 		// never a valid "correct reference" to diff the dot3 path against.
 		const float* m = reinterpret_cast<const float*>(&wm);
 		DX8Wrapper::Set_Vertex_Shader_Constant(4, m, 3);             // VS c4..c6 = world matrix rows (normal -> world)
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 20/10/2026 Forward: full world rows for the per-pixel point-light
+		// world position. c11..c14 are free in every GN vertex twin (c7..c10 stay the shadow rows).
+		DX8Wrapper::Set_Vertex_Shader_Constant(11, m, 4);            // VS c11..c14 = world rows (object -> world)
+#endif
 
 		if (useShadow) {
 			// object -> light-clip rows (VS c7..c10), composed by finite differences through the two
@@ -1305,6 +939,16 @@ namespace DX8GeomNormal
 		// carry eye/spec/shadow/hemi), so lights 4..7 upload in the second const pair.
 		Vector4 dirs[8];
 		Vector4 cols[8];
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 20/10/2026 Forward: point lights no longer share the directional
+		// slots. They are evaluated per pixel from PS c32..c48 (world center, inner radius, raw diffuse,
+		// outer radius), so a lamp or explosion attenuates across the surface instead of being flattened
+		// to one per-object direction. This is also what keeps the batch on the per-pixel path: the old
+		// "any point light -> fixed pipeline" rule is what turned tanks vertex-lit when a muzzle flash
+		// lit them and made a building lamp drop its normal map.
+		Vector4 pts[16];
+		int np = 0;
+#endif
 		Vector3 amb(0.0f, 0.0f, 0.0f);
 		int n = 0;
 
@@ -1315,6 +959,30 @@ namespace DX8GeomNormal
 			amb.Z = ma.Z * envAmb.Z + me.Z;
 			int lc = lenv->Get_Light_Count();
 			if (lc > 8) lc = 8;
+#if defined(SAGE_USE_VULKAN_CORE)
+			for (int li = 0; li < lc; ++li) {
+				if (lenv->isPointLight(li)) {
+					// A rejected point light was folded into the ambient term; adding its raw diffuse
+					// here would double-count it. Far lights are NOT rejected: their per-pixel falloff
+					// is exactly what lets a lamp on a large building light the part it reaches even
+					// when the object's center is outside the radius.
+					if (np < 8 && !lenv->isPointDiffuseRejected(li)) {
+						const Vector3& c = lenv->getPointCenter(li);
+						const Vector3& pd = lenv->getPointDiffuse(li);   // intensity-scaled, unattenuated
+						pts[np * 2]     = Vector4(c.X, c.Y, c.Z, lenv->getPointIrad(li));
+						pts[np * 2 + 1] = Vector4(pd.X * md.X, pd.Y * md.Y, pd.Z * md.Z, lenv->getPointOrad(li));
+						++np;
+					}
+					continue;
+				}
+				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
+				Normalize(d);
+				const Vector3& c = lenv->Get_Light_Diffuse(li);
+				dirs[n] = Vector4(d.X, d.Y, d.Z, 0.0f);
+				cols[n] = Vector4(c.X * md.X, c.Y * md.Y, c.Z * md.Z, 0.0f);
+				++n;
+			}
+#else
 			for (int li = 0; li < lc; ++li) {
 				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
 				Normalize(d);
@@ -1323,6 +991,7 @@ namespace DX8GeomNormal
 				cols[li] = Vector4(c.X * md.X, c.Y * md.Y, c.Z * md.Z, 0.0f);
 			}
 			n = lc;
+#endif
 		} else {
 			// Global-lit fallback (no per-mesh environment): the injected key sun + L1 sky fill.
 			amb.X = ma.X * g_Ambient.X + me.X;
@@ -1367,6 +1036,49 @@ namespace DX8GeomNormal
 		DX8Wrapper::Set_Pixel_Shader_Constant(9, &cols[0], 4);        // PS c9..c12 = matDiffuse-scaled colors 0..3
 		DX8Wrapper::Set_Pixel_Shader_Constant(17, &dirs[4], 4);       // PS c17..c20 = world light dirs 4..7 (P3-18)
 		DX8Wrapper::Set_Pixel_Shader_Constant(21, &cols[4], 4);       // PS c21..c24 = matDiffuse-scaled colors 4..7 (P3-18)
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature Qoder 20/10/2026 Forward: point-light block. c32.x = count, c33..c48 =
+		// 8 x (world center.xyz, inner radius) / (material-scaled diffuse.rgb, outer radius). Unused
+		// pairs are zeroed so the PS loop can stop on the count alone.
+		for (int pi = np; pi < 8; ++pi) {
+			pts[pi * 2] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+			pts[pi * 2 + 1] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+		Vector4 pcnt((float)np, 0.0f, 0.0f, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(32, &pcnt, 1);         // PS c32 = point-light count
+		DX8Wrapper::Set_Pixel_Shader_Constant(33, &pts[0], 16);      // PS c33..c48 = 8 point lights
+		// GeneralsX @feature Qoder 20/10/2026 Forward+: c29 = material diffuse for the global tile
+		// lights (their colors are raw, unlike the per-object cols above), c31.x = tile path selector.
+		// When the frame published no point lights the shader keeps the per-object c32..c48 list.
+		{
+			Vector4 c29(md.X, md.Y, md.Z, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(29, &c29, 1);
+			Vector4 c31((float)(VK_Forward_Active() ? 1 : 0), 0.0f, 0.0f, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(31, &c31, 1);
+			// GeneralsX @bugfix Qoder 21/10/2026 GNATEST: the GN family is mounted on NUV1/NUV2
+			// vegetation (hedges, dogwood, tree drawables) whose textures are alpha-cut. A custom PS
+			// has no fixed-function alpha test, so without this the whole leaf/hedge card renders as
+			// an opaque square. c30 = (enable, D3DCMP ordinal, reference, 0), sampled from the same
+			// states the fixed pipeline would use at this draw.
+			Vector4 c30(
+				(float)(DX8Wrapper::VK_Read_RS(D3DRS_ALPHATESTENABLE) ? 1 : 0),
+				(float)(DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC) & 7u),
+				(float)(DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu),
+				0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(30, &c30, 1);
+		}
+		// GeneralsX @debug Qoder 20/10/2026 Forward: proof that a point-lit batch stayed on the
+		// per-pixel path (the old gate would have dropped it to the fixed pipeline). Bounded.
+		{
+			static int s_gnptLog = 0;
+			if (np > 0 && s_gnptLog < 12) {
+				++s_gnptLog;
+				fprintf(stderr, "[GNPT] point-lit GN batch: dirs=%d pts=%d fvf=0x%08X tex=%s\n",
+					n, np, (unsigned)fvf, diffuse ? (const char*)diffuse->Get_Texture_Name() : "(none)");
+				fflush(stderr);
+			}
+		}
+#endif
 		// GeneralsX @feature PS3.0-P3-12 14/10/2026: PS c16 = hemi ambient rgb, multiplied by the
 		// world-up component (n.z) in the GN/GNS/GNS5 shaders. GENERALSX_HEMI=0 zeroes it and the
 		// extra term is a numerical no-op (flat-ambient parity).
@@ -1421,7 +1133,7 @@ namespace DX8GeomNormal
 
 		// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): merged-pair layer contract uploads.
 		// c27 = (bumpK, bumpOn, shadowOn, rpOn) selects the detail branches; c28 = (mode, LI, ENV,
-		// wetness) re-expresses the proven PBR c8 / PBRML c11 contract on this program. bumpK keeps the
+		// wetness) re-expresses the proven PBR c8 contract on this program. bumpK keeps the
 		// #69 slider mapping (default 0.8 -> xy deviation 2.5) so the 凹凸强度 slider drives the merged
 		// bump exactly like it drove the dot3 one. When no sun map is active the light-clip rows go
 		// identity: sv is still computed but c27.z=0 branches the taps out, so the pixel never reads the
@@ -1437,8 +1149,8 @@ namespace DX8GeomNormal
 					0.0f, 0.0f, 0.0f, 1.0f };
 				DX8Wrapper::Set_Vertex_Shader_Constant(7, kIdentity4, 4);   // VS c7..c10 = identity (sv unused)
 				// GeneralsX @bugfix Qoder 17/10/2026 P3 (self-caught while wiring): sticky categories can
-				// hand the merged pair straight after a PBRML batch (point-lit mesh then unlit one) and
-				// PBRML leaves the _rp texture on stage 2. GN's Restore only unbinds s2 when the shadow
+				// hand the merged pair straight after a point-lit batch and leave the _rp texture on
+				// stage 2. GN's Restore only unbinds s2 when the shadow
 				// flag was set, so without this the stale rp would outlive the category and leak into
 				// the next multi-stage fixed-pipeline material - the exact P4-1 hazard, closed the same way.
 				DX8Wrapper::Set_Texture(2, nullptr);
