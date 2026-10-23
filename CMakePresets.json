@@ -49,6 +49,8 @@
                 "SAGE_USE_OPENAL": "OFF",
                 "SAGE_USE_MINIAUDIO": "ON",
                 "SAGE_USE_GLM": "ON",
+                "SAGE_UPDATE_CHECK": "OFF",
+                "SAGE_USE_NGMP": "OFF",
                 "RTS_BUILD_OPTION_FFMPEG": "OFF",
                 "RTS_BUILD_GENERALS": "OFF",
                 "RTS_BUILD_ZEROHOUR": "ON",
