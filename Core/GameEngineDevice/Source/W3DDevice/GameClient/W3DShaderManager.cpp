@@ -5938,6 +5938,27 @@ void W3DShaderManager::init()
 		fflush(stderr);
 	}
 
+	// GeneralsX @feature 23/10/2026 P6 "底片/镜头" seed: HDR scene, exposure/tonemap, SSAA render
+	// scale and the 3D-only post-AA mode. The Vulkan draw layer owns the scene target and resolves the
+	// 3D image before the UI, so it needs the same pack the options page writes.
+	{
+		OptionPreferences hdrPrefs;
+		const Bool hdrOn = hdrPrefs.getHDREnabled();
+		const Real hdrExposure = (Real)hdrPrefs.getHDRExposure() * 0.01f;
+		const Int hdrTonemap = hdrPrefs.getHDRTonemap();
+		const Int hdrAA = hdrPrefs.getPostAAMode();
+		const Int hdrScale = hdrPrefs.getRenderScale();
+		DX8Wrapper::VK_Set_HDR_Knobs(hdrOn != FALSE ? 1 : 0, hdrExposure, hdrTonemap, hdrAA, hdrScale);
+		const Bool autoExp = hdrPrefs.getAutoExposure();
+		const Int sharpen = hdrPrefs.getSharpen();
+		const Bool colorLut = hdrPrefs.getColorLUT();
+		DX8Wrapper::VK_Set_Post_Extras(autoExp != FALSE ? 1 : 0, (Real)sharpen * 0.01f, colorLut != FALSE ? 1 : 0);
+		fprintf(stderr, "[VKPOST] HDR seed: hdr=%d exposure=%.2f tonemap=%d aa=%d scale=%d auto=%d sharpen=%.2f lut=%d\n",
+			hdrOn != FALSE ? 1 : 0, (double)hdrExposure, hdrTonemap, hdrAA, hdrScale,
+			autoExp != FALSE ? 1 : 0, (double)sharpen * 0.01f, colorLut != FALSE ? 1 : 0);
+		fflush(stderr);
+	}
+
 	D3DSURFACE_DESC desc = {};
 	// For now, check & see if we are gf3 or higher on the food chain.
 

@@ -188,6 +188,18 @@ public:
 	// Orthogonal to UseNormalMapping / RoughnessMapping / NormalMapStrength - those stay companion
 	// layers mounted per asset, this one only decides fixed-function vs per-pixel lighting.
 	Bool getPerPixelLighting() const;
+	// GeneralsX @feature 23/10/2026 P6 "底片/镜头" (HDR + AA + render scale). These are pure
+	// presentation settings and live in the Options.ini S-family, so they never enter m_iniCRC or the
+	// replay/LAN contract. GENERALSX_VK_* env overrides stay available for scripted A/B legs.
+	Bool getHDREnabled() const;					///< HDR scene target + tonemap; default off (parity)
+	Int getHDRExposure() const;					///< -200..200 ticks, returned /100 as EV; default 0
+	Int getHDRTonemap() const;					///< 0 none / 1 ACES / 2 Reinhard; default 1
+	Int getRenderScale() const;					///< 100/125/150/200 percent SSAA; default 100
+	Int getPostAAMode() const;					///< 0 off / 1 FXAA (SMAA reserved); default follows AntiAliasing
+	// P6 remaining film-stock controls (post-processing only, S-family).
+	Bool getAutoExposure() const;				///< per-frame auto EV from the bloom mip average; default off
+	Int getSharpen() const;						///< CAS sharpness ticks 0..200 = 0.0..2.0; default 0
+	Bool getColorLUT() const;					///< generated film-grade LUT; default off
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int getSkirmishTickRate() const;
 };

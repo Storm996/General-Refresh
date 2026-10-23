@@ -271,13 +271,14 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 	surface_level->Release();
 	// CPU mip chain. D3DXFilterTexture is not a reliable path under the pure-Vulkan D3D9 stub: the
 	// generated mips could stay uninitialised, and the far tree then sampled garbage alpha (opaque
-	// squares / flicker). Build the chain here: box-average RGB weighted by alpha and average alpha
-	// itself, so the 0x60 alpha test keeps seeing the same leaf coverage at every mip. Binarising each
-	// mip against "all four sub-texels >= 0x60" (the previous rule) shrank a 64px bush tile to zero by
-	// mip 2, which is exactly why the small shrubs popped and left torn fragments while the camera
-	// moved. The chain stops at TREE_ATLAS_MIP_LEVELS: a coarser mip averages a whole tile, and a
-	// cutout tree's tile is more than 37% opaque, so every texel would pass the alpha test and each
-	// distant card would become the opaque square this bug report started from.
+	// squares / flicker). Build the chain here: box-average RGB weighted by alpha, then binarise the
+	// averaged coverage at 0x50. The 22/10 version kept the average alpha, which made the fixed 0x60
+	// alpha test cross its threshold whenever the sampled mip changed - the visible leaf-edge shimmer.
+	// Binarising every mip keeps all levels on the same side of the test. 0x50 (not 0x60) compensates
+	// for box coverage shrinking slightly at coarse levels; the old "all four sub-texels >= 0x60" rule
+	// was far more aggressive and shrank a 64px bush tile to zero by mip 2. The chain still stops at
+	// TREE_ATLAS_MIP_LEVELS: a coarser mip averages a whole tile, and a cutout tree's tile is more than
+	// 37% opaque, so every texel would pass and each distant card would become an opaque square.
 	{
 		IDirect3DTexture9* tex = Peek_D3D_Texture();
 		const UINT levels = tex ? tex->GetLevelCount() : 0;
@@ -313,7 +314,14 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 								b = ((p00 & 0xFFu) * a00 + (p01 & 0xFFu) * a01 +
 									(p10 & 0xFFu) * a10 + (p11 & 0xFFu) * a11 + asum / 2u) / asum;
 							}
-							const unsigned a = (asum + 2u) >> 2;
+							// GeneralsX @bugfix 23/10/2026: keep the generated mips BINARY. The 22/10 chain
+							// averaged alpha, so a leaf edge texel's coverage could fall above 0x60 on one
+							// mip and below it on the next; every LOD switch then toggled the same silhouette
+							// texel (the small-shrub shimmer). Box-average the coverage, then binarise it at
+							// 0x50 - slightly under the 0x60 alpha test so the coarse-level coverage shrink
+							// does not eat the leaf, while every mip stays on the same side of the test.
+							unsigned a = (asum + 2u) >> 2;
+							a = (a >= 0x50u) ? 255u : 0u;
 							drow[x] = (a << 24) | (r << 16) | (g << 8) | b;
 						}
 					}
@@ -327,7 +335,7 @@ int W3DTreeBuffer::W3DTreeTextureClass::update(W3DTreeBuffer *buffer)
 			static int s_mipLog = 0;
 			if (s_mipLog < 2) {
 				++s_mipLog;
-				fprintf(stderr, "[TREEMIP] CPU-generated %u atlas mip levels (alpha-averaged, +%dpx gutters)\n",
+				fprintf(stderr, "[TREEMIP] CPU-generated %u atlas mip levels (coverage-binarised, +%dpx gutters)\n",
 					levels, TREE_ATLAS_GUTTER);
 				fflush(stderr);
 			}
@@ -1517,10 +1525,13 @@ void W3DTreeBuffer::allocateTreeBuffers()
 		// GeneralsX @bugfix PS3.0 batch22 14/10/2026: default off with the rest of the batch-8
 		// surface HLSL family (user blocky-ground verdict); GENERALSX_TREE30=1 opts back in and
 		// still requires the TERRAIN30 fog shaders to be active.
-		// GeneralsX @feature Qoder 22/10/2026: on the pure-Vulkan build the translated twin (tag 121,
-		// pgm_b1_tree.frag) carries the Forward+ point lights, so enable it by default there. On D3D9 the
-		// registry is off and the old batch22 default stays (opt-in only). The env still wins for A/B.
-		bool tree30On = VKPgm_On();
+		// GeneralsX @bugfix 23/10/2026: TREE30 is opt-in again. Its translated twin (tag 121,
+		// pgm_b1_tree.frag) introduced two independent differences from the fixed-function tree path -
+		// a round-to-nearest alpha test where the FF shader truncates, and a Forward+ point-light term
+		// whose tile Y was mirrored - and a map with `shroudBound` toggling could switch between the two
+		// alpha rules. The 21/10 FF path is the stable reference. GENERALSX_TREE30=1 still opts in for
+		// A/B runs; the env wins over this default.
+		bool tree30On = false;
 		const char* tenv = getenv("GENERALSX_TREE30");
 		if (tenv != nullptr && *tenv != 0) tree30On = (strcmp(tenv, "0") != 0);
 		if (tree30On && W3DShaderManager::arePerPixelFogShadersActive())
@@ -1901,8 +1912,11 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	}
 
 	Int curTree;
-	// Draw tree shadows.
-	if (m_shadow && TheW3DProjectedShadowManager && TheGlobalData->m_useShadowDecals) {
+	// Draw tree shadows. GeneralsX @bugfix 23/10/2026: this path queues and flushes decals directly, so
+	// DoShadows()' retail mute never saw it; with the native sun shadow on, the tree blobs were still
+	// multiplied over the terrain (and a stale/black decal texture read as a dark patch under the tree).
+	if (m_shadow && TheW3DProjectedShadowManager && TheGlobalData->m_useShadowDecals
+		&& !DX8Wrapper::VK_Retail_Shadow_Off()) {
 		for (curTree=0; curTree<m_numTrees; curTree++) {
 			Int type = m_trees[curTree].treeType;
 			if (type<0) {

@@ -1363,3 +1363,91 @@ Bool OptionPreferences::getPerPixelLighting() const
 	return result;
 }
 
+//-------------------------------------------------------------------------------------------------
+// GeneralsX @feature 23/10/2026 P6 "底片/镜头": HDR scene, exposure, tonemap, SSAA render scale and
+// the 3D-only post-AA mode. All presentation-only, so they live in the Options.ini S-family and never
+// enter m_iniCRC. Defaults are the parity values (HDR off, 0 EV, ACES selected but unused, 100 %,
+// AA follows the legacy AntiAliasing on/off switch).
+//-------------------------------------------------------------------------------------------------
+Bool OptionPreferences::getHDREnabled() const
+{
+	const char* env = getenv("GENERALSX_VK_HDR");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0) ? TRUE : FALSE;
+	return (getInt("HDREnabled", 0) != 0) ? TRUE : FALSE;
+}
+
+Int OptionPreferences::getHDRExposure() const
+{
+	const char* env = getenv("GENERALSX_VK_EXPOSURE");
+	Int tick = (env != nullptr && *env != 0) ? atoi(env) : getInt("HDRExposure", 0);
+	if (tick < -200) tick = -200;
+	if (tick > 200) tick = 200;
+	return tick;
+}
+
+Int OptionPreferences::getHDRTonemap() const
+{
+	const char* env = getenv("GENERALSX_VK_TONEMAP");
+	Int mode = (env != nullptr && *env != 0) ? atoi(env) : getInt("HDRTonemap", 1);
+	if (mode < 0) mode = 0;
+	if (mode > 2) mode = 2;
+	return mode;
+}
+
+Int OptionPreferences::getRenderScale() const
+{
+	const char* env = getenv("GENERALSX_VK_SCALE");
+	Int scale = (env != nullptr && *env != 0) ? atoi(env) : getInt("RenderScale", 100);
+	// Only four exact steps are accepted; anything else snaps up to the next one so a typo cannot
+	// create an arbitrary scene-target size.
+	if (scale <= 100) return 100;
+	if (scale <= 125) return 125;
+	if (scale <= 150) return 150;
+	return 200;
+}
+
+Int OptionPreferences::getPostAAMode() const
+{
+	const char* env = getenv("GENERALSX_VK_AA");
+	Int mode;
+	if (env != nullptr && *env != 0)
+		mode = atoi(env);
+	else
+	{
+		// No explicit row yet: keep the legacy AntiAliasing switch meaningful (any non-zero mode
+		// used to mean "FXAA on"), so an untouched Options.ini behaves exactly as before.
+		mode = getInt("PostAA", -1);
+		if (mode < 0)
+			mode = (getAntiAliasing() != WW3D::MULTISAMPLE_MODE_NONE) ? 1 : 0;
+	}
+	if (mode < 0) mode = 0;
+	if (mode > 1) mode = 1;   // SMAA reserved; until it lands, every non-zero mode is FXAA
+	return mode;
+}
+
+Bool OptionPreferences::getAutoExposure() const
+{
+	const char* env = getenv("GENERALSX_VK_AUTOEXPOSURE");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0) ? TRUE : FALSE;
+	return (getInt("AutoExposure", 0) != 0) ? TRUE : FALSE;
+}
+
+Int OptionPreferences::getSharpen() const
+{
+	const char* env = getenv("GENERALSX_VK_SHARPEN");
+	Int tick = (env != nullptr && *env != 0) ? atoi(env) : getInt("Sharpen", 0);
+	if (tick < 0) tick = 0;
+	if (tick > 200) tick = 200;
+	return tick;
+}
+
+Bool OptionPreferences::getColorLUT() const
+{
+	const char* env = getenv("GENERALSX_VK_COLORLUT");
+	if (env != nullptr && *env != 0)
+		return (atoi(env) != 0) ? TRUE : FALSE;
+	return (getInt("ColorLUT", 0) != 0) ? TRUE : FALSE;
+}
+

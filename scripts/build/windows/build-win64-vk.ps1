@@ -19,11 +19,20 @@ $vsRoot = $null
 if (Test-Path -LiteralPath $vswhere) {
     $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 }
+# GeneralsX @bugfix 23/10/2026: vswhere returns the installation's real path. On this machine that is
+# D:\软件\VS while the ASCII junction D:\Program Files\VS points at the same install. cmd.exe /c then
+# calls vcvars64.bat through the OEM code page and mangles the non-ASCII path, so the canonical build
+# failed with a "Missing vcvars64.bat: D:\???VS" message even though the file exists. Prefer an ASCII
+# installation path and fall back to the explicit junction before giving up.
+if ($vsRoot -and ($vsRoot -match '[^\x00-\x7F]')) { $vsRoot = $null }
 if (-not $vsRoot) {
     $fallback = 'D:\Program Files\VS'
     if (Test-Path -LiteralPath (Join-Path $fallback 'VC\Auxiliary\Build\vcvars64.bat')) {
         $vsRoot = $fallback
     }
+}
+if ($vsRoot -and -not (Test-Path -LiteralPath (Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'))) {
+    $vsRoot = $null
 }
 if (-not $vsRoot) {
     throw 'Visual Studio with the x64 C++ toolchain was not found. Install VS 2022 C++ tools first.'

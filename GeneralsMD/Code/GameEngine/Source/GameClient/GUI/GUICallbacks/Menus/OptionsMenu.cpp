@@ -317,6 +317,163 @@ static Int gameOptionFallback_Bloom()
 	return (Int)(OptionPreferences().getBloomIntensity() * 100.0f + 0.5f);
 }
 
+// GeneralsX @feature 23/10/2026 P6 "底片/镜头": the advanced page owns HDR, exposure, tonemap,
+// render scale and the 3D-only AA mode. Mirrors are kept here because the generic save loop writes
+// one key at a time; reading the ini again inside an apply would see the previous sibling value.
+static Int   s_hdrEnabled = 0;
+static Int   s_hdrExposure = 0;
+static Int   s_hdrTonemap = 1;
+static Int   s_hdrScale = 100;
+static Int   s_hdrAA = 0;
+// HDR and RenderScale rebuild the scene target and the passes that reference its format. The shadow
+// receiver and the vegetation/water passes cache pipelines against that pass, so changing the format
+// live would reuse a pipeline from the old target. Keep those two restart-only: the page writes the
+// ini key and the next launch seeds the renderer. Exposure/tonemap/AA are plain uniforms and stay live.
+static Int   s_hdrLive = 0;
+static Int   s_hdrScaleLive = 100;
+static Int   s_autoExposure = 0;
+static Int   s_sharpen = 0;
+static Int   s_colorLut = 0;
+
+static void pushPostExtras()
+{
+	DX8Wrapper::VK_Set_Post_Extras(s_autoExposure, (Real)s_sharpen * 0.01f, s_colorLut);
+}
+
+static void pushHdrKnobs()
+{
+	DX8Wrapper::VK_Set_HDR_Knobs(s_hdrLive, (Real)s_hdrExposure * 0.01f,
+		s_hdrTonemap, s_hdrAA, s_hdrScaleLive);
+	pushPostExtras();
+	fprintf(stderr, "[HDR] apply hdr=%d exposure=%.2f tonemap=%d scale=%d aa=%d auto=%d sharp=%d lut=%d\n",
+		s_hdrLive, (double)s_hdrExposure * 0.01f, s_hdrTonemap, s_hdrScaleLive, s_hdrAA,
+		s_autoExposure, s_sharpen, s_colorLut);
+	fflush(stderr);
+}
+
+static Int gameOptionFallback_HDR()
+{
+	OptionPreferences p;
+	s_hdrEnabled = p.getHDREnabled() != FALSE ? 1 : 0;
+	s_hdrExposure = p.getHDRExposure();
+	s_hdrTonemap = p.getHDRTonemap();
+	s_hdrScale = p.getRenderScale();
+	s_hdrAA = p.getPostAAMode();
+	// Keep the live HDR/scale pair separate from the ini value: those two only change on restart, so
+	// an exposure/AA apply on this page must not silently re-create the scene target. The renderer's
+	// current values are the source of truth for what is actually running.
+	s_hdrLive = DX8Wrapper::VK_HDR_Enabled() ? 1 : 0;
+	s_hdrScaleLive = DX8Wrapper::VK_Render_Scale();
+	return s_hdrEnabled;
+}
+
+static void gameOptionApply_HDR(Int on)
+{
+	s_hdrEnabled = on != 0 ? 1 : 0;
+	fprintf(stderr, "[HDR] HDR=%d saved - takes effect on restart\n", s_hdrEnabled);
+	fflush(stderr);
+}
+
+static Int gameOptionFallback_Exposure()
+{
+	OptionPreferences p;
+	s_hdrExposure = p.getHDRExposure();
+	return s_hdrExposure;
+}
+
+static void gameOptionApply_Exposure(Int tick)
+{
+	s_hdrExposure = tick;
+	pushHdrKnobs();
+}
+
+static Int gameOptionFallback_Tonemap()
+{
+	OptionPreferences p;
+	s_hdrTonemap = p.getHDRTonemap();
+	return s_hdrTonemap;
+}
+
+static void gameOptionApply_Tonemap(Int mode)
+{
+	s_hdrTonemap = mode;
+	pushHdrKnobs();
+}
+
+static Int gameOptionFallback_RenderScale()
+{
+	OptionPreferences p;
+	s_hdrScale = p.getRenderScale();
+	s_hdrScaleLive = s_hdrScale;
+	return s_hdrScale;
+}
+
+static void gameOptionApply_RenderScale(Int scale)
+{
+	s_hdrScale = scale;
+	fprintf(stderr, "[HDR] RenderScale=%d saved - takes effect on restart\n", s_hdrScale);
+	fflush(stderr);
+}
+
+static Int gameOptionFallback_PostAA()
+{
+	OptionPreferences p;
+	s_hdrAA = p.getPostAAMode();
+	return s_hdrAA;
+}
+
+static void gameOptionApply_PostAA(Int mode)
+{
+	s_hdrAA = mode;
+	pushHdrKnobs();
+}
+
+static Int gameOptionFallback_AutoExposure()
+{
+	OptionPreferences p;
+	s_autoExposure = p.getAutoExposure() != FALSE ? 1 : 0;
+	return s_autoExposure;
+}
+
+static void gameOptionApply_AutoExposure(Int on)
+{
+	s_autoExposure = on != 0 ? 1 : 0;
+	pushPostExtras();
+}
+
+static Int gameOptionFallback_Sharpen()
+{
+	OptionPreferences p;
+	s_sharpen = p.getSharpen();
+	return s_sharpen;
+}
+
+static void gameOptionApply_Sharpen(Int tick)
+{
+	s_sharpen = tick;
+	pushPostExtras();
+}
+
+static Int gameOptionFallback_ColorLUT()
+{
+	OptionPreferences p;
+	s_colorLut = p.getColorLUT() != FALSE ? 1 : 0;
+	return s_colorLut;
+}
+
+static void gameOptionApply_ColorLUT(Int on)
+{
+	s_colorLut = on != 0 ? 1 : 0;
+	pushPostExtras();
+}
+
+static const Int s_tonemapValues[] = { 0, 1, 2 };
+static const wchar_t *const s_tonemapTexts[] = { L"Off", L"ACES", L"Reinhard" };
+static const Int s_renderScaleValues[] = { 100, 125, 150, 200 };
+static const wchar_t *const s_renderScaleTexts[] = { L"100%", L"125%", L"150%", L"200%" };
+static const Int s_postAAValues[] = { 0, 1 };
+static const wchar_t *const s_postAATexts[] = { L"Off", L"FXAA" };
+
 // GeneralsX @feature Qoder 20/10/2026: the two shadow-density rows drive the native sun shadow.
 // The retail managers are back on their shipped constants and are muted while the native row is on,
 // so these mirrors only feed VulkanDraw's receiver: projected density is its darkening strength and
@@ -689,6 +846,57 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		nullptr, nullptr, 0, 0, 100,
 		gameOptionFallback_Bloom, gameOptionApply_Bloom,
 	},
+	// GeneralsX @feature 23/10/2026 P6 "底片/镜头": the advanced page rows. HDR and RenderScale change
+	// the scene target's format/size and are applied on the next frame by the Vulkan recorder; exposure,
+	// tonemap and AA are plain uniforms.
+	{
+		GAME_OPTION_BOOL, "HDREnabled", "CheckHDR",
+		nullptr, L"HDR \u5e95\u7247",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_HDR, gameOptionApply_HDR,
+	},
+	{
+		GAME_OPTION_SLIDER, "HDRExposure", "SliderExposure",
+		"StaticTextExposure", L"\u66dd\u5149 (EV x100)",
+		nullptr, nullptr, 0, -200, 200,
+		gameOptionFallback_Exposure, gameOptionApply_Exposure,
+	},
+	{
+		GAME_OPTION_COMBO, "HDRTonemap", "ComboBoxTonemap",
+		"StaticTextTonemap", L"Tonemap",
+		s_tonemapValues, s_tonemapTexts, (Int)ARRAY_SIZE(s_tonemapValues), 0, 0,
+		gameOptionFallback_Tonemap, gameOptionApply_Tonemap,
+	},
+	{
+		GAME_OPTION_COMBO, "RenderScale", "ComboBoxRenderScale",
+		"StaticTextRenderScale", L"Render Scale",
+		s_renderScaleValues, s_renderScaleTexts, (Int)ARRAY_SIZE(s_renderScaleValues), 0, 0,
+		gameOptionFallback_RenderScale, gameOptionApply_RenderScale,
+	},
+	{
+		GAME_OPTION_COMBO, "PostAA", "ComboBoxPostAA",
+		"StaticTextPostAA", L"Post AA",
+		s_postAAValues, s_postAATexts, (Int)ARRAY_SIZE(s_postAAValues), 0, 0,
+		gameOptionFallback_PostAA, gameOptionApply_PostAA,
+	},
+	{
+		GAME_OPTION_BOOL, "AutoExposure", "CheckAutoExposure",
+		nullptr, L"Auto Exposure",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_AutoExposure, gameOptionApply_AutoExposure,
+	},
+	{
+		GAME_OPTION_SLIDER, "Sharpen", "SliderSharpen",
+		"StaticTextSharpen", L"Sharpen (CAS)",
+		nullptr, nullptr, 0, 0, 200,
+		gameOptionFallback_Sharpen, gameOptionApply_Sharpen,
+	},
+	{
+		GAME_OPTION_BOOL, "ColorLUT", "CheckColorLUT",
+		nullptr, L"Color LUT",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_ColorLUT, gameOptionApply_ColorLUT,
+	},
 	// GeneralsX @refactor Qoder 20/10/2026: the sun-shadow rows (阴影浓度 / 阴影分辨率) are gone with
 	// W3DSunShadowMap. Both gadgets fed only that pass, so leaving them on the page would have been two
 	// dead knobs; the retail projected/volumetric shadow rows above remain live.
@@ -980,11 +1188,16 @@ static WindowLayout *s_graphicsLayout = nullptr;
 
 void OpenGraphicsOptionsLayout()
 {
+	// GeneralsX @feature 23/10/2026 P6 QA: GENERALSX_GFX_ADV_TEST=1 opens the advanced page directly,
+	// so the new rows can be smoke-tested without a mouse. The shipping path is unchanged.
+	static const char* s_advTest = getenv("GENERALSX_GFX_ADV_TEST");
+	const char* layoutName = (s_advTest && *s_advTest && atoi(s_advTest) != 0)
+		? "Menus/GraphicsAdvanced.wnd" : "Menus/GraphicsOptions.wnd";
 	if (!s_graphicsLayout)
-		s_graphicsLayout = TheWindowManager->winCreateLayout( "Menus/GraphicsOptions.wnd" );
+		s_graphicsLayout = TheWindowManager->winCreateLayout( layoutName );
 	if (!s_graphicsLayout)
 	{
-		fprintf( stderr, "[GFXOPT] winCreateLayout(Menus/GraphicsOptions.wnd) FAILED\n" );
+		fprintf( stderr, "[GFXOPT] winCreateLayout(%s) FAILED\n", layoutName );
 		fflush( stderr );
 		return;
 	}
@@ -1062,6 +1275,14 @@ void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
 		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:StaticTextTitle" ) );
 	if (title)
 		GadgetStaticTextSetText( title, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
+	GameWindow *advTitle = TheWindowManager->winGetWindowFromId( nullptr,
+		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:StaticTextAdvTitle" ) );
+	if (advTitle)
+		GadgetStaticTextSetText( advTitle, UnicodeString( L"Advanced Graphics" ) );
+	GameWindow *advButton = TheWindowManager->winGetWindowFromId( nullptr,
+		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonAdvanced@push Menus/GraphicsAdvanced.wnd" ) );
+	if (advButton)
+		GadgetButtonSetText( advButton, UnicodeString( L"Advanced" ) );
 }
 
 //-------------------------------------------------------------------------------------------------

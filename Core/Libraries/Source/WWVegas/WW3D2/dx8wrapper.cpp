@@ -2769,14 +2769,36 @@ bool DX8Wrapper::Set_Render_Device(int dev, int width, int height, int bits, int
 		*/
 		Find_Color_And_Z_Mode(ResolutionWidth,ResolutionHeight,BitDepth,&DisplayFormat,
 			&_PresentParameters.BackBufferFormat,&_PresentParameters.AutoDepthStencilFormat);
+
+		// GeneralsX @bugfix 23/10/2026: a fullscreen resolution that is not in the mode list of the
+		// monitor the window starts on used to leave both DisplayFormat and BackBufferFormat at
+		// D3DFMT_UNKNOWN. The Vulkan facade still creates the window/swapchain at the requested size,
+		// but every consumer of getBackBufferFormat() then sees WW3D_FORMAT_UNKNOWN (scene mirror
+		// format, terrain/water A8 branches), which is the reported "fullscreen 4K: the menu battle
+		// scene is black and unit textures read red, windowed at the same resolution is fine".
+		// A missing mode is not a fatal condition on this backend: fall back to the pair every working
+		// run uses instead of carrying an invalid format into the device. The stub now enumerates
+		// every attached display, so this is a safety net rather than the primary fix.
+		if (_PresentParameters.BackBufferFormat==D3DFMT_UNKNOWN) {
+			DisplayFormat = D3DFMT_A8R8G8B8;
+			_PresentParameters.BackBufferFormat = D3DFMT_A8R8G8B8;
+			fprintf(stderr, "[D3D] fullscreen %dx%d not in the starting monitor's mode list - using A8R8G8B8/D24S8\n",
+				ResolutionWidth, ResolutionHeight);
+			fflush(stderr);
+		}
 	}
 
 	/*
 	** Set default for depth stencil format if auto Z buffer failed.
+	** GeneralsX @bugfix 23/10/2026: the old default was D3DFMT_D32 for 32-bit modes. D32 is not the
+	** depth format any working frame uses - the scene depth mirror maps it to VK_FORMAT_D32_SFLOAT,
+	** which the object pass does not pair with the scene color target - so a failed mode search used
+	** to guarantee a broken frame. D24S8 is the pair every windowed run (and the 2K fullscreen run)
+	** resolves to; keep it as the universal fallback and only drop to D16 for 16-bit modes.
 	*/
 	if (_PresentParameters.AutoDepthStencilFormat==D3DFMT_UNKNOWN) {
 		if (BitDepth==32) {
-			_PresentParameters.AutoDepthStencilFormat=D3DFMT_D32;
+			_PresentParameters.AutoDepthStencilFormat=D3DFMT_D24S8;
 		}
 		else {
 			_PresentParameters.AutoDepthStencilFormat=D3DFMT_D16;
@@ -4657,6 +4679,45 @@ bool DX8Wrapper::VK_Post_AA()
 	return g_vkPostAA;
 }
 
+// GeneralsX @feature 23/10/2026 P6 "底片/镜头": the HDR/AA pack. HDR and render scale change the scene
+// target's format/size, so the draw layer re-creates the mirror when they change; exposure, tonemap
+// mode and AA mode are plain uniforms and take effect on the next frame.
+static int   g_vkHdrEnabled = 0;
+static float g_vkHdrExposure = 0.0f;
+static int   g_vkHdrTonemap = 1;
+static int   g_vkPostAaMode = 0;
+static int   g_vkRenderScale = 100;
+
+void DX8Wrapper::VK_Set_HDR_Knobs(int hdr, float exposure, int tonemap, int aa_mode, int scale)
+{
+	g_vkHdrEnabled = hdr != 0 ? 1 : 0;
+	g_vkHdrExposure = exposure < -4.0f ? -4.0f : (exposure > 4.0f ? 4.0f : exposure);
+	g_vkHdrTonemap = tonemap < 0 ? 0 : (tonemap > 2 ? 2 : tonemap);
+	g_vkPostAaMode = aa_mode < 0 ? 0 : (aa_mode > 1 ? 1 : aa_mode);
+	g_vkRenderScale = (scale <= 100) ? 100 : (scale <= 125 ? 125 : (scale <= 150 ? 150 : 200));
+}
+
+bool DX8Wrapper::VK_HDR_Enabled() { return g_vkHdrEnabled != 0; }
+float DX8Wrapper::VK_HDR_Exposure() { return g_vkHdrExposure; }
+int DX8Wrapper::VK_HDR_Tonemap() { return g_vkHdrTonemap; }
+int DX8Wrapper::VK_Post_AA_Mode() { return g_vkPostAaMode; }
+int DX8Wrapper::VK_Render_Scale() { return g_vkRenderScale; }
+
+static int   g_vkAutoExposure = 0;
+static float g_vkSharpen = 0.0f;
+static int   g_vkColorLut = 0;
+
+void DX8Wrapper::VK_Set_Post_Extras(int auto_exposure, float sharpen, int color_lut)
+{
+	g_vkAutoExposure = auto_exposure != 0 ? 1 : 0;
+	g_vkSharpen = sharpen < 0.0f ? 0.0f : (sharpen > 2.0f ? 2.0f : sharpen);
+	g_vkColorLut = color_lut != 0 ? 1 : 0;
+}
+
+bool DX8Wrapper::VK_Auto_Exposure() { return g_vkAutoExposure != 0; }
+float DX8Wrapper::VK_Sharpen() { return g_vkSharpen; }
+bool DX8Wrapper::VK_Color_LUT() { return g_vkColorLut != 0; }
+
 // GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation bridge (see VulkanDraw.h).
 bool DX8Wrapper::VK_LightShadow_Info(float vp[16], float pos_range[4])
 {
@@ -5852,6 +5913,16 @@ float DX8Wrapper::VK_Sun_Shadow_Penumbra() { return 1.0f; }
 void DX8Wrapper::VK_Set_Post_Knobs(float, bool) {}
 float DX8Wrapper::VK_Post_Bloom() { return 0.0f; }
 bool DX8Wrapper::VK_Post_AA() { return false; }
+void DX8Wrapper::VK_Set_HDR_Knobs(int, float, int, int, int) {}
+bool DX8Wrapper::VK_HDR_Enabled() { return false; }
+float DX8Wrapper::VK_HDR_Exposure() { return 0.0f; }
+int DX8Wrapper::VK_HDR_Tonemap() { return 1; }
+int DX8Wrapper::VK_Post_AA_Mode() { return 0; }
+int DX8Wrapper::VK_Render_Scale() { return 100; }
+void DX8Wrapper::VK_Set_Post_Extras(int, float, int) {}
+bool DX8Wrapper::VK_Auto_Exposure() { return false; }
+float DX8Wrapper::VK_Sharpen() { return 0.0f; }
+bool DX8Wrapper::VK_Color_LUT() { return false; }
 bool DX8Wrapper::VK_Vegetation_Ready() { return false; }
 bool DX8Wrapper::VK_Vegetation_Draw(const void*, unsigned, const void*, unsigned,
 	const float[16], const float[3], float, const float[3], const float[3], float, float, float)

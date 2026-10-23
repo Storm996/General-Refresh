@@ -83,7 +83,7 @@ struct StubMode
     unsigned short bpp;
 };
 
-StubMode g_stubModes[256];
+StubMode g_stubModes[512];
 unsigned g_stubModeCount = 0;
 wchar_t g_stubDisplayName[64] = L"\\\\.\\DISPLAY1";
 bool g_stubModesBuilt = false;
@@ -124,33 +124,70 @@ void stub_build_modes(HWND hwnd)
         g_stubDisplayName[63] = 0;
     }
 
-    DEVMODEW dm;
-    for (DWORD i = 0; i < 256; ++i) {
-        ::ZeroMemory(&dm, sizeof(dm));
-        dm.dmSize = sizeof(dm);
-        if (!EnumDisplaySettingsExW(g_stubDisplayName, i, &dm, 0)) break;
-        if ((dm.dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) != (DM_PELSWIDTH | DM_PELSHEIGHT)) continue;
-
-        const unsigned short bpp = (unsigned short)dm.dmBitsPerPel;
-        const unsigned long refresh = dm.dmDisplayFrequency ? dm.dmDisplayFrequency : 60;
-        bool duplicate = false;
-        for (unsigned k = 0; k < g_stubModeCount; ++k) {
-            if (g_stubModes[k].width == dm.dmPelsWidth && g_stubModes[k].height == dm.dmPelsHeight &&
-                g_stubModes[k].refresh == refresh && g_stubModes[k].bpp == bpp) {
-                duplicate = true;
-                break;
-            }
+    // GeneralsX @bugfix 23/10/2026: the mode list used to come from the monitor the game window
+    // happens to start on (MonitorFromWindow -> primary). When the requested fullscreen mode only
+    // exists on another attached display - the reported case is 4K requested while the primary is a
+    // 2K remote/virtual display - DX8Wrapper::Find_Color_And_Z_Mode() found no match, left
+    // BackBufferFormat = D3DFMT_UNKNOWN and the depth default was D3DFMT_D32. The Vulkan facade
+    // still builds the window/swapchain at the requested size, but everything that reads
+    // getBackBufferFormat() (scene mirror format, terrain/water branches) then behaves as if there
+    // were no back buffer, and the 3D scene disappears (black menu background, red-tinted units).
+    // Enumerate every attached display and dedupe by (w,h,refresh,bpp); the requested mode is then
+    // found wherever it actually exists. g_stubDisplayName stays the starting monitor, so the
+    // windowed "current mode" answer is unchanged.
+    wchar_t devices[8][64];
+    unsigned deviceCount = 0;
+    if (g_stubDisplayName[0]) {
+        wcsncpy(devices[deviceCount], g_stubDisplayName, 63);
+        devices[deviceCount][63] = 0;
+        ++deviceCount;
+    }
+    for (DWORD dev = 0; dev < 16 && deviceCount < 8; ++dev) {
+        DISPLAY_DEVICEW dd;
+        ::ZeroMemory(&dd, sizeof(dd));
+        dd.cb = sizeof(dd);
+        if (!EnumDisplayDevicesW(nullptr, dev, &dd, 0)) break;
+        if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0) continue;
+        bool known = false;
+        for (unsigned d = 0; d < deviceCount; ++d) {
+            if (wcscmp(devices[d], dd.DeviceName) == 0) { known = true; break; }
         }
-        if (duplicate) continue;
-
-        g_stubModes[g_stubModeCount].width = dm.dmPelsWidth;
-        g_stubModes[g_stubModeCount].height = dm.dmPelsHeight;
-        g_stubModes[g_stubModeCount].refresh = refresh;
-        g_stubModes[g_stubModeCount].bpp = bpp;
-        ++g_stubModeCount;
+        if (known) continue;
+        wcsncpy(devices[deviceCount], dd.DeviceName, 63);
+        devices[deviceCount][63] = 0;
+        ++deviceCount;
     }
 
-    fprintf(stderr, "[VKNOD3D] mode list built display=%ls modes=%u\n", g_stubDisplayName, g_stubModeCount);
+    DEVMODEW dm;
+    for (unsigned d = 0; d < deviceCount; ++d) {
+        for (DWORD i = 0; i < 256 && g_stubModeCount < 512; ++i) {
+            ::ZeroMemory(&dm, sizeof(dm));
+            dm.dmSize = sizeof(dm);
+            if (!EnumDisplaySettingsExW(devices[d], i, &dm, 0)) break;
+            if ((dm.dmFields & (DM_PELSWIDTH | DM_PELSHEIGHT)) != (DM_PELSWIDTH | DM_PELSHEIGHT)) continue;
+
+            const unsigned short bpp = (unsigned short)dm.dmBitsPerPel;
+            const unsigned long refresh = dm.dmDisplayFrequency ? dm.dmDisplayFrequency : 60;
+            bool duplicate = false;
+            for (unsigned k = 0; k < g_stubModeCount; ++k) {
+                if (g_stubModes[k].width == dm.dmPelsWidth && g_stubModes[k].height == dm.dmPelsHeight &&
+                    g_stubModes[k].refresh == refresh && g_stubModes[k].bpp == bpp) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            g_stubModes[g_stubModeCount].width = dm.dmPelsWidth;
+            g_stubModes[g_stubModeCount].height = dm.dmPelsHeight;
+            g_stubModes[g_stubModeCount].refresh = refresh;
+            g_stubModes[g_stubModeCount].bpp = bpp;
+            ++g_stubModeCount;
+        }
+    }
+
+    fprintf(stderr, "[VKNOD3D] mode list built display=%ls devices=%u modes=%u\n",
+        g_stubDisplayName, deviceCount, g_stubModeCount);
     fflush(stderr);
 }
 

@@ -453,6 +453,7 @@ struct VKDrawState {
     // the FF block it reads was made, because vkff.frag consumes the FF state block and the vertex gate is
     // what puts that block in every submit's descriptor.
     VkShaderModule   ffPs = nullptr;
+    VkShaderModule   ffPsHdr = nullptr;   // P6: FF variant without the final 1.0 clamp
     // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 8: shader modules stood up from the translated
     // program registry, one per (tag, stage), created on the first pipeline that names it. The registry is
     // keyed by the exact HLSL source the facade compiled; this layer only turns its rows into modules.
@@ -532,11 +533,28 @@ struct VKDrawState {
     // Scene target keys: addresses of statics, so they cannot alias a recycled D3D pointer.
     char sceneColorKey[8] = {};
     char sceneDepthKey[8] = {};
+    // GeneralsX @feature 23/10/2026 P6 "底片/镜头": when any of HDR / SSAA / 3D-only AA is on, the 3D
+    // scene is resolved into this LDR overlay before the UI is drawn, so tonemap/bloom/AA cannot touch
+    // the HUD. The overlay is always display-sized; the scene may be larger (RenderScale).
+    char overlayColorKey[8] = {};
+    int  overlayActive = 0;
+    int  hdrOn = 0;
+    float hdrExposure = 0.0f;
+    int  hdrTonemap = 1;
+    int  aaMode = 0;
+    int  renderScale = 100;
+    unsigned displayW = 0, displayH = 0;
 
     // Render resolution of the scene mirror (0 = follow the swapchain) and the destination rect of the
     // end-of-frame blit (0 width = full extent). Together these are what keeps a game rendered at 1024x768
     // inside a 2560x1440 window letterboxed exactly like the D3D9 path does.
     unsigned sceneW = 0, sceneH = 0;
+    // GeneralsX @bugfix 23/10/2026: a render-resolution/device change rebuilds the scene colour/depth
+    // pair. The engine's own clear is normally parked and applied below, but a frame that loses that
+    // race starts with an undefined depth image and every 3D fragment fails DEPTH_LEQUAL. Force one
+    // depth clear on the first frame after the extent changes; colour is only forced when the engine
+    // did not already park a colour clear, so an intentional fog/clear colour is preserved.
+    unsigned forceClearOnBegin = 0;
     unsigned rectX = 0, rectY = 0, rectW = 0, rectH = 0;
 
     // ---- GeneralsX @feature Qoder 21/10/2026 in-game vegetation -------------------------------------
@@ -917,9 +935,10 @@ static void fp_build_block(unsigned slot, const unsigned viewport[4], unsigned w
     const float vx = (float)viewport[0], vy = (float)viewport[1];
     const float vw = viewport[2] ? (float)viewport[2] : (float)w;
     const float vh = viewport[3] ? (float)viewport[3] : (float)h;
-    // Cluster X/Y are built in D3D's top-left screen space. Vulkan's gl_FragCoord.y starts at the
-    // bottom, so the PS flips it back with this height; without it every cluster was mirrored in Y
-    // and only a thin band of pixels ever matched a light.
+    // GeneralsX @bugfix 23/10/2026: gl_FragCoord has a TOP-LEFT origin in Vulkan (the old comment
+    // claimed bottom-left, which is OpenGL). The PS converts it to this grid's bottom-up row with
+    // (vh - gl_FragCoord.y); the light centres below are built in that same bottom-up space so the
+    // two meet. Mixing a top-down grid with the bottom-up lookup mirrored every light.
     blk->header2[3] = vh;
     const float yscale = fabsf(proj[1][1]);
 
@@ -943,7 +962,11 @@ static void fp_build_block(unsigned slot, const unsigned viewport[4], unsigned w
         if (clip.W <= 0.05f) continue;
         const float inv = 1.0f / clip.W;
         const float sx = vx + (clip.X * inv * 0.5f + 0.5f) * vw;
-        const float sy = vy + (0.5f - clip.Y * inv * 0.5f) * vh;
+        // GeneralsX @bugfix 23/10/2026: the point-light shaders reconstruct their row with
+        // (vh - gl_FragCoord.y)/ts (see fpHeader2[3]), i.e. they index the tile grid bottom-up. The
+        // previous top-down sy mirrored every light onto the opposite half of the screen. Build the
+        // grid in the same bottom-up space the shaders sample, not in D3D's top-down screen space.
+        const float sy = vy + (0.5f + clip.Y * inv * 0.5f) * vh;
         float rpx = yscale * L[7] * inv * (vh * 0.5f);
         if (!(rpx >= 0.0f) || L[7] <= 0.0f) rpx = (float)ts * 2.0f;   // no far range: conservative
         if (rpx > 4096.0f) rpx = 4096.0f;
@@ -1519,7 +1542,8 @@ VkPipeline pso_for(const VKDraw_Submit* s)
     const VKDraw_PSO_Key& k = s->key;
     // Wedge 8 stage choice: the mechanism/FF default, overridden per half by a registry tag.
     VkShaderModule vsMod = (wantFF & VKDRAW_FF_VERT_BIT) ? X.ffVs : X.vs;
-    VkShaderModule psMod = (wantFF & VKDRAW_FF_PIX_BIT)  ? X.ffPs : X.ps;
+    VkShaderModule psMod = (wantFF & VKDRAW_FF_PIX_BIT)
+        ? (X.hdrOn && X.ffPsHdr ? X.ffPsHdr : X.ffPs) : X.ps;
     if (k.vs_tag) {
         vsMod = pgm_module(k.vs_tag, 0u);
         if (!vsMod) { ++X.st.psoFailed; return nullptr; }
@@ -2415,6 +2439,8 @@ static bool vkdraw_build_layout_and_shaders()
     if (VKDraw_FF_Pixel_On() && X.ffVs) {
         smvi.codeSize = sizeof(VKFF_FRAG_SPV); smvi.pCode = VKFF_FRAG_SPV;
         if (!chk("vkCreateShaderModule(wedge7 ff fs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.ffPs))) return false;
+        smvi.codeSize = sizeof(VKFF__HDR_FRAG_SPV); smvi.pCode = VKFF__HDR_FRAG_SPV;
+        if (!chk("vkCreateShaderModule(p6 ff hdr fs)", G.vkCreateShaderModule(dev, &smvi, nullptr, &X.ffPsHdr))) return false;
         VKWP1_LOG("wedge7 fixed-function pixel stage: fs=%p (%u SPIR-V words)",
             (void*)X.ffPs, (unsigned)(sizeof(VKFF_FRAG_SPV) / 4u));
     }
@@ -2524,6 +2550,7 @@ void VKDraw_Destroy()
         if (X.ps) G.vkDestroyShaderModule(dev, X.ps, nullptr);
         if (X.ffVs) G.vkDestroyShaderModule(dev, X.ffVs, nullptr);
         if (X.ffPs) G.vkDestroyShaderModule(dev, X.ffPs, nullptr);
+        if (X.ffPsHdr) G.vkDestroyShaderModule(dev, X.ffPsHdr, nullptr);
         for (size_t i = 0; i < X.pgmModules.size(); ++i)
             G.vkDestroyShaderModule(dev, X.pgmModules[i].mod, nullptr);
         // Native sun shadow: the shadow map images belong to the VKRT mirror layer, everything created
@@ -2572,7 +2599,7 @@ void VKDraw_Destroy()
     X.pgmModules.clear();
     X.psos.clear(); X.psoIdx.clear(); X.fbs.clear(); X.passes.clear();
     for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) { X.pool[i] = nullptr; X.sets[i].clear(); X.setIdx[i].clear(); }
-    X.layout = nullptr; X.vs = nullptr; X.ps = nullptr; X.ffVs = nullptr; X.ffPs = nullptr;
+    X.layout = nullptr; X.vs = nullptr; X.ps = nullptr; X.ffVs = nullptr; X.ffPs = nullptr; X.ffPsHdr = nullptr;
     free_host_buffer(X.dummyVb, X.dummyVbMem, nullptr);
     X.dummyVb = nullptr; X.dummyVbMem = nullptr;
     for (size_t i = 0; i < X.geo.size(); ++i) geo_destroy(X.geo[i]);
@@ -2636,7 +2663,32 @@ void VKDraw_Scene_Targets(void** color_key, void** depth_key, unsigned* width, u
 
 void VKDraw_Set_Scene_Extent(unsigned width, unsigned height)
 {
-    X.sceneW = width; X.sceneH = height;
+    // GeneralsX @bugfix 23/10/2026: a resolution change is a new projection and a rebuilt scene mirror.
+    // The shadow fit's ground estimate and hysteresis side describe the old projection; keeping them
+    // reads as "shadows are late" after a fullscreen switch. Reset only on an actual change so the
+    // per-frame call from Begin_Scene stays free.
+    if (width && height && (width != X.sceneW || height != X.sceneH)) {
+        X.sceneW = width; X.sceneH = height;
+        X.displayW = width; X.displayH = height;
+        X.forceClearOnBegin = 1;
+        VKDraw_Shadow_Reset();
+    } else {
+        X.sceneW = width; X.sceneH = height;
+        if (width && height) { X.displayW = width; X.displayH = height; }
+    }
+}
+
+// GeneralsX @feature 23/10/2026 P6: overlay key/decision helpers. The overlay is the LDR image the UI
+// draws into after the 3D resolve; it only exists when at least one of HDR / render scale / 3D-only AA
+// is enabled, so the default path keeps the old single-target present chain bit-for-bit.
+void* vkdraw_overlay_key()
+{
+    return X.overlayColorKey;
+}
+
+bool vkdraw_overlay_wanted()
+{
+    return X.hdrOn != 0 || X.renderScale > 100 || X.aaMode != 0;
 }
 
 void VKDraw_Set_Present_Rect(unsigned x, unsigned y, unsigned width, unsigned height)
@@ -2702,11 +2754,30 @@ void VKDraw_Clear(int clear_color, int clear_z_stencil, const float color[4], fl
         // Parked, not dropped: WW3D::Begin_Render clears before Begin_Scene opens this frame's command
         // buffer, and D3D9 says that clear belongs to the frame about to start. VKDraw_Begin_Frame applies
         // whatever is parked here once the scene target is standing.
-        X.pendingClear = 1;
-        X.pendingClearColor = clear_color; X.pendingClearZStencil = clear_z_stencil;
-        X.pendingZ = z; X.pendingStencil = stencil;
-        if (color) {
-            for (int i = 0; i < 4; ++i) X.pendingColor[i] = color[i];
+        //
+        // GeneralsX @bugfix 23/10/2026: merge instead of overwrite. The engine can issue a colour clear
+        // and a depth/stencil clear as two calls; the old single-slot park kept only the last one, which
+        // left the depth image undefined (the "battlefield black, GUI lit" signature). Keep whichever
+        // aspects have been requested and update only those values.
+        if (!X.pendingClear) {
+            X.pendingClear = 1;
+            X.pendingClearColor = clear_color ? 1 : 0;
+            X.pendingClearZStencil = clear_z_stencil ? 1 : 0;
+            X.pendingZ = z; X.pendingStencil = stencil;
+            if (color) {
+                for (int i = 0; i < 4; ++i) X.pendingColor[i] = color[i];
+            }
+        } else {
+            if (clear_color) {
+                X.pendingClearColor = 1;
+                if (color) {
+                    for (int i = 0; i < 4; ++i) X.pendingColor[i] = color[i];
+                }
+            }
+            if (clear_z_stencil) {
+                X.pendingClearZStencil = 1;
+                X.pendingZ = z; X.pendingStencil = stencil;
+            }
         }
         ++X.st.clearsDeferred;
         return;
@@ -3185,7 +3256,11 @@ bool shadow_build_light(const float sun[3], const float view[16], const float pr
     // world units (a 2048 map then has 6 units per texel and small building shadows vanish). Keep only
     // casters near the visible footprint; the reference implementation does not fold casters in at all.
     const bool haveFootprint = lo[0] <= hi[0];
-    const float casterFitMargin = 800.0f;
+    // GeneralsX @bugfix 23/10/2026: 800 was not enough for a tall structure just outside the visible
+    // footprint (its shadow still reaches the screen) or for a caster whose origin is well inside the
+    // building footprint. A larger margin keeps those origins in the fit; the 4096 -> 8192 side cap
+    // below is what keeps the extra area from re-clipping the far edge.
+    const float casterFitMargin = 1200.0f;
     for (size_t i = 0; i < X.casters.size(); ++i) {
         const float* w = X.casters[i].world;
         if (fabsf(w[12]) > 60000.0f || fabsf(w[13]) > 60000.0f || fabsf(w[14]) > 5000.0f) continue;
@@ -3214,10 +3289,10 @@ bool shadow_build_light(const float sun[3], const float view[16], const float pr
     // depth), and a receiver can sit slightly below the slab. The far side used to add only 60 units,
     // which clipped every terrain level below the caster average: those receivers answered "outside the
     // map" and lost their shadow. The range only costs R32F depth precision, not map resolution.
-    lo[0] -= 400.0f; hi[0] += 400.0f;
-    lo[1] -= 400.0f; hi[1] += 400.0f;
-    lo[2] -= 1200.0f;
-    hi[2] += 1000.0f;
+    lo[0] -= 500.0f; hi[0] += 500.0f;
+    lo[1] -= 500.0f; hi[1] += 500.0f;
+    lo[2] -= 1500.0f;
+    hi[2] += 1200.0f;
 
     // GeneralsX @bugfix Qoder 21/10/2026 shell-map flicker: the fit side is quantized to 256-unit
     // steps, and a camera that idles near a step boundary made it alternate 4352/4608 frame after
@@ -3225,8 +3300,13 @@ bool shadow_build_light(const float sun[3], const float view[16], const float pr
     // moved <1 unit/frame). Every flip rescaled the light map and re-snapped its origin, which is the
     // visible flicker. Grow at once, shrink only after the request is clearly smaller, and cap the
     // box so a far menu camera keeps usable texels instead of losing the shadows entirely.
+    //
+    // GeneralsX @bugfix 23/10/2026: 4096 was too small for a 4K render. The 21/10 4K capture already
+    // measured side=3840 for a 2807-unit footprint; zooming out pushed the request past the cap and
+    // every receiver outside the box returned fully lit, which is the straight "shadow stops here"
+    // edge. 8192 with the shipped 4096 map is 2 world units/texel and still removes the cutoff.
     const float ext[2] = { hi[0] - lo[0], hi[1] - lo[1] };
-    const float kFitMaxSide = 4096.0f;
+    const float kFitMaxSide = 8192.0f;
     const float kFitShrinkRatio = 0.80f;
     float need = ext[0] > ext[1] ? ext[0] : ext[1];
     need = ceilf(need / 256.0f) * 256.0f;
@@ -4394,8 +4474,20 @@ static bool vkdraw_ensure_scene()
     const unsigned depthFmt = vkdraw_scene_depth_format();
     if (!depthFmt) return false;
     // B8G8R8A8_UNORM matches the swapchain format the present chain picked, so the blit is a straight copy.
-    if (!VKRT_Alloc_Color_Format(X.sceneColorKey, X.w, X.h, (unsigned)VK_FORMAT_B8G8R8A8_UNORM)) return false;
+    // P6: when HDR is on the scene target carries >1 values; the resolve pass writes the LDR overlay.
+    const unsigned sceneFmt = X.hdrOn
+        ? (unsigned)VK_FORMAT_R16G16B16A16_SFLOAT
+        : (unsigned)VK_FORMAT_B8G8R8A8_UNORM;
+    if (!VKRT_Alloc_Color_Format(X.sceneColorKey, X.w, X.h, sceneFmt)) return false;
     if (!VKRT_Alloc_Depth_Format(X.sceneDepthKey, X.w, X.h, depthFmt)) return false;
+    // The overlay is display-sized, never render-scaled: UI coordinates and the present rect are in
+    // display pixels, and the resolve pass is what removes the SSAA factor.
+    if (vkdraw_overlay_wanted()) {
+        const unsigned dw = X.displayW ? X.displayW : X.w;
+        const unsigned dh = X.displayH ? X.displayH : X.h;
+        if (!VKRT_Alloc_Color_Format(X.overlayColorKey, dw, dh, (unsigned)VK_FORMAT_B8G8R8A8_UNORM))
+            return false;
+    }
     return true;
 }
 
@@ -4581,11 +4673,22 @@ bool VKDraw_Begin_Frame()
             // Every frame starts on the scene target, whatever render target the last one ended on, and
             // the mirrors are standing up here so the end-of-frame blit always has a source.
             VkExtent2D e = core_()->Extent();
+            // P6: pull the HDR/AA pack once per frame. HDR and render scale change the scene target's
+            // format/size; the overlay path is only entered when one of the three switches is on.
+            X.hdrOn = DX8Wrapper::VK_HDR_Enabled() ? 1 : 0;
+            X.hdrExposure = DX8Wrapper::VK_HDR_Exposure();
+            X.hdrTonemap = DX8Wrapper::VK_HDR_Tonemap();
+            X.aaMode = DX8Wrapper::VK_Post_AA_Mode();
+            X.renderScale = DX8Wrapper::VK_Render_Scale();
+            X.overlayActive = 0;
             // The mirror follows the render resolution the facade published (see VKDraw_Set_Scene_Extent):
             // the game can render at a resolution the window is not, and a mirror sized to the window would
             // turn every viewport into a crop of the top-left. No render resolution published = swapchain.
-            const unsigned rw = X.sceneW ? X.sceneW : e.width;
-            const unsigned rh = X.sceneH ? X.sceneH : e.height;
+            const unsigned baseW = X.displayW ? X.displayW : (X.sceneW ? X.sceneW : e.width);
+            const unsigned baseH = X.displayH ? X.displayH : (X.sceneH ? X.sceneH : e.height);
+            const unsigned scale = (X.renderScale > 100) ? (unsigned)X.renderScale : 100u;
+            const unsigned rw = baseW ? (baseW * scale + 99u) / 100u : 0u;
+            const unsigned rh = baseH ? (baseH * scale + 99u) / 100u : 0u;
             if (rw && rh) { X.w = rw; X.h = rh; }
             else if (e.width) { X.w = e.width; X.h = e.height; }
             VKSTEP(9);
@@ -4607,6 +4710,7 @@ bool VKDraw_Begin_Frame()
             // while the scene target is standing and nothing has been drawn into it yet.
             else {
                 static const bool dbgClear = getenv("GENERALSX_VK_FORCECLEAR") != nullptr;
+                const bool hadPending = X.pendingClear != 0;
                 if (X.pendingClear) {
                     X.pendingClear = 0;
                     vkdraw_clear_locked(X.pendingClearColor, X.pendingClearZStencil, X.pendingColor,
@@ -4617,10 +4721,23 @@ bool VKDraw_Begin_Frame()
                         fflush(stderr);
                     }
                 }
-                // GeneralsX @bugfix Qoder 23/10/2026 fullscreen forensics: re-clear both attachments after
-                // the target has been made current. A frame whose engine clear raced a target resize can
-                // begin with an undefined depth image, and every 3D fragment then fails DEPTH_LEQUAL while
-                // the unlit UI still draws - the exact "battlefield black, GUI lit" signature.
+                // GeneralsX @bugfix 23/10/2026: the resize path rebuilds the scene depth image; the
+                // engine's parked clear normally covers it, but a race can leave the depth undefined and
+                // every 3D fragment then fails DEPTH_LEQUAL while the UI still draws. Clear depth on the
+                // first frame after an extent change, and clear colour only if the engine did not already
+                // park one (a fog/clear colour must survive).
+                if (X.forceClearOnBegin) {
+                    X.forceClearOnBegin = 0;
+                    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    vkdraw_clear_locked(hadPending ? 0 : 1, 1, black, 1.0f, 0, nullptr);
+                    if (flabel < 400ull) {
+                        fprintf(stderr, "[VKCLEAR] f=%llu resize clear c=%d target=%ux%u\n",
+                            flabel, hadPending ? 0 : 1, X.w, X.h);
+                        fflush(stderr);
+                    }
+                }
+                // GeneralsX @debug Qoder 23/10/2026 fullscreen forensics: forced re-clear under the QA
+                // switch. Kept separate from the production resize clear above.
                 if (dbgClear) {
                     static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                     vkdraw_clear_locked(1, 1, black, 1.0f, 0, nullptr);
@@ -4684,6 +4801,20 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
 
     VKDraw_Submit mut = *s;
     mut.key.rt_format = 0; mut.key.depth_format = 0;    // Terrain attribution: tag 118 is emitted by the heightmap pass, but the visible ground may be a
+    // P6 SSAA: the engine still publishes viewports in display pixels, while the scene mirror is
+    // render-scaled. Only the 3D scene is scaled; the UI runs after the resolve into the display-sized
+    // overlay and must keep native coordinates.
+    if (!X.overlayActive && X.renderScale > 100) {
+        const unsigned sc = (unsigned)X.renderScale;
+        mut.viewport[0] = (mut.viewport[0] * (float)sc) / 100.0f;
+        mut.viewport[1] = (mut.viewport[1] * (float)sc) / 100.0f;
+        mut.viewport[2] = (mut.viewport[2] * (float)sc) / 100.0f;
+        mut.viewport[3] = (mut.viewport[3] * (float)sc) / 100.0f;
+        mut.scissor[0] = (mut.scissor[0] * (float)sc) / 100.0f;
+        mut.scissor[1] = (mut.scissor[1] * (float)sc) / 100.0f;
+        mut.scissor[2] = (mut.scissor[2] * (float)sc) / 100.0f;
+        mut.scissor[3] = (mut.scissor[3] * (float)sc) / 100.0f;
+    }
     // different target. Name the target/viewport for the first few terrain submits so a color test that
     // never appears can be attributed to "drawn offscreen" instead of "shader ignored".
     if (mut.key.ps_tag >= 110u && mut.key.ps_tag <= 118u) {
@@ -4954,10 +5085,26 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
 
     // GeneralsX @feature Qoder 20/10/2026 native sun shadow: keep every opaque world-space batch that is
     // drawn into the scene, so the sun pass can replay it from the light. Batches for other targets
-    // (shadow maps, offscreen RTTs) are not part of this view. The camera matrices are only taken from
-    // world-space batches: the UI that follows the 3D views is RHW and would replace them with identity.
+    // (shadow maps, offscreen RTTs) are not part of this view.
+    //
+    // GeneralsX @bugfix 23/10/2026: the camera used to be adopted from EVERY non-RHW world batch, i.e.
+    // the LAST one won. Decals, alpha-mask passes, line/wireframe extra passes and water tracks all draw
+    // world-space batches into the scene, and several of them modify the projection (ZBias is folded into
+    // ff.proj, and the extra-pass code changes the camera's Zbuffer range). A late effect batch therefore
+    // replaced the main camera with a shifted projection; the fit and the receiver unprojected through
+    // it and the shadows jumped/rotated. Adopt only an OPAQUE, depth-writing, colour-writing triangle
+    // batch, only once, and let a terrain batch (the true scene camera) replace that first choice if it
+    // arrives later. This keeps decals, masks, particles and lines out of the shadow camera.
     if (mut.ff && X.colorKey == (void*)X.sceneColorKey && X.depthKey == (void*)X.sceneDepthKey) {
-        if (!(mut.ff->flags[0] & VKFF_FLAG_RHW)) {
+        const unsigned topo = mut.key.topology;
+        const bool opaqueWorld =
+            !(mut.ff->flags[0] & VKFF_FLAG_RHW) &&
+            !mut.key.blend_enable &&
+            mut.key.depth_write &&
+            (mut.key.write_mask & 0x7u) &&
+            (topo == D3D_PT_TRIANGLELIST || topo == D3D_PT_TRIANGLESTRIP);
+        const bool terrainBatch = (mut.key.ps_tag >= 110u && mut.key.ps_tag <= 118u);
+        if (opaqueWorld && (!X.shHaveVP || terrainBatch)) {
             if (vkdraw_no_camera(mut.ff->view, mut.ff->proj)) {
                 // Grass/smudge/point batches draw camera-space vertices with an identity view; adopting
                 // them as the scene camera made the receiver unproject into view space (all shadows
@@ -5270,6 +5417,20 @@ struct VKPostState {
     VkDescriptorPool pool = nullptr;
     VkDescriptorSet sets[VKGEO_SLOT_COUNT] = {};
     unsigned long long frames = 0, fallbacks = 0;
+    // P6 bloom mip chain: five box-downsampled levels, owned by VKRT and re-created on resize.
+    VkImageView bloomView[5] = {};
+    unsigned    bloomW[5] = {}, bloomH[5] = {};
+
+    // P6 "底片/镜头": the same shader/layout also resolves the 3D scene into the LDR UI overlay. That
+    // target is a single VKRT image (not a swapchain image), so it needs its own pass/framebuffer and a
+    // pipeline created against that pass; the shader modules, descriptor layout and pipeline layout are
+    // shared with the present-side pass above.
+    VkRenderPass overlayRp = nullptr;
+    VkFramebuffer overlayFb = nullptr;
+    VkPipeline overlayPipe = nullptr;
+    VkImageView overlayView = nullptr;
+    VkFormat overlayFormat = VK_FORMAT_UNDEFINED;
+    VkExtent2D overlayExtent = {};
 };
 VKPostState P;
 
@@ -5307,6 +5468,73 @@ bool vkpost_grade_on()
     return s != 0;
 }
 
+// P6 bloom mip chain keys. The images live in VKRT and are re-created on resize; the views are cached
+// in VkPostState for the descriptor write. A plain vkCmdBlitImage chain is enough here: the scene is
+// already resolved, and five box-filtered levels give the composite a real multi-scale halo.
+static char s_bloomKeys[5][8] = {};
+
+void vkpost_bloom_levels(VkImage scene, void* sceneKey, unsigned w, unsigned h)
+{
+    for (int i = 0; i < 5; ++i) { P.bloomView[i] = nullptr; P.bloomW[i] = P.bloomH[i] = 0; }
+    if (!scene || !sceneKey || !w || !h) return;
+
+    VKRT_Info si = {};
+    if (!VKRT_Query(sceneKey, &si) || !si.view) return;
+
+    VkImage srcImage = scene;
+    void* srcKey = sceneKey;
+    unsigned sw = w, sh = h;
+    for (int i = 0; i < 5; ++i) {
+        const unsigned bw = sw > 2u ? sw / 2u : 1u;
+        const unsigned bh = sh > 2u ? sh / 2u : 1u;
+        if (!VKRT_Alloc_Color_Format(s_bloomKeys[i], bw, bh, si.format)) return;
+        VKRT_Info di = {};
+        if (!VKRT_Query(s_bloomKeys[i], &di) || !di.view || !di.image) return;
+
+        VKRT_Cmd_Transition(X.cmd, srcKey, VKRT_LAYOUT_TRANSFER_SRC);
+        VKRT_Cmd_Transition(X.cmd, s_bloomKeys[i], VKRT_LAYOUT_TRANSFER_DST);
+        VkImageBlit blit = {};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstOffsets[1] = { (int32_t)bw, (int32_t)bh, 1 };
+        G.vkCmdBlitImage(X.cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         (VkImage)di.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &blit, VK_FILTER_LINEAR);
+        VKRT_Cmd_Transition(X.cmd, srcKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+        VKRT_Cmd_Transition(X.cmd, s_bloomKeys[i], VKRT_LAYOUT_SHADER_READ_ONLY);
+
+        P.bloomView[i] = (VkImageView)di.view;
+        P.bloomW[i] = bw; P.bloomH[i] = bh;
+        srcImage = (VkImage)di.image;
+        srcKey = s_bloomKeys[i];
+        sw = bw; sh = bh;
+    }
+}
+
+// Bind scene / depth / the five bloom levels into this slot's post descriptor set. Missing levels
+// fall back to the scene view so the shader always samples a valid image (and the code still runs
+// when bloom is off).
+void vkpost_update_set(void* sceneView, void* depthView)
+{
+    VkDescriptorImageInfo ii[7] = {};
+    VkWriteDescriptorSet wr[7] = {};
+    for (int b = 0; b < 7; ++b) {
+        ii[b].sampler = P.sampler;
+        ii[b].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii[b].imageView = (b == 0) ? (VkImageView)sceneView
+                        : (b == 1) ? (VkImageView)depthView
+                        : (P.bloomView[b - 2] ? P.bloomView[b - 2] : (VkImageView)sceneView);
+        wr[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[b].dstSet = P.sets[X.slot];
+        wr[b].dstBinding = (uint32_t)b;
+        wr[b].descriptorCount = 1;
+        wr[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[b].pImageInfo = &ii[b];
+    }
+    G.vkUpdateDescriptorSets(dev_(), 7, wr, 0, nullptr);
+}
+
 void vkpost_destroy()
 {
     VkDevice dev = dev_();
@@ -5314,6 +5542,11 @@ void vkpost_destroy()
     for (size_t i = 0; i < P.fbs.size(); ++i)
         if (P.fbs[i]) G.vkDestroyFramebuffer(dev, P.fbs[i], nullptr);
     P.fbs.clear(); P.fbViews.clear();
+    if (P.overlayFb) G.vkDestroyFramebuffer(dev, P.overlayFb, nullptr);
+    if (P.overlayRp) G.vkDestroyRenderPass(dev, P.overlayRp, nullptr);
+    if (P.overlayPipe) G.vkDestroyPipeline(dev, P.overlayPipe, nullptr);
+    P.overlayFb = nullptr; P.overlayRp = nullptr; P.overlayPipe = nullptr;
+    P.overlayView = nullptr; P.overlayFormat = VK_FORMAT_UNDEFINED; P.overlayExtent = {};
     if (P.pipe) G.vkDestroyPipeline(dev, P.pipe, nullptr);
     if (P.pl) G.vkDestroyPipelineLayout(dev, P.pl, nullptr);
     if (P.dsl) G.vkDestroyDescriptorSetLayout(dev, P.dsl, nullptr);
@@ -5379,18 +5612,16 @@ bool vkpost_build(VkFormat fmt, VkExtent2D e, unsigned count)
     smci.codeSize = sizeof(VKPOST_FRAG_SPV); smci.pCode = VKPOST_FRAG_SPV;
     if (!chk("vkCreateShaderModule(vkpost frag)", G.vkCreateShaderModule(dev, &smci, nullptr, &P.fs))) return false;
 
-    // GeneralsX @feature Qoder 22/10/2026: binding 1 is the scene depth for the contact AO.
-    VkDescriptorSetLayoutBinding binding[2] = {};
-    binding[0].binding = 0;
-    binding[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    binding[0].descriptorCount = 1;
-    binding[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    binding[1].binding = 1;
-    binding[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    binding[1].descriptorCount = 1;
-    binding[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Binding 1 is the scene depth for the contact AO; bindings 2..6 are the five bloom mip levels.
+    VkDescriptorSetLayoutBinding binding[7] = {};
+    for (int b = 0; b < 7; ++b) {
+        binding[b].binding = (uint32_t)b;
+        binding[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding[b].descriptorCount = 1;
+        binding[b].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo dlci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dlci.bindingCount = 2; dlci.pBindings = binding;
+    dlci.bindingCount = 7; dlci.pBindings = binding;
     if (!chk("vkCreateDescriptorSetLayout(vkpost)", G.vkCreateDescriptorSetLayout(dev, &dlci, nullptr, &P.dsl)))
         return false;
 
@@ -5400,7 +5631,7 @@ bool vkpost_build(VkFormat fmt, VkExtent2D e, unsigned count)
     plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     if (!chk("vkCreatePipelineLayout(vkpost)", G.vkCreatePipelineLayout(dev, &plci, nullptr, &P.pl))) return false;
 
-    VkDescriptorPoolSize psz = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (uint32_t)VKGEO_SLOT_COUNT * 2u };
+    VkDescriptorPoolSize psz = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (uint32_t)VKGEO_SLOT_COUNT * 7u };
     VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     dpci.maxSets = (uint32_t)VKGEO_SLOT_COUNT;
     dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz;
@@ -5504,35 +5735,19 @@ bool vkpost_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigne
     if (!P.built || imageIndex >= P.fbs.size() || !P.fbs[imageIndex]) return false;
     if (!sceneView || !sceneW || !sceneH || !dw || !dh) return false;
 
-    VkDescriptorImageInfo dii = {};
-    dii.sampler = P.sampler;
-    dii.imageView = (VkImageView)sceneView;
-    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet wr[2] = {};
-    wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    wr[0].dstSet = P.sets[X.slot];
-    wr[0].dstBinding = 0;
-    wr[0].descriptorCount = 1;
-    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    wr[0].pImageInfo = &dii;
     // The depth binding must always be written; without a scene-depth mirror the scene view stands in
     // and the AO strength is zeroed below, so the shader never samples it.
-    VkDescriptorImageInfo dai = {};
-    dai.sampler = P.sampler;
-    dai.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    dai.imageView = (VkImageView)sceneView;
     VKRT_Info dInfo = {};
+    void* depthView = sceneView;
     if (X.depthKey != nullptr && VKRT_Query(X.depthKey, &dInfo) && dInfo.is_depth && dInfo.sample_view) {
         VKRT_Cmd_Transition(X.cmd, X.depthKey, VKRT_LAYOUT_SHADER_READ_ONLY);
-        dai.imageView = (VkImageView)dInfo.sample_view;
+        depthView = dInfo.sample_view;
     }
-    wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    wr[1].dstSet = P.sets[X.slot];
-    wr[1].dstBinding = 1;
-    wr[1].descriptorCount = 1;
-    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    wr[1].pImageInfo = &dai;
-    G.vkUpdateDescriptorSets(dev_(), 2, wr, 0, nullptr);
+    // P6 bloom mip chain: build the five levels before the composite pass samples them. Auto exposure
+    // reads the smallest level, so it forces the chain even when the bloom slider is at zero.
+    if (DX8Wrapper::VK_Post_Bloom() > 0.0001f || DX8Wrapper::VK_Auto_Exposure())
+        vkpost_bloom_levels((VkImage)sceneImage, X.sceneColorKey, sceneW, sceneH);
+    vkpost_update_set(sceneView, depthView);
     {
         static int s_postProbe = 0;
         if (s_postProbe < 3) {
@@ -5566,6 +5781,9 @@ bool vkpost_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigne
     // AO / grading knobs: env-gated so both can be A/B-ed without a rebuild.
     const float aoStrength = vkpost_ao_strength();
     const float gradeOn = vkpost_grade_on() ? 1.0f : 0.0f;
+    const float autoExp = DX8Wrapper::VK_Auto_Exposure() ? 1.0f : 0.0f;
+    const float lutOn = DX8Wrapper::VK_Color_LUT() ? 1.0f : 0.0f;
+    const float sharpen = DX8Wrapper::VK_Sharpen();
     // No scene-depth mirror means no AO; the dummy binding above would read as colour.
     const bool haveAoDepth = dInfo.is_depth && dInfo.sample_view;
     Matrix4x4 projM;
@@ -5579,13 +5797,184 @@ bool vkpost_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigne
         sceneW ? 1.0f / (float)sceneW : 0.0f,
         sceneH ? 1.0f / (float)sceneH : 0.0f,
         DX8Wrapper::VK_Post_AA() ? 1.0f : 0.0f,
-        0.62f, 10.0f, 0.18f, haveAoDepth ? aoStrength : 0.0f,
-        gradeOn, aoScale, 1.06f, 1.03f,
+        0.62f, 10.0f, autoExp, haveAoDepth ? aoStrength : 0.0f,
+        gradeOn + 2.0f * lutOn, aoScale, 1.06f, 1.03f,
         0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f,
-        aoDebug, 0.0f, 0.0f, 0.0f
+        aoDebug, DX8Wrapper::VK_HDR_Exposure(), (float)DX8Wrapper::VK_HDR_Tonemap(), sharpen
+    };
+    for (int r = 0; r < 4; ++r) {
+        pc[12 + r * 4 + 0] = invProjM[r].X;
+        pc[12 + r * 4 + 1] = invProjM[r].Y;
+        pc[12 + r * 4 + 2] = invProjM[r].Z;
+        pc[12 + r * 4 + 3] = invProjM[r].W;
+    }
+    G.vkCmdPushConstants(X.cmd, P.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, (uint32_t)sizeof(pc), pc);
+    G.vkCmdDraw(X.cmd, 3, 1, 0, 0);
+    G.vkCmdEndRenderPass(X.cmd);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// P6 overlay resolve: 3D scene -> LDR overlay, before the UI is drawn.
+// ---------------------------------------------------------------------------
+void vkpost_overlay_destroy()
+{
+    VkDevice dev = dev_();
+    if (!dev) return;
+    if (P.overlayFb) G.vkDestroyFramebuffer(dev, P.overlayFb, nullptr);
+    if (P.overlayRp) G.vkDestroyRenderPass(dev, P.overlayRp, nullptr);
+    if (P.overlayPipe) G.vkDestroyPipeline(dev, P.overlayPipe, nullptr);
+    P.overlayFb = nullptr; P.overlayRp = nullptr; P.overlayPipe = nullptr;
+    P.overlayView = nullptr; P.overlayFormat = VK_FORMAT_UNDEFINED; P.overlayExtent = {};
+}
+
+bool vkpost_overlay_build(VkImageView view, VkFormat fmt, VkExtent2D e)
+{
+    VkDevice dev = dev_();
+    if (!dev || !view || !e.width || !e.height) return false;
+
+    VkAttachmentDescription att = {};
+    att.format = fmt;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    att.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp = {};
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount = 1; sp.pColorAttachments = &ref;
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    rpci.attachmentCount = 1; rpci.pAttachments = &att;
+    rpci.subpassCount = 1; rpci.pSubpasses = &sp;
+    rpci.dependencyCount = 1; rpci.pDependencies = &dep;
+    if (!chk("vkCreateRenderPass(vkpost overlay)", G.vkCreateRenderPass(dev, &rpci, nullptr, &P.overlayRp)))
+        return false;
+
+    VkFramebufferCreateInfo fci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    fci.renderPass = P.overlayRp;
+    fci.attachmentCount = 1; fci.pAttachments = &view;
+    fci.width = e.width; fci.height = e.height; fci.layers = 1;
+    if (!chk("vkCreateFramebuffer(vkpost overlay)", G.vkCreateFramebuffer(dev, &fci, nullptr, &P.overlayFb)))
+        return false;
+
+    VkPipelineShaderStageCreateInfo stg[2] = {};
+    stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stg[0].module = P.vs; stg[0].pName = "main";
+    stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stg[1].module = P.fs; stg[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = VK_FALSE;
+    cba.colorWriteMask = (VkColorComponentFlags)(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stg;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = P.pl; gpi.renderPass = P.overlayRp; gpi.subpass = 0;
+    if (!chk("vkCreateGraphicsPipelines(vkpost overlay)",
+             G.vkCreateGraphicsPipelines(dev, nullptr, 1, &gpi, nullptr, &P.overlayPipe)))
+        return false;
+
+    P.overlayView = view; P.overlayFormat = fmt; P.overlayExtent = e;
+    VKWP1_LOG("[VKPOST] overlay ready: %ux%u", e.width, e.height);
+    return true;
+}
+
+bool vkpost_overlay_ensure(VkImageView view, VkFormat fmt, VkExtent2D e)
+{
+    if (P.overlayFb && P.overlayView == view && P.overlayFormat == fmt
+        && P.overlayExtent.width == e.width && P.overlayExtent.height == e.height)
+        return true;
+    vkpost_overlay_destroy();
+    return vkpost_overlay_build(view, fmt, e);
+}
+
+bool vkpost_overlay_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigned sceneH)
+{
+    if (!P.overlayFb || !P.overlayPipe || !sceneView || !sceneW || !sceneH) return false;
+
+    VKRT_Info dInfo = {};
+    void* depthView = sceneView;
+    if (X.depthKey != nullptr && VKRT_Query(X.depthKey, &dInfo) && dInfo.is_depth && dInfo.sample_view) {
+        VKRT_Cmd_Transition(X.cmd, X.depthKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+        depthView = dInfo.sample_view;
+    }
+    if (DX8Wrapper::VK_Post_Bloom() > 0.0001f || DX8Wrapper::VK_Auto_Exposure())
+        vkpost_bloom_levels(sceneImage, X.sceneColorKey, sceneW, sceneH);
+    vkpost_update_set(sceneView, depthView);
+
+    VkClearValue clr = {};
+    clr.color.float32[3] = 1.0f;
+    VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rbi.renderPass = P.overlayRp;
+    rbi.framebuffer = P.overlayFb;
+    rbi.renderArea = { { 0, 0 }, { P.overlayExtent.width, P.overlayExtent.height } };
+    rbi.clearValueCount = 1; rbi.pClearValues = &clr;
+    G.vkCmdBeginRenderPass(X.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport vp = { 0.0f, 0.0f, (float)P.overlayExtent.width, (float)P.overlayExtent.height, 0.0f, 1.0f };
+    G.vkCmdSetViewport(X.cmd, 0, 1, &vp);
+    VkRect2D sc = { { 0, 0 }, { P.overlayExtent.width, P.overlayExtent.height } };
+    G.vkCmdSetScissor(X.cmd, 0, 1, &sc);
+    G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.overlayPipe);
+    G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl, 0, 1, &P.sets[X.slot], 0, nullptr);
+
+    const float aoStrength = vkpost_ao_strength();
+    const float gradeOn = vkpost_grade_on() ? 1.0f : 0.0f;
+    const float autoExp = DX8Wrapper::VK_Auto_Exposure() ? 1.0f : 0.0f;
+    const float lutOn = DX8Wrapper::VK_Color_LUT() ? 1.0f : 0.0f;
+    const float sharpen = DX8Wrapper::VK_Sharpen();
+    const bool haveAoDepth = dInfo.is_depth && dInfo.sample_view;
+    Matrix4x4 projM;
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, projM);
+    const Matrix4x4 invProjM = projM.Inverse();
+    const float aoScale = fabsf(projM[1].Y) * 0.5f * (float)sceneH;
+    float aoDebug = 0.0f;
+    if (const char* dbg = getenv("GENERALSX_VK_AO_DEBUG")) aoDebug = (atof(dbg) > 0.0) ? 1.0f : 0.0f;
+    float pc[32] = {
+        DX8Wrapper::VK_Post_Bloom(),
+        sceneW ? 1.0f / (float)sceneW : 0.0f,
+        sceneH ? 1.0f / (float)sceneH : 0.0f,
+        (X.aaMode == 1) ? 1.0f : 0.0f,
+        0.62f, 10.0f, autoExp, haveAoDepth ? aoStrength : 0.0f,
+        gradeOn + 2.0f * lutOn, aoScale, 1.06f, 1.03f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        aoDebug, X.hdrExposure, (float)X.hdrTonemap, sharpen
     };
     for (int r = 0; r < 4; ++r) {
         pc[12 + r * 4 + 0] = invProjM[r].X;
@@ -5600,6 +5989,67 @@ bool vkpost_render(VkImage sceneImage, void* sceneView, unsigned sceneW, unsigne
 }
 
 } // anon
+
+// ===========================================================================
+// P6 "底片/镜头": resolve the 3D scene into the LDR overlay, then point the
+// recorder at that overlay so the UI is drawn after tonemap/bloom/AA.
+// ===========================================================================
+bool VKDraw_Begin_UI()
+{
+    if (!X.frameOpen || !X.cmd || X.overlayActive) return false;
+    if (!vkdraw_overlay_wanted()) return false;
+
+    vk_queue_lock();
+    close_pass();
+
+    VKRT_Info si = {}, oi = {};
+    if (!VKRT_Query(X.sceneColorKey, &si) || !si.view ||
+        !VKRT_Query(X.overlayColorKey, &oi) || !oi.view) {
+        vk_queue_unlock();
+        return false;
+    }
+    VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+    if (X.depthKey) VKRT_Cmd_Transition(X.cmd, X.depthKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+
+    // vkpost_ensure() builds the shared shader/layout/descriptor state and the swapchain framebuffers;
+    // the overlay variant only adds its own pass/framebuffer/pipeline on top. A failure here leaves the
+    // old single-target path intact (the caller just keeps drawing the UI into the scene mirror).
+    bool ok = vkpost_ensure(core_()->SwapFormat(), core_()->Extent());
+    if (ok) {
+        ok = vkpost_overlay_ensure((VkImageView)oi.view, (VkFormat)oi.format,
+                                   VkExtent2D{ oi.width, oi.height });
+    }
+    if (ok) {
+        // The overlay is a VKRT image that starts life UNDEFINED; its pass declares SHADER_READ as the
+        // initial layout, so put it there explicitly before the first resolve.
+        VKRT_Cmd_Transition(X.cmd, X.overlayColorKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+        ok = vkpost_overlay_render((VkImage)si.image, si.view, si.width, si.height);
+    }
+    if (!ok) {
+        if (X.openPassWarns < 4) {
+            ++X.openPassWarns;
+            VKWP1_LOG("[VKPOST] overlay resolve refused - UI stays on the scene target");
+        }
+        vk_queue_unlock();
+        return false;
+    }
+
+    X.colorKey = X.overlayColorKey;
+    X.depthKey = nullptr;
+    X.w = oi.width; X.h = oi.height;
+    X.overlayActive = 1;
+    ok = open_pass();
+    {
+        static int s_log = 0;
+        if (s_log < 4) {
+            ++s_log;
+            VKWP1_LOG("[VKPOST] overlay active: scene %ux%u -> overlay %ux%u aa=%d hdr=%d tonemap=%d exp=%.2f",
+                si.width, si.height, oi.width, oi.height, X.aaMode, X.hdrOn, X.hdrTonemap, (double)X.hdrExposure);
+        }
+    }
+    vk_queue_unlock();
+    return ok;
+}
 
 // ===========================================================================
 // public: end frame, present, stats
@@ -5624,12 +6074,20 @@ void VKDraw_End_Frame()
     close_pass();
     VKTRACE("frame %llu: end pass closed", X.st.framesBegun);
 
-    // The scene colour mirror is what the player sees. It leaves the pass in SHADER_READ_ONLY, and which
-    // layout it needs next depends on the path below: the post pass samples it as a texture, the blit and
-    // the forensic copies read it as TRANSFER_SRC. Begin_Frame guarantees the mirror exists, so a missing
-    // one here means the mirror layer was torn down underneath us.
+    // The image the player sees is the overlay when the P6 resolve ran (3D tonemap/AA/scale + UI on
+    // top), otherwise the scene mirror, exactly as before. It leaves the last pass in SHADER_READ_ONLY;
+    // the blit and the forensic copies read it as TRANSFER_SRC. Begin_Frame guarantees the scene mirror
+    // exists, so a missing one here means the mirror layer was torn down underneath us.
+    void* presentKey = X.overlayActive ? (void*)X.overlayColorKey : (void*)X.sceneColorKey;
+    {
+        static int s_presentLog = 0;
+        if (s_presentLog < 4) {
+            ++s_presentLog;
+            VKWP1_LOG("[VKPOST] present source: overlay=%d key=%p", X.overlayActive, presentKey);
+        }
+    }
     VKRT_Info scene = {};
-    const bool haveScene = VKRT_Query(X.sceneColorKey, &scene) && scene.image;
+    const bool haveScene = VKRT_Query(presentKey, &scene) && scene.image;
 
     if (haveScene) {
         uint32_t img = 0;
@@ -5666,11 +6124,13 @@ void VKDraw_End_Frame()
             // Everything it needs already exists at this point, and any failure leaves the blit as the whole
             // path - the fallback is the behaviour the game shipped with, not a degraded variant of it.
             bool postDone = false;
-            const bool wantPost = vkpost_env_on()
+            // When the P6 overlay is active the tonemap/bloom/AO/FXAA already ran before the UI, so the
+            // present chain must only blit the overlay. Running vkpost again would post-process the HUD.
+            const bool wantPost = !X.overlayActive && vkpost_env_on()
                 && (DX8Wrapper::VK_Post_Bloom() > 0.0001f || DX8Wrapper::VK_Post_AA()
                     || vkpost_ao_strength() > 0.0f || vkpost_grade_on());
             if (wantPost && vkpost_ensure(core_()->SwapFormat(), e)) {
-                VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_SHADER_READ_ONLY);
+                VKRT_Cmd_Transition(X.cmd, presentKey, VKRT_LAYOUT_SHADER_READ_ONLY);
                 if (vkpost_render((VkImage)scene.image, scene.view, scene.width, scene.height,
                                   img, dx, dy, dw, dh)) {
                     postDone = true;
@@ -5682,7 +6142,7 @@ void VKDraw_End_Frame()
                     }
                     // Luma and the forensic shot are copies out of the scene and both name the source
                     // layout themselves, so put the image back where those copies expect it.
-                    VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_TRANSFER_SRC);
+                    VKRT_Cmd_Transition(X.cmd, presentKey, VKRT_LAYOUT_TRANSFER_SRC);
                     VKCore_Luma_Record(X.cmd, (VkImage)scene.image, scene.width, scene.height, X.slot);
                     // GENERALSX_VKSHOT_POST=1 captures the post-processed swapchain image instead of the
                     // scene mirror; the present-side effects are invisible to the scene shot.
@@ -5701,8 +6161,8 @@ void VKDraw_End_Frame()
             }
 
             if (!postDone) {
-                // The scene leaves the last pass in SHADER_READ_ONLY; a blit source has to be TRANSFER_SRC.
-                VKRT_Cmd_Transition(X.cmd, X.sceneColorKey, VKRT_LAYOUT_TRANSFER_SRC);
+                // The image leaves the last pass in SHADER_READ_ONLY; a blit source has to be TRANSFER_SRC.
+                VKRT_Cmd_Transition(X.cmd, presentKey, VKRT_LAYOUT_TRANSFER_SRC);
 
                 // The swapchain image's layout is not tracked by the render-target state machine (it is not a
                 // mirror), so these two barriers are recorded against the layouts the present chain itself owns.

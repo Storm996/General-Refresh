@@ -804,6 +804,22 @@ public:
 	static float VK_Post_Bloom();
 	static bool VK_Post_AA();
 
+	// GeneralsX @feature 23/10/2026 P6 "底片/镜头": HDR scene + exposure/tonemap + SSAA render scale +
+	// 3D-only AA. The game layer resolves OptionPreferences once per frame and pushes the pack here; the
+	// Vulkan draw layer never includes game headers. Defaults are the parity values (off / 0 EV / ACES
+	// selected but unused / 100 % / FXAA follows the legacy on-off switch).
+	static void VK_Set_HDR_Knobs(int hdr, float exposure, int tonemap, int aa_mode, int scale);
+	static bool VK_HDR_Enabled();
+	static float VK_HDR_Exposure();
+	static int VK_HDR_Tonemap();
+	static int VK_Post_AA_Mode();
+	static int VK_Render_Scale();
+	// P6 remaining film-stock controls: per-frame auto exposure, CAS sharpness (0..2), generated LUT grade.
+	static void VK_Set_Post_Extras(int auto_exposure, float sharpen, int color_lut);
+	static bool VK_Auto_Exposure();
+	static float VK_Sharpen();
+	static bool VK_Color_LUT();
+
 	// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation. The device-side grass buffer builds
 	// the instance stream; this bridge records the instanced draw into the scene pass that is open at
 	// the time of the call. False on any non-Vulkan build, so the retail billboard path stays in charge.

@@ -412,6 +412,12 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
 // gate is off, nothing was captured, or the pass could not be recorded.
 bool VKDraw_Shadow_Apply(const float sun_dir[3]);
 
+// GeneralsX @feature 23/10/2026 P6 "底片/镜头": resolve the 3D scene into the LDR UI overlay before
+// the HUD is drawn, so tonemap/bloom/FXAA/SSAA never touch the UI. No-op unless HDR, a render scale
+// above 100 %, or the 3D-only post AA mode is enabled; on any failure the caller simply keeps drawing
+// the UI into the scene target (the old path). Call between the shadow pass and TheInGameUI->DRAW().
+bool VKDraw_Begin_UI();
+
 // GeneralsX @bugfix Qoder 21/10/2026: drop the per-world sun-fit state when a new map/height map
 // takes over the scene. The ground-height estimate and the caster list describe the world that was
 // being drawn; keeping them across a map change makes the fit start at the old terrain height and

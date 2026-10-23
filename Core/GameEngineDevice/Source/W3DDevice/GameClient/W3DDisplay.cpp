@@ -2430,7 +2430,12 @@ AGAIN:
 
 			//Can't render into textures while rendering to screen so these textures need to be updated
 			//before we enter main rendering loop.
-			if (TheW3DProjectedShadowManager)
+			// GeneralsX @bugfix 23/10/2026: the pre-frame bake cannot land in its render target on the
+			// pure-Vulkan core (VKDraw_Begin_Frame resets to the scene target), and End_Render(false)
+			// does not submit. Running it while the native sun shadow is on only burns a nested frame
+			// and can leave the scene target cleared for a frame. The retail path is muted by the
+			// options row, so skip the dead bake with it.
+			if (TheW3DProjectedShadowManager && !DX8Wrapper::VK_Retail_Shadow_Off())
 				TheW3DProjectedShadowManager->updateRenderTargetTextures();
 
 			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9.G: the sun shadow depth pass moved
@@ -2505,6 +2510,11 @@ AGAIN:
 #endif
 				}
 
+				// GeneralsX @feature 23/10/2026 P6 "底片/镜头": resolve the 3D scene (tonemap/AA/SSAA)
+				// into the LDR overlay before the HUD. No-op unless HDR / RenderScale / PostAA is on.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+				VKDraw_Begin_UI();
+#endif
 				// draw the user interface
 				{
 					VKFph2Scope s(vkP ? &g_fph2.ingameui : nullptr);
