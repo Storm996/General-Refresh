@@ -86,10 +86,6 @@ Docker is the recommended build method on Linux hosts to ensure all toolchain re
     ./scripts/build/linux/build-linux-flatpak.sh linux64-deploy Generals    # Base game
     ./scripts/build/linux/build-linux-flatpak.sh linux64-deploy GeneralsMD  # Zero Hour
     ```
-*   **Optional MinGW Windows Cross-build**:
-    ```bash
-    ./scripts/build/linux/docker-build-mingw-zh.sh mingw-w64-i686
-    ```
 
 ### Native Linux
 *   **Configure & Build via CMake**:
@@ -124,6 +120,28 @@ Docker is the recommended build method on Linux hosts to ensure all toolchain re
     ./scripts/build/macos/bundle-macos-generals.sh  # Generals Mac app bundle
     ./scripts/build/macos/bundle-macos-zh.sh        # Generals Zero Hour Mac app bundle
     ```
+
+### Windows (Vulkan core only, canonical)
+The Windows game is a **pure Vulkan build**. There is exactly one supported entry point:
+
+```bat
+build-win64-vk.bat
+```
+
+It configures `win64vk` (`SAGE_USE_VULKAN_CORE=ON`) in `build/win64vk` and builds
+`build/win64vk/GeneralsMD/Release/GeneralRefresh.exe`. It hard-fails if the cache is not Vulkan-core.
+
+Deploy the canonical exe (backs up the old one first):
+
+```bat
+deploy-win64-vk.bat
+```
+
+**Forbidden / retired (do not call, do not recreate):**
+- `build/win64` (non-Vulkan 64-bit), `build/win32`, `build/win32-vcpkg`
+- presets `win64`, `win64-vcpkg`, `win32*`, `vc6*`, `unix`, `mingw-w64-i686*`
+- scripts under the removed `工具/T0 编译工具 64位/`
+- any `cmake --build` command that does not point at `build/win64vk`
 
 ## Target Priority
 1. **GeneralsXZH** (Zero Hour) – Primary target, most feature-complete
@@ -257,12 +275,12 @@ printf "%s" "$body" | rg '\\n' && echo "HAS_LITERAL_BACKSLASH_N=YES" || echo "HA
 ```
 
 ## Build Presets Reference
+- **win64vk** – MSVC x64, Release, **Vulkan core ON** (ONLY Windows build)
 - **linux64-deploy** – GCC/Clang x86_64, Release (PRIMARY LINUX)
-- **linux64-testing** – Debug variant
+- **linux64-miniaudio** – Linux MiniAudio variant
 - **macos-vulkan** – macOS ARM64, RelWithDebInfo (PRIMARY MACOS)
-- **mingw-w64-i686** – MinGW cross-compile (exploratory)
-- **vc6** – Visual Studio 6, 32-bit (legacy)
-- **win32** – MSVC 2022, experimental
+
+All 32-bit and non-Vulkan presets have been removed. Do not add them back.
 
 ## Directories
 - `GeneralsMD/`: Zero Hour.

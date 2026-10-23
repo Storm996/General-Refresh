@@ -2,44 +2,54 @@
 applyTo: 'cmake/**,CMakeLists.txt,CMakePresets.json'
 ---
 
-## Build Presets
+## Canonical Build Matrix
 
-### Legacy (Maintenance Only)
-- **`vc6`** — Visual Studio 6 (C++98), 32-bit, DirectX 8 + Miles
-- **`win32`** — MSVC 2022 (C++20), experimental upstream path
+The Windows game is **pure Vulkan**. There is exactly one supported Windows build.
 
-### Cross-Platform (SDL3 + DXVK + OpenAL) — Active Targets
-- **`linux64-deploy`** — GCC/Clang x86_64, Release — **PRIMARY LINUX**
-- **`linux64-testing`** — Linux debug variant
-- **`macos-vulkan`** — macOS ARM64, RelWithDebInfo — **PRIMARY MACOS**
-- **`mingw-w64-i686`** — exploratory MinGW-w64 cross-compile for Windows
-- **`windows64-deploy`** — planned MinGW-w64 x86_64 (issue #29, not active)
+### Windows (ONLY)
+- **`win64vk`** — MSVC x64, Release, `SAGE_USE_VULKAN_CORE=ON`
+- Entry point: `build-win64-vk.bat` (wraps `scripts/build/windows/build-win64-vk.ps1`)
+- Deploy: `deploy-win64-vk.bat` (wraps `scripts/build/windows/deploy-win64-vk.ps1`)
+- Product: `build/win64vk/GeneralsMD/Release/GeneralRefresh.exe`
 
-## Build Workflow
+**Never call or recreate:** `build/win64`, `build/win32`, `build/win32-vcpkg`, or presets
+`win64`, `win64-vcpkg`, `win32*`, `vc6*`, `unix`, `mingw-w64-i686*`. They have been deleted.
+
+### Linux
+- **`linux64-deploy`** — GCC/Clang x86_64, Release — PRIMARY LINUX
+- **`linux64-miniaudio`** — Linux MiniAudio variant
 
 ```bash
-# Linux (Docker)
 ./scripts/build/linux/docker-configure-linux.sh linux64-deploy
 ./scripts/build/linux/docker-build-linux-zh.sh linux64-deploy
 
-# Linux (native)
+# or native
 cmake --preset linux64-deploy
 cmake --build build/linux64-deploy --target z_generals
-
-# macOS
-cmake --preset macos-vulkan
-cmake --build build/macos-vulkan --target z_generals
-
-# Windows cross-build (exploratory)
-cmake --preset mingw-w64-i686
-cmake --build build/mingw-w64-i686 --target z_generals
 ```
 
-## DXVK Source of Truth (macOS)
+### macOS
+- **`macos-vulkan`** — macOS ARM64, RelWithDebInfo — PRIMARY MACOS
+
+```bash
+cmake --preset macos-vulkan
+cmake --build build/macos-vulkan --target z_generals
+```
+
+## Guard Rails
+
+1. Before trusting a Windows exe, check `build/win64vk/CMakeCache.txt` contains
+   `SAGE_USE_VULKAN_CORE:BOOL=ON`.
+2. If a build path does not contain `win64vk`, it is the wrong build — stop.
+3. `scripts/build/windows/build-win64-vk.ps1` hard-fails when the cache is not Vulkan-core.
+4. Do not re-add 32-bit or non-Vulkan presets; the user explicitly removed them.
+
+## DXVK Source of Truth (macOS / Windows runtime)
 
 - DXVK fixes must live in `generalsx-dxvk` and be pushed to the fork branch `generalsx-macos-v2.6`.
 - macOS build tracks that branch via CMake FetchContent (`UPDATE_DISCONNECTED FALSE`).
 - Local mode: `-DSAGE_DXVK_USE_LOCAL_FORK=ON` (disables update/fetch).
+- Windows runtime DLLs live in `dist/dxvk-x64/` and are copied by the deploy script.
 
 **Rules**:
 1. Never patch DXVK files inside `build/_deps/...`.
@@ -50,5 +60,5 @@ cmake --build build/mingw-w64-i686 --target z_generals
 ## Testing Strategy
 
 1. Per-platform smoke tests: launch game, reach main menu, load skirmish map.
-2. Replay compatibility: VC6 optimized builds with `RTS_BUILD_OPTION_DEBUG=OFF`.
+2. Replay compatibility: build with `RTS_BUILD_OPTION_DEBUG=OFF`.
 3. Cross-platform validation: same replays valid across platforms.

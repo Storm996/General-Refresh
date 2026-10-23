@@ -153,6 +153,7 @@ set(GAMEENGINE_SRC
     Include/GameClient/ControlBar.h
     Include/GameClient/ControlBarResizer.h
     Include/GameClient/ControlBarScheme.h
+    Include/GameClient/RightSidebar.h
     Include/GameClient/Credits.h
     Include/GameClient/DebugDisplay.h
     Include/GameClient/Diplomacy.h
@@ -727,6 +728,7 @@ set(GAMEENGINE_SRC
     Source/GameClient/GUI/AnimateWindowManager.cpp
     Source/GameClient/GUI/ChallengeGenerals.cpp
     Source/GameClient/GUI/ControlBar/ControlBar.cpp
+    Source/GameClient/GUI/ControlBar/ControlBarRightSidebar.cpp
     Source/GameClient/GUI/ControlBar/ControlBarBeacon.cpp
     Source/GameClient/GUI/ControlBar/ControlBarCommand.cpp
     Source/GameClient/GUI/ControlBar/ControlBarCommandProcessing.cpp

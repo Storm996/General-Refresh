@@ -115,6 +115,7 @@ references/GameServer/
 /.vcpkg/
 /vcpkg_installed/
 /manual_dl/
+/deps/
 /dist/
 /dist-generals/
 
@@ -169,3 +170,11 @@ references/GameServer/
 *.zip
 *.bmp
 *.py
+
+# Local scratch artifacts (probe scripts, logs, shader blobs, backups)
+/logs_scratch/
+/blender_pilot/
+/lastuser_debug.txt
+/tmp_*
+/*.spv
+*.bak*
