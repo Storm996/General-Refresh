@@ -4227,6 +4227,48 @@ void DX8Wrapper::VK_Shadow_Viewport(const D3DVIEWPORT9* viewport)
 	VK_VP.valid = true;
 }
 
+void DX8Wrapper::VK_Set_Cloud_Texture(void* d3dTex, float ox, float oy, float scale, float strength)
+{
+	VKDraw_Set_Cloud_Texture(d3dTex, ox, oy, scale, strength);
+}
+
+bool DX8Wrapper::VK_Cloud_Shadow_Active()
+{
+	return VKDraw_Cloud_Shadow_Active();
+}
+
+void DX8Wrapper::VK_Set_ShadowCaster(bool allowed)
+{
+	VKDraw_Set_ShadowCaster(allowed);
+}
+
+void DX8Wrapper::VK_Set_ShadowReceiver(bool receive)
+{
+	VKDraw_Set_Shadow_Receiver(receive);
+}
+
+void DX8Wrapper::VK_Material_Bind(unsigned family, unsigned features, unsigned variant, unsigned pass,
+	unsigned long long pipelineKey)
+{
+	VKDraw_Material_Bind(family, features, variant, pass, pipelineKey);
+}
+
+bool DX8Wrapper::VK_Sky_Set_Faces(TextureClass* north, TextureClass* east, TextureClass* south,
+	TextureClass* west, TextureClass* top)
+{
+	return VKDraw_Sky_Set_Faces(north, east, south, west, top);
+}
+
+bool DX8Wrapper::VK_Sky_Render(float tintR, float tintG, float tintB)
+{
+	return VKDraw_Sky_Render(tintR, tintG, tintB);
+}
+
+bool DX8Wrapper::VK_Bind_Vegetation_Material()
+{
+	return VKDraw_Vegetation_Bind();
+}
+
 // GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: the fixed-function vertex stage's input block.
 //
 // Everything in here comes from a shadow the facade already keeps, and the point of that is the one

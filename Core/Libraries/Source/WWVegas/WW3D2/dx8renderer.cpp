@@ -48,6 +48,7 @@
 #include "dx8fvf.h"
 #include "dx8caps.h"
 #include "dx8normalmap.h"   // GeneralsX @feature T3-0 M4 (段E): dot3 网格着色器挂载 hook
+#include "MaterialFeatures.h"
 #include "lightenvironment.h" // GeneralsX @feature PS3.0 L2: GN gate inspects the mesh light env
 #include <cstdio>           // GeneralsX @debug T3-0 mount diagnostics (fprintf)
 #include <cstdlib>          // GeneralsX @feature Qoder 18/10/2026 P3 diagnostics (getenv)
@@ -1978,7 +1979,7 @@ void DX8TextureCategoryClass::Render()
 	PolyRenderTaskClass * last_prt = nullptr;
 
 	/*
-	** GeneralsX @performance PS3.0 #71 15/10/2026 (第二档): 类别内粘性挂载 (sticky mount).
+	** GeneralsX @performance PS3.0 #71 15/10/2026 (第二�?: 类别内粘性挂�?(sticky mount).
 	** A texture category already groups every draw that shares the same textures+material+shader+FVF
 	** (one prt per visible instance batch of that material). The old path ran a full Apply + Restore
 	** pair per prt: a ten-instance category paid ten install/teardown cycles, and DX8Wrapper's
@@ -2163,10 +2164,8 @@ void DX8TextureCategoryClass::Render()
 			|| (vmaterial->Peek_Mapper(0) == nullptr && vmaterial->Peek_Mapper(1) == nullptr);
 
 		/*
-		** GeneralsX @feature PS3.0 L2 (段E'): 几何法线逐像素漫反射 - 只接管 dot3 路径没碰过的普通
-		** DUV1/DUV2 刚性批次, 且默认关 (GENERALSX_GEOMNORMAL=1 才挂)。PS 仅把太阳/L1 fill 两个
-		** Lambert 项从逐顶点改判为逐像素, 其余固定管线贡献 (ambient/贴花灯/自发光/tint) 原样保留。
-		*/
+		** GeneralsX @feature PS3.0 L2 (段E'): 几何法线逐像素漫反射 - 只接�?dot3 路径没碰过的普�?		** DUV1/DUV2 刚性批�? 且默认关 (GENERALSX_GEOMNORMAL=1 才挂)。PS 仅把太阳/L1 fill 两个
+		** Lambert 项从逐顶点改判为逐像�? 其余固定管线贡献 (ambient/贴花�?自发�?tint) 原样保留�?		*/
 		bool gnApplied = false;
 		// GeneralsX @debug PS3.0 L2 forensics: the GN run mounted zero batches. Log the first few
 		// rigid candidates' actual FVF and every gate sub-condition so we can see exactly which one
@@ -2275,26 +2274,53 @@ void DX8TextureCategoryClass::Render()
 				fflush(stderr);
 			}
 		}
-		if (gnLenvSafe && DX8GeomNormal::Ready_To_Render()
-			&& (gnVBLayout == (unsigned)DX8_FVF_XYZNUV1 || gnVBLayout == (unsigned)DX8_FVF_XYZNUV2
-				|| gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2
-				// GeneralsX @feature Qoder 17/10/2026 P3: the tangent layout rides the merged base now
-				// (Apply probes the _nm/_rp companions and declines batches with neither, so a TG3 mesh
-				// without assets stays on the fixed pipeline exactly as before). Gate 1's stricter
-				// per-material contract applies to this layout only: multi-pass composites and
-				// mapper-generated UVs are invisible to a VS that reads raw vertex UVs (T3-0 fix).
-				|| (gnVBLayout == (unsigned)DX8_FVF_XYZNDUV1TG3
-					&& nmMapperPlain && mesh->Peek_Model()->Uses_Normal_Map()))
-			&& mesh->Peek_Model()->Get_Pass_Count() == 1
-			&& !mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)
-			&& mesh->Get_Alpha_Override() == 1.0f
-			&& !(mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE)
-			// Same opaque-blend contract as the dot3 gate: alpha-blended glass with animated
-			// backgrounds flickered there (T3-0 fix), keep GN out of it too.
-			&& theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE
-			&& theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO) {
-			gnApplied = DX8GeomNormal::Apply(*world_transform, vmaterial, (int)gnVBLayout, lenv, Peek_Texture(0));
-			if (gnApplied) gnMountFVF = gnVBLayout;
+		const W3DMaterialVertexLayout gnMatLayout =
+			(gnVBLayout == (unsigned)DX8_FVF_XYZNUV1) ? W3DMAT_VL_NUV1 :
+			(gnVBLayout == (unsigned)DX8_FVF_XYZNUV2) ? W3DMAT_VL_NUV2 :
+			(gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2) ? W3DMAT_VL_SKIN :
+			(gnVBLayout == (unsigned)DX8_FVF_XYZNDUV1TG3) ? W3DMAT_VL_TG3 : W3DMAT_VL_UNKNOWN;
+		const bool gnMaterialOverride =
+			mesh->Get_User_Data() && *(int *)mesh->Get_User_Data() == RenderObjClass::USER_DATA_MATERIAL_OVERRIDE;
+		const bool gnOneZeroBlend =
+			theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE &&
+			theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO;
+		// GeneralsX @refactor 23/10/2026: the old inline FVF/pass/SORT/alpha/blend gate is now a
+		// named W3DMaterialSurface record. Same decisions, one contract; the next phase can add the
+		// texture/lighting fields without touching the renderer call site again.
+		W3DMaterialSurface gnSurface = {};
+		gnSurface.layout = gnMatLayout;
+		gnSurface.passCount = mesh->Peek_Model()->Get_Pass_Count();
+		gnSurface.nmMapperPlain = nmMapperPlain;
+		gnSurface.usesNormalMap = mesh->Peek_Model()->Uses_Normal_Map() != 0;
+		gnSurface.sorted = mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT) != 0;
+		gnSurface.alphaOverrideIsOpaque = mesh->Get_Alpha_Override() == 1.0f;
+		gnSurface.materialOverride = gnMaterialOverride;
+		gnSurface.oneZeroBlend = gnOneZeroBlend;
+		gnSurface.lenvSafe = gnLenvSafe;
+		DX8ModelMaterialInstance modelInstance = {};
+		modelInstance.surface = gnSurface;
+		modelInstance.material = vmaterial;
+		modelInstance.layout = (int)gnVBLayout;
+		modelInstance.lenv = lenv;
+		modelInstance.diffuse = Peek_Texture(0);
+		modelInstance.desc.family = (gnVBLayout == (unsigned)DX8_FVF_XYZNDUV2) ? W3DMAT_SKIN : W3DMAT_STATIC;
+		modelInstance.desc.features = W3DMATF_RECEIVE_FOG | W3DMATF_RECEIVE_SHADOW |
+			W3DMATF_LOCAL_LIGHTS | W3DMATF_CAST_SHADOW;
+		if (modelInstance.desc.family == W3DMAT_SKIN) modelInstance.desc.features |= W3DMATF_SKIN;
+		if (mesh->Peek_Model()->Uses_Normal_Map()) modelInstance.desc.features |= W3DMATF_NORMAL_MAP;
+		if (DX8NormalMap::Get_PBR_Mode() > 0) modelInstance.desc.features |= W3DMATF_PBR;
+		modelInstance.desc.fvf = gnVBLayout;
+		modelInstance.desc.passCount = 1u;
+		modelInstance.desc.variant = gnVBLayout;
+		if (DX8GeomNormal::Ready_To_Render()
+			&& W3D_Material_CanUseGeomNormal(gnSurface)) {
+			gnApplied = DX8GeomNormal::Apply(*world_transform, modelInstance);
+			if (gnApplied) {
+				gnMountFVF = gnVBLayout;
+				// GeneralsX @refactor 23/10/2026: classify the batch with the shared material
+				// vocabulary. This is a census, not a behaviour change.
+				W3D_MaterialCensus(modelInstance.desc);
+			}
 			// GeneralsX @debug PS3.0 L2: sampled mount counter - distinguishes "gate never hits"
 			// (wrong FVF/pass/blend in practice) from "mounts but the change is invisible".
 			static unsigned s_gnMounted = 0;
@@ -2374,7 +2400,11 @@ void DX8TextureCategoryClass::Render()
 		if (!DX8RendererDebugger::Is_Enabled() || !mesh->Is_Disabled_By_Debugger()) {
 
 		if ((!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)) && WW3D::Is_Sorting_Enabled()) {
+			DX8Wrapper::VK_Set_ShadowReceiver((modelInstance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0);
+			DX8Wrapper::VK_Set_ShadowCaster((modelInstance.desc.features & W3DMATF_CAST_SHADOW) != 0);
 			renderer->Render_Sorted(mesh->Get_Base_Vertex_Offset(),mesh->Get_Bounding_Sphere());
+			DX8Wrapper::VK_Set_ShadowCaster(true);
+			DX8Wrapper::VK_Set_ShadowReceiver(true);
 		} else {
 			//non-transparent mesh that will be rendered immediately.  Okay to adjust the shader/material
 			//if necessary
@@ -2426,7 +2456,11 @@ void DX8TextureCategoryClass::Render()
 					DX8Wrapper::Apply_Render_State_Changes();
 					DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF,(int)((float)0x60*mesh->Get_Alpha_Override()));
 
+					DX8Wrapper::VK_Set_ShadowReceiver((modelInstance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0);
+			DX8Wrapper::VK_Set_ShadowCaster((modelInstance.desc.features & W3DMATF_CAST_SHADOW) != 0);
 					renderer->Render(mesh->Get_Base_Vertex_Offset());
+					DX8Wrapper::VK_Set_ShadowCaster(true);
+			DX8Wrapper::VK_Set_ShadowReceiver(true);
 
 					DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHAREF,0x60);
 					vmaterial->Set_Opacity(oldOpacity);	//restore previous value
@@ -2434,7 +2468,11 @@ void DX8TextureCategoryClass::Render()
 					DX8Wrapper::Set_Shader(theShader);	//restore previous value
 				}
 				else
+					DX8Wrapper::VK_Set_ShadowReceiver((modelInstance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0);
+			DX8Wrapper::VK_Set_ShadowCaster((modelInstance.desc.features & W3DMATF_CAST_SHADOW) != 0);
 					renderer->Render(mesh->Get_Base_Vertex_Offset());
+					DX8Wrapper::VK_Set_ShadowCaster(true);
+			DX8Wrapper::VK_Set_ShadowReceiver(true);
 
 				if (oldMapper)	//did we override the uv offset?
 				{	oldMapper->Set_LastUsedSyncTime(oldUVOffsetSyncTime);
@@ -2444,7 +2482,11 @@ void DX8TextureCategoryClass::Render()
 				DX8Wrapper::Set_Material(vmaterial);	//restore previous material.
 			}
 			else
-				renderer->Render(mesh->Get_Base_Vertex_Offset());
+				DX8Wrapper::VK_Set_ShadowReceiver((modelInstance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0);
+			DX8Wrapper::VK_Set_ShadowCaster((modelInstance.desc.features & W3DMATF_CAST_SHADOW) != 0);
+					renderer->Render(mesh->Get_Base_Vertex_Offset());
+					DX8Wrapper::VK_Set_ShadowCaster(true);
+			DX8Wrapper::VK_Set_ShadowReceiver(true);
 		}
 //--------------------------------------------------------------------
 		if (mesh->Get_ObjectScale() != 1.0f)

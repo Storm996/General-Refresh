@@ -305,6 +305,10 @@ void VKPgm_Get_Stats(VKPgm_Stats* out)
     if (!out) return;
     *out = sStats;
     out->resets = sStats.resets;
+    out->ffDraws = sCensusFFOk;
+    // FFEnter is every batch that reached the submit path with no translated tag; FFOk is the subset
+    // that actually recorded. The difference is the genuinely refused draws, not the second call site.
+    out->ffRefused = (sCensusFFEnter > sCensusFFOk) ? (sCensusFFEnter - sCensusFFOk) : 0ull;
 }
 
 void VKPgm_Log_Stats()
@@ -375,7 +379,8 @@ void VKPgm_Reset_All() {}
 
 void VKPgm_Get_Stats(VKPgm_Stats* out)
 {
-    if (out) { out->notes = out->matched = out->unmatched = out->lookups = out->hits = out->resets = 0ull; }
+    if (out) { out->notes = out->matched = out->unmatched = out->lookups = out->hits = out->resets = 0ull;
+        out->ffDraws = out->ffRefused = 0ull; }
 }
 void VKPgm_Log_Stats() {}
 void VKPgm_Note_Draw(unsigned, unsigned, int, int) {}

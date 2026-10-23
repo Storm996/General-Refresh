@@ -40,6 +40,7 @@ typedef struct _D3DVERTEXELEMENT9 D3DVERTEXELEMENT9;
 struct IDirect3DPixelShader9;
 
 #include "WW3D2/texture.h"
+#include "MaterialFeatures.h"
 enum FilterTypes CPP_11(: Int);
 enum FilterModes CPP_11(: Int);
 enum CustomScenePassModes CPP_11(: Int);
@@ -104,14 +105,28 @@ public:
 	static Int64 getCurrentDriverVersion() {return m_driverVersion; }	///<return current driver version.
 	static Int getShaderPasses(ShaderTypes shader);	///<rendering passes required for shader
 	static Int setShader(ShaderTypes shader, Int pass);	///<enable specific shader pass.
+	/// GeneralsX @refactor 23/10/2026: one material-selection policy for the terrain/road families.
+	/// HeightMap/FlatHeightMap used to repeat the reflection/lightmap/cloud ladder inline.
+	static ShaderTypes selectTerrainShader(bool reflectionPass, bool useLightMap, bool doCloud);
+	static ShaderTypes selectRoadShader(bool useLightMap, bool doCloud);
+	/// Data-driven form: the decision reads the shared material descriptor, not ad-hoc booleans.
+	static ShaderTypes selectTerrainShader(const W3DMaterialKey& material, bool reflectionPass);
+	static ShaderTypes selectRoadShader(const W3DMaterialKey& material);
 	static Int setShroudTex(Int stage);	///<Set shroud in a texture stage.
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: uploads the shared [TERRAIN30] per-pixel haze
 	// ramp into PS constants c0/c1 (haze rgb + strength / start + 1/length). Used by the HLSL
 	// terrain trio and road shader in W3DShaderManager.cpp and by the W3DTreeBuffer TREE30 path.
 	static void uploadPerPixelFogConstants();
+	// GeneralsX @refactor 23/10/2026: expose the one terrain/GN/tree/water haze recipe as plain
+	// float[4] pairs (rgb + strength / start + 1/length). Water used to carry its own 55%/45%, 0.7
+	// ramp, which is why a DistanceHaze=0 frame still hazed the sea while the land was clear.
+	static void getWeatherFogRamp(float haze[4], float ramp[4]);
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed,
 	// meaning the shared per-pixel haze ramp is valid. The TREE30 path gates its own HLSL haze on this.
 	static Bool arePerPixelFogShadersActive();
+	/// GeneralsX @refactor 23/10/2026: weather-scaled native cloud-shadow strength (0.35 clear,
+	/// denser in storms). Keeps the receiver's cloud term on the same weather state as the haze.
+	static Real getCloudShadowStrength();
 	// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: TRUE when the TERRAIN30 HLSL trio was installed AND
 	// GENERALSX_TERRAIN_NM (default ON) is on. Gates both halves of the terrain normal pass: the packed
 	// normal atlas in WorldHeightMap, and the s4/c2 normal modulation inside the terrain pixel shaders.
@@ -396,4 +411,18 @@ protected:
 	static Real m_curFadeValue;
 	static Bool m_skipRender;
 	static TextureClass *m_fadePatternTexture;	///<shape/pattern of the fade
+};
+
+// GeneralsX @refactor 23/10/2026: first real material instance. It owns the descriptor, the selected
+// terrain shader and its texture set, so HeightMap stops passing loose ShaderTypes/texture pointers
+// around. The bind step is still the legacy W3DShaderManager route (fallback preserved).
+struct W3DTerrainMaterialInstance
+{
+	W3DMaterialDesc desc;
+	W3DShaderManager::ShaderTypes shader;
+	TextureClass *textures[5];
+	Int passCount;
+
+	W3DTerrainMaterialInstance();
+	void BindTextures() const;
 };

@@ -58,6 +58,7 @@
 #include <d3dx9core.h>
 
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"
 #include "Common/PerfTimer.h"
 #include "Common/Xfer.h"
 
@@ -2920,5 +2921,12 @@ void BaseHeightMapRenderObjClass::loadPostProcess()
 //=============================================================================
 Bool BaseHeightMapRenderObjClass::useCloud()
 {
+	// GeneralsX @refactor 23/10/2026: once the native shadow receiver owns cloud shadows (all opaque
+	// surfaces), the terrain-side cloud multiply must stand down or the ground receives the pattern
+	// twice. The receiver's strength is published independently of this gate, so the two cannot
+	// oscillate; with ShadowMap off, VK_Cloud_Shadow_Active() stays false and the old terrain path runs.
+	if (DX8Wrapper::VK_Cloud_Shadow_Active() && OptionPreferences().getShadowMapEnabled()) {
+		return FALSE;
+	}
 	return TheGlobalData->m_useCloudMap && TheGlobalData->m_timeOfDay != TIME_OF_DAY_NIGHT;
 }

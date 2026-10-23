@@ -94,6 +94,8 @@ static void drawFramerateBar();
 #include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @feature PS3.0 T6 (base game links the inline no-op stub)
 #include "W3DDevice/GameClient/W3DScreenshot.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#include "W3DDevice/GameClient/W3DRenderLighting.h"
+#include "W3DDevice/GameClient/W3DRenderGraph.h"
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 #include "WW3D2/Backend/VulkanDraw.h"	// GeneralsX @feature Qoder 20/10/2026 native sun shadow entry point
 #endif
@@ -413,6 +415,84 @@ inline Int64 getPerformanceCounterFrequency()
 // W3DDisplay::W3DDisplay =====================================================
 /** */
 //=============================================================================
+// GeneralsX @refactor 23/10/2026: the first shared render-lighting snapshot. Filled once per
+// time-of-day/weather change; tree/grass consume it now, and the remaining families move over in
+// later phases. Keeping it here (rather than in WW3D2) preserves the platform-isolation rule: the
+// backend stays game-agnostic, the game layer owns GlobalData.
+static W3DRenderLightingState s_renderLighting = {
+	{ 0.0f, 0.0f, 1.0f },
+	{ 1.0f, 1.0f, 1.0f },
+	{ 0.0f, 0.0f, 0.0f },
+	{ 0.72f, 0.78f, 0.84f, 0.0f },
+	{ 0.0f, 0.0f, 0.0f, 0.0f },
+	{ 0.0f, 0.0f },
+	0.0f,
+	1.0f,
+	0u
+};
+
+const W3DRenderLightingState& W3D_GetRenderLighting()
+{
+	return s_renderLighting;
+}
+
+void W3D_SetCloudOffset(float x, float y)
+{
+	// Per-frame scroll; deliberately does not bump revision (that would rebake baked families every
+	// frame). Terrain/road texture matrices and future sky clouds read this one pair.
+	s_renderLighting.cloudOffset[0] = x;
+	s_renderLighting.cloudOffset[1] = y;
+}
+
+void W3D_RefreshRenderLighting()
+{
+	if (!TheGlobalData) {
+		return;
+	}
+	TimeOfDay tod = W3DDisplay::getRenderTimeOfDay();
+	if ((Int)tod < 0 || (Int)tod >= TIME_OF_DAY_COUNT) {
+		tod = TheGlobalData->m_timeOfDay;
+	}
+	const GlobalData::TerrainLighting &slot = TheGlobalData->m_terrainObjectsLighting[tod][0];
+	Vector3 dir(-slot.lightPos.x, -slot.lightPos.y, -slot.lightPos.z);
+	const Real len = dir.Length();
+	if (len > 1e-6f) {
+		dir.X /= len;
+		dir.Y /= len;
+		dir.Z /= len;
+	} else {
+		dir.Set(0.0f, 0.0f, 1.0f);
+	}
+	s_renderLighting.sunDir[0] = dir.X;
+	s_renderLighting.sunDir[1] = dir.Y;
+	s_renderLighting.sunDir[2] = dir.Z;
+	s_renderLighting.sunColor[0] = slot.diffuse.red;
+	s_renderLighting.sunColor[1] = slot.diffuse.green;
+	s_renderLighting.sunColor[2] = slot.diffuse.blue;
+	s_renderLighting.ambient[0] = slot.ambient.red;
+	s_renderLighting.ambient[1] = slot.ambient.green;
+	s_renderLighting.ambient[2] = slot.ambient.blue;
+
+	// Same haze recipe terrain/road/tree and GN already use; one snapshot means water, terrain and
+	// the weather veil cannot disagree about start/length/strength.
+	float haze[4] = { 0.72f, 0.78f, 0.84f, 0.0f };
+	float ramp[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	W3DShaderManager::getWeatherFogRamp(haze, ramp);
+	s_renderLighting.fogColor[0] = haze[0];
+	s_renderLighting.fogColor[1] = haze[1];
+	s_renderLighting.fogColor[2] = haze[2];
+	s_renderLighting.fogColor[3] = haze[3];
+	s_renderLighting.fogRamp[0] = ramp[0];
+	s_renderLighting.fogRamp[1] = ramp[1];
+	s_renderLighting.fogRamp[2] = ramp[2];
+	s_renderLighting.fogRamp[3] = ramp[3];
+	s_renderLighting.cloudShadowStrength =
+		(TheGlobalData->m_useCloudMap && TheGlobalData->m_timeOfDay != TIME_OF_DAY_NIGHT)
+			? W3DShaderManager::getCloudShadowStrength() : 0.0f;
+	s_renderLighting.exposure = DX8Wrapper::VK_HDR_Exposure();
+	++s_renderLighting.revision;
+}
+
 W3DDisplay::W3DDisplay()
 {
 	Int i;
@@ -2467,6 +2547,28 @@ AGAIN:
 			//USE_PERF_TIMER(BigAssRenderLoop)
 			static Bool couldRender = true;
 			Bool vkBeginOK = FALSE;
+			// FrameGraph owns the frame prologue: allocate sceneColor/sceneDepth/overlay before
+			// VKDraw_Begin_Frame opens the backend frame, then only declare/use them below.
+			W3DRenderFrameScope rgFrame;
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+			W3DRenderGraph::SetBarrierHandler([](const char* resource, int layout) {
+				VKDraw_Graph_Barrier(resource, layout);
+			});
+			W3DRenderGraph::SetTargetHandlers(
+				[](unsigned* sceneW, unsigned* sceneH, unsigned* colorFormat, unsigned* depthFormat,
+					unsigned* overlayW, unsigned* overlayH, unsigned* overlayFormat, int* overlayWanted) {
+					return VKDraw_Graph_Target_Desc(sceneW, sceneH, colorFormat, depthFormat,
+						overlayW, overlayH, overlayFormat, overlayWanted);
+				},
+				[](const char* name, unsigned width, unsigned height, unsigned format, bool depth) {
+					return VKDraw_Graph_Alloc_Target(name, width, height, format, depth);
+				},
+				[](const char* name) { VKDraw_Graph_Free_Target(name); });
+			// Phase 6B: the graph owns the target lifetime. It asks the backend for this frame's exact
+			// scene/overlay shape (including render scale and HDR), allocates them, and releases the
+			// transient overlay once the P6 resolve stops being wanted.
+			W3DRenderGraph::Get().PrepareTargets();
+#endif
 			if (TheGlobalData->m_breakTheMovie == FALSE && TheGlobalData->m_disableRender == false)
 			{
 				VKFph2Scope s(vkP ? &g_fph2.begin : nullptr);
@@ -2474,7 +2576,6 @@ AGAIN:
 			}
 			if (vkBeginOK)
 			{
-
 				if(TheGlobalData->m_loadScreenRender == TRUE)
 				{
 					TheInGameUI->draw();
@@ -2490,6 +2591,9 @@ AGAIN:
 
 				// draw all views of the world
 				{
+					W3DRenderPassScope rgPass("world");
+					W3DRenderGraph::Get().Require("sceneColor", W3DRenderGraph::LAYOUT_COLOR_ATTACHMENT, W3DRenderGraph::RES_WRITE);
+					W3DRenderGraph::Get().Require("sceneDepth", W3DRenderGraph::LAYOUT_DEPTH_ATTACHMENT, W3DRenderGraph::RES_WRITE);
 					VKFph2Scope s(vkP ? &g_fph2.views : nullptr);
 					drawViews();
 				}
@@ -2499,12 +2603,28 @@ AGAIN:
 				// depth map and darkens the scene where the depth test says a caster blocks the light.
 				// It runs inside the open scene, before the UI, so the shadow only covers the world.
 				{
+					W3DRenderPassScope rgPass("shadow");
+					W3DRenderGraph::Get().Require("sceneDepth", W3DRenderGraph::LAYOUT_SHADER_READ, W3DRenderGraph::RES_READ);
+					W3DRenderGraph::Get().Require("shadowMap", W3DRenderGraph::LAYOUT_SHADER_READ, W3DRenderGraph::RES_WRITE);
 					VKFph2Scope s(vkP ? &g_fph2.receiver : nullptr);
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 					if (TheW3DShadowManager)
 					{
-						const Vector3 &sunPos = TheW3DShadowManager->getLightPosWorld(0);
-						const float sunDir[3] = { sunPos.X, sunPos.Y, sunPos.Z };
+						// GeneralsX @refactor 23/10/2026: the shadow pass now follows the same sun
+						// direction the lighting snapshot publishes. The old manager point was a
+						// separate source and could disagree with terrain/GN/grass after a TOD edit.
+						const W3DRenderLightingState &lighting = W3D_GetRenderLighting();
+						float sunDir[3];
+						if (lighting.revision > 0u) {
+							sunDir[0] = lighting.sunDir[0];
+							sunDir[1] = lighting.sunDir[1];
+							sunDir[2] = lighting.sunDir[2];
+						} else {
+							const Vector3 &sunPos = TheW3DShadowManager->getLightPosWorld(0);
+							sunDir[0] = sunPos.X;
+							sunDir[1] = sunPos.Y;
+							sunDir[2] = sunPos.Z;
+						}
 						VKDraw_Shadow_Apply(sunDir);
 					}
 #endif
@@ -2513,10 +2633,18 @@ AGAIN:
 				// GeneralsX @feature 23/10/2026 P6 "底片/镜头": resolve the 3D scene (tonemap/AA/SSAA)
 				// into the LDR overlay before the HUD. No-op unless HDR / RenderScale / PostAA is on.
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-				VKDraw_Begin_UI();
+				{
+					W3DRenderPassScope rgPass("overlay");
+					W3DRenderGraph::Get().Require("sceneColor", W3DRenderGraph::LAYOUT_SHADER_READ, W3DRenderGraph::RES_READ);
+					W3DRenderGraph::Get().Require("overlay", W3DRenderGraph::LAYOUT_COLOR_ATTACHMENT, W3DRenderGraph::RES_WRITE);
+					VKDraw_Begin_UI();
+				}
 #endif
 				// draw the user interface
 				{
+					W3DRenderPassScope rgPass("ui");
+					W3DRenderGraph::Get().Require("overlay", W3DRenderGraph::LAYOUT_COLOR_ATTACHMENT,
+						W3DRenderGraph::RES_READ | W3DRenderGraph::RES_WRITE);
 					VKFph2Scope s(vkP ? &g_fph2.ingameui : nullptr);
 					TheInGameUI->DRAW();
 				}
@@ -2526,6 +2654,7 @@ AGAIN:
 				// draw the mouse
 				if( TheMouse )
 				{
+					W3DRenderPassScope rgPass("mouse");
 					VKFph2Scope s(vkP ? &g_fph2.mouse : nullptr);
 					TheMouse->DRAW();
 				}
@@ -3311,6 +3440,8 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 	// scalars (GN/ML haze ramp + PBR wetness) from here puts them on the same frame as the fixed
 	// pipeline, the terrain haze and the screen layer. WEATHER_NORMAL publishes fogScale 1.0 /
 	// wetness 0, which re-uploads exactly the install numbers, so a clear map stays unchanged.
+	// applyWeatherToShaders refreshes the one shared lighting snapshot internally, so do not publish
+	// a second time here: the old double call bumped revision twice and scheduled duplicate rebakes.
 	W3DShaderManager::applyWeatherToShaders();
 }
 

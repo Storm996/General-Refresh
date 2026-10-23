@@ -80,6 +80,7 @@
 #include "W3DDevice/GameClient/W3DWaypointBuffer.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
+#include "W3DDevice/GameClient/W3DRenderLighting.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/GameClient/W3DWater.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
@@ -1994,6 +1995,28 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		W3DShaderManager::updateCloud();
 	}
 
+	// GeneralsX @refactor 23/10/2026: terrain vertex colours are baked from the lighting table.
+	// Watch the shared atmosphere revision (TOD/weather/key changes) and schedule a rebuild, so a
+	// sun/ambient edit reaches the ground even when it did not go through setTimeOfDay.
+	{
+		static unsigned s_terrainLightingRevision = ~0u;
+		const unsigned revision = W3D_GetRenderLighting().revision;
+		if (revision != s_terrainLightingRevision) {
+			s_terrainLightingRevision = revision;
+			scheduleFullUpdate();
+			// Roads carry their own baked vertex colours; keep them on the same atmosphere revision.
+			if (m_roadBuffer) {
+				m_roadBuffer->updateLighting();
+			}
+			if (m_bibBuffer) {
+				m_bibBuffer->updateLighting();
+			}
+			if (m_bridgeBuffer) {
+				m_bridgeBuffer->updateLighting();
+			}
+		}
+	}
+
 #if 0 // There is some weirdness sometimes with the dx8 static buffers.
 			// This usually fixes terrain flashing.  jba.
 	static Int delay = 1;
@@ -2083,36 +2106,36 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		DX8Wrapper::Set_Material(m_vertexMaterialClass);
 		DX8Wrapper::Set_Shader(m_shaderClass);
 
- 		st=W3DShaderManager::ST_TERRAIN_BASE; //set default shader
+		// GeneralsX @refactor 23/10/2026: the terrain batch is now a W3DTerrainMaterialInstance:
+		// descriptor + selected shader + texture set travel together, instead of loose locals.
+		W3DTerrainMaterialInstance terrainInstance;
+		terrainInstance.desc.family = W3DMAT_TERRAIN;
+		terrainInstance.desc.features =
+			(TheGlobalData->m_useLightMap ? W3DMATF_LIGHTMAP : 0u) |
+			(doCloud ? W3DMATF_RECEIVE_CLOUD : 0u) |
+			W3DMATF_RECEIVE_SHADOW;
+		terrainInstance.shader = W3DShaderManager::selectTerrainShader(
+			terrainInstance.desc, ShaderClass::Is_Backface_Culling_Inverted() != 0);
+		terrainInstance.textures[0] = m_stageZeroTexture;
+		terrainInstance.textures[1] = m_stageZeroTexture;
+		terrainInstance.textures[2] = m_stageTwoTexture;
+		terrainInstance.textures[3] = m_stageThreeTexture;
+		terrainInstance.textures[4] = m_map ? m_map->getTerrainNormalTexture() : nullptr;
+		terrainInstance.BindTextures();
+		st = terrainInstance.shader;
 
- 		//set correct shader based on current settings
- 		if (!ShaderClass::Is_Backface_Culling_Inverted())
- 		{
- 			//not reflection pass
- 			if (TheGlobalData->m_useLightMap && doCloud)
- 			{	st=W3DShaderManager::ST_TERRAIN_BASE_NOISE12;
- 			}
- 			else
- 			if (TheGlobalData->m_useLightMap)
- 			{
- 				//lightmap only
- 				st=W3DShaderManager::ST_TERRAIN_BASE_NOISE2;
- 			}
- 			else
- 			if (doCloud)
- 			{
- 				//cloudmap only
- 				st=W3DShaderManager::ST_TERRAIN_BASE_NOISE1;
- 			}
- 		}
- 		else
- 		{
- 			//reflection pass, just do base texture
- 			st=W3DShaderManager::ST_TERRAIN_BASE;
- 		}
+		// GeneralsX @feature 23/10/2026: publish the cloud map/scroll for the native shadow receiver.
+		// Strength is 0 in this plumbing step, so the receiver's cloud term is inert until the next
+		// step enables it and suppresses the terrain-side multiply (avoids a double shadow).
+		{
+			const W3DRenderLightingState &atm = W3D_GetRenderLighting();
+			DX8Wrapper::VK_Set_Cloud_Texture(
+				m_stageTwoTexture ? (void *)m_stageTwoTexture->Peek_D3D_Texture() : nullptr,
+				atm.cloudOffset[0], atm.cloudOffset[1], 1.0f / 315.0f, atm.cloudShadowStrength);
+		}
 
  		//Find number of passes required to render current shader
- 		devicePasses=W3DShaderManager::getShaderPasses(st);
+		devicePasses = terrainInstance.passCount = W3DShaderManager::getShaderPasses(st);
 
  		if (m_disableTextures)
  			devicePasses=1;	//force to 1 lighting-only pass
@@ -2123,17 +2146,6 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  				TheGlobalData->m_useLightMap ? 1 : 0, doCloud ? 1 : 0);
  			fflush(stderr);
  		}
-
- 		//Specify all textures that this shader may need.
- 		W3DShaderManager::setTexture(0,m_stageZeroTexture);
- 		W3DShaderManager::setTexture(1,m_stageZeroTexture);
- 		W3DShaderManager::setTexture(2,m_stageTwoTexture);	//cloud
- 		W3DShaderManager::setTexture(3,m_stageThreeTexture);//noise
- 		// GeneralsX @feature PS3.0 L2.1 TNM 17/10/2026: parallel normal atlas for the TERRAIN30
- 		// NM variants (sampler s4). Null is a supported state - TerrainShaderPixelShader::set()
- 		// binds a 1x1 flat-normal fallback whenever no atlas exists, so maps without _nm sheets
- 		// stay pixel-identical to the non-NM leg.
- 		W3DShaderManager::setTexture(4,m_map ? m_map->getTerrainNormalTexture() : nullptr);
 		// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 identity probe: name the facade handles the
 		// terrain draw actually binds, so the mirror log can be attributed to cloud/lightmap/atlas.
 		{
@@ -2457,24 +2469,13 @@ void HeightMapRenderObjClass::renderExtraBlendTiles()
 			W3DShaderManager::setTexture(1,m_stageTwoTexture);	//cloud
 			W3DShaderManager::setTexture(2,m_stageThreeTexture);	//noise/lightmap
 
-			W3DShaderManager::ShaderTypes st = W3DShaderManager::ST_ROAD_BASE;
-
 			const Bool doCloud = useCloud();
-
-			if (TheGlobalData->m_useLightMap && doCloud)
- 			{
-				st = W3DShaderManager::ST_ROAD_BASE_NOISE12;
- 			}
- 			else if (TheGlobalData->m_useLightMap)
- 			{
- 				//lightmap only
- 				st = W3DShaderManager::ST_ROAD_BASE_NOISE2;
- 			}
- 			else if (doCloud)
- 			{
- 				//cloudmap only
- 				st = W3DShaderManager::ST_ROAD_BASE_NOISE1;
- 			}
+			W3DMaterialKey roadMaterial = {};
+			roadMaterial.family = W3DMAT_STATIC;
+			roadMaterial.features =
+				(TheGlobalData->m_useLightMap ? W3DMATF_LIGHTMAP : 0u) |
+				(doCloud ? W3DMATF_RECEIVE_CLOUD : 0u);
+			W3DShaderManager::ShaderTypes st = W3DShaderManager::selectRoadShader(roadMaterial);
 
 			Int devicePasses=W3DShaderManager::getShaderPasses(st);
 

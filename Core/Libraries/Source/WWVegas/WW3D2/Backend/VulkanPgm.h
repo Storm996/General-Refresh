@@ -65,6 +65,11 @@ struct VKPgm_Stats {
     unsigned long long lookups;    // handle -> tag queries from the draw path
     unsigned long long hits;       // ... answered with a tag
     unsigned long long resets;     // handle maps dropped on device reset
+    // Phase 5A fallback audit: fixed-function draws that reached the submit path. ffDraws means the
+    // retail FF interpreter actually rendered; ffRefused means the draw was refused. Both are zero
+    // only when every batch has a translated program and no FF path is needed.
+    unsigned long long ffDraws;
+    unsigned long long ffRefused;
 };
 void VKPgm_Get_Stats(VKPgm_Stats* out);
 void VKPgm_Log_Stats();

@@ -183,7 +183,7 @@ void RoadType::loadTexture(AsciiString path, Int ID)
 	m_roadTexture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_REPEAT);
 	m_roadTexture->Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_REPEAT);
 
-	m_vertexRoad=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,TheGlobalData->m_maxRoadVertex+4, (s_dynamic?DX8VertexBufferClass::USAGE_DYNAMIC:DX8VertexBufferClass::USAGE_DEFAULT)));
+	m_vertexRoad=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZNDUV1,TheGlobalData->m_maxRoadVertex+4, (s_dynamic?DX8VertexBufferClass::USAGE_DYNAMIC:DX8VertexBufferClass::USAGE_DEFAULT)));
 	m_indexRoad=NEW_REF(DX8IndexBufferClass,(TheGlobalData->m_maxRoadIndex+4, (s_dynamic?DX8IndexBufferClass::USAGE_DYNAMIC:DX8IndexBufferClass::USAGE_DEFAULT)));
 	m_numRoadVertices=0;
 	m_numRoadIndices=0;
@@ -256,7 +256,7 @@ RoadSegment::~RoadSegment()
 //=============================================================================
 /** Allocates & sets the vertex entries. */
 //=============================================================================
-void RoadSegment::SetVertexBuffer(VertexFormatXYZDUV1 *vb, Int numVertex)
+void RoadSegment::SetVertexBuffer(VertexFormatXYZNDUV1 *vb, Int numVertex)
 {
 	delete[] m_vb;
 	m_vb = nullptr;
@@ -266,12 +266,12 @@ void RoadSegment::SetVertexBuffer(VertexFormatXYZDUV1 *vb, Int numVertex)
 	if (numVertex<1 || numVertex > MAX_SEG_VERTEX)
 		return;
 
-	m_vb = NEW VertexFormatXYZDUV1[numVertex];	// pool[]ify
+	m_vb = NEW VertexFormatXYZNDUV1[numVertex];	// pool[]ify
 	if (!m_vb)
 		return;
 
 	m_numVertex = numVertex;
-	memcpy(m_vb, vb, numVertex*sizeof(VertexFormatXYZDUV1));
+	memcpy(m_vb, vb, numVertex*sizeof(VertexFormatXYZNDUV1));
 	Int i;
 	for (i=0; i<numVertex; i++) {
 		verts[i].X = m_vb[i].x;
@@ -309,11 +309,11 @@ void RoadSegment::SetIndexBuffer(UnsignedShort *ib, Int numIndex)
 //=============================================================================
 /** Copies vertex entries into destination_vb. */
 //=============================================================================
-Int RoadSegment::GetVertices(VertexFormatXYZDUV1 *destination_vb, Int numToCopy)
+Int RoadSegment::GetVertices(VertexFormatXYZNDUV1 *destination_vb, Int numToCopy)
 {
 	if (m_vb == nullptr || numToCopy<1) return	(0);
 	if (numToCopy > m_numVertex) return(0);
-	memcpy(destination_vb, m_vb, numToCopy*sizeof(VertexFormatXYZDUV1));
+	memcpy(destination_vb, m_vb, numToCopy*sizeof(VertexFormatXYZNDUV1));
 	return(numToCopy);
 }
 
@@ -570,7 +570,7 @@ void W3DRoadBuffer::loadFloat4PtSection(RoadSegment *pRoad, Vector2 loc,
 	const Real FLOAT_AMOUNT = MAP_HEIGHT_SCALE/8;
 	const Real MAX_ERROR = MAP_HEIGHT_SCALE*1.1f;
 	UnsignedShort ib[MAX_SEG_INDEX];
-	VertexFormatXYZDUV1 vb[MAX_SEG_VERTEX];
+	VertexFormatXYZNDUV1 vb[MAX_SEG_VERTEX];
 	Int numRoadVertices = 0;
 	Int numRoadIndices = 0;
 
@@ -716,6 +716,9 @@ void W3DRoadBuffer::loadFloat4PtSection(RoadSegment *pRoad, Vector2 loc,
 				vb[numRoadVertices].x = curColumn.vtx[j].X;
 				vb[numRoadVertices].y = curColumn.vtx[j].Y;
 				vb[numRoadVertices].z = curColumn.vtx[j].Z+FLOAT_AMOUNT;
+				vb[numRoadVertices].nx = 0.0f;
+				vb[numRoadVertices].ny = 0.0f;
+				vb[numRoadVertices].nz = 1.0f;
 				vb[numRoadVertices].diffuse = diffuse;
 				curColumn.vertexIndex[j] = numRoadVertices;
 				numRoadVertices++;
@@ -784,7 +787,7 @@ terrain.  The road is loaded into the quadrilateral defined by the
 the road vector gives the direction of the road, and the road normal is perpendicular
 to the road normal.  */
 //=============================================================================
-void W3DRoadBuffer::loadLit4PtSection(RoadSegment *pRoad, UnsignedShort *ib, VertexFormatXYZDUV1 *vb, RefRenderObjListIterator *pDynamicLightsIterator)
+void W3DRoadBuffer::loadLit4PtSection(RoadSegment *pRoad, UnsignedShort *ib, VertexFormatXYZNDUV1 *vb, RefRenderObjListIterator *pDynamicLightsIterator)
 {
 
 	const Real FLOAT_AMOUNT = MAP_HEIGHT_SCALE/8;
@@ -998,6 +1001,9 @@ void W3DRoadBuffer::loadLit4PtSection(RoadSegment *pRoad, UnsignedShort *ib, Ver
 				vb[m_curNumRoadVertices].x = curColumn.vtx[j].X;
 				vb[m_curNumRoadVertices].y = curColumn.vtx[j].Y;
 				vb[m_curNumRoadVertices].z = curColumn.vtx[j].Z+FLOAT_AMOUNT;
+				vb[m_curNumRoadVertices].nx = 0.0f;
+				vb[m_curNumRoadVertices].ny = 0.0f;
+				vb[m_curNumRoadVertices].nz = 1.0f;
 				vb[m_curNumRoadVertices].diffuse = diffuse;
 				curColumn.vertexIndex[j] = m_curNumRoadVertices;
 				m_curNumRoadVertices++;
@@ -1229,7 +1235,7 @@ void W3DRoadBuffer::loadRoadsInVertexAndIndexBuffers()
 	}
 	m_curNumRoadVertices = 0;
 	m_curNumRoadIndices = 0;
-	VertexFormatXYZDUV1 *vb;
+	VertexFormatXYZNDUV1 *vb;
 	UnsignedShort *ib;
 	// Lock the buffers.
 	if (m_roadTypes[m_curRoadType].getIB() == nullptr) {
@@ -1239,7 +1245,7 @@ void W3DRoadBuffer::loadRoadsInVertexAndIndexBuffers()
 	}
 	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_roadTypes[m_curRoadType].getIB(), s_dynamic?D3DLOCK_DISCARD:0);
 	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_roadTypes[m_curRoadType].getVB(), s_dynamic?D3DLOCK_DISCARD:0);
-	vb=(VertexFormatXYZDUV1*)lockVtxBuffer.Get_Vertex_Array();
+	vb=(VertexFormatXYZNDUV1*)lockVtxBuffer.Get_Vertex_Array();
 	ib = lockIdxBuffer.Get_Index_Array();
 	// Add to the index buffer & vertex buffer.
 
@@ -1313,12 +1319,12 @@ void W3DRoadBuffer::loadLitRoadsInVertexAndIndexBuffers(RefRenderObjListIterator
 	}
 	m_curNumRoadVertices = 0;
 	m_curNumRoadIndices = 0;
-	VertexFormatXYZDUV1 *vb;
+	VertexFormatXYZNDUV1 *vb;
 	UnsignedShort *ib;
 	// Lock the buffers.
 	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_roadTypes[m_curRoadType].getIB());
 	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_roadTypes[m_curRoadType].getVB());
-	vb=(VertexFormatXYZDUV1*)lockVtxBuffer.Get_Vertex_Array();
+	vb=(VertexFormatXYZNDUV1*)lockVtxBuffer.Get_Vertex_Array();
 	ib = lockIdxBuffer.Get_Index_Array();
 	// Add to the index buffer & vertex buffer.
 
@@ -1343,7 +1349,7 @@ void W3DRoadBuffer::loadLitRoadsInVertexAndIndexBuffers(RefRenderObjListIterator
 //=============================================================================
 /** Loads a road segment into the vertex buffer for drawing. */
 //=============================================================================
-void W3DRoadBuffer::loadRoadSegment(UnsignedShort *ib, VertexFormatXYZDUV1 *vb, RoadSegment *pRoad)
+void W3DRoadBuffer::loadRoadSegment(UnsignedShort *ib, VertexFormatXYZNDUV1 *vb, RoadSegment *pRoad)
 {
 	if (pRoad->m_uniqueID != m_curUniqueID) {
 		return;

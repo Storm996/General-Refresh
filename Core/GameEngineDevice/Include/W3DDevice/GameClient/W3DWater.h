@@ -59,6 +59,37 @@ with rectangular planar surfaces and was tuned with an emphasis on water.
 Since skies are only visible in reflections, this code will also
 render clouds and sky bodies.
 */
+#include "W3DDevice/GameClient/W3DMaterialInstance.h"
+
+// Phase 5B.3: water material identity. The three water draw paths share this record instead of
+// each building a throw-away W3DMaterialInstance and each poking the same stage/blend/texture state.
+// Bind() now owns the family/features/variant descriptor, the texture set, the fixed-function stage
+// and the blend class; the draw still owns its shader program and per-frame constants.
+struct W3DWaterMaterialInstance : public W3DMaterialInstance
+{
+	enum Kind { WATER_SEA = 0, WATER_RIVER = 1, WATER_TRAPEZOID = 2 };
+	Int waterType;
+	TextureClass *reflection;
+	void *bump;
+	Real bumpScale;
+
+	// River/trapezoid surface state, copied from the WaterRenderObjClass before Bind(). Sea leaves
+	// these null/zero.
+	TextureClass *waterTexture;
+	TextureClass *alphaEdgeTexture;
+	TextureClass *sparklesTexture;
+	TextureClass *noiseTexture;
+	TextureClass *whiteTexture;
+	TextureClass *shroudTexture;
+	IDirect3DPixelShader9 *pixelShader;
+	Real vOrigin;
+	Bool additiveBlend;
+	Bool featherBlend;
+
+	W3DWaterMaterialInstance();
+	void Bind();
+};
+
 class WaterRenderObjClass : public Snapshot,
 														public RenderObjClass
 {
@@ -123,7 +154,7 @@ public:
 	{	if (m_meshData)	*value=m_meshData[(y+1)*(m_gridCellsX+1+2)+x+1].height+ Get_Position().Z;}
 	inline Bool worldToGridSpace(Real worldX, Real worldY, Real &gridX, Real &gridY);	///<convert from world coordinates to grid's local coordinate system.
 
-	void replaceSkyboxTexture(const AsciiString& oldTexName, const AsciiString& newTextName);
+	// Sky draw moved out of Render(): W3DSkyRenderer owns the cubemap pass now.
 
 protected:
 	DX8IndexBufferClass			*m_indexBuffer;	///<indices defining quad
@@ -179,7 +210,6 @@ protected:
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
-	RenderObjClass	*m_skyBox;		///<box around level
 	WaterTracksRenderSystem *m_waterTrackSystem;	///<object responsible for rendering water wakes
 
 	enum WaterMeshStatus
@@ -262,8 +292,10 @@ protected:
 	Bool getClippedWaterPlane(CameraClass *cam, AABoxClass *box);
 
 	void setupFlatWaterShader();
-	void setupJbaWaterShader();
 	void cleanupJbaWaterShader();
+	/// Fill a water material record from this object's current textures/state. The three draw paths
+	/// and the 3D mesh path share it so their texture set and blend class cannot drift apart.
+	void configureWaterMaterial(W3DWaterMaterialInstance &material, Int kind, Bool featherBlend);
 
 	//Methods used for GeForce3 specific water
 	HRESULT generateIndexBuffer(int sizeX, int sizeY);	///<Generate static index buufer

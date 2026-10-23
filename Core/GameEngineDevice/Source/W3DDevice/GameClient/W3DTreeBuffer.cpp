@@ -57,13 +57,14 @@ enum
 
 #include "W3DDevice/GameClient/W3DTreeBuffer.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
+#include "W3DDevice/GameClient/W3DRenderLighting.h"
+#include "MaterialFeatures.h"
+#include "W3DDevice/GameClient/W3DMaterialInstance.h"
 #include "W3DDevice/GameClient/W3DTreeAlias.h"
 
-#include <cstdlib>   // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: getenv for GENERALSX_TREE30 opt-out
-#include <cstring>   // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: strcmp for the opt-out compare
+#include <cstdlib>   // getenv for GENERALSX_TREE_NO_SHROUD QA fallback
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
-#include "WW3D2/Backend/VulkanPgm.h"	// GeneralsX @feature Qoder 22/10/2026: enable the translated tree PS on pure Vulkan
 #include "Common/FramePacer.h"
 #include "Common/GameUtility.h"
 #include "Common/MapReaderWriterInfo.h"
@@ -407,40 +408,6 @@ void W3DTreeBuffer::W3DTreeTextureClass::Apply(unsigned int stage)
 #endif
 static ShaderClass detailAlphaShader(SC_ALPHA_DETAIL);
 static ShaderClass detailAlphaShader2X(SC_ALPHA_DETAIL_2X);
-
-// GeneralsX @feature PS3.0 batch8 G1 14/10/2026 -----------------------------------------------------------------------
-// TREE30: per-pixel haze for the fixed-function tree path (the one taken when shaders/Trees.vso is
-// not installed; the .vso sway path keeps retail behaviour because a binary vertex shader cannot
-// relay eye depth and POSITION-as-PS-input is rejected by fxc (X4502, batch8 probe forensics -
-// logs/posw_probe_run5.txt). The shader mirrors this path's exact FF combiner state: stage0 is the
-// detailAlphaShader GRADIENT_MODULATE (diffuse * atlas), stage1 is the shroud projection set by
-// setShroudTex() (MODULATE rgb / SELECTARG2 keeps current alpha), and eye depth arrives through the
-// stage-2 CAMERASPACEPOSITION COUNT3 identity relay - the only per-pixel depth channel that works
-// on both native d3d9 and DXVK. c0/c1 are the shared [TERRAIN30] haze ramp, so the path is gated on
-// W3DShaderManager::arePerPixelFogShadersActive(); GENERALSX_TREE30=0 opts out explicitly.
-static const char* kTreePS30 =
-	"sampler s0 : register(s0);\n"                 // atlas (stage0, uv0)
-	"sampler s1 : register(s1);\n"                 // shroud projection (stage1, CAMERASPACEPOSITION COUNT2)
-	"float4 c0 : register(c0);\n"                  // haze rgb, w = fog strength
-	"float4 c1 : register(c1);\n"                  // x = eye-depth start, y = 1/ramp length
-	"struct PS_IN\n"
-	"{\n"
-	"    float2 uv  : TEXCOORD0;\n"
-	"    float2 shr : TEXCOORD1;\n"                 // projected shroud uv
-	"    float3 dep : TEXCOORD2;\n"                 // .z = camera depth (stage-2 COUNT3 relay)
-	"    float4 vc  : COLOR0;\n"                    // vertex diffuse
-	"};\n"
-	"float4 main(PS_IN i) : COLOR\n"
-	"{\n"
-	"    float4 tex = tex2D(s0, i.uv);\n"
-	"    float4 c   = i.vc * tex;\n"                          // stage0: GRADIENT_MODULATE
-	"    c.rgb      = c.rgb * tex2D(s1, i.shr).rgb;\n"        // stage1: shroud MODULATE
-	"    float a    = tex.a * i.vc.a;\n"                      // stage1 ALPHAOP SELECTARG2 = current
-	"    float fogf = saturate((-i.dep.z - c1.x) * c1.y) * c0.w;\n"   // batch23: camera z is negative ahead (D3D -Z); batch8 form folded to zero
-	"    return float4(lerp(c.rgb, c0.rgb, fogf), a);\n"
-	"}\n";
-static IDirect3DPixelShader9* s_treeHlslPS = nullptr;
-static Bool s_treeHlslTried = FALSE;
 
 
 /*
@@ -1515,47 +1482,6 @@ void W3DTreeBuffer::allocateTreeBuffers()
 		m_curNumTreeIndices[i]=0;
 	}
 
-		// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: compile the TREE30 fixed-function haze pixel
-		// shader once. This runs before the Trees.vso load below because the tree geometry only reaches
-		// the FF path (Set_Vertex_FVF) when the .vso is absent - the exact case this HLSL PS serves. It is
-		// gated on the ps_3_0 terrain trio being active so the shared c0/c1 haze ramp is valid.
-	if (!s_treeHlslTried)
-	{
-		s_treeHlslTried = TRUE;
-		// GeneralsX @bugfix PS3.0 batch22 14/10/2026: default off with the rest of the batch-8
-		// surface HLSL family (user blocky-ground verdict); GENERALSX_TREE30=1 opts back in and
-		// still requires the TERRAIN30 fog shaders to be active.
-		// GeneralsX @bugfix 23/10/2026: TREE30 is opt-in again. Its translated twin (tag 121,
-		// pgm_b1_tree.frag) introduced two independent differences from the fixed-function tree path -
-		// a round-to-nearest alpha test where the FF shader truncates, and a Forward+ point-light term
-		// whose tile Y was mirrored - and a map with `shroudBound` toggling could switch between the two
-		// alpha rules. The 21/10 FF path is the stable reference. GENERALSX_TREE30=1 still opts in for
-		// A/B runs; the env wins over this default.
-		bool tree30On = false;
-		const char* tenv = getenv("GENERALSX_TREE30");
-		if (tenv != nullptr && *tenv != 0) tree30On = (strcmp(tenv, "0") != 0);
-		if (tree30On && W3DShaderManager::arePerPixelFogShadersActive())
-		{
-			const char* prof = nullptr;
-			const HRESULT hr = W3DShaderManager::compileShaderAtBestProfile(kTreePS30, false, "[TREE30]", &prof, (void**)&s_treeHlslPS);
-			// Only keep the handle when the draw facade can translate it; an untranslated custom PS
-			// would take over the batch and leave the trees undrawn under VKPRESENT.
-			const bool translated = s_treeHlslPS != nullptr &&
-				VKPgm_Tag_For_Handle((void*)s_treeHlslPS, 1) != 0;
-			if (SUCCEEDED(hr) && translated)
-			{
-				fprintf(stderr, "[TREE30] HLSL tree haze pixel shader installed profile=%s\n", prof ? prof : "?");
-				fflush(stderr);
-			}
-			else
-			{
-				if (s_treeHlslPS != nullptr) { s_treeHlslPS->Release(); s_treeHlslPS = nullptr; }
-				fprintf(stderr, "[TREE30] HLSL compile failed, fixed-function trees kept\n");
-				fflush(stderr);
-			}
-		}
-	}
-
 		//shader decleration
 	// DX8_FVF_XYZNDUV1
 	D3DVERTEXELEMENT9 Declaration[] =
@@ -1900,12 +1826,42 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 
 	m_isTerrainPass = false;
 
+	// GeneralsX @refactor 23/10/2026: tree colours are baked into the vertex buffer from
+	// m_terrainObjectsLighting at build time, so a render-TOD/weather change used to leave every tree
+	// on the old sun while terrain rebaked and GN/water moved. Watch the shared lighting revision and
+	// rebuild the vertex/index buffers (loadTreesInVertexAndIndexBuffers re-runs doLighting with the
+	// current table) when it changes.
+	{
+		static unsigned s_treeLightingRevision = ~0u;
+		const unsigned lightingRevision = W3D_GetRenderLighting().revision;
+		if (lightingRevision != s_treeLightingRevision) {
+			s_treeLightingRevision = lightingRevision;
+			m_anythingChanged = true;
+			doFullUpdate();
+		}
+	}
+
 	if (m_needToUpdateTexture) {
 		m_needToUpdateTexture = false;
 		updateTexture();
 	}
 	if (m_treeTexture==nullptr) {
 		return;
+	}
+	{
+		// Phase 5B.1: foliage is a real material instance and no longer has a TREE30 special PS;
+		// the generic fixed-function material/PSO path draws it.
+		W3DMaterialInstance treeMat;
+		treeMat.desc.family = W3DMAT_FOLIAGE;
+		treeMat.desc.features = W3DMATF_ALPHA_TEST | W3DMATF_RECEIVE_FOG | W3DMATF_RECEIVE_SHADOW |
+			W3DMATF_CAST_SHADOW;
+		if (W3DShaderManager::arePerPixelFogShadersActive()) treeMat.desc.features |= W3DMATF_LOCAL_LIGHTS;
+		treeMat.desc.fvf = DX8_FVF_XYZNDUV1;
+		treeMat.desc.passCount = 1u;
+		treeMat.desc.variant = 0u;
+		treeMat.textures[0] = m_treeTexture;
+		W3D_MaterialCensus(treeMat.desc);
+		W3DMaterialBinder::Bind(treeMat);
 	}
 	if (m_updateAllKeys) {
 		cull(camera);
@@ -2070,9 +2026,8 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE, D3DCULL_NONE);
 	// Draw all the trees.
 	DX8Wrapper::Apply_Render_State_Changes();
-	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: capture the shroud bind result - the TREE30 HLSL
-	// PS mirrors the stage-1 shroud modulation, so without a live shroud texture it would multiply the
-	// trees to black; the path falls back to plain fixed-function rendering in that case.
+	// Capture the shroud bind result: without a live shroud texture the stage-1 modulation would
+	// multiply the trees to black, so the FF path falls back to SELECTARG2 in that case.
 	Int shroudBound = W3DShaderManager::setShroudTex(1);
 	DX8Wrapper::Apply_Render_State_Changes();
 	{
@@ -2112,10 +2067,6 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 			fflush(stderr);
 		}
 	}
-
-	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE when this call bound the TREE30 HLSL pixel
-	// shader; the cleanup below then also drops the stage-2 depth relay so it cannot leak.
-	Bool tree30BoundNow = FALSE;
 
 	if (m_dwTreeVertexShader != nullptr) {
 		// GeneralsX @bugfix BenderAI 13/02/2026 Matrix4x4 for GLM compatibility (fighter19 pattern)
@@ -2175,24 +2126,6 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	} else {
 		DX8Wrapper::Set_Vertex_FVF(DX8_FVF_XYZNDUV1); // GeneralsX @bugfix d3d9 port 12/10/2026 FVF constants must go through SetFVF
 
-		// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TREE30 per-pixel haze for the fixed-function
-		// tree path. Needs the compiled HLSL PS and a live stage-1 shroud (the PS mirrors the shroud
-		// modulation, so without it the trees would multiply to black). Eye depth arrives through the
-		// stage-2 CAMERASPACEPOSITION COUNT3 identity relay - the channel the batch8 [FFDEPTH] probe
-		// confirmed on both native d3d9 and DXVK; nothing samples stage 2, the generator output is
-		// pure relay. The sway .vso path is untouched: a binary vertex shader cannot add the channel
-		// (POSITION-as-PS-input is fxc-rejected X4502), so it keeps the retail fixed-function pixel
-		// pipeline.
-		if (s_treeHlslPS != nullptr && shroudBound)
-		{
-			W3DShaderManager::uploadPerPixelFogConstants();
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3);
-			Matrix4x4 identM(true);
-			DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, identM);
-			tree30BoundNow = TRUE;
-			DX8Wrapper::Set_Pixel_Shader((UINT_PTR)s_treeHlslPS);
-		}
 	}
 
 
@@ -2220,13 +2153,6 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 	DX8Wrapper::Set_Vertex_Shader(0);
 	DX8Wrapper::Set_Vertex_FVF(DX8_FVF_XYZNDUV1); // GeneralsX @bugfix d3d9 port 12/10/2026 FVF through SetFVF
 	DX8Wrapper::Set_Pixel_Shader(0);
-	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: drop the TREE30 stage-2 depth relay so its
-	// COUNT3 CAMERASPACEPOSITION generator cannot leak into the next fixed-function batch.
-	if (tree30BoundNow)
-	{
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|2);
-	}
 	DX8Wrapper::Invalidate_Cached_Render_States();	//code above mucks around with W3D states so make sure we reset
 
 }

@@ -13,6 +13,7 @@
 #include "WWLib/always.h"
 #include "WWMath/vector3.h"
 #include "WWMath/vector4.h"   // GeneralsX @feature PS3.0-P3-14 14/10/2026: Set_Fog carries Vector4 pairs
+#include "MaterialFeatures.h"  // common include path (Core/Libraries/Include), not WW3D2-local
 
 class Matrix3D;
 class Matrix4x4;
@@ -118,6 +119,20 @@ namespace DX8NormalMap
 // missing leaves the mesh on the fixed pipeline.
 //=============================================================================
 class VertexMaterialClass;
+class LightEnvironmentClass;
+class TextureClass;
+
+// GeneralsX @refactor 23/10/2026: one record for a static/skin GN batch, mirroring the terrain
+// material instance. The legacy Apply overload still performs the actual mount/fallback.
+struct DX8ModelMaterialInstance
+{
+	W3DMaterialDesc desc;
+	W3DMaterialSurface surface;
+	const VertexMaterialClass *material;
+	int layout;
+	LightEnvironmentClass *lenv;
+	TextureClass *diffuse;
+};
 
 namespace DX8GeomNormal
 {
@@ -209,6 +224,7 @@ namespace DX8GeomNormal
 	// false (state untouched) otherwise. The caller (dx8renderer) guarantees every light is
 	// directional and count<=MAX_LIGHTS before invoking this.
 	bool Apply(const Matrix3D& world, const VertexMaterialClass* vm, int fvf, LightEnvironmentClass* lenv, TextureClass* diffuse);
+	bool Apply(const Matrix3D& world, const DX8ModelMaterialInstance& instance);
 
 	// Restore the fixed pipeline after drawing (FVF + no VS/PS).
 	void Restore(UINT_PTR fvf);

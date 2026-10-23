@@ -86,6 +86,9 @@
 #include "W3DDevice/GameClient/W3DAssetManager.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
+#include "W3DDevice/GameClient/W3DWater.h"
+#include "W3DDevice/GameClient/W3DSkyRenderer.h"
+#include "W3DDevice/GameClient/W3DRenderGraph.h"
 #include "W3DDevice/GameClient/W3DView.h"
 #include "d3dx9math.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
@@ -2141,6 +2144,16 @@ void W3DView::draw()
 			W3DDisplay::m_3DScene->doRender( m_3DCamera );
 		}
 		W3DShaderManager::endFixedFunctionHaze();
+		// GeneralsX @refactor 23/10/2026: sky is a scene pass owned by the sky renderer, not a side
+		// effect of water rendering and not conditional on a post filter being active. Draw it after
+		// the world so its depth-EQUAL background stroke fills only the untouched pixels.
+		if (TheSkyRenderer && TheSkyRenderer->isReady()) {
+			W3DRenderPassScope rgSky("sky");
+			W3DRenderGraph::Get().Require("sceneColor", W3DRenderGraph::LAYOUT_COLOR_ATTACHMENT,
+				W3DRenderGraph::RES_READ | W3DRenderGraph::RES_WRITE);
+			RenderInfoClass skyInfo(*m_3DCamera);
+			TheSkyRenderer->render(skyInfo);
+		}
 		W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_DISABLE);
 		m_isWireFrameEnabled = m_nextWireFrameEnabled;
 

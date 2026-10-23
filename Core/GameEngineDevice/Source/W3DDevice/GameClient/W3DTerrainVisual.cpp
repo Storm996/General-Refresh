@@ -51,6 +51,7 @@
 #include "W3DDevice/GameClient/W3DTerrainVisual.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
 #include "W3DDevice/GameClient/W3DWater.h"
+#include "W3DDevice/GameClient/W3DSkyRenderer.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DDebugIcons.h"
 #include "W3DDevice/GameClient/W3DTerrainTracks.h"
@@ -192,6 +193,10 @@ W3DTerrainVisual::~W3DTerrainVisual()
 
 	REF_PTR_RELEASE( m_waterRenderObject );
 	TheWaterRenderObj=nullptr;
+
+	delete TheSkyRenderer;
+	TheSkyRenderer=nullptr;
+
 	REF_PTR_RELEASE( m_terrainRenderObject );
 	REF_PTR_RELEASE( m_logicHeightMap );
 
@@ -250,6 +255,12 @@ void W3DTerrainVisual::init()
 			m_waterRenderObject->toggleCloudLayer(true);
 		else
 			m_waterRenderObject->toggleCloudLayer(false);
+
+		// GeneralsX @refactor 23/10/2026: the sky has its own renderer and lifetime. It no longer
+		// hangs off the water object, so the sky pass does not depend on water being created.
+		delete TheSkyRenderer;
+		TheSkyRenderer = NEW W3DSkyRenderer;
+		TheSkyRenderer->init();
 	}
 
 	// set the vertex animated water properties
@@ -307,7 +318,8 @@ void W3DTerrainVisual::reset()
 			//check if this texture was ever changed from default
 			if (m_currentSkyboxTexNames[i] != m_initialSkyboxTexNames[i])
 			{
-				m_waterRenderObject->replaceSkyboxTexture(m_currentSkyboxTexNames[i], m_initialSkyboxTexNames[i]);
+				if (TheSkyRenderer)
+					TheSkyRenderer->replaceTexture(m_currentSkyboxTexNames[i], m_initialSkyboxTexNames[i]);
 				m_currentSkyboxTexNames[i]=m_initialSkyboxTexNames[i];	//update current state to new texture
 			}
 		}
@@ -1120,7 +1132,6 @@ void W3DTerrainVisual::setShoreLineDetail()
 /// Replace the skybox texture
 void W3DTerrainVisual::replaceSkyboxTextures(const AsciiString *oldTexName[5], const AsciiString *newTexName[5])
 {
-	if (m_waterRenderObject)
 	{
 		for (Int i=0; i<5; i++)
 		{
@@ -1131,7 +1142,9 @@ void W3DTerrainVisual::replaceSkyboxTextures(const AsciiString *oldTexName[5], c
 			}
 
 			if (m_currentSkyboxTexNames[i] != *newTexName[i])
-			{	m_waterRenderObject->replaceSkyboxTexture(m_currentSkyboxTexNames[i], *newTexName[i]);
+			{
+				if (TheSkyRenderer)
+					TheSkyRenderer->replaceTexture(m_currentSkyboxTexNames[i], *newTexName[i]);
 				m_currentSkyboxTexNames[i]=*newTexName[i];	//update current state to new texture
 			}
 		}

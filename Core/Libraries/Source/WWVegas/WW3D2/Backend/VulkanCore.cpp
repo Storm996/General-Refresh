@@ -2282,6 +2282,22 @@ bool VKRT_Alloc_Depth_Format(void* key, unsigned int width, unsigned int height,
     return r;
 }
 
+bool VKRT_Free(void* key)
+{
+    if (!VKRT_Ready() || !key) return false;
+    vk_queue_lock();
+    VKRTImg* e = vkrt_find(key);
+    if (!e) { vk_queue_unlock(); return true; }
+    g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+    if (e->sampleView && e->sampleView != e->view)
+        g_vulkanCore->Retire_Mirror(nullptr, e->sampleView, nullptr);
+    RT.vramBytes = (RT.vramBytes >= e->size) ? (RT.vramBytes - e->size) : 0ull;
+    size_t idx = (size_t)(e - &RT.imgs[0]);
+    RT.imgs.erase(RT.imgs.begin() + (long)idx);
+    vk_queue_unlock();
+    return true;
+}
+
 bool VKRT_Query(void* key, VKRT_Info* out)
 {
     if (!out) return false;

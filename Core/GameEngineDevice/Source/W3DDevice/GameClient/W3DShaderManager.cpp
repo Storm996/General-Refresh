@@ -69,6 +69,9 @@
 #include "Common/file.h"
 #include "Common/FileSystem.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
+#include "W3DDevice/GameClient/W3DRenderLighting.h"
+#include "MaterialFeatures.h"
+#include "W3DDevice/GameClient/W3DMaterialInstance.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
@@ -2401,6 +2404,10 @@ void TerrainShader2Stage::updateCloud()
 	// This moves offsets towards zero when smaller -1.0 or larger 1.0
 	m_xOffset -= (Int)m_xOffset;
 	m_yOffset -= (Int)m_yOffset;
+
+	// GeneralsX @refactor 23/10/2026: publish the scroll once per frame; terrain/road texture
+	// matrices (and sky consumers later) read the same pair instead of each owning a copy.
+	W3D_SetCloudOffset(m_xOffset, m_yOffset);
 }
 
 void TerrainShader2Stage::updateNoise1(D3DXMATRIX *destMatrix,D3DXMATRIX *curViewInverse, Bool doUpdate)
@@ -2413,7 +2420,10 @@ void TerrainShader2Stage::updateNoise1(D3DXMATRIX *destMatrix,D3DXMATRIX *curVie
 	*destMatrix = *curViewInverse * scale;
 
 	D3DXMATRIX offset;
-	D3DXMatrixTranslation(&offset, m_xOffset, m_yOffset,0);
+	const W3DRenderLightingState &atmos = W3D_GetRenderLighting();
+	const float ox = (atmos.revision > 0u) ? atmos.cloudOffset[0] : m_xOffset;
+	const float oy = (atmos.revision > 0u) ? atmos.cloudOffset[1] : m_yOffset;
+	D3DXMatrixTranslation(&offset, ox, oy, 0);
 	*destMatrix *= offset;
 }
 
@@ -2914,7 +2924,9 @@ static void Build_Weather_Fog_Ramp(Real fogScale, Vector4 &colorStrength, Vector
 	if (strength > 1.0f) strength = 1.0f;
 
 	colorStrength.Set(0.72f, 0.78f, 0.84f, strength);
-	ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f);
+	// z = height-fog falloff (1/world unit), w = how much of the distance fog is height-modulated.
+	// Terrain PGM reads these; GN/water ignore the unused channels, so the shared ramp stays one source.
+	ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 1.0f / 220.0f, 0.5f);
 }
 
 // GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: the fixed-function half of the horizon.
@@ -2999,10 +3011,30 @@ static void Upload_Terrain30_Fog_Constants(void)
 	// of being frozen at first use, so a script-driven weather switch moves the horizon haze on the
 	// same frame the lighting and the screen layer do. One builder call per terrain batch is arithmetic
 	// on a struct read; no allocation and no new plumbing.
-	Vector4 haze, ramp;
-	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
-	DX8Wrapper::Set_Pixel_Shader_Constant(0, (const float*)&haze, 1);
-	DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)&ramp, 1);
+	const W3DRenderLightingState &atmosphere = W3D_GetRenderLighting();
+	if (atmosphere.revision > 0u)
+	{
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, atmosphere.fogColor, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(1, atmosphere.fogRamp, 1);
+	}
+	else
+	{
+		Vector4 haze, ramp;
+		Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, haze, ramp);
+		DX8Wrapper::Set_Pixel_Shader_Constant(0, (const float*)&haze, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)&ramp, 1);
+	}
+
+	// GeneralsX @feature 23/10/2026 dynamic sun: terrain/road/tree stop reading baked vertex RGB and
+	// evaluate albedo * (ambient + sun * N.L) per pixel. c33 sun colour, c34 ambient, c35 sun dir.
+	{
+		Vector4 sunColor(atmosphere.sunColor[0], atmosphere.sunColor[1], atmosphere.sunColor[2], 1.0f);
+		Vector4 ambient(atmosphere.ambient[0], atmosphere.ambient[1], atmosphere.ambient[2], 1.0f);
+		Vector4 sunDir(atmosphere.sunDir[0], atmosphere.sunDir[1], atmosphere.sunDir[2], 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(33, (const float*)&sunColor, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(34, (const float*)&ambient, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(35, (const float*)&sunDir, 1);
+	}
 
 	// GeneralsX @feature Qoder 22/10/2026 light shadows: c6..c9 = world -> light clip rows (row-vector,
 	// D3D), c10 = light xyz + range with .w = 1 when this frame built the strongest light's map. The
@@ -3068,6 +3100,24 @@ void W3DShaderManager::uploadPerPixelFogConstants()
 	Upload_Terrain30_Fog_Constants();
 }
 
+void W3DShaderManager::getWeatherFogRamp(float haze[4], float ramp[4])
+{
+	Vector4 h, r;
+	Build_Weather_Fog_Ramp(weatherRenderState().m_fogScale, h, r);
+	haze[0] = h.X; haze[1] = h.Y; haze[2] = h.Z; haze[3] = h.W;
+	ramp[0] = r.X; ramp[1] = r.Y; ramp[2] = r.Z; ramp[3] = r.W;
+}
+
+Real W3DShaderManager::getCloudShadowStrength()
+{
+	// Clear weather keeps the shipped 0.35; a storm's fogScale (up to 2.4) thickens the cloud
+	// shadows with it. 0.35..0.60 stays subtle enough not to double as a second sun shadow.
+	Real scale = weatherRenderState().m_fogScale;
+	if (scale < 1.0f) scale = 1.0f;
+	if (scale > 2.0f) scale = 2.0f;
+	return 0.35f * (0.75f + 0.25f * scale);
+}
+
 // GeneralsX @feature PS3.0 Weather W5 16/10/2026: the shader half of the weather coupling.
 // Two values travel into the WW3D2 dot3/PBR layer, which cannot read game-side weather state itself
 // (platform-isolation rule, same as the Set_Fog injection at the install below):
@@ -3080,8 +3130,17 @@ void W3DShaderManager::uploadPerPixelFogConstants()
 void W3DShaderManager::applyWeatherToShaders()
 {
 	const WeatherRenderState &wx = weatherRenderState();
+	// GeneralsX @refactor 23/10/2026: refresh the shared atmosphere first, then feed GN from the
+	// same snapshot terrain/tree/water use. No second fog recipe, no family-specific start/length.
+	W3D_RefreshRenderLighting();
+	const W3DRenderLightingState &atmosphere = W3D_GetRenderLighting();
 	Vector4 haze, ramp;
-	Build_Weather_Fog_Ramp(wx.m_fogScale, haze, ramp);
+	if (atmosphere.revision > 0u) {
+		haze.Set(atmosphere.fogColor[0], atmosphere.fogColor[1], atmosphere.fogColor[2], atmosphere.fogColor[3]);
+		ramp.Set(atmosphere.fogRamp[0], atmosphere.fogRamp[1], atmosphere.fogRamp[2], atmosphere.fogRamp[3]);
+	} else {
+		Build_Weather_Fog_Ramp(wx.m_fogScale, haze, ramp);
+	}
 	DX8NormalMap::Set_Fog(haze, ramp);
 	DX8NormalMap::Set_Wetness(wx.m_wetness);
 
@@ -3107,6 +3166,7 @@ void W3DShaderManager::applyWeatherToShaders()
 		s_lastShaderFog = wx.m_fogScale;
 		s_lastShaderWet = wx.m_wetness;
 	}
+
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed, which
@@ -3681,6 +3741,18 @@ Int TerrainShaderPixelShader::set(Int pass)
 		}
 	}
 
+	// GeneralsX @refactor 23/10/2026: shared material census for the terrain family.
+	{
+		W3DMaterialKey mk = {};
+		mk.family = W3DMAT_TERRAIN;
+		mk.features = W3DMATF_RECEIVE_FOG | W3DMATF_RECEIVE_CLOUD | W3DMATF_RECEIVE_SHADOW;
+		if (s_terrainNMEnv || s_terrainPPL) mk.features |= W3DMATF_NORMAL_MAP;
+		if (s_terrainPPL) mk.features |= W3DMATF_PBR;
+		mk.passCount = 1u;
+		mk.variant = (unsigned)W3DShaderManager::getCurrentShader();
+		W3D_MaterialCensus(mk);
+	}
+
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	DX8Wrapper::Apply_Render_State_Changes();
 
@@ -3751,8 +3823,17 @@ Int TerrainShaderPixelShader::set(Int pass)
 				// falls back to straight up, which is neutral for the overhead RTS view.
 				float sun[4];
 				{
-					const Coord3D &lp = TheGlobalData->m_terrainLightPos[0];
-					Vector3 L(-lp.x, -lp.y, -lp.z);
+					// GeneralsX @refactor 23/10/2026: read the shared render-lighting snapshot so the
+					// terrain normal pass, GN, grass and water all follow one sun direction. Fall back
+					// to the old table if the snapshot has not been published yet (menu/init frame).
+					const W3DRenderLightingState &lighting = W3D_GetRenderLighting();
+					Vector3 L;
+					if (lighting.revision > 0u) {
+						L.Set(lighting.sunDir[0], lighting.sunDir[1], lighting.sunDir[2]);
+					} else {
+						const Coord3D &lp = TheGlobalData->m_terrainLightPos[0];
+						L.Set(-lp.x, -lp.y, -lp.z);
+					}
 					Real mag = L.Length();
 					if (mag < 1e-3f) { sun[0] = 0.0f; sun[1] = 0.0f; sun[2] = 1.0f; }
 					else { sun[0] = L.X / mag; sun[1] = L.Y / mag; sun[2] = L.Z / mag; }
@@ -6159,6 +6240,114 @@ Int W3DShaderManager::getShaderPasses(ShaderTypes shader)
 	setup for each shader.
  */
 //=============================================================================
+void W3DMaterialInstance::BindTextureSlot(unsigned slot) const
+{
+	if (slot < 8u) {
+		DX8Wrapper::Set_Texture(slot, textures[slot]);
+	}
+}
+
+void W3DMaterialInstance::BindNativeTextureSlot(unsigned slot) const
+{
+	if (slot < 8u) {
+		DX8Wrapper::Set_DX8_Texture(slot, (IDirect3DTexture9 *)nativeTextures[slot]);
+	}
+}
+
+void W3DMaterialInstance::BindAllTextures() const
+{
+	for (unsigned i = 0; i < 8u; ++i) {
+		if (textures[i]) {
+			BindTextureSlot(i);
+		} else if (nativeTextures[i]) {
+			BindNativeTextureSlot(i);
+		}
+	}
+}
+
+W3DMaterialPipelineKey W3DMaterialInstance::MakePipelineKey(unsigned pass) const
+{
+	W3DMaterialPipelineKey key = {};
+	key.family = desc.family;
+	key.features = desc.features;
+	key.variant = desc.variant;
+	key.pass = pass;
+	key.blend = blendMode;
+	return key;
+}
+
+void W3DMaterialBinder::Bind(const W3DMaterialInstance& instance, unsigned pass)
+{
+	instance.BindAllTextures();
+	// Phase 5B.3: water is the first family whose PSO identity is the material key itself. The other
+	// families keep the legacy state-derived key so the shared cache cannot fragment until their
+	// executors are migrated in turn; a zero hash is the backend's "no material key" marker.
+	const unsigned long long pipelineKey = instance.desc.family == W3DMAT_WATER
+		? W3D_MaterialPipelineHash(instance.MakePipelineKey(pass)) : 0ull;
+	DX8Wrapper::VK_Material_Bind(instance.desc.family, instance.desc.features,
+		instance.desc.variant, pass, pipelineKey);
+	DX8Wrapper::VK_Set_ShadowCaster((instance.desc.features & W3DMATF_CAST_SHADOW) != 0u);
+	DX8Wrapper::VK_Set_ShadowReceiver((instance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0u);
+	// Phase 5B.2: the instanced vegetation pipeline is selected by the material family, not by
+	// W3DGrassBuffer poking the backend directly.
+	if (instance.desc.family == W3DMAT_GRASS)
+		DX8Wrapper::VK_Bind_Vegetation_Material();
+}
+
+W3DTerrainMaterialInstance::W3DTerrainMaterialInstance()
+	: shader(W3DShaderManager::ST_INVALID), passCount(1)
+{
+	for (Int i = 0; i < 5; ++i) {
+		textures[i] = nullptr;
+	}
+}
+
+void W3DTerrainMaterialInstance::BindTextures() const
+{
+	for (Int i = 0; i < 5; ++i) {
+		W3DShaderManager::setTexture(i, textures[i]);
+	}
+}
+
+W3DShaderManager::ShaderTypes W3DShaderManager::selectTerrainShader(const W3DMaterialKey& material, bool reflectionPass)
+{
+	if (reflectionPass) return ST_TERRAIN_BASE;
+	const bool lightMap = (material.features & W3DMATF_LIGHTMAP) != 0u;
+	const bool cloud = (material.features & W3DMATF_RECEIVE_CLOUD) != 0u;
+	if (lightMap && cloud) return ST_TERRAIN_BASE_NOISE12;
+	if (lightMap) return ST_TERRAIN_BASE_NOISE2;
+	if (cloud) return ST_TERRAIN_BASE_NOISE1;
+	return ST_TERRAIN_BASE;
+}
+
+W3DShaderManager::ShaderTypes W3DShaderManager::selectRoadShader(const W3DMaterialKey& material)
+{
+	const bool lightMap = (material.features & W3DMATF_LIGHTMAP) != 0u;
+	const bool cloud = (material.features & W3DMATF_RECEIVE_CLOUD) != 0u;
+	if (lightMap && cloud) return ST_ROAD_BASE_NOISE12;
+	if (lightMap) return ST_ROAD_BASE_NOISE2;
+	if (cloud) return ST_ROAD_BASE_NOISE1;
+	return ST_ROAD_BASE;
+}
+
+W3DShaderManager::ShaderTypes W3DShaderManager::selectTerrainShader(bool reflectionPass, bool useLightMap, bool doCloud)
+{
+	W3DMaterialKey material = {};
+	material.family = W3DMAT_TERRAIN;
+	material.features = (useLightMap ? W3DMATF_LIGHTMAP : 0u) |
+		(doCloud ? W3DMATF_RECEIVE_CLOUD : 0u);
+	return selectTerrainShader(material, reflectionPass);
+}
+
+W3DShaderManager::ShaderTypes W3DShaderManager::selectRoadShader(bool useLightMap, bool doCloud)
+{
+	W3DMaterialKey material = {};
+	material.family = W3DMAT_STATIC;
+	material.features = (useLightMap ? W3DMATF_LIGHTMAP : 0u) |
+		(doCloud ? W3DMATF_RECEIVE_CLOUD : 0u);
+	return selectRoadShader(material);
+}
+
 Int W3DShaderManager::setShader(ShaderTypes shader, Int pass)
 {
 	if (shader == m_currentShader && pass == m_currentShaderPass)

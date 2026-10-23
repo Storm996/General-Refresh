@@ -1179,6 +1179,13 @@ namespace DX8GeomNormal
 		return true;
 	}
 
+	bool Apply(const Matrix3D& world, const DX8ModelMaterialInstance& instance)
+	{
+		// Descriptor/surface are the material contract; the legacy overload still owns pair
+		// selection, constants and the fixed-pipeline fallback.
+		return Apply(world, instance.material, instance.layout, instance.lenv, instance.diffuse);
+	}
+
 	void Restore(UINT_PTR fvf)
 	{
 		// GeneralsX @feature PS3.0 P3-21b: unbind the sun map from stage 2 after a shadow batch so the

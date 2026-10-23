@@ -155,6 +155,8 @@ public:
 	void clearAllBridges();
 	/// Draws the bridges.  Uses camera for culling.
 	void drawBridges(CameraClass * camera, Bool wireframe, TextureClass *cloudTexture);
+	/// GeneralsX @refactor 23/10/2026: rebake bridge static lighting after an atmosphere revision.
+	void updateLighting();
 	/// Called when the view changes, and sort key needs to be recalculated.
 	/// Normally sortKey gets calculated when a bridge becomes visible.
 	void doFullUpdate() {m_updateVis = true;};

@@ -17,6 +17,9 @@
 // and issues a single merged draw. Render-side only - it never writes to logic.
 
 #include "W3DDevice/GameClient/W3DGrassBuffer.h"
+#include "W3DDevice/GameClient/W3DRenderLighting.h"
+#include "MaterialFeatures.h"
+#include "W3DDevice/GameClient/W3DMaterialInstance.h"
 
 #include "GameClient/View.h"					// TheTacticalView (camera anchor)
 #include "GameClient/TerrainVisual.h"		// TheTerrainVisual->getTerrainTile (render-side terrain class)
@@ -744,21 +747,56 @@ void W3DGrassBuffer::render(RenderInfoClass &rinfo)
 		if (radius < 60.0f) radius = 60.0f;
 
 		// Match the scene's fog colour so blades melt into the view distance instead of popping out.
-		const D3DCOLOR fogColor = DX8Wrapper::Get_Fog_Color();
-		const float fogCol[3] = {
-			(float)((fogColor >> 16) & 0xff) / 255.0f,
-			(float)((fogColor >> 8) & 0xff) / 255.0f,
-			(float)(fogColor & 0xff) / 255.0f
-		};
-		const float sunLen = sqrtf(0.35f * 0.35f + 0.45f * 0.45f + 0.75f * 0.75f);
-		const float sun[3] = { 0.35f / sunLen, 0.45f / sunLen, 0.75f / sunLen };
+		// GeneralsX @refactor 23/10/2026: prefer the shared atmosphere haze (same values terrain/GN/tree
+		// use); the old FF fog colour remains the fallback for the first frame before the snapshot exists.
+		float fogCol[3];
+		const W3DRenderLightingState &atmos = W3D_GetRenderLighting();
+		if (atmos.revision > 0u) {
+			fogCol[0] = atmos.fogColor[0];
+			fogCol[1] = atmos.fogColor[1];
+			fogCol[2] = atmos.fogColor[2];
+		} else {
+			const D3DCOLOR fogColor = DX8Wrapper::Get_Fog_Color();
+			fogCol[0] = (float)((fogColor >> 16) & 0xff) / 255.0f;
+			fogCol[1] = (float)((fogColor >> 8) & 0xff) / 255.0f;
+			fogCol[2] = (float)(fogColor & 0xff) / 255.0f;
+		}
+		// GeneralsX @refactor 23/10/2026: grass used a hardcoded sun vector while terrain/GN/water
+		// followed the time-of-day table. Read the shared render-lighting snapshot so a TOD/key-colour
+		// change moves the grass highlight with the rest of the scene.
+		const W3DRenderLightingState &lighting = W3D_GetRenderLighting();
+		float sun[3] = { lighting.sunDir[0], lighting.sunDir[1], lighting.sunDir[2] };
+		const float sunLen = sqrtf(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+		if (sunLen > 1e-6f) {
+			sun[0] /= sunLen;
+			sun[1] /= sunLen;
+			sun[2] /= sunLen;
+		} else {
+			sun[0] = 0.35f;
+			sun[1] = 0.45f;
+			sun[2] = 0.75f;
+		}
 		const float timeSec = (float)TheGameLogic->getFrame() * (1.0f / 30.0f);
 
-		if (DX8Wrapper::VK_Vegetation_Draw(
+		{
+			W3DMaterialInstance grassMat;
+			grassMat.desc.family = W3DMAT_GRASS;
+			grassMat.desc.features = W3DMATF_INSTANCED | W3DMATF_RECEIVE_FOG |
+				W3DMATF_RECEIVE_SHADOW;
+			grassMat.desc.fvf = 0u;
+			grassMat.desc.passCount = 1u;
+			grassMat.desc.variant = 0u;
+			W3D_MaterialCensus(grassMat.desc);
+			W3DMaterialBinder::Bind(grassMat);   // unified binder entry; constants come from the vegetation draw
+		}
+		DX8Wrapper::VK_Set_ShadowCaster(false);
+		const bool vegDrawn = DX8Wrapper::VK_Vegetation_Draw(
 				m_grassInst.empty() ? nullptr : &m_grassInst[0], grassCount,
 				m_rockInst.empty() ? nullptr : &m_rockInst[0], rockCount,
 				vpf, cam, timeSec, sun, fogCol,
-				radius * 0.55f, radius * 1.10f, radius * 1.15f))
+				radius * 0.55f, radius * 1.10f, radius * 1.15f);
+		DX8Wrapper::VK_Set_ShadowCaster(true);
+		if (vegDrawn)
 		{
 			static Int s_vkLogTick = 0;
 			if ((++s_vkLogTick % 600) == 0)

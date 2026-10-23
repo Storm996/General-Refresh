@@ -126,7 +126,7 @@ public:
 	Bool			m_visible;
 protected:
 	Int										m_numVertex;
-	VertexFormatXYZDUV1*	m_vb;
+	VertexFormatXYZNDUV1*	m_vb;
 	Int										m_numIndex;
 	UnsignedShort*				m_ib;
 	TRoadSegInfo					m_info;
@@ -135,14 +135,14 @@ public:
 	RoadSegment();
 	~RoadSegment();
 public:
-	void SetVertexBuffer(VertexFormatXYZDUV1 *vb, Int numVertex);
+	void SetVertexBuffer(VertexFormatXYZNDUV1 *vb, Int numVertex);
 	void SetIndexBuffer(UnsignedShort *ib, Int numIndex);
 	void SetRoadSegInfo(TRoadSegInfo *pInfo) {m_info = *pInfo;};
 	void GetRoadSegInfo(TRoadSegInfo *pInfo) {*pInfo = m_info;};
 	const SphereClass &getBounds() {return m_bounds;};
 	Int GetNumVertex() {return m_numVertex;};
 	Int GetNumIndex() {return m_numIndex;};
-	Int GetVertices(VertexFormatXYZDUV1 *destination_vb, Int numToCopy);
+	Int GetVertices(VertexFormatXYZNDUV1 *destination_vb, Int numToCopy);
 	Int GetIndices(UnsignedShort *destination_ib, Int numToCopy, Int offset);
 	void updateSegLighting();
 } ;
@@ -269,10 +269,10 @@ protected:
 														Vector2 roadNormal, Vector2 roadVector,
 														Vector2 *cornersP,
 														Real uOffset, Real vOffset, Real uScale, Real vScale);
-	void loadLit4PtSection(RoadSegment *pRoad, UnsignedShort *ib, VertexFormatXYZDUV1 *vb, RefRenderObjListIterator *pDynamicLightsIterator);
+	void loadLit4PtSection(RoadSegment *pRoad, UnsignedShort *ib, VertexFormatXYZNDUV1 *vb, RefRenderObjListIterator *pDynamicLightsIterator);
 	void loadRoadsInVertexAndIndexBuffers(); ///< Fills the index and vertex buffers for drawing.
 	void loadLitRoadsInVertexAndIndexBuffers(RefRenderObjListIterator *pDynamicLightsIterator); ///< Fills the index and vertex buffers for drawing.
-	void loadRoadSegment(UnsignedShort *ib, VertexFormatXYZDUV1 *vb, RoadSegment *pRoad); ///< Fills the index and vertex buffers for drawing 1 segment.
+	void loadRoadSegment(UnsignedShort *ib, VertexFormatXYZNDUV1 *vb, RoadSegment *pRoad); ///< Fills the index and vertex buffers for drawing 1 segment.
 	void allocateRoadBuffers();							 ///< Allocates the buffers.
 	void freeRoadBuffers();									 ///< Frees the index and vertex buffers.
 	Bool visibilityChanged(const IRegion2D &bounds);								///< Returns true if some roads are now visible that weren't, or vice versa.

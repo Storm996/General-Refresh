@@ -76,6 +76,7 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/GameClient/W3DVideoBuffer.h
     Include/W3DDevice/GameClient/W3DView.h
     Include/W3DDevice/GameClient/W3DScreenshot.h
+    Include/W3DDevice/GameClient/W3DSkyRenderer.h
 #    Include/W3DDevice/GameClient/W3DVolumetricShadow.h
     Include/W3DDevice/GameClient/W3DWater.h
     Include/W3DDevice/GameClient/W3DWaterTracks.h
@@ -167,6 +168,7 @@ set(GAMEENGINEDEVICE_SRC
 #    Source/W3DDevice/GameClient/W3DScene.cpp
     Source/W3DDevice/GameClient/W3DShaderManager.cpp
 #    Source/W3DDevice/GameClient/W3DShroud.cpp
+    Source/W3DDevice/GameClient/W3DSkyRenderer.cpp
     Source/W3DDevice/GameClient/W3DSmudge.cpp
     Source/W3DDevice/GameClient/W3DSnow.cpp
     Source/W3DDevice/GameClient/W3DGrassBuffer.cpp

@@ -691,6 +691,13 @@ void W3DBridgeBuffer::cull(CameraClass * camera)
 //=============================================================================
 /** Loads the bridges into the vertex buffer for drawing. */
 //=============================================================================
+void W3DBridgeBuffer::updateLighting()
+{
+	// Bridge vertex colours come from the current GlobalData light table; the iterator is only an
+	// optional per-object light source, and the revision path has none to hand.
+	loadBridgesInVertexAndIndexBuffers(nullptr);
+}
+
 void W3DBridgeBuffer::loadBridgesInVertexAndIndexBuffers(RefRenderObjListIterator *pLightsIterator)
 {
 	if (!m_indexBridge || !m_vertexBridge || !m_initialized) {

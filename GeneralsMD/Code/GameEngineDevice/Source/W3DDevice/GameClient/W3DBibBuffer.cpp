@@ -83,6 +83,13 @@ static ShaderClass detailAlphaShader(SC_ALPHA_DETAIL);
 //=============================================================================
 /** Loads the bibs into the vertex buffer for drawing. */
 //=============================================================================
+void W3DBibBuffer::updateLighting()
+{
+	// Static shade is baked into VertexFormatXYZDUV1; force the reload path.
+	m_anythingChanged = TRUE;
+	loadBibsInVertexAndIndexBuffers();
+}
+
 void W3DBibBuffer::loadBibsInVertexAndIndexBuffers()
 {
 	if (!m_indexBib || !m_vertexBib || !m_initialized) {

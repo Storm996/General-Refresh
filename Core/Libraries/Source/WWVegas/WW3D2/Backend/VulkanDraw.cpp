@@ -20,9 +20,13 @@
 #include "VkShadersFF.h"
 #include "VkShadersShadow.h"
 #include "VkShadersPost.h"
+#include "VkShadersSky.h"
 // GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation instance pass.
 #include "VkShadersVeg.h"
 #include "WW3D2/dx8wrapper.h"
+#include "WW3D2/texture.h"
+#include "WW3D2/surfaceclass.h"
+#include "WW3D2/ww3dformat.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -327,6 +331,9 @@ struct VKDrawPSO {
     // batch and a mechanism probe share the same FVF, shader bits and light mask), and the FF path adds a
     // second vertex binding, so the two must never alias onto one pipeline object.
     unsigned       ff;
+    // Phase 5B.3: the material pipeline key that selected this pipeline. Zero means the family still
+    // uses the legacy state-derived identity, so its cache behaviour is unchanged.
+    unsigned long long mat_key;
     VkPipeline     pso;
 };
 struct VKDrawSetEntry {
@@ -411,6 +418,14 @@ struct VKShadowCastSet {
 
 struct VKDrawState {
     bool  envOn = false, envChecked = false, built = false, broken = false;
+    // P6 per-material shadow receive: 1 writes stencil bit 0x80, 0 clears it. Set around a draw by
+    // DX8Renderer from W3DMATF_RECEIVE_SHADOW; the native receiver tests the bit.
+    int   shadowReceive = 1;
+    // Phase 5A current material key, published by W3DMaterialBinder.
+    unsigned matFamily = 0, matFeatures = 0, matVariant = 0, matPass = 0;
+    // Phase 5B.3: explicit material pipeline key hash for families migrated off the state-derived
+    // identity (water). Zero for every other family and for draws that never go through the binder.
+    unsigned long long matPipeline = 0;
 
     // GeneralsX @performance Qoder 19/10/2026 R-05: deque, not vector - the draw path looked a backing up
     // by walking X.geo linearly (247+ entries, twice per batch, 1.27k batches per frame). The two maps make
@@ -544,6 +559,8 @@ struct VKDrawState {
     int  aaMode = 0;
     int  renderScale = 100;
     unsigned displayW = 0, displayH = 0;
+    // Phase 6B: sceneColor/sceneDepth/overlay lifetime is owned by W3DRenderGraph and reaches this layer
+    // only through VKDraw_Graph_Alloc_Target()/VKDraw_Graph_Free_Target() and the scene descriptor.
 
     // Render resolution of the scene mirror (0 = follow the swapchain) and the destination rect of the
     // end-of-frame blit (0 width = full extent). Together these are what keeps a game rendered at 1024x768
@@ -617,8 +634,16 @@ struct VKDrawState {
     VkDescriptorPool shCastPool[VKGEO_SLOT_COUNT] = {};
     std::vector<VKShadowCastSet> shCastSets[VKGEO_SLOT_COUNT];
     VkDescriptorSet shSets[VKGEO_SLOT_COUNT] = {};
-    void* shSetViews[VKGEO_SLOT_COUNT][2] = {};
+    void* shSetViews[VKGEO_SLOT_COUNT][3] = {};
     VkSampler shSampler = nullptr;
+    // GeneralsX @feature 23/10/2026 cloud shadows on every opaque surface: the receiver samples the
+    // game's cloud map in world XZ. Params: xy scroll, z world->uv scale, w strength (0 = inert).
+    VkImageView shCloudView = nullptr;
+    VkSampler shCloudSampler = nullptr;
+    float shCloudParams[4] = { 0.0f, 0.0f, 1.0f / 315.0f, 0.0f };
+    // GeneralsX @refactor 23/10/2026: material cast flag, toggled by the sky/grass draws so the
+    // receiver does not replay a skybox or grass blades as occluders.
+    bool shCasterAllowed = true;
     std::vector<VKShadowCastPSO> shCastPSOs;
     VkPipeline shRecvPSO = nullptr;
     unsigned shRecvPass = 0xFFFFFFFFu;
@@ -647,6 +672,8 @@ struct VKDrawState {
     unsigned long long fpBuilds = 0ull, fpLightTotal = 0ull, fpTileMaxLights = 0ull;
 };
 VKDrawState X;
+
+void vksky_destroy();   // defined with the sky cubemap path below
 
 bool vkdraw_env_on()
 {
@@ -1513,6 +1540,11 @@ VkPipeline pso_for(const VKDraw_Submit* s)
     ph ^= vkdraw_hash_bytes(&wantFF, sizeof(wantFF));
     ph ^= vkdraw_hash_bytes(&s->attr_count, sizeof(s->attr_count));
     if (s->attr_count) ph ^= vkdraw_hash_bytes(s->attrs, sizeof(VKDraw_Attr) * s->attr_count);
+    // Phase 5B.3: a migrated family names its pipeline by material, so the key is part of identity.
+    // Keeping it out of VKDraw_PSO_Key leaves the shared struct and its census layout untouched; the
+    // stored entry carries the same number and the linear probe compares it field-for-field.
+    const unsigned long long matKey = X.matPipeline;
+    ph ^= vkdraw_hash_bytes(&matKey, sizeof(matKey));
     const std::pair<std::unordered_multimap<unsigned long long, unsigned>::iterator,
                      std::unordered_multimap<unsigned long long, unsigned>::iterator> prange =
         X.psoIdx.equal_range(ph);
@@ -1521,7 +1553,8 @@ VkPipeline pso_for(const VKDraw_Submit* s)
         const size_t ei = pi->second;
         if (ei >= X.psos.size()) continue;
         const VKDrawPSO& e = X.psos[ei];
-        if (e.ff == wantFF && e.attr_count == s->attr_count && pso_key_equal(e.key, s->key) &&
+        if (e.ff == wantFF && e.mat_key == matKey &&
+            e.attr_count == s->attr_count && pso_key_equal(e.key, s->key) &&
             (e.attr_count == 0 ||
              memcmp(e.attrs, s->attrs, sizeof(VKDraw_Attr) * e.attr_count) == 0)) {
             ++X.st.psoReused;
@@ -1713,7 +1746,7 @@ VkPipeline pso_for(const VKDraw_Submit* s)
         }
         return nullptr;
     }
-    VKDrawPSO e; e.key = k; e.attr_count = s->attr_count; e.pso = pso; e.ff = wantFF;
+    VKDrawPSO e; e.key = k; e.attr_count = s->attr_count; e.pso = pso; e.ff = wantFF; e.mat_key = matKey;
     if (s->attr_count) memcpy(e.attrs, s->attrs, sizeof(VKDraw_Attr) * s->attr_count);
     X.psoIdx.emplace(ph, (unsigned)X.psos.size());
     X.psos.push_back(e);
@@ -2538,6 +2571,7 @@ void VKDraw_Destroy()
     // Drain before freeing: pipelines, framebuffers and the geometry backings may all still be referenced
     // by a frame in flight. Shutdown happens once per process, so the wait costs nothing.
     if (dev) chk("wedge5 destroyWait", G.vkDeviceWaitIdle(dev));
+    vksky_destroy();
     vkrt_probe_free_staging();   // defined with the wedge-11 probe below
     X.frameOpen = 0; X.cmd = nullptr; X.inPass = 0; X.haveImage = 0;
     if (dev) {
@@ -2571,6 +2605,7 @@ void VKDraw_Destroy()
         if (X.shSetLayout) G.vkDestroyDescriptorSetLayout(dev, X.shSetLayout, nullptr);
         if (X.shCastSetLayout) G.vkDestroyDescriptorSetLayout(dev, X.shCastSetLayout, nullptr);
         if (X.shSampler) G.vkDestroySampler(dev, X.shSampler, nullptr);
+        if (X.shCloudSampler) G.vkDestroySampler(dev, X.shCloudSampler, nullptr);
         // GeneralsX @feature Qoder 21/10/2026 vegetation instancing resources.
         if (X.veg.gpipe) G.vkDestroyPipeline(dev, X.veg.gpipe, nullptr);
         if (X.veg.rpipe) G.vkDestroyPipeline(dev, X.veg.rpipe, nullptr);
@@ -2588,10 +2623,13 @@ void VKDraw_Destroy()
     X.shCastVs = X.shCastPs = X.shCastAlphaPs = X.shRecvVs = X.shRecvPs = nullptr;
     X.shCastLayout = X.shCastAlphaLayout = X.shRecvLayout = nullptr;
     X.shSetLayout = nullptr; X.shCastSetLayout = nullptr;
-    X.shPool = nullptr; X.shSampler = nullptr;
+    X.shPool = nullptr; X.shSampler = nullptr; X.shCloudSampler = nullptr;
+    X.shCloudView = nullptr;
+    X.shCloudParams[0] = X.shCloudParams[1] = 0.0f;
+    X.shCloudParams[2] = 1.0f / 315.0f; X.shCloudParams[3] = 0.0f;
     for (int i = 0; i < VKGEO_SLOT_COUNT; ++i) {
         X.shSets[i] = nullptr;
-        X.shSetViews[i][0] = X.shSetViews[i][1] = nullptr;
+        X.shSetViews[i][0] = X.shSetViews[i][1] = X.shSetViews[i][2] = nullptr;
         X.shCastPool[i] = nullptr;
         X.shCastSets[i].clear();
     }
@@ -3432,20 +3470,20 @@ bool shadow_ensure()
         }
     }
 
-    VkDescriptorSetLayoutBinding binding[2] = {};
-    for (int i = 0; i < 2; ++i) {
+    VkDescriptorSetLayoutBinding binding[3] = {};
+    for (int i = 0; i < 3; ++i) {
         binding[i].binding = (uint32_t)i;
         binding[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         binding[i].descriptorCount = 1;
         binding[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    slci.bindingCount = 2; slci.pBindings = binding;
+    slci.bindingCount = 3; slci.pBindings = binding;
     if (!chk("vkCreateDescriptorSetLayout(vkshadow)",
              G.vkCreateDescriptorSetLayout(dev, &slci, nullptr, &X.shSetLayout))) {
         X.shFailed = true; return false;
     }
-    VkPushConstantRange pcr2 = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 176u };
+    VkPushConstantRange pcr2 = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 192u };
     VkPipelineLayoutCreateInfo plci2 = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     plci2.setLayoutCount = 1; plci2.pSetLayouts = &X.shSetLayout;
     plci2.pushConstantRangeCount = 1; plci2.pPushConstantRanges = &pcr2;
@@ -3453,7 +3491,7 @@ bool shadow_ensure()
         X.shFailed = true; return false;
     }
 
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * (uint32_t)VKGEO_SLOT_COUNT };
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u * (uint32_t)VKGEO_SLOT_COUNT };
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets = (uint32_t)VKGEO_SLOT_COUNT;
     pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -3468,6 +3506,14 @@ bool shadow_ensure()
     si.compareEnable = VK_FALSE;
     si.minLod = 0.0f; si.maxLod = 0.0f;
     if (!chk("vkCreateSampler(vkshadow)", G.vkCreateSampler(dev, &si, nullptr, &X.shSampler))) {
+        X.shFailed = true; return false;
+    }
+    VkSamplerCreateInfo csi = si;
+    csi.magFilter = csi.minFilter = VK_FILTER_LINEAR;
+    csi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    csi.addressModeU = csi.addressModeV = csi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    csi.maxLod = 16.0f;
+    if (!chk("vkCreateSampler(vkshadow cloud)", G.vkCreateSampler(dev, &csi, nullptr, &X.shCloudSampler))) {
         X.shFailed = true; return false;
     }
 
@@ -3593,6 +3639,26 @@ VkPipeline shadow_recv_pso()
     VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     dss.depthTestEnable = VK_FALSE;
     dss.depthWriteEnable = VK_FALSE;
+    // P6 per-material receive: only pixels stamped by a RECEIVE_SHADOW draw are darkened. The stencil
+    // aspect is optional (D32_SFLOAT fallback has none), in which case the old full-screen behaviour stays.
+    bool stencilReceivers = false;
+    if (X.depthKey) {
+        VKRT_Info di = {};
+        if (VKRT_Query(X.depthKey, &di) && di.is_depth && vk_format_has_stencil((VkFormat)di.format))
+            stencilReceivers = true;
+    }
+    if (stencilReceivers) {
+        dss.stencilTestEnable = VK_TRUE;
+        VkStencilOpState so = {};
+        so.compareOp = VK_COMPARE_OP_EQUAL;
+        so.compareMask = 0x80u;
+        so.writeMask = 0u;
+        so.reference = 0x80u;
+        so.failOp = VK_STENCIL_OP_KEEP;
+        so.depthFailOp = VK_STENCIL_OP_KEEP;
+        so.passOp = VK_STENCIL_OP_KEEP;
+        dss.front = so; dss.back = so;
+    }
 
     // Scene colour *= visibility: zero contribution from the new fragment, destination scaled by it.
     // Diagnostic modes replace the colour instead, so 0.35/0.75/0.5..1 read as plain grey levels.
@@ -3637,7 +3703,7 @@ VkPipeline shadow_recv_pso()
     return pso;
 }
 
-bool shadow_update_set(VkImageView shadowView, VkImageView depthView)
+bool shadow_update_set(VkImageView shadowView, VkImageView depthView, VkImageView cloudView)
 {
     const unsigned slot = X.slot;
     if (!X.shSets[slot]) {
@@ -3647,17 +3713,19 @@ bool shadow_update_set(VkImageView shadowView, VkImageView depthView)
         if (G.vkAllocateDescriptorSets(dev_(), &ai, &X.shSets[slot]) != VK_SUCCESS) return false;
         X.shSetViews[slot][0] = nullptr;
         X.shSetViews[slot][1] = nullptr;
+        X.shSetViews[slot][2] = nullptr;
     }
-    if (X.shSetViews[slot][0] == shadowView && X.shSetViews[slot][1] == depthView) return true;
+    if (X.shSetViews[slot][0] == shadowView && X.shSetViews[slot][1] == depthView &&
+        X.shSetViews[slot][2] == cloudView) return true;
 
-    VkDescriptorImageInfo ii[2] = {};
-    for (int i = 0; i < 2; ++i) {
-        ii[i].sampler = X.shSampler;
-        ii[i].imageView = (i == 0) ? shadowView : depthView;
+    VkDescriptorImageInfo ii[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        ii[i].sampler = (i == 2) ? X.shCloudSampler : X.shSampler;
+        ii[i].imageView = (i == 0) ? shadowView : ((i == 1) ? depthView : (cloudView ? cloudView : depthView));
         ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    VkWriteDescriptorSet w[2] = {};
-    for (int i = 0; i < 2; ++i) {
+    VkWriteDescriptorSet w[3] = {};
+    for (int i = 0; i < 3; ++i) {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet = X.shSets[slot];
         w[i].dstBinding = (uint32_t)i;
@@ -3665,9 +3733,10 @@ bool shadow_update_set(VkImageView shadowView, VkImageView depthView)
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[i].pImageInfo = &ii[i];
     }
-    G.vkUpdateDescriptorSets(dev_(), 2, w, 0, nullptr);
+    G.vkUpdateDescriptorSets(dev_(), 3, w, 0, nullptr);
     X.shSetViews[slot][0] = shadowView;
     X.shSetViews[slot][1] = depthView;
+    X.shSetViews[slot][2] = cloudView;
     return true;
 }
 
@@ -3730,6 +3799,7 @@ bool vkdraw_no_camera(const float* view, const float* proj)
 void shadow_record_caster(const VKDraw_Submit& s)
 {
     if (!shadow_env_on() || X.shFailed) return;
+    if (!X.shCasterAllowed) return;
     if (s.ff && vkdraw_no_camera(s.ff->view, s.ff->proj)) return;
 
     // One line per vertex program (and axis: skin or not) that reaches this recorder, with the state
@@ -4028,6 +4098,11 @@ bool VKDraw_Vegetation_Ready()
     return VKDraw_Ready() && !X.veg.failed;
 }
 
+bool VKDraw_Vegetation_Bind()
+{
+    return vkveg_ensure() && vkveg_pipelines();
+}
+
 bool VKDraw_Vegetation_Draw(const void* grass, unsigned grass_count,
                             const void* rocks, unsigned rock_count,
                             const float view_proj[16], const float camera[3], float time_seconds,
@@ -4102,6 +4177,82 @@ void VKDraw_Shadow_Reset()
     X.shFitSide = 0.0f;
     X.shLastHits = 0;
     X.casters.clear();
+}
+
+void VKDraw_Set_Cloud_Texture(void* d3dTex, float ox, float oy, float scale, float strength)
+{
+    VkImageView oldView = X.shCloudView;
+    X.shCloudParams[0] = ox;
+    X.shCloudParams[1] = oy;
+    X.shCloudParams[2] = scale > 1e-9f ? scale : (1.0f / 315.0f);
+    X.shCloudParams[3] = strength > 0.0f ? strength : 0.0f;
+    if (!d3dTex || strength <= 0.0f) {
+        X.shCloudView = nullptr;
+    } else {
+        VKTex_Info info;
+        X.shCloudView = (VKTex_Query(d3dTex, &info) && info.view) ? (VkImageView)info.view : nullptr;
+    }
+    if (oldView != X.shCloudView) {
+        // Once per transition: proves the receiver actually has a cloud map, not just a strength.
+        fprintf(stderr, "[VKCLOUD] view=%p strength=%.2f scale=%.5f tex=%p\n",
+            (void*)X.shCloudView, (double)X.shCloudParams[3], (double)X.shCloudParams[2], d3dTex);
+        fflush(stderr);
+    }
+}
+
+bool VKDraw_Cloud_Shadow_Active()
+{
+    return X.shCloudView != nullptr && X.shCloudParams[3] > 0.0f;
+}
+
+void VKDraw_Set_ShadowCaster(bool allowed)
+{
+    X.shCasterAllowed = allowed;
+}
+
+void VKDraw_Set_Shadow_Receiver(bool receive)
+{
+    X.shadowReceive = receive ? 1 : 0;
+}
+
+void VKDraw_Material_Bind(unsigned family, unsigned features, unsigned variant, unsigned pass,
+                          unsigned long long pipelineKey)
+{
+    X.matFamily = family;
+    X.matFeatures = features;
+    X.matVariant = variant;
+    X.matPass = pass;
+    X.matPipeline = pipelineKey;
+    // Phase 5B.3: prove the material-keyed path reached the cache. One line per distinct key, so the
+    // log says which water kinds actually selected a pipeline by material instead of by leftover state.
+    if (pipelineKey) {
+        static unsigned long long seen[8] = {};
+        static unsigned seenCount = 0;
+        bool known = false;
+        for (unsigned i = 0; i < seenCount; ++i)
+            if (seen[i] == pipelineKey) { known = true; break; }
+        if (!known && seenCount < 8u) {
+            seen[seenCount++] = pipelineKey;
+            fprintf(stderr, "[VKMAT] water pipeline key=%016llx family=%u variant=%u pass=%u\n",
+                pipelineKey, family, variant, pass);
+            fflush(stderr);
+        }
+    }
+}
+
+bool VKDraw_Graph_Barrier(const char* resource, int layout)
+{
+    if (!resource) return false;
+    void* key = nullptr;
+    if (strcmp(resource, "sceneColor") == 0) key = X.colorKey;
+    else if (strcmp(resource, "sceneDepth") == 0) key = X.depthKey;
+    else if (strcmp(resource, "shadowMap") == 0) key = X.shColorKey;
+    else if (strcmp(resource, "shadowDepth") == 0) key = X.shDepthKey;
+    else if (strcmp(resource, "overlay") == 0) key = X.overlayColorKey;
+    if (!key) return false;
+    if (layout < 0 || layout >= (int)VKRT_LAYOUT_COUNT) return false;
+    VKRT_Set_Layout(key, (VKRT_Layout)layout);
+    return true;
 }
 
 bool VKDraw_Shadow_Apply(const float sun_dir[3])
@@ -4340,7 +4491,8 @@ bool VKDraw_Shadow_Apply(const float sun_dir[3])
                 if (shadow_mat_inverse(invVP, pv)) {
                     recvWhy = "recv-set";
                     if (shadow_update_set((VkImageView)mapInfo.view,
-                                          (VkImageView)(depthInfo.sample_view ? depthInfo.sample_view : depthInfo.view))) {
+                                          (VkImageView)(depthInfo.sample_view ? depthInfo.sample_view : depthInfo.view),
+                                          (VkImageView)X.shCloudView)) {
                         const float mapSize = (float)X.shMapSize;
                         const float texelWorld = mapWorld / mapSize;
                         const float safeRange = range > 1e-3f ? range : 1.0f;
@@ -4355,6 +4507,7 @@ bool VKDraw_Shadow_Apply(const float sun_dir[3])
                             float params[4];
                             float viewport[4];
                             float aux[4];
+                            float cloud[4];
                         } push;
                         memcpy(push.invVP, invVP, sizeof(push.invVP));
                         memcpy(push.lightVP, lightVP, sizeof(push.lightVP));
@@ -4363,6 +4516,10 @@ bool VKDraw_Shadow_Apply(const float sun_dir[3])
                         push.aux[1] = safeRange;
                         push.aux[2] = mapSize;
                         push.aux[3] = mapWorld;     // box world size, used for the PCSS radius ceilings
+                        push.cloud[0] = X.shCloudParams[0];
+                        push.cloud[1] = X.shCloudParams[1];
+                        push.cloud[2] = X.shCloudParams[2];
+                        push.cloud[3] = X.shCloudView ? X.shCloudParams[3] : 0.0f;
                         push.params[0] = (texelWorld * 2.2f + 0.12f) / safeRange;  // depth bias
                         push.params[1] = shadow_debug_mode() ? -(float)shadow_debug_mode() : shadow_strength();
                         push.params[2] = searchUV;
@@ -4466,26 +4623,135 @@ static unsigned vkdraw_scene_depth_format()
     return 0;
 }
 
-// Make sure the scene mirrors exist with the shape the frame is about to render into. The shape guard
-// inside the mirror layer destroys and rebuilds on a size change, so a resize needs no extra bookkeeping
-// here beyond asking for the new extent.
-static bool vkdraw_ensure_scene()
+// Phase 6B: the graph asks for the exact targets the frame needs. The rules that decide them stay in
+// the backend (HDR format, render scale, depth format, overlay policy), but the lifetime is graph-owned:
+// it calls this once in its frame prologue, then allocates through VKDraw_Graph_Alloc_Target().
+static void vkdraw_pull_p6_state()
 {
-    const unsigned depthFmt = vkdraw_scene_depth_format();
-    if (!depthFmt) return false;
-    // B8G8R8A8_UNORM matches the swapchain format the present chain picked, so the blit is a straight copy.
-    // P6: when HDR is on the scene target carries >1 values; the resolve pass writes the LDR overlay.
+    X.hdrOn = DX8Wrapper::VK_HDR_Enabled() ? 1 : 0;
+    X.hdrExposure = DX8Wrapper::VK_HDR_Exposure();
+    X.hdrTonemap = DX8Wrapper::VK_HDR_Tonemap();
+    X.aaMode = DX8Wrapper::VK_Post_AA_Mode();
+    X.renderScale = DX8Wrapper::VK_Render_Scale();
+    X.overlayActive = 0;
+}
+
+static void vkdraw_resolve_scene_shape(unsigned& w, unsigned& h)
+{
+    VkExtent2D e = core_()->Extent();
+    const unsigned baseW = X.displayW ? X.displayW : (X.sceneW ? X.sceneW : e.width);
+    const unsigned baseH = X.displayH ? X.displayH : (X.sceneH ? X.sceneH : e.height);
+    const unsigned scale = (X.renderScale > 100) ? (unsigned)X.renderScale : 100u;
+    const unsigned rw = baseW ? (baseW * scale + 99u) / 100u : 0u;
+    const unsigned rh = baseH ? (baseH * scale + 99u) / 100u : 0u;
+    if (rw && rh) { w = rw; h = rh; }
+    else if (e.width) { w = e.width; h = e.height; }
+}
+
+bool VKDraw_Graph_Target_Desc(unsigned* sceneW, unsigned* sceneH, unsigned* colorFormat,
+                              unsigned* depthFormat, unsigned* overlayW, unsigned* overlayH,
+                              unsigned* overlayFormat, int* overlayWanted)
+{
+    if (!VKDraw_Ready() || !core_() || !sceneW || !sceneH || !colorFormat || !depthFormat ||
+        !overlayW || !overlayH || !overlayFormat || !overlayWanted) {
+        return false;
+    }
+    vkdraw_pull_p6_state();
+    unsigned w = 0, h = 0;
+    vkdraw_resolve_scene_shape(w, h);
+    const unsigned dFmt = vkdraw_scene_depth_format();
+    if (!w || !h || !dFmt) return false;
+    X.w = w; X.h = h;   // the graph and Begin_Frame must agree on the extent
+    *sceneW = w; *sceneH = h;
+    *colorFormat = X.hdrOn ? (unsigned)VK_FORMAT_R16G16B16A16_SFLOAT : (unsigned)VK_FORMAT_B8G8R8A8_UNORM;
+    *depthFormat = dFmt;
+    *overlayWanted = vkdraw_overlay_wanted() ? 1 : 0;
+    *overlayW = X.displayW ? X.displayW : w;
+    *overlayH = X.displayH ? X.displayH : h;
+    *overlayFormat = (unsigned)VK_FORMAT_B8G8R8A8_UNORM;
+    return true;
+}
+
+static void* vkdraw_target_key(const char* name)
+{
+    if (!name) return nullptr;
+    if (strcmp(name, "sceneColor") == 0) return X.sceneColorKey;
+    if (strcmp(name, "sceneDepth") == 0) return X.sceneDepthKey;
+    if (strcmp(name, "overlay") == 0) return X.overlayColorKey;
+    return nullptr;
+}
+
+bool VKDraw_Graph_Alloc_Target(const char* name, unsigned width, unsigned height,
+                               unsigned format, bool depth)
+{
+    if (!width || !height || !format) return false;
+    void* key = vkdraw_target_key(name);
+    if (!key) return false;
+    return depth ? VKRT_Alloc_Depth_Format(key, width, height, format)
+                 : VKRT_Alloc_Color_Format(key, width, height, format);
+}
+
+void VKDraw_Graph_Free_Target(const char* name)
+{
+    void* key = vkdraw_target_key(name);
+    if (key) VKRT_Free(key);
+}
+
+static bool vkdraw_validate_scene();
+
+// The graph prologue runs before WW3D::Begin_Render publishes the final render resolution through
+// VKDraw_Set_Scene_Extent(), so the very first frame after a resolution change can arrive with targets
+// allocated for the previous shape. Repair that one transition here; steady-state lifetime stays
+// graph-owned (the next PrepareTargets sees the published shape and reuses it).
+static bool vkdraw_repair_scene_targets()
+{
     const unsigned sceneFmt = X.hdrOn
         ? (unsigned)VK_FORMAT_R16G16B16A16_SFLOAT
         : (unsigned)VK_FORMAT_B8G8R8A8_UNORM;
+    const unsigned dFmt = vkdraw_scene_depth_format();
+    if (!dFmt) return false;
     if (!VKRT_Alloc_Color_Format(X.sceneColorKey, X.w, X.h, sceneFmt)) return false;
-    if (!VKRT_Alloc_Depth_Format(X.sceneDepthKey, X.w, X.h, depthFmt)) return false;
-    // The overlay is display-sized, never render-scaled: UI coordinates and the present rect are in
-    // display pixels, and the resolve pass is what removes the SSAA factor.
+    if (!VKRT_Alloc_Depth_Format(X.sceneDepthKey, X.w, X.h, dFmt)) return false;
     if (vkdraw_overlay_wanted()) {
         const unsigned dw = X.displayW ? X.displayW : X.w;
         const unsigned dh = X.displayH ? X.displayH : X.h;
         if (!VKRT_Alloc_Color_Format(X.overlayColorKey, dw, dh, (unsigned)VK_FORMAT_B8G8R8A8_UNORM))
+            return false;
+    } else {
+        VKRT_Free(X.overlayColorKey);
+    }
+    static int s_repairLog = 0;
+    if (s_repairLog < 4) {
+        ++s_repairLog;
+        fprintf(stderr, "[RG] repaired scene targets after resolution publish: %ux%u\n", X.w, X.h);
+        fflush(stderr);
+    }
+    return vkdraw_validate_scene();
+}
+
+// The graph allocated these before the frame opened; this only proves they are present at the shape the
+// recorder is about to use. A missing/mismatched pair fails the frame instead of rendering undefined.
+static bool vkdraw_validate_scene()
+{
+    VKRT_Info ci = {}, di = {};
+    const unsigned sceneFmt = X.hdrOn
+        ? (unsigned)VK_FORMAT_R16G16B16A16_SFLOAT
+        : (unsigned)VK_FORMAT_B8G8R8A8_UNORM;
+    const unsigned dFmt = vkdraw_scene_depth_format();
+    if (!dFmt) return false;
+    if (!VKRT_Query(X.sceneColorKey, &ci) || !ci.view || ci.width != X.w || ci.height != X.h ||
+        ci.format != sceneFmt) {
+        return false;
+    }
+    if (!VKRT_Query(X.sceneDepthKey, &di) || !di.view || di.width != X.w || di.height != X.h ||
+        di.format != dFmt) {
+        return false;
+    }
+    if (vkdraw_overlay_wanted()) {
+        VKRT_Info oi = {};
+        const unsigned dw = X.displayW ? X.displayW : X.w;
+        const unsigned dh = X.displayH ? X.displayH : X.h;
+        if (!VKRT_Query(X.overlayColorKey, &oi) || !oi.view || oi.width != dw || oi.height != dh)
             return false;
     }
     return true;
@@ -4536,6 +4802,7 @@ struct VKDraw_UsScope {
 bool VKDraw_Begin_Frame()
 {
     if (!VKDraw_Ready()) return false;
+    X.shCasterAllowed = true;
     // GeneralsX @performance Qoder 19/10/2026 R-05 L9: phase11 inner probe. B3_10 measured begin_scene at
     // 9-10 ms/frame while the slot fence it waits averages single-digit us in steady state, so the time
     // hides in one of the steps below. Each step is accumulated and dumped every 600 frames to
@@ -4670,34 +4937,25 @@ bool VKDraw_Begin_Frame()
                 DX8Wrapper::VK_Set_Retail_Shadow_Off(nativeOn);
             }
 
-            // Every frame starts on the scene target, whatever render target the last one ended on, and
-            // the mirrors are standing up here so the end-of-frame blit always has a source.
-            VkExtent2D e = core_()->Extent();
-            // P6: pull the HDR/AA pack once per frame. HDR and render scale change the scene target's
-            // format/size; the overlay path is only entered when one of the three switches is on.
-            X.hdrOn = DX8Wrapper::VK_HDR_Enabled() ? 1 : 0;
-            X.hdrExposure = DX8Wrapper::VK_HDR_Exposure();
-            X.hdrTonemap = DX8Wrapper::VK_HDR_Tonemap();
-            X.aaMode = DX8Wrapper::VK_Post_AA_Mode();
-            X.renderScale = DX8Wrapper::VK_Render_Scale();
-            X.overlayActive = 0;
-            // The mirror follows the render resolution the facade published (see VKDraw_Set_Scene_Extent):
-            // the game can render at a resolution the window is not, and a mirror sized to the window would
-            // turn every viewport into a crop of the top-left. No render resolution published = swapchain.
-            const unsigned baseW = X.displayW ? X.displayW : (X.sceneW ? X.sceneW : e.width);
-            const unsigned baseH = X.displayH ? X.displayH : (X.sceneH ? X.sceneH : e.height);
-            const unsigned scale = (X.renderScale > 100) ? (unsigned)X.renderScale : 100u;
-            const unsigned rw = baseW ? (baseW * scale + 99u) / 100u : 0u;
-            const unsigned rh = baseH ? (baseH * scale + 99u) / 100u : 0u;
-            if (rw && rh) { X.w = rw; X.h = rh; }
-            else if (e.width) { X.w = e.width; X.h = e.height; }
+            // Every frame starts on the scene target, whatever render target the last one ended on.
+            // The targets themselves were acquired by the FrameGraph prologue (see
+            // VKDraw_Graph_Target_Desc); this only re-derives the same shape for the recorder.
+            vkdraw_pull_p6_state();
+            unsigned shapeW = 0, shapeH = 0;
+            vkdraw_resolve_scene_shape(shapeW, shapeH);
+            if (shapeW && shapeH) {
+                X.w = shapeW; X.h = shapeH;
+            } else {
+                VkExtent2D e = core_()->Extent();
+                if (e.width) { X.w = e.width; X.h = e.height; }
+            }
             VKSTEP(9);
             close_pass();
             VKTRACE("frame %llu: pass closed", flabel);
             V11_MARK(v11Close);
             X.colorKey = X.sceneColorKey; X.depthKey = X.sceneDepthKey;
             VKSTEP(10);
-            const bool sceneOk = vkdraw_ensure_scene();
+            const bool sceneOk = vkdraw_validate_scene() || vkdraw_repair_scene_targets();
             V11_MARK(v11Scene);
             if (!sceneOk) {
                 ok = false;
@@ -4800,6 +5058,19 @@ bool VK_Draw_Submit(const VKDraw_Submit* s)
     if (!open_pass()) { vk_queue_unlock(); ++X.st.drawsSkipped; return false; }
 
     VKDraw_Submit mut = *s;
+    // P6 receive-shadow stencil mask. Every depth-tested scene draw stamps bit 0x80 (1 = receive,
+    // 0 = explicitly excluded); the native shadow receiver tests that bit. Only draws that do not
+    // already use stencil are touched, so player-colour/selection stencil state stays untouched.
+    if (mut.key.depth_test && !mut.key.stencil_test) {
+        mut.key.stencil_test = 1;
+        mut.key.stencil_func = 8;          // D3DCMP_ALWAYS
+        mut.key.stencil_ref = X.shadowReceive ? 0x80u : 0u;
+        mut.key.stencil_mask = 0x80u;
+        mut.key.stencil_write_mask = 0x80u;
+        mut.key.stencil_fail = 1;          // D3DSTENCILOP_KEEP
+        mut.key.stencil_zfail = 1;         // KEEP
+        mut.key.stencil_pass = X.shadowReceive ? 3 : 2;   // REPLACE 1 / ZERO
+    }
     mut.key.rt_format = 0; mut.key.depth_format = 0;    // Terrain attribution: tag 118 is emitted by the heightmap pass, but the visible ground may be a
     // P6 SSAA: the engine still publishes viewports in display pixels, while the scene mirror is
     // render-scaled. Only the 3D scene is scaled; the UI runs after the resolve into the display-sized
@@ -5434,6 +5705,359 @@ struct VKPostState {
 };
 VKPostState P;
 
+// ---------------------------------------------------------------------------
+// P6 sky cubemap / fullscreen sky PSO
+// ---------------------------------------------------------------------------
+// The retail sky is five textured faces of new_skybox. This path copies N/E/S/W/T into one cube image
+// and draws it with a single fullscreen triangle at depth == 1.0, so it only fills pixels no geometry
+// touched. The mesh remains the fallback when a face is unreadable (compressed/odd TGA).
+struct VKSkyState {
+    bool           ready = false;
+    VkImage        image = nullptr;
+    VkDeviceMemory mem = nullptr;
+    VkImageView    view = nullptr;
+    VkSampler      sampler = nullptr;
+    VkDescriptorSetLayout dsl = nullptr;
+    VkDescriptorPool      pool = nullptr;
+    VkDescriptorSet       set = nullptr;
+    VkPipelineLayout      pl = nullptr;
+    VkPipeline            pipe = nullptr;
+    VkRenderPass          pipeRp = nullptr;
+    VkShaderModule        vs = nullptr, fs = nullptr;
+    unsigned       size = 0;
+    const TextureClass* faces[5] = {};
+};
+VKSkyState S;
+
+void vksky_destroy()
+{
+    VkDevice dev = dev_();
+    if (!dev) return;
+    if (S.pipe) G.vkDestroyPipeline(dev, S.pipe, nullptr);
+    if (S.pl) G.vkDestroyPipelineLayout(dev, S.pl, nullptr);
+    if (S.dsl) G.vkDestroyDescriptorSetLayout(dev, S.dsl, nullptr);
+    if (S.pool) G.vkDestroyDescriptorPool(dev, S.pool, nullptr);
+    if (S.sampler) G.vkDestroySampler(dev, S.sampler, nullptr);
+    if (S.view) G.vkDestroyImageView(dev, S.view, nullptr);
+    if (S.image) G.vkDestroyImage(dev, S.image, nullptr);
+    if (S.mem) G.vkFreeMemory(dev, S.mem, nullptr);
+    if (S.vs) G.vkDestroyShaderModule(dev, S.vs, nullptr);
+    if (S.fs) G.vkDestroyShaderModule(dev, S.fs, nullptr);
+    S = VKSkyState();
+}
+
+bool vksky_upload_faces(TextureClass* n, TextureClass* e, TextureClass* s, TextureClass* w, TextureClass* t)
+{
+    TextureClass* faces[5] = { n, e, s, w, t };
+    SurfaceClass::SurfaceDescription sd = {};
+    SurfaceClass* surf0 = faces[0] ? faces[0]->Get_Surface_Level(0) : nullptr;
+    if (!surf0) { VKWP1_LOG("[VKSKY] upload fail: no surface for north"); return false; }
+    surf0->Get_Description(sd);
+    const unsigned size = sd.Width;
+    REF_PTR_RELEASE(surf0);
+    if (!size || sd.Height != sd.Width) {
+        VKWP1_LOG("[VKSKY] upload fail: face extent %ux%u", sd.Width, sd.Height);
+        return false;
+    }
+
+    // Sky TGA assets are usually DXT-compressed (Get_Bytes_Per_Pixel returns 0 for those). Upload the
+    // block data as BC1/BC2/BC3 rather than decoding: it keeps the copy path simple and the GPU filters
+    // the compressed cube directly.
+    VkFormat skyFmt = VK_FORMAT_B8G8R8A8_UNORM;
+    bool compressed = false;
+    unsigned blockBytes = 0;
+    switch (sd.Format) {
+        case WW3D_FORMAT_DXT1: skyFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; compressed = true; blockBytes = 8; break;
+        case WW3D_FORMAT_DXT2:
+        case WW3D_FORMAT_DXT3: skyFmt = VK_FORMAT_BC2_UNORM_BLOCK; compressed = true; blockBytes = 16; break;
+        case WW3D_FORMAT_DXT4:
+        case WW3D_FORMAT_DXT5: skyFmt = VK_FORMAT_BC3_UNORM_BLOCK; compressed = true; blockBytes = 16; break;
+        default: break;
+    }
+    const unsigned blocksX = compressed ? (size + 3u) / 4u : size;
+    const unsigned blocksY = compressed ? (size + 3u) / 4u : size;
+    const size_t layerBytes = compressed
+        ? (size_t)blocksX * blocksY * blockBytes
+        : (size_t)size * size * 4u;
+    if (!compressed) {
+        const unsigned bpp0 = sd.Format == WW3D_FORMAT_R8G8B8 ? 3u : 4u;
+        if (bpp0 != 3 && bpp0 != 4) {
+            VKWP1_LOG("[VKSKY] upload fail: fmt=%d", (int)sd.Format);
+            return false;
+        }
+    }
+
+    VkDevice dev = dev_();
+    if (!dev || !X.cmd) return false;
+
+    // Cube layer order follows the Vulkan face convention: +X,-X,+Y,-Y,+Z,-Z.
+    // N=-Z, E=+X, S=+Z, W=-X, T=+Y; the missing bottom reuses the top face.
+    TextureClass* layerTex[6] = { e, w, t, t, s, n };
+    VkBuffer stageBuf = nullptr; VkDeviceMemory stageMem = nullptr; void* stageMap = nullptr;
+    if (!make_host_buffer((unsigned long long)(layerBytes * 6u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          &stageBuf, &stageMem, &stageMap))
+        return false;
+
+    bool ok = true;
+    for (int layer = 0; layer < 6 && ok; ++layer) {
+        TextureClass* tex = layerTex[layer];
+        SurfaceClass* surf = tex ? tex->Get_Surface_Level(0) : nullptr;
+        if (!surf) { VKWP1_LOG("[VKSKY] upload fail: layer %d no surface", layer); ok = false; break; }
+        SurfaceClass::SurfaceDescription d = {};
+        surf->Get_Description(d);
+        if (d.Width != size || d.Height != size) {
+            VKWP1_LOG("[VKSKY] upload fail: layer %d extent %ux%u", layer, d.Width, d.Height);
+            REF_PTR_RELEASE(surf); ok = false; break;
+        }
+        int pitch = 0;
+        unsigned char* src = (unsigned char*)surf->Lock(&pitch);
+        if (!src) { VKWP1_LOG("[VKSKY] upload fail: layer %d lock", layer); REF_PTR_RELEASE(surf); ok = false; break; }
+        unsigned char* dst = (unsigned char*)stageMap + layerBytes * (size_t)layer;
+        if (compressed) {
+            const unsigned rowBytes = blocksX * blockBytes;
+            for (unsigned y = 0; y < blocksY; ++y)
+                memcpy(dst + (size_t)y * rowBytes, src + (size_t)y * (size_t)pitch, rowBytes);
+        } else {
+            const unsigned bpp = (d.Format == WW3D_FORMAT_R8G8B8) ? 3u : 4u;
+            for (unsigned y = 0; y < size; ++y) {
+                const unsigned char* row = src + (size_t)y * (size_t)pitch;
+                unsigned char* out = dst + (size_t)y * size * 4u;
+                if (bpp == 4) {
+                    memcpy(out, row, (size_t)size * 4u);
+                } else {
+                    for (unsigned x = 0; x < size; ++x) {
+                        out[x * 4u + 0] = row[x * 3u + 0];
+                        out[x * 4u + 1] = row[x * 3u + 1];
+                        out[x * 4u + 2] = row[x * 3u + 2];
+                        out[x * 4u + 3] = 255;
+                    }
+                }
+            }
+        }
+        surf->Unlock();
+        REF_PTR_RELEASE(surf);
+    }
+    if (!ok) {
+        G.vkDestroyBuffer(dev, stageBuf, nullptr);
+        G.vkFreeMemory(dev, stageMem, nullptr);
+        return false;
+    }
+
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = skyFmt;
+    ici.extent = { size, size, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = 6; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!chk("vkCreateImage(vksky)", G.vkCreateImage(dev, &ici, nullptr, &S.image))) ok = false;
+    VkMemoryRequirements req = {};
+    if (ok) G.vkGetImageMemoryRequirements(dev, S.image, &req);
+    const uint32_t mt = ok ? memtype_(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : 0xFFFFFFFFu;
+    if (!ok || mt == 0xFFFFFFFFu) ok = false;
+    if (ok) {
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
+        if (!chk("vkAllocateMemory(vksky)", G.vkAllocateMemory(dev, &mai, nullptr, &S.mem))) ok = false;
+    }
+    if (ok && !chk("vkBindImageMemory(vksky)", G.vkBindImageMemory(dev, S.image, S.mem, 0))) ok = false;
+
+    if (ok) {
+        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = S.image;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy cp[6] = {};
+        for (int layer = 0; layer < 6; ++layer) {
+            cp[layer].bufferOffset = layerBytes * (VkDeviceSize)layer;
+            cp[layer].imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)layer, 1 };
+            cp[layer].imageExtent = { size, size, 1 };
+        }
+        G.vkCmdCopyBufferToImage(X.cmd, stageBuf, S.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 6, cp);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        G.vkCmdPipelineBarrier(X.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+
+    // The staging copy is still referenced by the current command buffer; retire it instead of freeing.
+    VKGeoZombie z = { stageBuf, stageMem, stageMap, 3u };
+    X.geoZombies.push_back(z);
+
+    if (!ok) return false;
+
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = S.image; vci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    vci.format = skyFmt;
+    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
+    if (!chk("vkCreateImageView(vksky)", G.vkCreateImageView(dev, &vci, nullptr, &S.view))) return false;
+
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sci.magFilter = VK_FILTER_LINEAR; sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.0f;
+    if (!chk("vkCreateSampler(vksky)", G.vkCreateSampler(dev, &sci, nullptr, &S.sampler))) return false;
+
+    VkDescriptorSetLayoutBinding db = {};
+    db.binding = 0; db.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    db.descriptorCount = 1; db.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dl.bindingCount = 1; dl.pBindings = &db;
+    if (!chk("vkCreateDescriptorSetLayout(vksky)", G.vkCreateDescriptorSetLayout(dev, &dl, nullptr, &S.dsl))) return false;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+    VkDescriptorPoolCreateInfo dp = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dp.maxSets = 1; dp.poolSizeCount = 1; dp.pPoolSizes = &ps;
+    if (!chk("vkCreateDescriptorPool(vksky)", G.vkCreateDescriptorPool(dev, &dp, nullptr, &S.pool))) return false;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = S.pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &S.dsl;
+    if (!chk("vkAllocateDescriptorSets(vksky)", G.vkAllocateDescriptorSets(dev, &ai, &S.set))) return false;
+    VkDescriptorImageInfo dii = { S.sampler, S.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    wr.dstSet = S.set; wr.dstBinding = 0; wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &dii;
+    G.vkUpdateDescriptorSets(dev, 1, &wr, 0, nullptr);
+
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96u };
+    VkPipelineLayoutCreateInfo plc = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plc.setLayoutCount = 1; plc.pSetLayouts = &S.dsl;
+    plc.pushConstantRangeCount = 1; plc.pPushConstantRanges = &pcr;
+    if (!chk("vkCreatePipelineLayout(vksky)", G.vkCreatePipelineLayout(dev, &plc, nullptr, &S.pl))) return false;
+
+    VkShaderModuleCreateInfo sm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    sm.codeSize = sizeof(VKSKY_VERT_SPV); sm.pCode = VKSKY_VERT_SPV;
+    if (!chk("vkCreateShaderModule(vksky vs)", G.vkCreateShaderModule(dev, &sm, nullptr, &S.vs))) return false;
+    sm.codeSize = sizeof(VKSKY_FRAG_SPV); sm.pCode = VKSKY_FRAG_SPV;
+    if (!chk("vkCreateShaderModule(vksky fs)", G.vkCreateShaderModule(dev, &sm, nullptr, &S.fs))) return false;
+
+    S.size = size;
+    S.faces[0] = n; S.faces[1] = e; S.faces[2] = s; S.faces[3] = w; S.faces[4] = t;
+    S.ready = true;
+    VKWP1_LOG("[VKSKY] cubemap ready %ux%u (N/E/S/W/T)", size, size);
+    return true;
+}
+
+bool sky_set_faces_internal(TextureClass* north, TextureClass* east, TextureClass* south,
+                          TextureClass* west, TextureClass* top)
+{
+    if (!north || !east || !south || !west || !top) return false;
+    if (S.ready && S.faces[0] == north && S.faces[1] == east && S.faces[2] == south &&
+        S.faces[3] == west && S.faces[4] == top)
+        return true;
+    // Rebuilding is a TOD/weather event, not per-frame: wait so the old cube/sampler are not in flight.
+    if (S.ready && dev_()) G.vkDeviceWaitIdle(dev_());
+    vksky_destroy();
+    return vksky_upload_faces(north, east, south, west, top);
+}
+
+bool sky_ready_internal()
+{
+    return S.ready && S.image && S.view && S.set && S.pl && S.vs && S.fs;
+}
+
+bool vksky_ensure_pipeline()
+{
+    if (!sky_ready_internal() || X.curPass >= X.passes.size()) return false;
+    VkRenderPass rp = X.passes[X.curPass].rp;
+    if (S.pipe && S.pipeRp == rp) return true;
+    if (S.pipe) { G.vkDestroyPipeline(dev_(), S.pipe, nullptr); S.pipe = nullptr; }
+
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vpi = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpi.viewportCount = 1; vpi.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = (VkSampleCountFlagBits)X.passes[X.curPass].samples;
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = VK_FALSE;
+    dss.depthCompareOp = VK_COMPARE_OP_EQUAL;   // far plane only; scene depth clear is 1.0
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable = VK_FALSE;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+    VkPipelineShaderStageCreateInfo stg[2] = {};
+    stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stg[0].module = S.vs; stg[0].pName = "main";
+    stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stg[1].module = S.fs; stg[1].pName = "main";
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stg;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vpi; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dss; gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = S.pl; gpi.renderPass = rp; gpi.subpass = 0;
+    if (!chk("vkCreateGraphicsPipelines(vksky)", G.vkCreateGraphicsPipelines(dev_(), nullptr, 1, &gpi, nullptr, &S.pipe)))
+        return false;
+    S.pipeRp = rp;
+    return true;
+}
+
+bool sky_render_internal(float tintR, float tintG, float tintB)
+{
+    if (!vksky_ensure_pipeline() || !X.cmd) return false;
+    if (!X.depthKey) return false;
+
+    Matrix4x4 view, proj;
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, view);
+    DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, proj);
+    const Matrix4x4 vp = view * proj;
+    const Matrix4x4 invVP = vp.Inverse();
+    const Matrix4x4 invView = view.Inverse();
+    const Vector3 cam(invView[3].X, invView[3].Y, invView[3].Z);
+
+    float pc[24] = {
+        invVP[0].X, invVP[0].Y, invVP[0].Z, invVP[0].W,
+        invVP[1].X, invVP[1].Y, invVP[1].Z, invVP[1].W,
+        invVP[2].X, invVP[2].Y, invVP[2].Z, invVP[2].W,
+        invVP[3].X, invVP[3].Y, invVP[3].Z, invVP[3].W,
+        cam.X, cam.Y, cam.Z, 1.0f,
+        tintR, tintG, tintB, 1.0f
+    };
+
+    VkViewport vpRect;
+    VkRect2D scRect;
+    if (X.shHaveVP && X.shViewport[2] > 0.0f && X.shViewport[3] > 0.0f) {
+        vpRect = { X.shViewport[0], X.shViewport[1], X.shViewport[2], X.shViewport[3], 0.0f, 1.0f };
+        scRect = { { (int32_t)X.shViewport[0], (int32_t)X.shViewport[1] },
+                   { (uint32_t)X.shViewport[2], (uint32_t)X.shViewport[3] } };
+    } else {
+        vpRect = { 0.0f, 0.0f, (float)X.w, (float)X.h, 0.0f, 1.0f };
+        scRect = { { 0, 0 }, { X.w, X.h } };
+    }
+    G.vkCmdSetViewport(X.cmd, 0, 1, &vpRect);
+    G.vkCmdSetScissor(X.cmd, 0, 1, &scRect);
+    G.vkCmdBindPipeline(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipe);
+    G.vkCmdBindDescriptorSets(X.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl, 0, 1, &S.set, 0, nullptr);
+    G.vkCmdPushConstants(X.cmd, S.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96u, pc);
+    G.vkCmdDraw(X.cmd, 3, 1, 0, 0);
+    {
+        static int s_skyDrawLog = 0;
+        if (s_skyDrawLog < 3) {
+            ++s_skyDrawLog;
+            VKWP1_LOG("[VKSKY] fullscreen draw %ux%u cube=%u", (unsigned)vpRect.width,
+                (unsigned)vpRect.height, S.size);
+        }
+    }
+    return true;
+}
+
 bool vkpost_env_on()
 {
     if (!P.envChecked) {
@@ -5990,6 +6614,19 @@ bool vkpost_overlay_render(VkImage sceneImage, void* sceneView, unsigned sceneW,
 
 } // anon
 
+// Sky cubemap entry points need external linkage; the implementation above lives in the post pass's
+// anonymous namespace so its state stays private to this translation unit.
+bool VKDraw_Sky_Set_Faces(TextureClass* north, TextureClass* east, TextureClass* south,
+                          TextureClass* west, TextureClass* top)
+{
+    return sky_set_faces_internal(north, east, south, west, top);
+}
+
+bool VKDraw_Sky_Render(float tintR, float tintG, float tintB)
+{
+    return sky_render_internal(tintR, tintG, tintB);
+}
+
 // ===========================================================================
 // P6 "底片/镜头": resolve the 3D scene into the LDR overlay, then point the
 // recorder at that overlay so the UI is drawn after tonemap/bloom/AA.
@@ -6345,6 +6982,14 @@ unsigned long long VKDraw_Get_Const_WindowCap(int ring)
     return (X.built && ring >= 0 && ring < 3) ? X.cr[ring].winCap : 0ull;
 }
 
+static bool vk_fallback_strict()
+{
+    static int s = -1;
+    if (s < 0) s = (getenv("GENERALSX_VK_NO_FALLBACK") != nullptr &&
+                    atoi(getenv("GENERALSX_VK_NO_FALLBACK")) != 0) ? 1 : 0;
+    return s != 0;
+}
+
 void VKDraw_Log_Stats()
 {
     unsigned long long cup = 0, cre = 0, cwr = 0, csp = 0;
@@ -6368,8 +7013,24 @@ void VKDraw_Log_Stats()
     VKPgm_Stats pg = {};
     VKPgm_Get_Stats(&pg);
     if (pg.notes) {
-        VKWP1_LOG("VKPGM stats: modules=%u notes=%llu matched=%llu unmatched=%llu lookups=%llu hits=%llu resets=%llu",
-            (unsigned)X.pgmModules.size(), pg.notes, pg.matched, pg.unmatched, pg.lookups, pg.hits, pg.resets);
+        VKWP1_LOG("VKPGM stats: modules=%u notes=%llu matched=%llu unmatched=%llu lookups=%llu hits=%llu resets=%llu ffDraws=%llu ffRefused=%llu",
+            (unsigned)X.pgmModules.size(), pg.notes, pg.matched, pg.unmatched, pg.lookups, pg.hits, pg.resets,
+            pg.ffDraws, pg.ffRefused);
+    }
+    // Phase 5A fallback audit: one line per stats window. ffDraws/ffRefused count the retail FF
+    // interpreter actually rendering/refusing; unmatched counts shader sources with no translation.
+    // The five-face sky mesh fallback is retired, so there is no sky-fallback counter any more.
+    {
+        VKPgm_Stats pg = {};
+        VKPgm_Get_Stats(&pg);
+        fprintf(stderr, "[VKFALLBACK] frames=%llu draws=%llu ffDraws=%llu ffRefused=%llu unmatched=%llu retailShadow=%d strict=%d\n",
+            X.st.framesBegun, X.st.draws, pg.ffDraws, pg.ffRefused, pg.unmatched,
+            X.shOn ? 0 : 1, vk_fallback_strict() ? 1 : 0);
+        if (vk_fallback_strict() && (pg.unmatched > 0ull || pg.ffRefused > 0ull || !X.shOn)) {
+            fprintf(stderr, "[VKFALLBACK][STRICT] violation: unmatched=%llu refused=%llu retailShadow=%d\n",
+                pg.unmatched, pg.ffRefused, X.shOn ? 0 : 1);
+        }
+        fflush(stderr);
     }
     // GeneralsX @feature Qoder 18/10/2026 wedge 8 path census, kept off the 4096-draw line so the log
     // stays readable: every 65536 recorded draws still lands inside a 45 s benchmark, and the per-tag

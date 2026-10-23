@@ -114,6 +114,9 @@ struct VKRT_Info {
 // so it comes in through these instead of the WW3DFormat-taking factories above.
 bool VKRT_Alloc_Color_Format(void* key, unsigned int width, unsigned int height, unsigned int vk_format);
 bool VKRT_Alloc_Depth_Format(void* key, unsigned int width, unsigned int height, unsigned int vk_format);
+// Release a mirror (used by graph-owned transient targets). The image goes through the retire queue,
+// so a frame still in flight can finish naming it.
+bool VKRT_Free(void* key);
 
 // False when there is no mirror for 'key'.
 bool VKRT_Query(void* key, VKRT_Info* out);

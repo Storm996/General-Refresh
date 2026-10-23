@@ -412,6 +412,40 @@ bool VK_Draw_Indexed_User_Primitive_State(unsigned primitive_type,
 // gate is off, nothing was captured, or the pass could not be recorded.
 bool VKDraw_Shadow_Apply(const float sun_dir[3]);
 
+// GeneralsX @feature 23/10/2026: cloud-shadow inputs for the same receiver. d3dTex is the game's
+// TSCloudMed texture (raw IDirect3DTexture9*); xy = scroll offsets, scale = world->uv, strength 0
+// disables the term. The view is resolved through the texture mirror.
+void VKDraw_Set_Cloud_Texture(void* d3dTex, float ox, float oy, float scale, float strength);
+bool VKDraw_Cloud_Shadow_Active();
+// Material cast flag: false around sky/grass draws so the receiver never replays them.
+void VKDraw_Set_ShadowCaster(bool allowed);
+// Per-material receive-shadow mask. Receivers write bit 0x80 of the scene stencil; the native shadow
+// receiver tests it, so materials flagged RECEIVE_SHADOW=false are not darkened by the fullscreen pass.
+void VKDraw_Set_Shadow_Receiver(bool receive);
+// Phase 5A material key: stored by the binder and exposed to the backend so the eventual PSO cache
+// can key on material identity instead of the legacy per-family state blocks.
+// Phase 5B.3: pipelineKey is a W3DMaterialPipelineKey hash for families whose PSO identity is the
+// material itself (water). 0 keeps the historical state-derived key, so unmigrated families share
+// exactly the pipelines they did before.
+void VKDraw_Material_Bind(unsigned family, unsigned features, unsigned variant, unsigned pass,
+                          unsigned long long pipelineKey);
+// Sky cubemap path: five face textures (N/E/S/W/T) are uploaded into one VkImage cube; the fullscreen
+// sky draw replaces the retail five-face mesh when the cubemap and pipeline are ready.
+class TextureClass;
+bool VKDraw_Sky_Set_Faces(TextureClass* north, TextureClass* east, TextureClass* south,
+                          TextureClass* west, TextureClass* top);
+bool VKDraw_Sky_Render(float tintR, float tintG, float tintB);
+// FrameGraph resource barrier bridge: names map to the backend's owned keys, layout is VKRT_Layout.
+bool VKDraw_Graph_Barrier(const char* resource, int layout);
+// Phase 6B: the graph owns target lifetime. This describes the exact scene/overlay targets this frame
+// needs (HDR format, render-scale extent, overlay policy); the graph then asks for them by name.
+bool VKDraw_Graph_Target_Desc(unsigned* sceneW, unsigned* sceneH, unsigned* colorFormat,
+                              unsigned* depthFormat, unsigned* overlayW, unsigned* overlayH,
+                              unsigned* overlayFormat, int* overlayWanted);
+bool VKDraw_Graph_Alloc_Target(const char* name, unsigned width, unsigned height,
+                               unsigned format, bool depth);
+void VKDraw_Graph_Free_Target(const char* name);
+
 // GeneralsX @feature 23/10/2026 P6 "底片/镜头": resolve the 3D scene into the LDR UI overlay before
 // the HUD is drawn, so tonemap/bloom/FXAA/SSAA never touch the UI. No-op unless HDR, a render scale
 // above 100 %, or the 3D-only post AA mode is enabled; on any failure the caller simply keeps drawing
@@ -436,6 +470,8 @@ bool VKDraw_Vegetation_Ready();
 // this frame built it. False when the feature is off or has no map/light; the caller then leaves the
 // receiver constants disabled. The VP is row-vector (D3D) and projects world -> light clip (0..1 z).
 bool VKDraw_LightShadow_Info(float vp[16], float pos_range[4]);
+// Explicit vegetation PSO bind: the grass material calls this before its instance draw.
+bool VKDraw_Vegetation_Bind();
 bool VKDraw_Vegetation_Draw(const void* grass, unsigned grass_count,
                             const void* rocks, unsigned rock_count,
                             const float view_proj[16], const float camera[3], float time_seconds,

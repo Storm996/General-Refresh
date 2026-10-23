@@ -871,6 +871,25 @@ public:
 	// batch - so Set_Viewport has to publish it here as well as to D3D9 while both paths are alive.
 	static void VK_Shadow_Viewport(const D3DVIEWPORT9* viewport);
 
+	// GeneralsX @feature 23/10/2026: feed the native shadow receiver the game's cloud map and scroll
+	// parameters, so cloud shadows cover every opaque surface, not only terrain/road/bridge.
+	static void VK_Set_Cloud_Texture(void* d3dTex, float ox, float oy, float scale, float strength);
+	static bool VK_Cloud_Shadow_Active();
+	static void VK_Set_ShadowCaster(bool allowed);
+	// P6 per-material receive flag: DX8Renderer sets it from W3DMATF_RECEIVE_SHADOW around each batch.
+	static void VK_Set_ShadowReceiver(bool receive);
+	// Phase 5A material key publication: family/features/variant/pass for the backend's material cache
+	// and diagnostics. The legacy executor still owns the draw; this is the binder seam.
+	// Phase 5B.3: pipelineKey is the explicit W3DMaterialPipelineKey hash for families whose PSO
+	// identity is the material (water); 0 keeps the legacy state-derived key.
+	static void VK_Material_Bind(unsigned family, unsigned features, unsigned variant, unsigned pass,
+		unsigned long long pipelineKey = 0ull);
+	// Sky cubemap (N/E/S/W/T) + fullscreen sky draw. Returns false when the five faces are unavailable.
+	static bool VK_Sky_Set_Faces(TextureClass* north, TextureClass* east, TextureClass* south,
+		TextureClass* west, TextureClass* top);
+	static bool VK_Sky_Render(float tintR, float tintG, float tintB);
+	static bool VK_Bind_Vegetation_Material();
+
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 6: read one shadowed render state as the value
 	// the device would have used. Invalidate_Cached_Render_States fills RenderStates with the 0x12345678
 	// sentinel, and a slot the game never wrote after that has no shadow at all - which is not zero. See
