@@ -5,13 +5,15 @@
 <h1 align="center">General Refresh</h1>
 
 <p align="center">
-  <strong>A modernized <em>Command &amp; Conquer: Generals / Zero Hour</em> built on <a href="https://github.com/fbraz3/GeneralsX">GeneralsX</a> — native 64-bit, a Direct3D9 renderer with a PS 3.0 shader ceiling, AI-upscaled artwork, a modern command system, and truly smooth high-frame-rate gameplay.</strong>
+  <strong>A modernized <em>Command &amp; Conquer: Generals / Zero Hour</em> built on <a href="https://github.com/fbraz3/GeneralsX">GeneralsX</a> — a native Vulkan renderer, Forward+ clustered lighting, a physical HDR post pipeline, AI-upscaled artwork, and truly smooth high-frame-rate gameplay.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/Storm996/General-Refresh/releases"><img src="https://img.shields.io/github/v/release/Storm996/General-Refresh?include_prereleases&sort=date&display_name=tag&style=flat&label=Release" alt="GitHub Release"></a>
   <a href="https://github.com/fbraz3/GeneralsX"><img src="https://img.shields.io/badge/Built%20on-GeneralsX-blueviolet" alt="Built on GeneralsX"></a>
-  <img src="https://img.shields.io/badge/Renderer-D3D9%20%2F%20PS%203.0-blue" alt="D3D9 Renderer">
+  <img src="https://img.shields.io/badge/Renderer-Vulkan%20(native)-red" alt="Native Vulkan Renderer">
+  <img src="https://img.shields.io/badge/Lighting-Forward%2B%20%C2%B7%20512%20lights-orange" alt="Forward+ Lighting">
+  <img src="https://img.shields.io/badge/Post-HDR%20%C2%B7%20ACES%20%C2%B7%20Bloom-cyan" alt="HDR Post Pipeline">
   <img src="https://img.shields.io/badge/Arch-64--bit-success" alt="64-bit">
   <img src="https://img.shields.io/badge/Frame%20Rate-Uncapped%20(render%20%2B%20unit%20motion)-brightgreen" alt="High Frame Rate">
   <img src="https://img.shields.io/badge/Platform-Windows-lightgrey" alt="Windows">
@@ -28,11 +30,11 @@
 
 **General Refresh** is a derivative of the excellent **[GeneralsX](https://github.com/fbraz3/GeneralsX)** project — a modern, open-source re-port of *Command & Conquer: Generals* and *Zero Hour*.
 
-GeneralsX modernized the **platform**: SDL3 windowing, DXVK/Vulkan rendering, OpenAL/MiniAudio sound, a 64-bit toolchain and cross-platform online play — so the game runs on today's systems. **General Refresh goes one step further: it modernizes the game itself.** We build on that foundation and push the actual player experience forward:
+GeneralsX modernized the **platform**: windowing, a 64-bit toolchain, a modern audio/video stack and cross-platform online play — so the game runs on today's systems. **General Refresh goes one step further: it rebuilds the renderer and relights the game.** We keep the deterministic simulation untouched and push the actual player experience forward:
 
 ### 🎨 Visual quality
 
-AI-refined textures, dot3 normal maps, per-pixel lighting and PBR roughness materials make the battlefield dramatically crisper and more tactile.
+The battlefield is drawn by a **native Vulkan renderer** — Forward+ clustered lighting, unified per-pixel light rig, sun and dynamic light shadow maps, volumetric fog, and an HDR post chain with ACES tone mapping, bloom and film grading. Combined with AI-refined textures, dot3 normal maps and PBR roughness materials, the 2003 fixed-function look is gone.
 
 ### 🕹️ Gameplay & experience
 
@@ -40,7 +42,7 @@ High-frame-rate battles, an RA3-style selection panel, a reworked mission UI, qu
 
 ### 🛠️ Platform & build
 
-A Direct3D9 renderer with a PS 3.0 shader ceiling, a native 64-bit build, and a modern audio/video stack (MiniAudio / OpenAL + FFmpeg).
+A **self-contained Vulkan backend** (no Direct3D runtime is loaded at all), a native 64-bit build, a modern audio/video stack (MiniAudio / OpenAL + FFmpeg), and an external WPF launcher that exposes the graphics settings.
 
 > *Note: like GeneralsX, this is an engine re-port and requires original game data from a legitimate copy of Command & Conquer: Generals / Zero Hour.*
 
@@ -50,12 +52,20 @@ A Direct3D9 renderer with a PS 3.0 shader ceiling, a native 64-bit build, and a 
 
 The following are **already implemented and playable**:
 
-### 🎨 Visual quality
+### 🖼️ Renderer & architecture
 
-- 🎨 **Texture repaints / upscaling** — unit and terrain artwork has been re-painted and upscaled through an AI-assisted texture pipeline, replacing blurry low-res retail textures with crisper, higher-detail maps.
-- 🧱 **Normal-mapped (dot3) rendering** — a tangent-space dot3 normal-mapping path is wired into the W3D renderer, giving surfaces real per-pixel lighting depth. It can be toggled live from **Options → the "Normal Mapping" checkbox** without a restart.
-- 💡 **Per-pixel lighting** — rigid battlefield meshes are lit per pixel instead of per vertex: each batch's own directional lights (up to 4) are re-evaluated against interpolated world-space geometric normals with Blinn-Phong specular, sharpening light/shadow transitions on tanks and buildings; the ambient floor ships at 0.5 for stronger contrast. Enabled by default (`GENERALSX_GEOMNORMAL=0` reverts to per-vertex).
-- 🔩 **Physically-based material (PBR roughness) rendering** — a metallic-roughness PBR path is wired into the dot3 lighting pipeline: `GENERALSX_PBR=1` selects the rough-Blinn variant and `=2` the GGX variant; surfaces missing the `_rp` material map fall back to constant rough/metal values. Assets are produced by an AI texture-decomposition pipeline (CHORD) that splits diffuse art into basecolor / normal / roughness / metalness channels, packed into engine `_rp.tga` maps — verified on real hardware with `[PBR] variant compiled/installed/mounted` and replay-CRC-proven logic independence.
+- 🎇 **Native Vulkan renderer** — the W3D drawing core runs on a self-built Vulkan backend (render targets, command buffers, descriptor sets, pipeline cache). No Direct3D runtime is loaded: the legacy device API is served by an internal stub, and all shaders are pre-baked GLSL → SPIR-V. There is no fixed-function ceiling left to hit — the whole pipeline is modern and programmable.
+- 🧩 **Frame graph** — `W3DRenderGraph` owns the GPU lifetime of scene colour/depth, the overlay target, the five-level bloom chain and the water reflection image, and records real `vkCmdPipelineBarrier` transitions. Targets are rebuilt automatically after device loss.
+- 💡 **Forward+ clustered lighting** — lighting data lives in SSBOs (the old uniform block exceeded the 64 KB limit on NVIDIA), with **512 light slots** (`fpLights[512]` + `fpLightExtra[512]`). Clustered and direct (256) paths both run; the per-frame budget defaults to 128 and lights are admitted by strength. Stress-tested at 300 lights / 1080p ≈ 157 fps (clustered) and 120 fps (direct).
+- 🎨 **One unified light rig** — a single `W3DRenderLightingState` (sun, ambient, fog, height falloff, cloud shadow, exposure, revision) feeds terrain, roads, trees, vegetation, bibs, bridges, water, objects and the fixed-function path. Time-of-day and weather therefore affect every surface consistently, and atmosphere changes rebake the affected batches.
+- ☀️ **GGX sun, hemisphere ambient, depth AO, direct-only shadows** — per-pixel GGX specular on terrain, roads, objects and point lights; hemisphere ambient (sky + ground) instead of a flat ambient term; depth-only AO (default 0.50); shadow maps attenuate sun light only, so ambient and emissive still hold the shadowed side.
+- 🌗 **Shadow maps** — a 4096² sun shadow map with a **fixed 8192-unit world box, texel-snapped** (removes the shimmer while panning and the "shadows vanish when zooming" bug), terrain and roads as shadow casters, up to **4 dynamic light shadow maps** in the same frame, soft filtering and cloud shadows.
+- 💡 **Point & spot lights** — inverse-square falloff with a corrected reference distance, real spot cones with inner/outer angles, an 8-cell light-cookie atlas plus procedural window gobos, vehicle headlight cones, and muzzle-flash / impact light pulses.
+- 🌫️ **Volumetric fog (4 tiers)** — tier 0 is the retail distance haze, tier 1 an analytic exponential height integral along the eye ray, tiers 2/3 add 8/16 sun-shadow visibility samples (god-shaft style). Density, height, start distance and sun strength are exposed in the launcher.
+- 🎞️ **HDR post pipeline** — the scene renders to `R16G16B16A16_SFLOAT`, followed by ACES/Reinhard tone mapping with exposure EV, a five-level bloom chain, CAS sharpening, auto exposure, a generated film LUT, SSAA 100/125/150/200 %, FXAA (3D only) and optional film grading (vignette, grain, saturation, contrast). The UI is always composited **after** the resolve, so post effects never blur or tint the HUD.
+- 🖌️ **Materials** — tangent-space dot3 normal mapping, metallic-roughness PBR (rough-Blinn and GGX variants), and an AI texture-decomposition pipeline (CHORD) that produces `_nm` / `_rp` companion maps; texture atlas seams were fixed by making the terrain normal atlas single-level.
+- 🌿 **World surfaces** — per-pixel roads, trees, vegetation, bibs and bridges (no more baked vertex lighting that ignored the sun), unified water material instance across sea/river/trapezoid with sky reflection and Forward+ point lights, an independent 5-face cubemap sky renderer, and reworked grass/foliage placement.
+- 🎨 **AI-upscaled artwork** — unit and terrain textures re-painted and upscaled through an AI-assisted pipeline, replacing the blurry retail maps.
 
 ### 🕹️ Gameplay & experience
 
@@ -67,9 +77,20 @@ The following are **already implemented and playable**:
 
 ### 🛠️ Platform & build
 
-- 🎇 **Direct3D9 renderer** — the `DX8Wrapper` core has been ported from Direct3D8 to the modern Direct3D9 (`IDirect3D9`/`IDirect3DDevice9`, loaded at runtime from `d3d9.dll`), lifting the shader ceiling from `ps_1_4` toward `ps_3_0` and paving the way for multi-light, HDR and bloom effects without touching fixed-pipeline behaviour or replay compatibility.
-- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client has been fully ported to a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM** — no 32-bit D3D8 shims needed anymore: the Direct3D9 renderer runs on the native 64-bit runtime.
-- 🔊 **Audio & video backend modernization** — shipped together with the 64-bit switch: audio moved fully from the 32-bit Miles engine to **MiniAudio / OpenAL (x64)**, and intro/cutscene video is decoded by **FFmpeg**, completing the 64-bit platform layer.
+- 🖥️ **Native 64-bit build (Windows x64)** — the Windows client runs on a 64-bit toolchain, breaking the legacy 32-bit process's 2GB/4GB address-space ceiling and **truly using all available system RAM and physical VRAM**.
+- 🔊 **Audio & video backend modernization** — audio runs on **MiniAudio / OpenAL (x64)** instead of the 32-bit Miles engine, and intro/cutscene video is decoded by **FFmpeg**.
+- 🚀 **External launcher** — a WPF launcher separates the pre-game UI from the engine and exposes the graphics stack: resolution and LOD, light budget, volumetric fog (tier, density, height, start, sun), HDR, tone mapping, bloom, AO, post AA, MSAA, GPU particles and weather, film grade and the rest of the advanced page.
+- 🧪 **QA tooling** — five calibrated fixed camera positions, golden screenshots, PNG diff tooling, shader bake/light-layout checks and replay-CRC verification, so every visual change can be proven against the retail baseline.
+
+### 🧪 Implemented but opt-in
+
+These run on the shipped backend and are **off by default**; enable them in the launcher / Options.ini:
+
+- 💥 **GPU combat particles** — compute + SSBO simulation feeding `vkCmdDrawIndirect`, spawned from retail additive batches (texture-preserving).
+- 🌧️ **GPU weather** — rain, snow and sandstorm particle volumes driven camera-relative.
+- 🌫️ **Soft particles** and 🔥 **heat haze** — scene-depth fade and screen-space distortion driven by live fire sources.
+- 🔲 **MSAA 4x** — colour + depth resolve with alpha-to-coverage to follow; the UI is excluded from multisampling.
+- 🌟 **God rays** — implemented and verified, but the sun is simply off-screen at the RTS camera angle, so it stays off unless a low-angle view asks for it.
 
 ---
 
@@ -77,36 +98,46 @@ The following are **already implemented and playable**:
 
 What we are actively building and planning next:
 
-1. 🌿 **World ecosystem systems** — enriching the environment with living systems, currently a **grass/foliage system** (in progress) and a planned **particle-effect upgrade** (smoke, dust, explosions, weather).
-2. 🗺️ **Mission map support** — expanded handling for mission/custom maps.
-3. 🎮 **Native Vulkan / D3D11 renderer backend** — the long-term goal beyond the current D3D9 pipeline.
+1. 🌊 **Screen-space reflections (SSR)** — needs a G-buffer normal/height pass first; the current post chain reconstructs normals from depth and is too noisy on grazing surfaces.
+2. 🌤️ **Prefiltered IBL** — GGX-prefiltered sky cubemap with per-mip convolution, plus a roughness channel in the reflection interface.
+3. ☁️ **Physical sky + aerial perspective** — a procedural atmosphere to replace the stitched cubemap.
+4. 🔲 **TAA / SMAA** — both need extra buffers or LUT assets; the leaf/edge shimmer is expected to be better solved by MSAA + alpha-to-coverage first.
+5. 🧱 **HBAO / GTAO** and **lit decals** — both blocked on the same G-buffer work as SSR.
+6. 🌿 **World ecosystem systems** — richer foliage and a longer-term particle-effect upgrade (smoke, dust, explosions, weather).
+7. 🗺️ **Mission map support** — expanded handling for mission/custom maps.
 
 ---
 
 ## 📰 Changelog
 
-Every update is tracked by date in **[CHANGELOG.md](CHANGELOG.md)** — see exactly what shipped on which day, from the initial import to the 64-bit build, D3D9, PS 3.0 and beyond.
+Every update is tracked by date in **[CHANGELOG.md](CHANGELOG.md)** — from the initial import and the 64-bit build to the Vulkan renderer rewrite, the lighting refactor and the 2.0 visual pass.
 
 ---
 
 ## 🚀 Getting Started
 
 ### Download & Play
+
 Ready-to-run builds are published on the releases page:
 
 * 📦 **[Download General Refresh Releases](https://github.com/Storm996/General-Refresh/releases)**
 * 📖 Installation and game-data setup guides are available in the upstream Wiki lineage: [GeneralsX Wiki](https://github.com/fbraz3/GeneralsX/wiki)
 
 ### 🛠️ Building from Source
-General Refresh uses CMake presets (inherited from GeneralsX). Windows (MSVC) example:
 
-```bash
-cmake --preset win32
-cmake --build build/win32-vcpkg --config Release --target z_generals
-# Output: build/win32-vcpkg/GeneralsMD/Release/GeneralRefresh.exe
+General Refresh builds with CMake presets. On Windows there is exactly one supported entry point — the **Vulkan core** build:
+
+```bat
+build-win64-vk.bat
+:: Output: build\win64vk\GeneralsMD\Release\GeneralRefresh.exe
+
+deploy-win64-vk.bat
+:: Copies the exe next to your game data (previous exe is backed up first)
 ```
 
-For full prerequisites and the cross-platform Linux / macOS pipelines that GeneralsX provides, see the [GeneralsX build guides](https://github.com/fbraz3/GeneralsX/wiki).
+The base game (Generals) uses the same script with the `-Game Generals` switch, which builds `build\win64vk-generals` → `GeneralsX.exe`. Both the preset and the launcher hard-fail if the CMake cache is not Vulkan-core.
+
+For the cross-platform Linux / macOS pipelines, see the [GeneralsX build guides](https://github.com/fbraz3/GeneralsX/wiki).
 
 ---
 
@@ -116,8 +147,8 @@ General Refresh stands on the shoulders of the RTS community and open-source pio
 
 * **[Westwood Studios & EA](https://www.ea.com/)** — for creating the Command & Conquer: Generals universe.
 * **[TheSuperHackers](https://github.com/TheSuperHackers/GeneralsGameCode)** — foundational code modernization, stability fixes and upstream preservation.
-* **[GeneralsX / fbraz3](https://github.com/fbraz3/GeneralsX)** — the cross-platform SDL3 + DXVK + OpenAL re-port that this project is directly forked from.
-* **[Fighter19](https://github.com/Fighter19) & [feliwir](https://github.com/feliwir)** — early reference work pioneering SDL3, DXVK and OpenAL in Zero Hour.
+* **[GeneralsX / fbraz3](https://github.com/fbraz3/GeneralsX)** — the cross-platform re-port that this project is directly forked from.
+* **[Fighter19](https://github.com/Fighter19) & [feliwir](https://github.com/feliwir)** — early reference work pioneering modern platform and graphics in Zero Hour.
 
 ---
 
