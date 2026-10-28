@@ -94,6 +94,13 @@ void* VKDesc_Set_Layout();
 void* VKDesc_White_View();
 void* VKDesc_Default_Sampler();
 
+// GeneralsX @feature 24/10/2026 P34 D2/C4: the two static images behind bindings 9 and 10. The cookie
+// atlas is uploaded once from VkLightCookieAtlas.h; the white cube is the legal stand-in for the sky
+// until W3DDisplay uploads the retail faces. Null when the layer is down or the upload failed.
+void* VKDesc_Cookie_View();
+void* VKDesc_Cookie_Sampler();
+void* VKDesc_White_Cube_View();
+
 // One-shot self-test at co-create time (env GENERALSX_VKDESC): mirrors a 1x1 white texture and a
 // 64x64 color + depth render-target pair through the real wedge-3 paths, builds an offscreen render
 // pass WITH a depth attachment, compiles the probe SPIR-V, makes a pipeline layout + PSO, binds

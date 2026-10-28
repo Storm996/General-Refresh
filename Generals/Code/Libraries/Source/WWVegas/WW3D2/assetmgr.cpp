@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -34,6 +34,7 @@
  *                    $Revision:: 46                                                          $*
  *                                                                                             *
  * 06/27/02 KM Texture class abstraction																			*
+ * 07/01/02 KM Shader library integration
  * 08/05/02 KM Texture class redesign (revisited)
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -119,6 +120,7 @@
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 #include "Backend/VulkanGeo.h"	// VKDiag_Log_Mirror_State: cross-match live-mirror snapshot
 #endif
+
 #include "shdlib.h"
 
 /*
@@ -234,7 +236,6 @@ WW3DAssetManager::WW3DAssetManager() :
 	Register_Prototype_Loader (&_RingLoader);
 	Register_Prototype_Loader (&_SphereLoader);
 
-	// GeneralsX @build Copilot 11/05/2026 Keep shader library prototype loader parity with ZH path.
 	SHD_REG_LOADER;
 
 	// allocate the hash table and clear it.
@@ -335,7 +336,7 @@ static void Log_Textures(bool inited,unsigned& total_count, unsigned& total_mem)
 		case D3DFMT_X8L8V8U8: tex_format="D3DFMT_X8L8V8U8"; break;
 		case D3DFMT_Q8W8V8U8: tex_format="D3DFMT_Q8W8V8U8"; break;
 		case D3DFMT_V16U16: tex_format="D3DFMT_V16U16"; break;
-		// GeneralsX @build d3d9 port 12/10/2026 - D3DFMT_W11V11U10 removed in D3D9
+		// GeneralsX @build d3d9 port 11/10/2026 - D3DFMT_W11V11U10 removed in D3D9
 		case D3DFMT_UYVY: tex_format="D3DFMT_UYVY"; break;
 		case D3DFMT_YUY2: tex_format="D3DFMT_YUY2"; break;
 		case D3DFMT_DXT1: tex_format="D3DFMT_DXT1"; break;
@@ -497,8 +498,10 @@ void WW3DAssetManager::Release_Unused_Assets()
 	Release_Unused_Textures();
 	Release_Unused_Font3DDatas();
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-	// GeneralsX @feature Qoder 21/10/2026 multi-match forensics: same snapshot as the MD tree; one line
-	// per game reset with live mirror bytes/images, budget skips and stub live-object occupancy.
+	// GeneralsX @feature Qoder 21/10/2026 multi-match forensics: W3DDisplay::reset calls this once per
+	// game reset, i.e. after the previous match stopped rendering and before the next map loads. The
+	// line is the snapshot that tells a real asset leak from a stale budget: live mirror bytes and
+	// images, budget skips and the stub live-object table occupancy in one place.
 	VKDiag_Log_Mirror_State("Release_Unused_Assets");
 #endif
 }
@@ -807,8 +810,7 @@ RenderObjClass * WW3DAssetManager::Create_Render_Obj(const char * name)
 		char filename [MAX_PATH];
 		const char *mesh_name = ::strchr (name, '.');
 		if (mesh_name != nullptr) {
-			// GeneralsX @build Copilot 11/05/2026 Use SIZE_T pointer-delta math to avoid truncation in 64-bit builds.
-			::lstrcpyn (filename, name, ((SIZE_T)mesh_name) - ((SIZE_T)name) + 1);
+			::lstrcpyn (filename, name, ((SIZE_T)mesh_name) - ((SIZE_T)name) + 1);		// GeneralsX @build BenderAI 10/02/2026 - Use SIZE_T for 64-bit safe pointer arithmetic
 			::lstrcat (filename, ".w3d");
 		} else {
 			snprintf( filename, ARRAY_SIZE(filename), "%s.w3d", name);
@@ -1004,7 +1006,7 @@ HAnimClass *	WW3DAssetManager::Get_HAnim(const char * name)
 				Load_3D_Assets( new_filename );
 			}
 
-			anim = HAnimManager.Get_Anim(name);		// Try agai
+			anim = HAnimManager.Get_Anim(name);		// Try again
 			if (anim == nullptr) {
 				HAnimManager.Register_Missing( name );		// This is now a KNOWN missing anim
 				AssetStatusClass::Peek_Instance()->Report_Missing_HAnim(name);

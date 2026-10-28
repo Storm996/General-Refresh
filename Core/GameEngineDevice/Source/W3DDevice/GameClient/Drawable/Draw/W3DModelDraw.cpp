@@ -2185,6 +2185,47 @@ static Bool isNightRenderTOD()
 	return s_ov == (Int)TIME_OF_DAY_NIGHT;
 }
 
+// GeneralsX @feature 24/10/2026 P14 D2/D6: authored lamps can publish as cones (see updateLamps). Seed
+// from GENERALSX_LAMP_SPOT. Default OFF: the P14 A/B on this map only moved 1.7% of the frame (the
+// fixtures' authored intensity is too low to judge the cone there), so the shipped omni night look stays
+// until a lamp-rich scene or authored directions exist. GENERALSX_LAMP_SPOT=1 opts in.
+static Bool lampSpotCones()
+{
+	static Int s_on = -1;
+	if (s_on < 0) {
+		const char* ev = getenv("GENERALSX_LAMP_SPOT");
+		s_on = (ev != nullptr && *ev != 0) ? ((atoi(ev) != 0) ? 1 : 0) : 0;
+	}
+	return s_on != 0;
+}
+
+// GeneralsX @bugfix 25/10/2026 P35: two lamp extras that made the night look worse, both now opt-in.
+//  * WASH: the FPNIGHT second emitter below every lamp doubled the dynamic-light count (one extra light
+//    per fixture). Each object's LightEnvironment only has eight slots, so the wash lights crowded out
+//    explosion/muzzle pulses and made the "lit floor" read as a flat green-ish wash instead of pools.
+//  * FLICKER: the generated LampList gives every lamp a 0.12-amplitude breathing period; with 80+
+//    fixtures visible the whole scene pulses, and because the Forward+ list is re-sorted by energy every
+//    frame the order churns too. Retail's own lamp data has no flicker; keep it available for an A/B.
+static Bool lampWashEnabled()
+{
+	static Int s_on = -1;
+	if (s_on < 0) {
+		const char* ev = getenv("GENERALSX_LAMP_WASH");
+		s_on = (ev != nullptr && *ev != 0) ? ((atoi(ev) != 0) ? 1 : 0) : 0;
+	}
+	return s_on != 0;
+}
+
+static Bool lampFlickerEnabled()
+{
+	static Int s_on = -1;
+	if (s_on < 0) {
+		const char* ev = getenv("GENERALSX_LAMP_FLICKER");
+		s_on = (ev != nullptr && *ev != 0) ? ((atoi(ev) != 0) ? 1 : 0) : 0;
+	}
+	return s_on != 0;
+}
+
 void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 {
 	if (TheLampStore == nullptr)
@@ -2213,6 +2254,15 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 	// next frame instead of the next start. OFF takes the existing fade-out route, the same one shroud
 	// and hide use, so a lamp that was already lit goes out over 5 frames instead of sticking.
 	if (!TheLampStore->getGlobalLampsEnabled())
+	{
+		releaseLamps();
+		return;
+	}
+
+	// GeneralsX @feature Qoder 24/10/2026 P4 D5: building lamps are a night effect. The retail lamp
+	// data also has a daylight entry, which made every authored lamp glow at noon; release on any
+	// non-night render TOD and let isNightRenderTOD() re-arm them at dusk/night.
+	if (!isNightRenderTOD())
 	{
 		releaseLamps();
 		return;
@@ -2314,7 +2364,7 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		// that lamp, and the reference look has buildings glowing into their own yard. Presentation-only.
 		const Real nightGain = isNightRenderTOD() ? 1.28f : 1.0f;   // user verdict: lamps a touch dimmer at night
 		Real intensity = def->m_intensity * TheLampStore->getGlobalIntensityGain() * nightGain;
-		if (def->m_flickerPeriodFrames > 0 && def->m_flickerAmp > 0.0f)
+		if (def->m_flickerPeriodFrames > 0 && def->m_flickerAmp > 0.0f && lampFlickerEnabled())
 		{
 			// smooth periodic breathing; per-instance random phase + per-lamp offset desynchronizes lamps
 			const Real phase = (6.2831853f * (Real)s_lampFrameClock) / (Real)def->m_flickerPeriodFrames
@@ -2336,11 +2386,51 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 		light->Set_Far_Attenuation_Range(2.0f, radius);
 		light->Set_Position(worldPos);
 
+		// GeneralsX @feature 24/10/2026 P14 D2/D6: an authored lamp is a fixture, not a bare bulb. Publish
+		// it as a cone aimed outwards from the model centre and tilted down, so the light pools where the
+		// fixture points instead of washing through the wall it is mounted on. The axis is derived, not
+		// authored: LampDef has no direction, and inventing one per template in the INI would be a content
+		// task. GENERALSX_LAMP_SPOT=1 opts in (default OFF: see lampSpotCones()).
+		light->Set_Type(lampSpotCones() ? LightClass::SPOT : LightClass::POINT);
+		light->Set_Forward_Cookie(0);
+		if (light->Get_Type() == LightClass::SPOT)
+		{
+			Vector3 axis(0.0f, 0.0f, -1.0f);
+			if (m_renderObject != nullptr)
+			{
+				const SphereClass& bs = m_renderObject->Get_Bounding_Sphere();
+				Vector3 centre = worldMtx.Rotate_Vector(bs.Center);
+				centre += worldMtx.Get_Translation();
+				axis = worldPos - centre;
+				// Tilt below the horizontal so the pool lands on the yard, not on the wall next door.
+				axis.Z -= 0.55f * axis.Length();
+				if (axis.Length() > 1e-3f)
+					axis.Normalize();
+				else
+					axis.Set(0.0f, 0.0f, -1.0f);
+			}
+			light->Set_Spot_Angle(0.5585054f);	// 32 degrees outer half-angle
+			light->Set_Spot_Direction(axis);
+			light->Set_Spot_Exponent(1.0f);
+			{
+				static const Bool s_spotLog = (getenv("GENERALSX_LAMPLIGHT_LOG") != nullptr)
+					&& (atoi(getenv("GENERALSX_LAMPLIGHT_LOG")) != 0);
+				static Int s_spotLogs = 0;
+				if (s_spotLog && i == 0 && s_spotLogs < 8)
+				{
+					++s_spotLogs;
+					fprintf(stderr, "[LAMP] spot tpl=%s axis=(%.2f,%.2f,%.2f) angle=32\n",
+						draw->getTemplate()->getName().str(), axis.X, axis.Y, axis.Z);
+					fflush(stderr);
+				}
+			}
+		}
+
 		// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: a second, low emitter for the same lamp. The
 		// data lamp sits above the eaves (roof glow), so the walls and the yard only saw grazing light.
 		// This one sits 3 units above the ground under it and lights the wall base and a real pool on
 		// the ground; it is night-only so the daytime look is untouched.
-		if (nightGain > 1.0f)
+		if (nightGain > 1.0f && lampWashEnabled())
 		{
 			if ((Int)m_lampWashLights.size() < lampCount)
 				m_lampWashLights.resize(lampCount, nullptr);
@@ -2380,6 +2470,11 @@ void W3DModelDraw::updateLamps(const Matrix3D& worldMtx)
 //-------------------------------------------------------------------------------------------------
 void W3DModelDraw::updateHeadlights(const Matrix3D& worldMtx)
 {
+	// GeneralsX @debug 24/10/2026 P34 D6: a headlight that never appears has four indistinguishable causes
+	// (not night, lamps off, not a vehicle, pool exhausted). One bounded line per cause names it.
+	static const Bool s_hlLog = (getenv("GENERALSX_LAMPLIGHT_LOG") != nullptr)
+		&& (atoi(getenv("GENERALSX_LAMPLIGHT_LOG")) != 0);
+	static Int s_hlGateLogs = 0;
 	if (!isNightRenderTOD() || TheLampStore == nullptr || !TheLampStore->getGlobalLampsEnabled())
 	{
 		releaseHeadlights();
@@ -2388,6 +2483,24 @@ void W3DModelDraw::updateHeadlights(const Matrix3D& worldMtx)
 
 	Drawable* draw = getDrawable();
 	const ThingTemplate* tt = (draw != nullptr) ? draw->getTemplate() : nullptr;
+	{
+		// GeneralsX @debug 24/10/2026 P34 D6: first six calls name every gate, so "no headlight" can be
+		// attributed to night/lamp-store/vehicle-class/visibility instead of guessing.
+		static Int s_dbg = 0;
+		if (s_hlLog && s_dbg < 6)
+		{
+			++s_dbg;
+			fprintf(stderr, "[HEADLIGHT] gate night=%d store=%d enabled=%d tpl=%s veh=%d air=%d hidden=%d obscured=%d\n",
+				(int)isNightRenderTOD(), (TheLampStore != nullptr) ? 1 : 0,
+				(TheLampStore != nullptr && TheLampStore->getGlobalLampsEnabled()) ? 1 : 0,
+				(tt != nullptr) ? tt->getName().str() : "(null)",
+				(tt != nullptr && tt->isKindOf(KINDOF_VEHICLE)) ? 1 : 0,
+				(tt != nullptr && tt->isKindOf(KINDOF_AIRCRAFT)) ? 1 : 0,
+				(draw != nullptr && draw->isDrawableEffectivelyHidden()) ? 1 : 0,
+				(int)m_fullyObscuredByShroud);
+			fflush(stderr);
+		}
+	}
 	if (tt == nullptr || !tt->isKindOf(KINDOF_VEHICLE) || tt->isKindOf(KINDOF_AIRCRAFT) ||
 		draw->isDrawableEffectivelyHidden() || m_fullyObscuredByShroud)
 	{
@@ -2403,7 +2516,16 @@ void W3DModelDraw::updateHeadlights(const Matrix3D& worldMtx)
 	{
 		light = W3DDisplay::m_3DScene->getADynamicLight();
 		if (light == nullptr)
+		{
+			if (s_hlLog && s_hlGateLogs < 4)
+			{
+				++s_hlGateLogs;
+				fprintf(stderr, "[HEADLIGHT] pool exhausted for %s (no pooled dynamic light this frame)\n",
+					tt->getName().str());
+				fflush(stderr);
+			}
 			return;	// pool exhausted this frame; retry on the next transform update
+		}
 		m_headlightLight = light;
 		light->Set_Flag(LightClass::FAR_ATTENUATION, true);
 	}
@@ -2411,18 +2533,50 @@ void W3DModelDraw::updateHeadlights(const Matrix3D& worldMtx)
 	light->setEnabled(TRUE);
 	light->setFrameFade(0, 0);	// we own its lifecycle while it stays in front of the hull
 
-	// The emitter has to clear the hull: at +11 units the pool fell under the tank where nothing can
-	// see it. +22 puts the bright core on the road in front of the bumper, which is the look the
-	// reference wants (a lit strip of ground ahead of each vehicle).
+	// GeneralsX @feature 24/10/2026 P34 D6: the emitter is now a real headlight, not a bare bulb.
+	// A vehicle *has* the direction data the building lamps lack: its own facing (worldMtx +X). The cone
+	// apex sits just ahead of the bumper and looks along that axis, slightly down, so the road ahead gets
+	// a directional pool instead of a circular blob under the tank. The twin-beam look comes from the
+	// baked cookie atlas (binding 9, tile 7 = cookieId 10), which is the "two headlights" content.
+	// The emitter still has to clear the hull: at +11 the pool fell under the tank, so the apex stays at
+	// +14 while the cone (not the position) carries the light forward.
 	const Vector3 fwd = worldMtx.Get_X_Vector();
 	Vector3 pos = worldMtx.Get_Translation();
-	pos += fwd * 22.0f;
+	pos += fwd * 14.0f;
 	pos.Z += 5.0f;
 	light->Set_Position(pos);
 	light->Set_Ambient(Vector3(0.0f, 0.0f, 0.0f));
 	light->Set_Diffuse(Vector3(1.0f, 0.92f, 0.78f));
 	light->Set_Intensity(1.4f);
-	light->Set_Far_Attenuation_Range(3.0f, 45.0f);
+	light->Set_Far_Attenuation_Range(3.0f, 52.0f);
+
+	static const Bool s_cone = [] {
+		const char* ev = getenv("GENERALSX_HEADLIGHT_SPOT");
+		return (ev != nullptr && *ev != 0) ? (atoi(ev) != 0) : 1;   // default ON: direction is authored by the hull
+	}();
+	light->Set_Type(s_cone ? LightClass::SPOT : LightClass::POINT);
+	light->Set_Forward_Cookie(s_cone ? 10 : 0);
+	if (s_cone)
+	{
+		Vector3 axis = fwd;
+		axis.Z -= 0.14f * axis.Length();		// aim at the road, not the horizon
+		if (axis.Length() > 1e-3f)
+			axis.Normalize();
+		else
+			axis.Set(1.0f, 0.0f, 0.0f);
+		light->Set_Spot_Angle(0.61f);			// 35 degrees outer half-angle: a wide but directional low beam
+		light->Set_Spot_Direction(axis);
+		light->Set_Spot_Exponent(1.35f);		// a soft edge, no hard circle
+		static Int s_logs = 0;
+		if (getenv("GENERALSX_LAMPLIGHT_LOG") != nullptr && atoi(getenv("GENERALSX_LAMPLIGHT_LOG")) != 0 &&
+			s_logs < 3)
+		{
+			++s_logs;
+			fprintf(stderr, "[HEADLIGHT] cone tpl=%s axis=(%.2f,%.2f,%.2f) angle=35 cookie=10\n",
+				draw->getTemplate()->getName().str(), axis.X, axis.Y, axis.Z);
+			fflush(stderr);
+		}
+	}
 }
 
 void W3DModelDraw::releaseHeadlights()
@@ -2432,6 +2586,10 @@ void W3DModelDraw::releaseHeadlights()
 		m_headlightLight->setFrameFade(0, 5);
 		m_headlightLight->setDecayRange();
 		m_headlightLight->setDecayColor();
+		// GeneralsX @feature 24/10/2026 P34 D6: never hand a cone back to the pool, or the next borrower
+		// (a muzzle flash, an explosion) would inherit the vehicle's headlight direction and cookie.
+		m_headlightLight->Set_Type(LightClass::POINT);
+		m_headlightLight->Set_Forward_Cookie(0);
 		m_headlightLight = nullptr;
 	}
 }

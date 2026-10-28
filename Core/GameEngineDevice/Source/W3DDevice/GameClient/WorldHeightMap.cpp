@@ -2455,7 +2455,14 @@ TextureClass *WorldHeightMap::getTerrainTexture()
 		REF_PTR_RELEASE(m_terrainNMTex);
 		if (W3DShaderManager::isTerrainNormalEnabled())
 		{
-			m_terrainNMTex = MSGNEW("WorldHeightMap_getTerrainTexture") TerrainTextureClass(pow2Height);
+			// GeneralsX @feature 24/10/2026 P25 C8: no mip chain for the normal atlas (see the ctor note).
+			// GENERALSX_TERRAIN_NM_MIPS=1 restores the old chain for a same-build A/B.
+			static int s_nmMips = -1;
+			if (s_nmMips < 0) {
+				const char* ev = getenv("GENERALSX_TERRAIN_NM_MIPS");
+				s_nmMips = (ev != nullptr && *ev != 0 && atoi(ev) != 0) ? 1 : 0;
+			}
+			m_terrainNMTex = MSGNEW("WorldHeightMap_getTerrainTexture") TerrainTextureClass(pow2Height, s_nmMips != 0);
 			m_terrainNMHeight = m_terrainNMTex->updateNM(this);
 			if (m_terrainNMHeight <= 0) {
 				// Builder refused (atlas format without 8-bit channels, etc.) - drop the atlas.

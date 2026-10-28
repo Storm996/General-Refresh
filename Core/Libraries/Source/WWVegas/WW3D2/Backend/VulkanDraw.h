@@ -26,6 +26,8 @@
 #ifndef GENERALSX_VULKANDRAW_H
 #define GENERALSX_VULKANDRAW_H
 
+#include "VkLightingLayout.h"   // P34 E3/E4: shadow-map layout shared by the Forward+ block and FF state
+
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
 
 #define VKDRAW_MAX_STREAMS 8
@@ -139,7 +141,9 @@ struct VKDraw_PSO_Key {
 // GeneralsX @bugfix Qoder 19/10/2026 BUG-03: 1824 -> 2336. The eight D3DTS_TEXTUREn matrices are appended
 // after them; the terrain passes project camera-space positions with TEXTURE2/3 and nothing rendered right
 // without them (see VKDraw_FF_State::tex_mat).
-#define VKFF_STATE_BYTES 2336u
+// GeneralsX @feature 24/10/2026 P34 E4: 2336 -> 2656. Four light-shadow maps are appended so the
+// fixed-function pixel stage can darken the dynamic light it is actually lit by (see light_shadow).
+#define VKFF_STATE_BYTES 2656u
 #define VKFF_LIGHT_VEC4  7u
 #define VKFF_MAX_STAGES  8u
 
@@ -162,6 +166,10 @@ struct VKDraw_PSO_Key {
 // gl_PointCoord, so the pixel stage substitutes it for the stage's coordinate set 0. Point SIZE is a
 // separate state (D3DRS_POINTSIZE and the scale registers), so this bit only decides the UV source.
 #define VKFF_FLAG_POINT_SPRITE    (1u << 10)
+// GeneralsX @feature 26/10/2026 HDR: this batch writes linear colour into the HDR scene target. The
+// packer converts material/light/fog colours, the vertex stage converts D3DCOLOR vertex colours, and
+// the pixel stage drops the legacy [0,1] clamp. The UI overlay never sets it.
+#define VKFF_FLAG_LINEAR          (1u << 12)
 
 // flags.y packs the small enums: light mask in bits 0..7, texture-coordinate set count in 8..10,
 // vertex fog mode in 11..13, table fog mode in 14..16, and the four material colour sources two bits
@@ -265,6 +273,11 @@ struct VKDraw_FF_State {
     // taken from DX8Wrapper::DX8Transforms with the device-default identity standing in for never-written
     // slots (the shadow is memset to zero by Set_Transform_Dirty).
     float   tex_mat[VKFF_MAX_STAGES][16];   // +1824  8 * 64 = 512, ends +2336
+    // GeneralsX @feature 24/10/2026 P34 E4: the four light-shadow maps, byte-identical to the Forward+
+    // block's fpLightShadow[20] (four slots x (4 row-vector VP rows + light xyz/gateRange)). The FF pixel
+    // stage matches a map to a light by position because its light list is the mesh's own environment,
+    // not the Forward+ order. vkff.vert declares the same trailing member so the shared block stays legal.
+    float   light_shadow[VkLighting::kShadowVec4 * 4];   // +2336  20 vec4 = 320, ends +2656
 };
 
 // One indexed draw, fully described: no hidden device state is consulted at submit time, because on
@@ -429,6 +442,9 @@ void VKDraw_Set_Shadow_Receiver(bool receive);
 // exactly the pipelines they did before.
 void VKDraw_Material_Bind(unsigned family, unsigned features, unsigned variant, unsigned pass,
                           unsigned long long pipelineKey);
+// GeneralsX @feature 26/10/2026 HDR: true while recording into the linear scene target (HDR on and
+// not the UI overlay). Texture binding uses it to pick the sRGB view for colour stages.
+bool VKDraw_Linear_Scene_Active();
 // Sky cubemap path: five face textures (N/E/S/W/T) are uploaded into one VkImage cube; the fullscreen
 // sky draw replaces the retail five-face mesh when the cubemap and pipeline are ready.
 class TextureClass;
@@ -445,6 +461,17 @@ bool VKDraw_Graph_Target_Desc(unsigned* sceneW, unsigned* sceneH, unsigned* colo
 bool VKDraw_Graph_Alloc_Target(const char* name, unsigned width, unsigned height,
                                unsigned format, bool depth);
 void VKDraw_Graph_Free_Target(const char* name);
+// 6B: P6 bloom intermediates (bloom0..4) are described here so W3DRenderGraph allocates/releases them.
+// count=0 means the chain is not wanted this frame (bloom off, auto-exposure off, or parity).
+bool VKDraw_Graph_Post_Target_Desc(unsigned* count, unsigned* width, unsigned* height,
+                                   unsigned* format);
+// 6B: the water reflection image. The engine's RT wrapper creates the texture; the graph adopts the
+// key here, and then owns its barrier/lifetime through the normal graph target path.
+bool VKDraw_Graph_Water_Target_Desc(void** key, unsigned* width, unsigned* height, unsigned* format);
+void VKDraw_Graph_Adopt_Target(const char* name, void* key);
+// 6B: release an adopted image by key (the graph never allocated it). Retires it through VKRT so a
+// frame still in flight can finish naming it.
+void VKDraw_Graph_Free_Target_Key(void* key);
 
 // GeneralsX @feature 23/10/2026 P6 "底片/镜头": resolve the 3D scene into the LDR UI overlay before
 // the HUD is drawn, so tonemap/bloom/FXAA/SSAA never touch the UI. No-op unless HDR, a render scale
@@ -466,10 +493,20 @@ void VKDraw_Shadow_Reset();
 // projection*view in row-major memory and is transposed here for GLSL. Returns false when the Vulkan core is off, no pass
 // is open, or the instance payload is empty - the caller then keeps the retail billboard path.
 bool VKDraw_Vegetation_Ready();
-// GeneralsX @feature Qoder 22/10/2026 light shadows: the strongest dynamic light's own shadow map, as
-// this frame built it. False when the feature is off or has no map/light; the caller then leaves the
-// receiver constants disabled. The VP is row-vector (D3D) and projects world -> light clip (0..1 z).
-bool VKDraw_LightShadow_Info(float vp[16], float pos_range[4]);
+// GeneralsX @feature Qoder 22/10/2026 light shadows, extended 24/10/2026 P34 E3 to four maps: slot s
+// holds the map for light-list slot s. False when the feature is off or that slot has no map this frame.
+// The VP is row-vector (D3D) and projects world -> light clip (0..1 z).
+bool VKDraw_LightShadow_Info(int slot, float vp[16], float pos_range[4]);
+int  VKDraw_LightShadow_Count();
+void* VKDraw_LightShadow_View(int slot);   // VkImageView for the scene descriptor set (nullptr = empty)
+// C4: the retail sky cubemap as a sampled cube (nullptr until the sky faces are uploaded).
+void* VKDraw_Sky_View();
+void* VKDraw_Sky_Sampler();
+// C4: publish the shared lighting snapshot into the shaders' fpEnv[] block (sun/sky/ground/fill plus the
+// environment-reflection strength; 0 disables the sky term). Called from W3D_RefreshRenderLighting().
+void VKDraw_Set_Environment(const float sun_dir[3], const float sun_color[3], const float sky_color[3],
+                            const float ground_color[3], const float fill_dir[3], const float fill_color[3],
+                            float reflect_strength);
 // Explicit vegetation PSO bind: the grass material calls this before its instance draw.
 bool VKDraw_Vegetation_Bind();
 bool VKDraw_Vegetation_Draw(const void* grass, unsigned grass_count,

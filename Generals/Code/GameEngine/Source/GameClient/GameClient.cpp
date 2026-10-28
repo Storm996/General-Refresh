@@ -423,6 +423,14 @@ void GameClient::init()
 
 	m_intro = NEW Intro;
 
+	// GeneralsX @feature 25/10/2026 Launcher boot: no intro, so GameClient::update does not
+	// early-return before the HUD is drawn.
+	if (TheGlobalData->m_skipMainMenu)
+	{
+		delete m_intro;
+		m_intro = nullptr;
+	}
+
 #ifdef PERF_TIMERS
 	TheGraphDraw = new GraphDraw;
 #endif

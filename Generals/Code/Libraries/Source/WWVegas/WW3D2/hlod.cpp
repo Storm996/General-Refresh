@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -121,7 +121,7 @@
  *   HLodClass::Set_HTree -- replace the hierarchy tree                                        *
  *   HLodClass::Get_Proxy_Count -- Returns the number of proxy objects                         *
  *   HLodClass::Get_Proxy -- returns the information for the i'th proxy                        *
- * HLodClass::Set_Hidden -- Propogates the hidden bit to particle emitters.                    *
+ * HLodClass::Set_Hidden -- Propagates the hidden bit to particle emitters.                    *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 
@@ -365,7 +365,7 @@ void HLodDefClass::Initialize(HLodClass &src_lod)
 	// Start with a fresh set of data
 	Free ();
 
-	// Copy the name and hierarcy name from the source object
+	// Copy the name and hierarchy name from the source object
 	Name = ::strdup (src_lod.Get_Name ());
 	const HTreeClass *phtree = src_lod.Get_HTree ();
 	if (phtree != nullptr) {
@@ -3500,6 +3500,14 @@ void HLodClass::Add_Lod_Model(int lod, RenderObjClass * robj, int boneindex)
 {
 	WWASSERT(robj != nullptr);
 
+	// (gth) survive the case where the skeleton for this object no longer has
+	// the bone that we're trying to use.  This happens when a skeleton is re-exported
+	// but the models that depend on it aren't re-exported...
+	if (boneindex >= HTree->Num_Pivots()) {
+		WWDEBUG_SAY(("ERROR: Model %s tried to use bone %d in skeleton %s.  Please re-export!",Get_Name(),boneindex,HTree->Get_Name()));
+		boneindex = 0;
+	}
+
 	ModelNodeClass newnode;
 	newnode.Model = robj;
 	newnode.Model->Add_Ref();
@@ -3588,7 +3596,7 @@ void HLodClass::Set_HTree(HTreeClass * htree)
 
 
 /***********************************************************************************************
- * HLodClass::Set_Hidden -- Propogates the hidden bit to particle emitters.                    *
+ * HLodClass::Set_Hidden -- Propagates the hidden bit to particle emitters.                    *
  *                                                                                             *
  * INPUT:                                                                                      *
  *                                                                                             *

@@ -61,6 +61,8 @@ render clouds and sky bodies.
 */
 #include "W3DDevice/GameClient/W3DMaterialInstance.h"
 
+class ZTextureClass;	// WW3D2 depth-target wrapper used by the sea reflection pair
+
 // Phase 5B.3: water material identity. The three water draw paths share this record instead of
 // each building a throw-away W3DMaterialInstance and each poking the same stage/blend/texture state.
 // Bind() now owns the family/features/variant descriptor, the texture set, the fixed-function stage
@@ -210,6 +212,7 @@ protected:
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
+	ZTextureClass * m_pReflectionDepth;	///<depth for the reflection target (same size; the recorder needs a matching pair)
 	WaterTracksRenderSystem *m_waterTrackSystem;	///<object responsible for rendering water wakes
 
 	enum WaterMeshStatus

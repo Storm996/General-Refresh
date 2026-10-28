@@ -39,7 +39,7 @@ struct W3DMaterialInstance
 
 // Phase 5A: one material entry point for every family. It binds the texture set, publishes the
 // material key to the backend (family/features/variant/pass), and applies the shared shadow flags.
-// The actual executor (DX8Renderer, terrain PS30, TREE30, vegetation, water, sky) is still the legacy
+// The actual executor (DX8Renderer, terrain PS30, vegetation, water, sky) is still the legacy
 // path until Phase 5B replaces it; this is the seam that lets those executors disappear one at a time.
 class W3DMaterialBinder
 {

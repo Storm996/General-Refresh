@@ -502,6 +502,140 @@ void SortingRendererClass::Flush_Sorting_Pool()
 			// it is because D3D is in illegal state, and the only known cure is rebooting.
 			// This illegal state is usually caused by Quake3-engine powered games such as MOHAA.
 			memcpy(dest_verts, src_verts, sizeof(VertexFormatXYZNDUV2)*state->vertex_count);
+
+			// GeneralsX @debug 24/10/2026 ROTORPROBE: the rotor blur discs reach the pool and are flushed
+			// but still do not show on screen, so dump the geometry the batch will draw and the state it
+			// will be drawn with (cull / depth / alpha test / vertex diffuse).
+			{
+				static int s_rotorProbe = 0;
+				const char *rn = state->sorting_state.Textures[0]
+					? (const char *)state->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+				if (s_rotorProbe < 6 && rn && strstr(rn, "avcomanche_p")) {
+					++s_rotorProbe;
+					const D3DXMATRIX &w = (const D3DXMATRIX &)state->sorting_state.world;
+					fprintf(stderr,
+						"[ROTORPROBE] #%d polys=%u verts=%u start=%u minv=%u vba=%u iba=%u "
+						"cull=%u zcmp=%u zwrite=%u atest=%u | "
+						"d0=%08x d1=%08x d2=%08x | v0=(%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f) v2=(%.2f,%.2f,%.2f) "
+						"| world=(%.1f,%.1f,%.1f) view=(%.1f,%.1f,%.1f)\n",
+						s_rotorProbe, (unsigned)state->polygon_count, (unsigned)state->vertex_count,
+						(unsigned)state->start_index, (unsigned)state->min_vertex_index,
+						(unsigned)state->sorting_state.vba_offset, (unsigned)state->sorting_state.iba_offset,
+						(unsigned)state->sorting_state.shader.Get_Cull_Mode(),
+						(unsigned)state->sorting_state.shader.Get_Depth_Compare(),
+						(unsigned)state->sorting_state.shader.Get_Depth_Mask(),
+						(unsigned)state->sorting_state.shader.Get_Alpha_Test(),
+						(unsigned)src_verts[0].diffuse, (unsigned)src_verts[1].diffuse, (unsigned)src_verts[2].diffuse,
+						(double)src_verts[0].x, (double)src_verts[0].y, (double)src_verts[0].z,
+						(double)src_verts[1].x, (double)src_verts[1].y, (double)src_verts[1].z,
+						(double)src_verts[2].x, (double)src_verts[2].y, (double)src_verts[2].z,
+						(double)w._41, (double)w._42, (double)w._43,
+						(double)state->sorting_state.view[3][0], (double)state->sorting_state.view[3][1],
+						(double)state->sorting_state.view[3][2]);
+					fflush(stderr);
+
+					// GeneralsX @debug 25/10/2026 ROTORUV: the last unknown of the invisible rotor disc is
+					// the alpha the fixed-function sampler will read. Print the stage-0 coordinate source and
+					// decode the BC3 alpha texel under the first three vertices straight from the managed D3D
+					// texture, so "wrong UV set" and "alpha is really zero" stop looking alike.
+					{
+						TextureBaseClass* rtb = state->sorting_state.Textures[0];
+						TextureClass* rtc = rtb ? rtb->As_TextureClass() : nullptr;
+						const unsigned tci0 = DX8Wrapper::VK_Read_TSS(0, D3DTSS_TEXCOORDINDEX, 0);
+						// GeneralsX @debug 25/10/2026 ROTORW: the address and first vertices the pool just
+						// wrote. Compared with ROTORBUF's read address at draw time this separates "the
+						// draw binds another region" from "the region was overwritten in between".
+						fprintf(stderr, "[ROTORW] #%d dest=%p v0=(%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f) uv1=(%.3f,%.3f)\n",
+							s_rotorProbe, (const void*)dest_verts,
+							(double)dest_verts[0].x, (double)dest_verts[0].y, (double)dest_verts[0].z,
+							(double)dest_verts[1].x, (double)dest_verts[1].y, (double)dest_verts[1].z,
+							(double)dest_verts[0].u1, (double)dest_verts[0].v1);
+						fflush(stderr);
+
+						fprintf(stderr, "[ROTORUV] #%d tci0=%u fmt=%d %dx%d uv0=(%.3f,%.3f) uv1=(%.3f,%.3f) uv2=(%.3f,%.3f)\n",
+							s_rotorProbe, tci0, rtc ? (int)rtc->Get_Texture_Format() : -1,
+							rtc ? rtc->Get_Width() : 0, rtc ? rtc->Get_Height() : 0,
+							(double)src_verts[0].u1, (double)src_verts[0].v1,
+							(double)src_verts[1].u1, (double)src_verts[1].v1,
+							(double)src_verts[2].u1, (double)src_verts[2].v1);
+						IDirect3DTexture9* rd3dt = rtc ? rtc->Peek_D3D_Texture() : nullptr;
+						D3DLOCKED_RECT rlr;
+						if (rd3dt && SUCCEEDED(rd3dt->LockRect(0, &rlr, nullptr, D3DLOCK_READONLY))) {
+							const unsigned char* rbase = (const unsigned char*)rlr.pBits;
+							const int rw = rtc->Get_Width(), rh = rtc->Get_Height();
+							for (int vi = 0; vi < 3; ++vi) {
+								const float uu = src_verts[vi].u1, vv = src_verts[vi].v1;
+								if (uu < 0.0f || uu > 1.0f || vv < 0.0f || vv > 1.0f) {
+									fprintf(stderr, "[ROTORUV]   v%d uv outside [0,1]\n", vi);
+									continue;
+								}
+								const int px = (int)(uu * (float)(rw - 1) + 0.5f);
+								const int py = (int)(vv * (float)(rh - 1) + 0.5f);
+								const unsigned char* blk = rbase + (py / 4) * rlr.Pitch + (px / 4) * 16;
+								const unsigned a0 = blk[0], a1 = blk[1];
+								unsigned long long abits = 0ull;
+								for (int b = 0; b < 6; ++b) abits |= (unsigned long long)blk[2 + b] << (8 * b);
+								const unsigned aidx = (unsigned)((abits >> (3 * ((px & 3) + (py & 3) * 4))) & 7u);
+								int aval;
+								if (a0 > a1) {
+									if (aidx == 0) aval = (int)a0;
+									else if (aidx == 1) aval = (int)a1;
+									else aval = (int)(((8u - aidx) * a0 + (aidx - 1u) * a1) / 7u);
+								} else {
+									if (aidx == 0) aval = (int)a0;
+									else if (aidx == 1) aval = (int)a1;
+									else if (aidx == 6) aval = 0;
+									else if (aidx == 7) aval = 255;
+									else aval = (int)(((6u - aidx) * a0 + (aidx - 1u) * a1) / 5u);
+								}
+								fprintf(stderr, "[ROTORUV]   v%d px=(%d,%d) a0=%u a1=%u idx=%u alpha=%d\n",
+									vi, px, py, a0, a1, aidx, aval);
+							}
+							rd3dt->UnlockRect(0);
+						} else {
+							fprintf(stderr, "[ROTORUV]   texture lock failed\n");
+						}
+						fflush(stderr);
+					}
+
+					// Where is that disc on screen? Camera-space centre through world*view, then NDC
+					// through the projection diagonal (a transpose does not touch [0][0]/[1][1]).
+					{
+						D3DXMATRIX wm = (const D3DXMATRIX &)state->sorting_state.world;
+						D3DXMATRIX vm = (const D3DXMATRIX &)state->sorting_state.view;
+						D3DXMATRIX wv = wm * vm;
+						D3DXVECTOR4 c;
+						D3DXVECTOR3 origin(0.0f, 0.0f, 0.0f);
+						D3DXVec3Transform(&c, &origin, &wv);
+						Matrix4x4 pm4;
+						DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, pm4);
+						const float p00 = pm4[0][0], p11 = pm4[1][1];
+						const float ndcx = (c.w > 1e-4f) ? (c.x * p00 / c.w) : 999.0f;
+						const float ndcy = (c.w > 1e-4f) ? (c.y * p11 / c.w) : 999.0f;
+						fprintf(stderr, "[ROTORSCREEN] cam=(%.1f,%.1f,%.1f) p00=%.4f p11=%.4f ndc=(%.3f,%.3f)\n",
+							(double)c.x, (double)c.y, (double)c.w, (double)p00, (double)p11,
+							(double)ndcx, (double)ndcy);
+						fflush(stderr);
+						fprintf(stderr, "[ROTORWORLD] r0=(%.3f,%.3f,%.3f) r1=(%.3f,%.3f,%.3f) r2=(%.3f,%.3f,%.3f) r3=(%.3f,%.3f,%.3f)\n",
+							(double)w._11, (double)w._12, (double)w._13,
+							(double)w._21, (double)w._22, (double)w._23,
+							(double)w._31, (double)w._32, (double)w._33,
+							(double)w._41, (double)w._42, (double)w._43);
+						fflush(stderr);
+					}
+				}
+			}
+			// GeneralsX @debug 24/10/2026 ROTORPROBE: solid magenta vertices for the debug draw above.
+			{
+				static int s_rotorTint = -1;
+				if (s_rotorTint < 0) s_rotorTint = getenv("GENERALSX_ROTOR_DEBUG") ? 1 : 0;
+				const char *tn = state->sorting_state.Textures[0]
+					? (const char *)state->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+				if (s_rotorTint && tn && strstr(tn, "avcomanche_p")) {
+					for (unsigned v = 0; v < state->vertex_count; ++v)
+						dest_verts[v].diffuse = 0xFFFF00FFu;
+				}
+			}
 			dest_verts += state->vertex_count;
 
 			D3DXMATRIX d3d_mtx=(D3DXMATRIX&)state->sorting_state.world*(D3DXMATRIX&)state->sorting_state.view;
@@ -570,8 +704,78 @@ void SortingRendererClass::Flush_Sorting_Pool()
 	}
 	if (vk14p) { vkf14b::g_seg[vkf14b::SEG_VCOPY].us += vkf14b::now_us() - t_vcopy; vkf14b::g_seg[vkf14b::SEG_VCOPY].cnt++; }
 
+	// GeneralsX @debug 24/10/2026 ROTORPROBE: A/B only the rotor discs' cull bit, so one run says
+	// whether the invisible propeller is a winding/cull decision or something downstream of it.
+	{
+		static int s_rotorNoCull = -1;
+		if (s_rotorNoCull < 0) s_rotorNoCull = getenv("GENERALSX_ROTOR_NOCULL") ? 1 : 0;
+		if (s_rotorNoCull) {
+			for (unsigned n = 0; n < overlapping_node_count; ++n) {
+				SortingNodeStruct *st = overlapping_nodes[n];
+				const char *tn = st->sorting_state.Textures[0]
+					? (const char *)st->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+				if (tn && strstr(tn, "avcomanche_p"))
+					st->sorting_state.shader.Set_Cull_Mode(ShaderClass::CULL_MODE_DISABLE);
+			}
+		}
+	}
+
 	if (vk14p) { vkf14b::Scope s(vk14p, vkf14b::SEG_SORT); (void)s;
 	Sort(tis, tis + overlapping_polygon_count); }
+
+	// GeneralsX @debug 24/10/2026 ROTORPROBE: untextured magenta rotor discs, opaque and unculled.
+	// If nothing magenta appears the batch never reaches the raster at all; if it does, the invisible
+	// propeller is a texture/alpha/lighting problem, not geometry or culling.
+	{
+		static int s_rotorDebug = -1;
+		if (s_rotorDebug < 0) s_rotorDebug = getenv("GENERALSX_ROTOR_DEBUG") ? 1 : 0;
+		if (s_rotorDebug) {
+			for (unsigned n = 0; n < overlapping_node_count; ++n) {
+				SortingNodeStruct *st = overlapping_nodes[n];
+				const char *tn = st->sorting_state.Textures[0]
+					? (const char *)st->sorting_state.Textures[0]->Get_Texture_Name() : nullptr;
+				if (!tn || !strstr(tn, "avcomanche_p")) continue;
+				st->sorting_state.shader = ShaderClass::_PresetOpaqueSolidShader;
+				st->sorting_state.shader.Set_Cull_Mode(ShaderClass::CULL_MODE_DISABLE);
+				st->sorting_state.shader.Set_Depth_Mask(ShaderClass::DEPTH_WRITE_DISABLE);
+				st->sorting_state.shader.Set_Depth_Compare(ShaderClass::PASS_ALWAYS);
+				// GeneralsX @debug 25/10/2026 ROTORFLAT: vertex tint alone was not visible because the
+				// solid preset routes the diffuse material source, not the vertex colour. Paint the
+				// material itself so a magenta disc proves the batch reaches the rasteriser.
+				if (st->sorting_state.material) {
+					st->sorting_state.material->Set_Diffuse(1.0f, 0.0f, 1.0f);
+					st->sorting_state.material->Set_Ambient(1.0f, 0.0f, 1.0f);
+				}
+				// Where does the disc land? Two-step world->view so no matrix-product convention is
+				// guessed at, then NDC through the projection diagonal (transpose-invariant).
+				{
+					static unsigned s_ndcTick = 0, s_ndcLog = 0;
+					if ((++s_ndcTick % 45u) == 0u && s_ndcLog < 60u) {
+						++s_ndcLog;
+						D3DXMATRIX wm = (const D3DXMATRIX &)st->sorting_state.world;
+						D3DXMATRIX vm = (const D3DXMATRIX &)st->sorting_state.view;
+						D3DXVECTOR3 o(0.0f, 0.0f, 0.0f);
+						D3DXVECTOR4 wp;
+						D3DXVec3Transform(&wp, &o, &wm);
+						D3DXVECTOR3 wp3(wp.x, wp.y, wp.z);
+						D3DXVECTOR4 cp;
+						D3DXVec3Transform(&cp, &wp3, &vm);
+						Matrix4x4 pm4;
+						DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, pm4);
+						const float p00 = pm4[0][0], p11 = pm4[1][1];
+						const float ndcx = (cp.z > 1e-4f) ? (cp.x * p00 / cp.z) : 999.0f;
+						const float ndcy = (cp.z > 1e-4f) ? (cp.y * p11 / cp.z) : 999.0f;
+						fprintf(stderr, "[ROTORNDC] cam=(%.1f,%.1f,%.1f) p00=%.3f p11=%.3f ndc=(%.2f,%.2f)\n",
+							(double)cp.x, (double)cp.y, (double)cp.z,
+							(double)p00, (double)p11, (double)ndcx, (double)ndcy);
+						fflush(stderr);
+					}
+				}
+				// White stage-0 tap so MODULATE(texture, vertexColour) resolves to the tinted vertices.
+				REF_PTR_RELEASE(st->sorting_state.Textures[0]);
+			}
+		}
+	}
 
 	// TheSuperHackers @fix stephanmeesters 10/06/2026
 	// Split rendering into chunks to prevent a crash when exceeding the 16-bit index buffer limit.
@@ -737,8 +941,12 @@ void SortingRendererClass::Flush()
 
 		if ((state->sorting_state.index_buffer_type==BUFFER_TYPE_SORTING || state->sorting_state.index_buffer_type==BUFFER_TYPE_DYNAMIC_SORTING) &&
 			(state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_SORTING || state->sorting_state.vertex_buffer_types[0]==BUFFER_TYPE_DYNAMIC_SORTING)) {
-			if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_POOLINS); (void)s;
-			Insert_To_Sorting_Pool(state); }
+			// GeneralsX @bugfix 24/10/2026: the R-05 segment timer used to wrap the call itself, so a
+			// normal run (GENERALSX_VKFPS_PHASES unset) never inserted the node into the pool and every
+			// sorted mesh batch was silently dropped - the rotor blur discs (PROPS01/02) among them.
+			// Only the measurement is gated now; the insert always runs.
+			vkf14b::Scope s(vk14, vkf14b::SEG_POOLINS);
+			Insert_To_Sorting_Pool(state);
 		}
 		else {
 			{
@@ -765,21 +973,30 @@ void SortingRendererClass::Flush()
 
 	bool old_enable=DX8Wrapper::_Is_Triangle_Draw_Enabled();
 	DX8Wrapper::_Enable_Triangle_Draw(_EnableTriangleDraw);
-	if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_POOL); (void)s;
-	Flush_Sorting_Pool(); }
+	{
+		// GeneralsX @bugfix 24/10/2026: Flush_Sorting_Pool is the draw of every pooled batch, and it
+		// used to live inside the GENERALSX_VKFPS_PHASES gate; with the probe off the pool was never
+		// flushed, so sorted geometry never reached the GPU. The timer is what is gated, not the draw.
+		vkf14b::Scope s(vk14, vkf14b::SEG_POOL);
+		Flush_Sorting_Pool();
+	}
 	DX8Wrapper::_Enable_Triangle_Draw(old_enable);
 
-	if (vk14) { vkf14b::Scope s(true, vkf14b::SEG_RESET); (void)s;
-	DX8Wrapper::Set_Index_Buffer(nullptr,0);
-	DX8Wrapper::Set_Vertex_Buffer(nullptr);
-	total_sorting_vertices=0;
+	{
+		// GeneralsX @bugfix 24/10/2026: same gate bug - the per-frame reset of the dynamic buffer
+		// rings and the VIEW/WORLD restore must happen on every run, not only under the FPS probe.
+		vkf14b::Scope s(vk14, vkf14b::SEG_RESET);
+		DX8Wrapper::Set_Index_Buffer(nullptr,0);
+		DX8Wrapper::Set_Vertex_Buffer(nullptr);
+		total_sorting_vertices=0;
 
-	DynamicIBAccessClass::_Reset(false);
-	DynamicVBAccessClass::_Reset(false);
+		DynamicIBAccessClass::_Reset(false);
+		DynamicVBAccessClass::_Reset(false);
 
 
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,old_view);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,old_world); }
+		DX8Wrapper::Set_Transform(D3DTS_VIEW,old_view);
+		DX8Wrapper::Set_Transform(D3DTS_WORLD,old_world);
+	}
 
 }
 

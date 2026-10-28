@@ -371,6 +371,14 @@ public:
 	AsciiString m_loadSaveGame;				///< If this is specified, load a save game file from the command-line
 	AsciiString m_loadReplayGame;			///< If this is specified, play a replay file from the command-line
 
+	// GeneralsX @feature 25/10/2026 External launcher boot contract. Presentation only.
+	Bool m_skipMainMenu;						///< Do not push Menus/MainMenu.wnd during startup.
+	AsciiString m_launcherScreen;			///< Optional shell layout to push instead of the main menu.
+	AsciiString m_skirmishSpec;			///< -skirmish spec: map;aiCount;difficulty;style;seed;fps
+	AsciiString m_campaignSpec;			///< -campaign spec: campaign;mission;difficulty
+	AsciiString m_challengeSpec;			///< -challenge spec: personaIndex;difficulty
+	AsciiString m_keyMapFile;			///< -keymap: user key-binding overrides
+
 	// GeneralsX @feature Qoder 11/10/2026 AI-editable map logic dumper (-dumplogic). Read-only tool.
 	Bool m_dumpMapLogic;						///< If true, after map scripts load, dump logic layer to text sidecars and exit.
 	AsciiString m_dumpMapLogicDir;			///< Destination directory for dumped sidecars (empty = beside the .map).
@@ -422,7 +430,6 @@ public:
 																			 units will always keep their formation. If it's <1.0, then the user must click a
 																			 smaller area within the rectangle to order the gather. */
 
-	UnsignedInt m_antiAliasLevel;          ///< value of selected antialias level in the game options
 	UnsignedInt m_textureFilteringMode;       ///< value related to TextureFilterClass::TextureFilterModeEnum
 	UnsignedInt m_textureAnisotropyLevel;     ///< value related to TextureFilterClass::AnisotropicFilterMode
 

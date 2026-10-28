@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -235,7 +235,7 @@ Bool W3DBridge::load(BodyDamageType curDamageState)
 	char section[_MAX_PATH];
 	char right[_MAX_PATH];
 
-	static_assert(ARRAY_SIZE(left) >= ARRAY_SIZE(section), "Incorrect array size");
+	static_assert(ARRAY_SIZE(left) >= ARRAY_SIZE(modelName), "Incorrect array size");
 	static_assert(ARRAY_SIZE(section) >= ARRAY_SIZE(modelName), "Incorrect array size");
 	static_assert(ARRAY_SIZE(right) >= ARRAY_SIZE(modelName), "Incorrect array size");
 	strcpy(left, modelName);
@@ -435,8 +435,6 @@ Int W3DBridge::getModelVertices(VertexFormatXYZNDUV1 *destination_vb, Int curVer
 	VertexFormatXYZNDUV1 *curVb = destination_vb+curVertex;
 
 	for (i=0; i<numVertex; i++) {
-		curVb->u1 = uvs[i].U;
-		curVb->v1 = uvs[i].V;
 		Vector3 vLoc;
 		Vector3 vertex;
 		Matrix3D::Transform_Vector(mtx, pVert[i], &vertex);
@@ -457,17 +455,22 @@ Int W3DBridge::getModelVertices(VertexFormatXYZNDUV1 *destination_vb, Int curVer
 
 		Vector3 normal;
 		Matrix3D::Rotate_Vector(mtx, pNormal[i], &normal);
-		curVb->diffuse = 0xFF000000;
 #ifdef USE_BRIDGE_NORMALS
 		curVb->nx = normal.X;
 		curVb->ny = normal.Y;
 		curVb->nz = normal.Z;
+		curVb->diffuse = 0xFF000000;
 #else
 		normal = (normal.X) * vec + normal.Y*vecNormal + normal.Z*vecZ;
 		normal.Normalize();
 		TheTerrainRenderObject->doTheLight(&vb, lightRay, &normal, nullptr, 1.0f);
+		curVb->nx = 0;	//will these to keep AGP write buffer happy.
+		curVb->ny = 0;
+		curVb->nz = 1;
 		curVb->diffuse = vb.diffuse | 0xFF000000;
 #endif
+		curVb->u1 = uvs[i].U;
+		curVb->v1 = uvs[i].V;
 		curVb++;
 	}
 	return(numVertex);
@@ -688,6 +691,13 @@ void W3DBridgeBuffer::cull(CameraClass * camera)
 //=============================================================================
 /** Loads the bridges into the vertex buffer for drawing. */
 //=============================================================================
+void W3DBridgeBuffer::updateLighting()
+{
+	// Bridge vertex colours come from the current GlobalData light table; the iterator is only an
+	// optional per-object light source, and the revision path has none to hand.
+	loadBridgesInVertexAndIndexBuffers(nullptr);
+}
+
 void W3DBridgeBuffer::loadBridgesInVertexAndIndexBuffers(RefRenderObjListIterator *pLightsIterator)
 {
 	if (!m_indexBridge || !m_vertexBridge || !m_initialized) {
@@ -698,8 +708,8 @@ void W3DBridgeBuffer::loadBridgesInVertexAndIndexBuffers(RefRenderObjListIterato
 	VertexFormatXYZNDUV1 *vb;
 	UnsignedShort *ib;
 	// Lock the buffers.
-	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexBridge);
-	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexBridge);
+	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexBridge, D3DLOCK_DISCARD);
+	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexBridge, D3DLOCK_DISCARD);
 	vb=(VertexFormatXYZNDUV1*)lockVtxBuffer.Get_Vertex_Array();
 	ib = lockIdxBuffer.Get_Index_Array();
 

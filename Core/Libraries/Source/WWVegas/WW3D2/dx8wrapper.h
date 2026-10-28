@@ -260,6 +260,36 @@ struct RenderStateStruct
 	RenderStateStruct& operator= (const RenderStateStruct& src);
 };
 
+// GeneralsX @feature 26/10/2026 volumetric fog: the game layer resolves TOD/weather into this POD and
+// pushes it through DX8Wrapper, so the WW3D2 Vulkan backend never includes game headers. mode is the
+// quality tier: 0 off, 1 analytic height fog, 2 height fog + 8-step sun shafts, 3 + 16-step shafts.
+struct VKAtmosphereFogParams
+{
+	int   mode;
+	float density;			///< extinction at baseHeight, inverse world units
+	float heightFalloff;	///< 1 / scale height
+	float baseHeight;
+	float startDistance;	///< world units before fog starts (RTS near-field clarity)
+	float fadeLength;
+	float maxOpacity;
+	float color[3];			///< ambient fog colour (already TOD/weather shaped)
+	float sunColor[3];
+	float sunDir[3];		///< world-space direction TOWARD the sun
+	float sunScatter;		///< 0 disables the sun term; shader also needs a valid shadow map
+	float noiseScale;
+	float windSpeed;
+	float time;
+	float skyAffect;		///< 0 leaves depth==1 pixels untouched
+	float contactShadows;	///< 0 disables the post-pass screen-space contact shadows (0..1)
+	float godRays;			///< 0 disables the screen-space sun shafts (0..1)
+	float aoQuality;		///< 1 = rotated 16-tap AO kernel, 0 = the old 12-tap spiral
+	/// Camera-to-world rows the post shader uses to rebuild world positions: row0 = right axis with the
+	/// camera position in .w, row1 = up, row2 = forward, row3 = (0,0,0,1). All-zero disables the override
+	/// and the backend falls back to inverting the D3D view transform. The game layer fills this because
+	/// the D3DTS_VIEW the backend can read at post time is not guaranteed to still be the 3D camera.
+	float camWorld[16];
+};
+
 /**
 ** DX8Wrapper
 **
@@ -800,9 +830,12 @@ public:
 	// target the stub cannot return), and every attachment on this path is one sample, so the two
 	// user settings are applied here instead: the slider maps to the halo gain and the anti-aliasing
 	// mode to the FXAA tap. Pushed on the first filtered frame and again by the options apply hooks.
-	static void VK_Set_Post_Knobs(float bloom, bool aa);
+	static void VK_Set_Post_Knobs(float bloom);
 	static float VK_Post_Bloom();
-	static bool VK_Post_AA();
+
+	// GeneralsX @feature 26/10/2026 volumetric fog: one POD per frame, consumed by the post pass.
+	static void VK_Set_Atmosphere_Fog(const VKAtmosphereFogParams& params);
+	static const VKAtmosphereFogParams& VK_Atmosphere_Fog();
 
 	// GeneralsX @feature 23/10/2026 P6 "底片/镜头": HDR scene + exposure/tonemap + SSAA render scale +
 	// 3D-only AA. The game layer resolves OptionPreferences once per frame and pushes the pack here; the
@@ -811,22 +844,43 @@ public:
 	static void VK_Set_HDR_Knobs(int hdr, float exposure, int tonemap, int aa_mode, int scale);
 	static bool VK_HDR_Enabled();
 	static float VK_HDR_Exposure();
+	// GeneralsX @feature 27/10/2026 HDR: per-time-of-day exposure offset (EV) applied to the HDR post
+	// exposure only. The volumetric fog's in-scatter lifts night more than day (measured night 0.148 vs
+	// legacy 0.124); this is the presentation-side calibration for that, not a lighting change.
+	static void VK_Set_TOD_Exposure(float ev);
+	static float VK_TOD_Exposure();
 	static int VK_HDR_Tonemap();
 	static int VK_Post_AA_Mode();
 	static int VK_Render_Scale();
+	// GeneralsX @feature 26/10/2026 HDR: W3D_RefreshRenderLighting publishes the per-TOD QA gain
+	// multipliers here so the terrain/tree/water state, GN/lenv lights and the FF packer read one rig.
+	// Colours are decoded per channel by the publisher; there is no per-family saturation knob.
+	static void VK_Set_Linear_Light_Gains(float sun, float amb, float fill);
+	static float VK_Linear_Sun_Gain();
+	static float VK_Linear_Amb_Gain();
+	static float VK_Linear_Fill_Gain();
+	// GeneralsX @debug 27/10/2026 live sun sweep (QA): 0..1 directional factor, time-based so the
+	// per-draw/per-frame consumers can animate without a game-side per-frame hook.
+	static float VK_Sun_Sweep();
 	// P6 remaining film-stock controls: per-frame auto exposure, CAS sharpness (0..2), generated LUT grade.
 	static void VK_Set_Post_Extras(int auto_exposure, float sharpen, int color_lut);
 	static bool VK_Auto_Exposure();
 	static float VK_Sharpen();
 	static bool VK_Color_LUT();
+	// GeneralsX @feature 24/10/2026 P0: AO strength (0..1.5) and the contrast grade used to be
+	// hard-coded post defaults (0.55 / on). They are now seeded from OptionPreferences and default
+	// off, so the Advanced page can expose them and "all off" is the retail picture.
+	static void VK_Set_AO_Grade(float ao_strength, bool grade);
+	static float VK_AO_Strength();
+	static bool VK_Film_Grade();
 
 	// GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation. The device-side grass buffer builds
 	// the instance stream; this bridge records the instanced draw into the scene pass that is open at
 	// the time of the call. False on any non-Vulkan build, so the retail billboard path stays in charge.
 	static bool VK_Vegetation_Ready();
-	// GeneralsX @feature Qoder 22/10/2026 light shadows: the strongest dynamic light's map (see
-	// VKDraw_LightShadow_Info). False on any non-Vulkan build.
-	static bool VK_LightShadow_Info(float vp[16], float pos_range[4]);
+	// GeneralsX @feature Qoder 22/10/2026 light shadows, extended 24/10/2026 P34 E3: slot s is the map
+	// for light-list slot s (0..3). False on any non-Vulkan build or when that slot has no map.
+	static bool VK_LightShadow_Info(int slot, float vp[16], float pos_range[4]);
 	static bool VK_Vegetation_Draw(const void* grass, unsigned grass_count,
 	                               const void* rocks, unsigned rock_count,
 	                               const float view_proj[16], const float camera[3], float time_seconds,

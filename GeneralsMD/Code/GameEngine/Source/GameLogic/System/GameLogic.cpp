@@ -1757,7 +1757,16 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 					fflush(stderr);
 #endif
 					DEBUG_LOG(("ERROR - Unable to read in multiplayer scripts."));
-					return;
+					// GeneralsX @bugfix 25/10/2026 A parse failure used to return from
+					// startNewGame() before m_loadScreenRender was cleared, leaving the map
+					// visible but the HUD permanently in load-screen mode. That is exactly what
+					// a launcher -skirmish boot hit. Continue without the optional multiplayer
+					// scripts instead of stranding the game; the retail/menu path still returns.
+					fprintf(stderr, "[SKIRMISH] MultiplayerScripts.scb parse failed%s\n",
+						TheGlobalData->m_skipMainMenu ? " (launcher: continuing)" : "");
+					fflush(stderr);
+					if (!TheGlobalData->m_skipMainMenu)
+						return;
 				}
 				ScriptList *scripts[MAX_PLAYER_COUNT];
 				Int count = ScriptList::getReadScripts(scripts);
@@ -2466,7 +2475,15 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 
 	if(m_gameMode == GAME_SHELL)
 	{
-		if (!TheGlobalData->m_headless)
+		// GeneralsX @feature 25/10/2026 Launcher mode: after a match the engine normally returns
+		// to the main menu. With -nomenu there is no menu to return to, so exit and let the
+		// external launcher regain control instead of showing an empty shell.
+		if (TheGlobalData->m_skipMainMenu)
+		{
+			if (TheGameEngine)
+				TheGameEngine->setQuitting(TRUE);
+		}
+		else if (!TheGlobalData->m_headless)
 		{
 			if(TheShell->getScreenCount() == 0)
 				TheShell->push( "Menus/MainMenu.wnd" );

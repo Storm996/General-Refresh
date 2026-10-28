@@ -41,8 +41,14 @@ W3DScorch::~W3DScorch() { freeBuffers(); }
 void W3DScorch::allocateBuffers()
 {
 	freeBuffers();
-	m_vertexScorch = NEW_REF(DX8VertexBufferClass, (DX8_FVF_XYZDUV1, MAX_SCORCH_VERTEX, DX8VertexBufferClass::USAGE_DEFAULT));
-	m_indexScorch = NEW_REF(DX8IndexBufferClass, (MAX_SCORCH_INDEX));
+	// GeneralsX @bugfix 28/10/2026 SCORCHTEAR: updateScorches() rewrites the whole decal list every time a
+	// crater is added, and craters are added by explosions - i.e. right when the frame being rendered is
+	// already busy. As USAGE_DEFAULT both buffers were a single fixed region, so the rewrite landed on the
+	// bytes the frames still in flight were reading and one frame drew a decal quad whose vertices came
+	// from two different lists: a long dark streak dragged across the ground that is gone the next frame.
+	// USAGE_DYNAMIC + D3DLOCK_DISCARD lets the Vulkan backing rotate to a fresh per-frame region instead.
+	m_vertexScorch = NEW_REF(DX8VertexBufferClass, (DX8_FVF_XYZDUV1, MAX_SCORCH_VERTEX, DX8VertexBufferClass::USAGE_DYNAMIC));
+	m_indexScorch = NEW_REF(DX8IndexBufferClass, (MAX_SCORCH_INDEX, DX8IndexBufferClass::USAGE_DYNAMIC));
 	m_scorchTexture = NEW ScorchTextureClass;
 	invalidateBuffers();
 }
@@ -180,10 +186,12 @@ void W3DScorch::updateScorches(WorldHeightMap& map)
 	m_curNumScorchVertices = 0;
 	m_curNumScorchIndices = 0;
 
-	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexScorch);
+	// Full rewrite of both buffers (every live decal is re-emitted below), so DISCARD is exactly right:
+	// the new list goes to a fresh region and the frames still in flight keep the list they recorded.
+	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexScorch, D3DLOCK_DISCARD);
 	UnsignedShort* ib = lockIdxBuffer.Get_Index_Array();
 
-	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexScorch);
+	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexScorch, D3DLOCK_DISCARD);
 	VertexFormatXYZDUV1* vb = (VertexFormatXYZDUV1*)lockVtxBuffer.Get_Vertex_Array();
 
 	Real shadeR = (TheGlobalData->m_terrainAmbient[0].red + TheGlobalData->m_terrainDiffuse[0].red) / 2.0f;

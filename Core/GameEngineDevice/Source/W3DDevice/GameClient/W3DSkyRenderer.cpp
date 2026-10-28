@@ -138,16 +138,21 @@ void W3DSkyRenderer::render(RenderInfoClass &rinfo)
 	if (atmos.revision > 0u) {
 		// Ambient keeps the sky's overall exposure; the haze colour pulls the horizon toward the
 		// same band terrain/GN/water fade into, so TOD/weather changes do not leave a mismatched sky.
-		float exposure = atmos.exposure;
+		// GeneralsX @feature 26/10/2026 HDR: the tonemap owns exposure in the linear pipeline, so the
+		// sky must not pre-multiply the EV (that applied it twice and in the wrong unit). The tint is
+		// linear light now and keeps headroom so the tonemap/ACES have something to roll off.
+		const bool linear = DX8Wrapper::VK_HDR_Enabled();
+		float exposure = linear ? 1.0f : atmos.exposure;
 		if (exposure < 0.5f) exposure = 0.5f;
 		if (exposure > 2.0f) exposure = 2.0f;
 		tint.Set(
 			(0.70f + 0.20f * atmos.ambient[0] + 0.10f * atmos.fogColor[0]) * exposure,
 			(0.70f + 0.20f * atmos.ambient[1] + 0.10f * atmos.fogColor[1]) * exposure,
 			(0.70f + 0.20f * atmos.ambient[2] + 0.10f * atmos.fogColor[2]) * exposure);
-		if (tint.X > 1.0f) tint.X = 1.0f;
-		if (tint.Y > 1.0f) tint.Y = 1.0f;
-		if (tint.Z > 1.0f) tint.Z = 1.0f;
+		const float tintMax = linear ? 4.0f : 1.0f;
+		if (tint.X > tintMax) tint.X = tintMax;
+		if (tint.Y > tintMax) tint.Y = tintMax;
+		if (tint.Z > tintMax) tint.Z = tintMax;
 	}
 	// Sky textures still go through the same material binder as water/grass. The mesh owns the
 	// per-pass material, while the instance records/binds the five skybox faces for the cubemap

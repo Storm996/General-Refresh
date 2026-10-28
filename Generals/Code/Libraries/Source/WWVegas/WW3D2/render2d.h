@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -26,9 +26,9 @@
  *                                                                                             *
  *                       Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                     $Modtime:: 8/28/01 5:00p                                               $*
+ *                     $Modtime:: 12/17/01 11:47a                                             $*
  *                                                                                             *
- *                    $Revision:: 21                                                          $*
+ *                    $Revision:: 26                                                          $*
  *                                                                                             *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -37,7 +37,8 @@
 #pragma once
 
 #include "WWLib/always.h"
-#include "WWLib/simplevec.h"
+//#include "simplevec.h"
+#include "WWLib/Vector.h"
 #include "WWMath/vector2.h"
 
 #include "shader.h"
@@ -145,11 +146,15 @@ public:
 	// Move all verts
 	void	Move( const Vector2 & a );
 
+	// Force all alphas
+	void	Force_Alpha( float alpha );
+	void	Force_Color( int color );
+
 	// Color access
-	SimpleDynVecClass<unsigned long> &	Get_Color_Array ()	{ return Colors; }
+	DynamicVectorClass<unsigned long> &	Get_Color_Array ()	{ return Colors; }
 
 	// statics to access the Screen Resolution in Pixels
-	static void	Set_Screen_Resolution( const RectClass & screen )	{ ScreenResolution = screen; }
+	static void	Set_Screen_Resolution( const RectClass & screen );
 	static const RectClass & Get_Screen_Resolution()			{ return ScreenResolution; }
 
 protected:
@@ -158,10 +163,14 @@ protected:
 	Vector2										BiasedCoordinateOffset;
 	TextureClass *								Texture;
 	ShaderClass									Shader;
-	SimpleDynVecClass<unsigned short>	Indices;
-	SimpleDynVecClass<Vector2>				Vertices;
-	SimpleDynVecClass<Vector2>				UVCoordinates;
-	SimpleDynVecClass<unsigned long>		Colors;
+	DynamicVectorClass<unsigned short>	Indices;
+	unsigned short								PreAllocatedIndices[60];
+	DynamicVectorClass<Vector2>				Vertices;
+	Vector2										PreAllocatedVertices[60];
+	DynamicVectorClass<Vector2>				UVCoordinates;
+	Vector2										PreAllocatedUVCoordinates[60];
+	DynamicVectorClass<unsigned long>		Colors;
+	unsigned long								PreAllocatedColors[60];
 	bool											IsHidden;
 	bool											IsGrayScale;
 	float											ZValue;

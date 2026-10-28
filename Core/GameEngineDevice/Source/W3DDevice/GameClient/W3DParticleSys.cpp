@@ -27,6 +27,7 @@
 // Author: Michael S. Booth, November 2001
 
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"
 #include "GameClient/Color.h"
 #include "W3DDevice/GameClient/W3DParticleSys.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
@@ -108,6 +109,18 @@ void DoParticles( RenderInfoClass &rinfo )
 
 void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 {
+	// GeneralsX @debug 28/10/2026 QA: this is the REAL particle pass (WW3D::Flush calls it), unlike
+	// ParticleSystemManager::draw in the game layer. GENERALSX_NO_PARTICLES=1 skips it so a per-frame
+	// sprite can be told apart from a flickering surface.
+	{
+		static int s_noParticles = -1;
+		if (s_noParticles < 0) {
+			const char* e = getenv("GENERALSX_NO_PARTICLES");
+			s_noParticles = (e != nullptr && *e != 0 && atoi(e) != 0) ? 1 : 0;
+			if (s_noParticles) { fprintf(stderr, "[PART] particle pass disabled\n"); fflush(stderr); }
+		}
+		if (s_noParticles) return;
+	}
 
 	if (m_readyToRender == false)
 		return;
@@ -407,6 +420,53 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	// TheSuperHackers @info Flush the last batch if one is pending.
 	flushParticleBatch(rinfo, pointCount);
 
+	// 光影升级2.0 B1: every batch has been handed to the renderer's spawn list by now, so dispatch the
+	// simulation and draw it inside the same scene pass. No-op unless GENERALSX_VK_GPU_FX is set.
+#if defined(SAGE_USE_VULKAN_CORE)
+	{
+		extern void VKDraw_GPU_FX(const float cam[3], const float right[3], const float up[3],
+			const float fwd[3], const float view_proj[16]);
+		extern void VKDraw_GPU_Weather(const float cam[3], const float right[3], const float up[3],
+			const float fwd[3], const float view_proj[16]);
+		extern void VKDraw_GPU_FX_Configure(int particles, int weatherType, int softParticles, int heatHaze);
+		extern void VKDraw_Set_MSAA(int samples);
+		// Shipped switches (Options.ini / launcher); env vars still win inside the renderer.
+		VKDraw_GPU_FX_Configure(OptionPreferences().getGpuParticles(), OptionPreferences().getGpuWeather(),
+			OptionPreferences().getSoftParticles(), OptionPreferences().getHeatHaze());
+		VKDraw_Set_MSAA(OptionPreferences().getMSAA());
+		// Same construction as W3DGrassBuffer: the camera owns the projection convention, and the view
+		// plane sits at z=-1, so unprojecting plane points gives the eye axes in world space directly.
+		Matrix3D view;
+		Matrix4x4 proj, view4, vp;
+		rinfo.Camera.Get_View_Matrix(&view);
+		rinfo.Camera.Get_Projection_Matrix(&proj);
+		view4 = Matrix4x4(view);
+		Matrix4x4::Multiply(proj, view4, &vp);
+		float vpf[16];
+		for (int r = 0; r < 4; ++r)
+			for (int c = 0; c < 4; ++c)
+				vpf[r * 4 + c] = vp[r][c];
+
+		Vector3 centre, rEdge, uEdge;
+		const Vector3 eye = rinfo.Camera.Get_Position();
+		rinfo.Camera.Un_Project(centre, Vector2(0.0f, 0.0f));
+		rinfo.Camera.Un_Project(rEdge, Vector2(1.0f, 0.0f));
+		rinfo.Camera.Un_Project(uEdge, Vector2(0.0f, 1.0f));
+		Vector3 fwd = centre - eye;
+		Vector3 right = rEdge - centre;
+		Vector3 up = uEdge - centre;
+		fwd.Normalize();
+		right.Normalize();
+		up.Normalize();
+		const float cam[3] = { eye.X, eye.Y, eye.Z };
+		const float rt[3] = { right.X, right.Y, right.Z };
+		const float ut[3] = { up.X, up.Y, up.Z };
+		const float ft[3] = { fwd.X, fwd.Y, fwd.Z };
+		VKDraw_GPU_FX(cam, rt, ut, ft, vpf);
+		VKDraw_GPU_Weather(cam, rt, ut, ft, vpf);
+	}
+#endif
+
 		/// @todo lorenzen sez: this should be debug only:
 	TheParticleSystemManager->setOnScreenParticleCount(m_onScreenParticleCount);
 
@@ -419,7 +479,16 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	// next to the weather pass so it inherits the same view/proj and device lifecycle.
 	if (!TheGrassBuffer)
 		TheGrassBuffer = new W3DGrassBuffer;
-	TheGrassBuffer->render(rinfo);
+	// GeneralsX @debug 28/10/2026 QA: isolate the grass/rock instanced path from the flicker report.
+	{
+		static int s_noVeg = -1;
+		if (s_noVeg < 0) {
+			const char* e = getenv("GENERALSX_NO_VEG");
+			s_noVeg = (e && *e && atoi(e)) ? 1 : 0;
+			if (s_noVeg) { fprintf(stderr, "[VEG] vegetation render disabled\n"); fflush(stderr); }
+		}
+		if (!s_noVeg) TheGrassBuffer->render(rinfo);
+	}
 
 	//Now process screen smudges which are particles that distort the background behind them.
 	if(TheSmudgeManager)
@@ -444,6 +513,25 @@ void W3DParticleSystemManager::initializeBatch(const ParticleSystem& system, con
 
 void W3DParticleSystemManager::flushParticleBatch(RenderInfoClass& rinfo, UnsignedInt& pointCount)
 {
+#if defined(SAGE_USE_VULKAN_CORE)
+	// 光影升级2.0 B1 step 3: feed the batch we are about to draw as GPU spawn records, and skip the
+	// retail point-group draw when the GPU path is armed (otherwise both would render).
+	{
+		extern bool VKDraw_GPU_FX_Spawn(const void* pos, const void* size, const void* rgba,
+			unsigned count, void* d3dTex);
+		// Only additive batches: the GPU pipeline is additive, so smoke/multiply stay on the retail path.
+		if (m_batchShaderType == ParticleSystemInfo::ADDITIVE &&
+			VKDraw_GPU_FX_Spawn(m_posBuffer->Get_Array(), m_sizeBuffer->Get_Array(),
+								m_RGBABuffer->Get_Array(), pointCount,
+								m_batchTexture ? m_batchTexture->Peek_D3D_Texture() : nullptr)) {
+			pointCount = 0;
+			m_batchTexture.Clear();
+			m_batchParticleAlignment = ParticleSystemInfo::PARTICLE_ALIGNMENT_BILLBOARD;
+			m_batchShaderType = ParticleSystemInfo::INVALID_SHADER;
+			return;
+		}
+	}
+#endif
 	if (pointCount > 0)
 	{
 		m_pointGroup->Set_Texture(m_batchTexture.Peek());

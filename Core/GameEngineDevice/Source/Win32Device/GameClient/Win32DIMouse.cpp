@@ -413,7 +413,14 @@ void DirectInputMouse::setMouseLimits()
 	// window cause it's annoying to mouse out of the window and click
 	// on a background window.
 	//
-	if( TheDisplay && TheDisplay->getWindowed() == TRUE )
+	// GeneralsX @bugfix 26/10/2026 GENERALSX_NO_CLIP_CURSOR=1 disables the desktop-wide pointer trap, so
+	// an unattended QA instance never pins the cursor to its window on a multi-monitor desktop.
+	static int s_diNoClipCursor = -1;
+	if (s_diNoClipCursor < 0) {
+		const char* ev = getenv("GENERALSX_NO_CLIP_CURSOR");
+		s_diNoClipCursor = (ev != nullptr && *ev != 0 && atoi(ev) != 0) ? 1 : 0;
+	}
+	if( s_diNoClipCursor == 0 && TheDisplay && TheDisplay->getWindowed() == TRUE )
 	{
 		RECT windowRect;
 

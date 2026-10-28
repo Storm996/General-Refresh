@@ -2047,7 +2047,15 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 
 	if(m_gameMode == GAME_SHELL)
 	{
-		if (!TheGlobalData->m_headless)
+		// GeneralsX @feature 25/10/2026 Launcher mode: after a match the engine normally returns
+		// to the main menu. With -nomenu there is no menu to return to, so exit and let the
+		// external launcher regain control instead of showing an empty shell.
+		if (TheGlobalData->m_skipMainMenu)
+		{
+			if (TheGameEngine)
+				TheGameEngine->setQuitting(TRUE);
+		}
+		else if (!TheGlobalData->m_headless)
 		{
 			if(TheShell->getScreenCount() == 0)
 				TheShell->push( "Menus/MainMenu.wnd" );

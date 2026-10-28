@@ -903,7 +903,7 @@ const char* W3DShaderManager::getVertexShaderProfile()
 // rejects the newer profile outright, not for source that needs rewriting.
 #ifdef _WIN32
 HRESULT W3DShaderManager::compileShaderAtBestProfile(const char* hlslSource, Bool ShaderType,
-	const char* logTag, const char** outProfile, void** pHandle)
+	const char* logTag, const char** outProfile, void** pHandle, unsigned forceTag)
 {
 	if (pHandle) *pHandle=nullptr;
 	if (outProfile) *outProfile=nullptr;
@@ -967,7 +967,9 @@ HRESULT W3DShaderManager::compileShaderAtBestProfile(const char* hlslSource, Boo
 			// translated-program registry. The hash is over hlslSource (not the prefixed buffer), because
 			// that is the bytes the exported block and scripts/pgm_hash.py describe. A source with no row
 			// is logged once and simply leaves the D3D9 path in charge.
-			[[maybe_unused]] const unsigned boundTag = VKPgm_Note_Compiled(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, hlslSource, logTag);
+			[[maybe_unused]] const unsigned boundTag = (forceTag != 0u)
+				? VKPgm_Bind_Tag(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, forceTag)
+				: VKPgm_Note_Compiled(pHandle ? *pHandle : nullptr, ShaderType ? 0 : 1, hlslSource, logTag);
 			// GeneralsX @bugfix Qoder 19/10/2026 BUG-03: under no-d3d9 an untagged handle has no twin to
 			// execute, and the draw path refuses every batch that binds one - the whole family would
 			// disappear instead of staying on its fixed-function leg. Release the handle and fail the
@@ -2774,6 +2776,10 @@ Int TerrainShaderPixelShader::shutdown()
 // three paths has run the sentinel is gone for good.
 static Real s_hazeStrength = -1.0f;
 static Bool s_hazeEnabled = TRUE;
+// GeneralsX @feature 26/10/2026: set while the post-process volumetric fog owns the atmosphere. It is
+// checked inside Build_Weather_Fog_Ramp, so the legacy families go to zero strength without changing
+// the player's DistanceHaze value.
+static Bool s_volumetricFogSuppression = FALSE;
 
 static void seedDistanceHaze()
 {
@@ -2785,6 +2791,11 @@ static void seedDistanceHaze()
 	fprintf(stderr, "[HAZE] seeded enabled=%d strength=%.2f (Options.ini / GENERALSX_GNFOG)\n",
 		(int)s_hazeEnabled, (double)s_hazeStrength);
 	fflush(stderr);
+}
+
+void W3DShaderManager::setVolumetricFogSuppression(Bool on)
+{
+	s_volumetricFogSuppression = on;
 }
 
 void W3DShaderManager::setDistanceHaze(Bool enabled, Real strength01)
@@ -2848,7 +2859,7 @@ void W3DShaderManager::setBloomIntensity(Real intensity01)
 	if (!lightingEnvPresent("GENERALSX_BLOOM_INTENSITY"))
 		s_bloomIntensityLive = clamp01(intensity01);
 	const Real live = getBloomIntensity();
-	DX8Wrapper::VK_Set_Post_Knobs(live, DX8Wrapper::VK_Post_AA());
+	DX8Wrapper::VK_Set_Post_Knobs(live);
 	fprintf(stderr, "[BLOOM3] user set intensity=%.2f\n", (double)live);
 	fflush(stderr);
 }
@@ -2856,13 +2867,6 @@ void W3DShaderManager::setBloomIntensity(Real intensity01)
 // GeneralsX @feature Qoder 20/10/2026: the anti-aliasing row of the graphics page. On the D3D path it can
 // only take effect on the next device creation, but the pure-Vulkan present pass resolves it live, so the
 // same slider/tick that names the level now switches the FXAA term of that pass on or off.
-void W3DShaderManager::setPostAntiAliasing(Bool enabled)
-{
-	DX8Wrapper::VK_Set_Post_Knobs(getBloomIntensity(), enabled != FALSE);
-	fprintf(stderr, "[VKPOST] anti-aliasing knob -> %s\n", enabled != FALSE ? "on" : "off");
-	fflush(stderr);
-}
-
 Real W3DShaderManager::getBloomIntensity()
 {
 	if (s_bloomIntensityLive < 0.0f)
@@ -2898,14 +2902,15 @@ Real W3DShaderManager::getShadowMapStrength()
 // blizzard's 2.4 pulls the ramp in to 19%/21% of the far clip so the horizon closes down, and lifts
 // the strength a little. scale 1.0 reproduces the install numbers exactly, which is what keeps a
 // clear map byte-identical.
-// Shared by the GN-family install below, the terrain/road/TREE30 c0/c1 upload and the weather refresh,
+// Shared by the GN-family install below, the terrain/road/foliage c0/c1 upload and the weather refresh,
 // because three copies of one knob-reading recipe is how a haze ramp drifts.
 static void Build_Weather_Fog_Ramp(Real fogScale, Vector4 &colorStrength, Vector4 &ramp)
 {
 	// Read live: this runs per terrain batch, and two struct reads with the value already resolved
 	// is cheap enough that the effect can be re-tuned mid-match (options page) instead of at launch.
 	seedDistanceHaze();
-	const float s_fogStrength = (s_hazeEnabled != FALSE) ? (float)s_hazeStrength : 0.0f;
+	const float s_fogStrength = (s_hazeEnabled != FALSE && s_volumetricFogSuppression == FALSE)
+		? (float)s_hazeStrength : 0.0f;
 
 	// Range covers everything the recipes publish (1.0 clear .. 2.4 blizzard) with room for an INI
 	// author to write more; the clamp only keeps the ramp from collapsing to zero length.
@@ -2924,9 +2929,12 @@ static void Build_Weather_Fog_Ramp(Real fogScale, Vector4 &colorStrength, Vector
 	if (strength > 1.0f) strength = 1.0f;
 
 	colorStrength.Set(0.72f, 0.78f, 0.84f, strength);
-	// z = height-fog falloff (1/world unit), w = how much of the distance fog is height-modulated.
-	// Terrain PGM reads these; GN/water ignore the unused channels, so the shared ramp stays one source.
-	ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 1.0f / 220.0f, 0.5f);
+	// z/w used to carry a per-material "height fog" multiplier (1/220, 0.5) read by the terrain/road/tree
+	// haze shaders. It modulated by vWorldPos.y, which in SAGE's Z-up render world is a HORIZONTAL axis,
+	// so it tinted the haze north-south instead of by altitude - and it only weakened the distance fog on
+	// some materials. The volumetric fog now does a real Z-up height integral plus sun in-scatter, so the
+	// term is removed (GENERALSX @tweak 26/10/2026); keep z/w at zero so nothing silently reintroduces it.
+	ramp.Set(fogStart, 1.0f / (fogLen > 1.0f ? fogLen : 1.0f), 0.0f, 0.0f);
 }
 
 // GeneralsX @feature Storm996 17/10/2026 PS3.0 haze coverage: the fixed-function half of the horizon.
@@ -3025,32 +3033,77 @@ static void Upload_Terrain30_Fog_Constants(void)
 		DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)&ramp, 1);
 	}
 
-	// GeneralsX @feature 23/10/2026 dynamic sun: terrain/road/tree stop reading baked vertex RGB and
-	// evaluate albedo * (ambient + sun * N.L) per pixel. c33 sun colour, c34 ambient, c35 sun dir.
+	// GeneralsX @feature 27/10/2026 unified rig: the ground family no longer reads private light
+	// constants. It reads the canonical rig from the Forward+ block (fpEnv, binding 4), the same source
+	// GN/FF/water read, so this upload only carries the per-batch camera position (c38) and QA probes.
 	{
-		Vector4 sunColor(atmosphere.sunColor[0], atmosphere.sunColor[1], atmosphere.sunColor[2], 1.0f);
-		Vector4 ambient(atmosphere.ambient[0], atmosphere.ambient[1], atmosphere.ambient[2], 1.0f);
-		Vector4 sunDir(atmosphere.sunDir[0], atmosphere.sunDir[1], atmosphere.sunDir[2], 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(33, (const float*)&sunColor, 1);
-		DX8Wrapper::Set_Pixel_Shader_Constant(34, (const float*)&ambient, 1);
-		DX8Wrapper::Set_Pixel_Shader_Constant(35, (const float*)&sunDir, 1);
+		Matrix4x4 view;
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, view);
+		const Matrix4x4 invView = view.Inverse();
+		Vector4 camPos(invView[3].X, invView[3].Y, invView[3].Z, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(38, (const float*)&camPos, 1);
+
+		// GeneralsX @debug Qoder 24/10/2026: terrain raw-light / light-shadow probe (c31.y).
+		{
+			const char* dbgEnv = getenv("GENERALSX_LIGHT_DEBUG");
+			float dbgLevel = 0.0f;
+			if (dbgEnv != nullptr && *dbgEnv != 0) {
+				const int lv = atoi(dbgEnv);
+				if (lv > 0) { dbgLevel = (lv > 3) ? 3.0f : (float)lv; }
+			}
+			Vector4 dbg(0.0f, dbgLevel, 0.0f, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(31, (const float*)&dbg, 1);
+		}
+
+		// GeneralsX @debug Qoder 24/10/2026: mirror the QA spot anchor into c30 for the terrain probe.
+		{
+			const char* atEnv = getenv("GENERALSX_FP_DEMO_SPOT_AT");
+			Vector4 at(0.0f, 0.0f, 0.0f, 0.0f);
+			if (atEnv != nullptr) { float ax = 0.0f, ay = 0.0f, az = 0.0f; sscanf(atEnv, "%f,%f,%f", &ax, &ay, &az); at.Set(ax, ay, az, 0.0f); }
+			DX8Wrapper::Set_Pixel_Shader_Constant(30, (const float*)&at, 1);
+		}
+
+		// GeneralsX @debug 27/10/2026: the canonical linear rig every family reads.
+		{
+			static unsigned s_lastRigRev = 0xFFFFFFFFu;
+			if (s_lastRigRev != atmosphere.revision) {
+				s_lastRigRev = atmosphere.revision;
+				fprintf(stderr, "[LIGHTRIG] rev=%u sun=(%.3f,%.3f,%.3f) amb=(%.3f,%.3f,%.3f) "
+					"sky=(%.3f,%.3f,%.3f) ground=(%.3f,%.3f,%.3f) fill=(%.3f,%.3f,%.3f)\n",
+					atmosphere.revision,
+					atmosphere.sunColor[0], atmosphere.sunColor[1], atmosphere.sunColor[2],
+					atmosphere.ambient[0], atmosphere.ambient[1], atmosphere.ambient[2],
+					atmosphere.skyColor[0], atmosphere.skyColor[1], atmosphere.skyColor[2],
+					atmosphere.groundColor[0], atmosphere.groundColor[1], atmosphere.groundColor[2],
+					atmosphere.fillColor[0], atmosphere.fillColor[1], atmosphere.fillColor[2]);
+				fflush(stderr);
+			}
+		}
 	}
 
-	// GeneralsX @feature Qoder 22/10/2026 light shadows: c6..c9 = world -> light clip rows (row-vector,
-	// D3D), c10 = light xyz + range with .w = 1 when this frame built the strongest light's map. The
-	// receiver applies it to list index 0 only, so a missing map is one disabled uniform, not a branch.
-	float lsVP[16], lsPR[4];
-	if (DX8Wrapper::VK_LightShadow_Info(lsVP, lsPR))
-	{
-		DX8Wrapper::Set_Pixel_Shader_Constant(6, lsVP, 4);
-		Vector4 pr(lsPR[0], lsPR[1], lsPR[2], 1.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(10, (const float*)&pr, 1);
-	}
-	else
-	{
-		Vector4 off(0.0f, 0.0f, 0.0f, 0.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(10, (const float*)&off, 1);
-	}
+	// GeneralsX @refactor 24/10/2026 P34 E3: the terrain/road/tree light-shadow matrices moved out of
+	// the pixel constant ring (c6..c10) and into the Forward+ block's fpLightShadow[] section, so all
+	// four maps arrive with the light list instead of five registers the terrain twins special-cased.
+}
+
+// GeneralsX @feature 27/10/2026 unified lighting: the per-pixel twins that replaced baked vertex light
+// (tree/road/static lit) read the same haze registers and camera position as the terrain trio.
+void W3DShaderManager::Upload_Fog_Constants()
+{
+	Upload_Terrain30_Fog_Constants();
+}
+
+// The road twin is the program for every textured decal that used to be fixed-function lit (bib,
+// bridge): texture x shared rig, no family constants. It is created by RoadShaderPixelShader::init.
+static IDirect3DPixelShader9* s_roadTwinPS = nullptr;
+
+void W3DShaderManager::Bind_Lit_Static()
+{
+#if defined(SAGE_USE_VULKAN_CORE)
+	if (s_roadTwinPS == nullptr) return;
+	Upload_Fog_Constants();
+	DX8Wrapper::Set_Pixel_Shader((UINT_PTR)s_roadTwinPS);
+#endif
 }
 
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio below has
@@ -3093,8 +3146,8 @@ Bool W3DShaderManager::isTerrainNormalEnabled()
 // GeneralsX @feature PS3.0 batch8 G1 14/10/2026: same contract for the road dual-noise HLSL swap.
 static Bool s_roadHlslFog = FALSE;
 
-// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: public bridge so the W3DTreeBuffer TREE30 path can
-// reuse the exact haze ramp the terrain/road HLSL shaders upload, instead of duplicating the recipe.
+// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: public bridge so the foliage FF batch can reuse the
+// exact haze ramp the terrain/road HLSL shaders upload, instead of duplicating the recipe.
 void W3DShaderManager::uploadPerPixelFogConstants()
 {
 	Upload_Terrain30_Fog_Constants();
@@ -3110,6 +3163,15 @@ void W3DShaderManager::getWeatherFogRamp(float haze[4], float ramp[4])
 
 Real W3DShaderManager::getCloudShadowStrength()
 {
+	// GeneralsX @debug 27/10/2026 HDR QA: the cloud map scrolls, so two captures minutes apart sample a
+	// different cloud phase and any area A/B reads that as a false colour shift. GENERALSX_CLOUDSHADOW=0
+	// freezes that variable for the comparison; the shipped default is untouched.
+	static int s_cloudOn = -1;
+	if (s_cloudOn < 0) {
+		const char* e = getenv("GENERALSX_CLOUDSHADOW");
+		s_cloudOn = (e != nullptr && *e != 0 && atoi(e) == 0) ? 0 : 1;
+	}
+	if (!s_cloudOn) return 0.0f;
 	// Clear weather keeps the shipped 0.35; a storm's fogScale (up to 2.4) thickens the cloud
 	// shadows with it. 0.35..0.60 stays subtle enough not to double as a second sun shadow.
 	Real scale = weatherRenderState().m_fogScale;
@@ -4182,6 +4244,30 @@ Int RoadShaderPixelShader::init()
 			if (FAILED(hr))
 			{
 				DEBUG_LOG(("W3DShaderManager: roadnoise2.pso not found, using 2-stage fallback"));
+#if defined(SAGE_USE_VULKAN_CORE)
+				// GeneralsX @feature 27/10/2026 unified lighting: the port does not ship roadnoise2.pso, so
+				// this branch used to keep the fixed-function road (texture x baked vertex light) and the
+				// road never moved with the sun. The translated twin (pgm_b1_road.frag, tag 120) IS the
+				// road program: it reads the shared rig per pixel exactly like terrain/objects. Compile a
+				// key block so the handle maps to that tag and take the pixel-shader path.
+				void* twin = nullptr;
+				const char* tp = nullptr;
+				static const char kRoadTwinKey[] = "float4 main() : COLOR { return float4(1,1,1,1); }\n";
+				if (SUCCEEDED(W3DShaderManager::compileShaderAtBestProfile(kRoadTwinKey, false, "[ROAD30]",
+						&tp, &twin, 120u)) && twin != nullptr)
+				{
+					m_dwBaseNoise2PixelShader = (IDirect3DPixelShader9*)twin;
+					s_roadTwinPS = (IDirect3DPixelShader9*)twin;
+					W3DShaders[W3DShaderManager::ST_ROAD_BASE_NOISE12] = &roadShaderPixelShader;
+					W3DShadersPassCount[W3DShaderManager::ST_ROAD_BASE_NOISE12] = 1;
+					s_roadHlslFog = TRUE;
+					fprintf(stderr, "[ROAD30] Vulkan twin bound (tag 120): per-pixel rig road\n");
+					fflush(stderr);
+					return TRUE;
+				}
+				fprintf(stderr, "[ROAD30] Vulkan twin bind failed; the fixed-function road stays\n");
+				fflush(stderr);
+#endif
 				// Fall back to 2-stage shader - don't fail init
 				return TRUE;
 			}
@@ -4262,6 +4348,10 @@ Int RoadShaderPixelShader::set(Int pass)
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
 
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
+	// GeneralsX @bugfix 27/10/2026: the road strips are single-sided quads laid flat on the terrain. The
+	// pixel-shader path inherited the terrain batch's cull mode and the whole road network was culled
+	// away; the 2-stage path happened to leave culling neutral. Roads are decals, so cull none.
+	DX8Wrapper::Set_DX8_Render_State(D3DRS_CULLMODE,D3DCULL_NONE);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
 	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
 
@@ -6013,9 +6103,10 @@ void W3DShaderManager::init()
 	// creates a multisampled swapchain, so every device-reported level would read back as none.
 	{
 		const Real seedBloom = getBloomIntensity();
-		const Bool seedAA = OptionPreferences().getAntiAliasing() != WW3D::MULTISAMPLE_MODE_NONE;
-		DX8Wrapper::VK_Set_Post_Knobs(seedBloom, seedAA != FALSE);
-		fprintf(stderr, "[VKPOST] options seed: bloom=%.2f aa=%u\n", (double)seedBloom, seedAA != FALSE ? 1u : 0u);
+		// GeneralsX @bugfix 28/10/2026: the retail MSAA row is gone; the Advanced "PostAA" row owns AA and
+		// is seeded through the HDR knobs (VK_Set_HDR_Knobs' aa_mode), not through this legacy pair.
+		DX8Wrapper::VK_Set_Post_Knobs(seedBloom);
+		fprintf(stderr, "[VKPOST] options seed: bloom=%.2f (AA is the Advanced PostAA row)", (double)seedBloom);
 		fflush(stderr);
 	}
 
@@ -6024,6 +6115,9 @@ void W3DShaderManager::init()
 	// 3D image before the UI, so it needs the same pack the options page writes.
 	{
 		OptionPreferences hdrPrefs;
+		const Bool p6Bypass = hdrPrefs.getP6Bypass();
+		const char* parityEnv = getenv("GENERALSX_VK_PARITY");
+		const Bool parity = (parityEnv != nullptr && *parityEnv != 0 && atoi(parityEnv) != 0) ? TRUE : FALSE;
 		const Bool hdrOn = hdrPrefs.getHDREnabled();
 		const Real hdrExposure = (Real)hdrPrefs.getHDRExposure() * 0.01f;
 		const Int hdrTonemap = hdrPrefs.getHDRTonemap();
@@ -6034,9 +6128,36 @@ void W3DShaderManager::init()
 		const Int sharpen = hdrPrefs.getSharpen();
 		const Bool colorLut = hdrPrefs.getColorLUT();
 		DX8Wrapper::VK_Set_Post_Extras(autoExp != FALSE ? 1 : 0, (Real)sharpen * 0.01f, colorLut != FALSE ? 1 : 0);
-		fprintf(stderr, "[VKPOST] HDR seed: hdr=%d exposure=%.2f tonemap=%d aa=%d scale=%d auto=%d sharpen=%.2f lut=%d\n",
-			hdrOn != FALSE ? 1 : 0, (double)hdrExposure, hdrTonemap, hdrAA, hdrScale,
-			autoExp != FALSE ? 1 : 0, (double)sharpen * 0.01f, colorLut != FALSE ? 1 : 0);
+		// P0 24/10/2026: AO/grade are no longer hidden hard-coded defaults; seed the player's choice.
+		const Int aoTicks = hdrPrefs.getAmbientOcclusion();
+		const Bool gradeOn = hdrPrefs.getFilmGrade();
+		DX8Wrapper::VK_Set_AO_Grade((Real)aoTicks * 0.01f, gradeOn != FALSE);
+		// Log the values the renderer will actually use, not the ones a bypass swallowed.
+		const Bool hdrEff = (p6Bypass || parity) ? FALSE : hdrOn;
+		const Real exposureEff = (p6Bypass || parity) ? 0.0f : hdrExposure;
+		const Int tonemapEff = (p6Bypass || parity) ? 0 : hdrTonemap;
+		const Bool autoEff = (p6Bypass || parity) ? FALSE : autoExp;
+		const Bool lutEff = (p6Bypass || parity) ? FALSE : colorLut;
+		const Int aaEff = parity ? 0 : hdrAA;
+		const Int scaleEff = parity ? 100 : hdrScale;
+		const Int aoEff = parity ? 0 : aoTicks;
+		const Bool gradeEff = parity ? FALSE : gradeOn;
+		fprintf(stderr, "[VKPOST] HDR seed: hdr=%d exposure=%.2f tonemap=%d aa=%d scale=%d auto=%d sharpen=%.2f lut=%d ao=%.2f grade=%d\n",
+			hdrEff != FALSE ? 1 : 0, (double)exposureEff, tonemapEff, aaEff, scaleEff,
+			autoEff != FALSE ? 1 : 0, (double)sharpen * 0.01f, lutEff != FALSE ? 1 : 0,
+			(double)aoEff * 0.01, gradeEff != FALSE ? 1 : 0);
+		if (parity)
+		{
+			fprintf(stderr, "[VKPOST] parity: GENERALSX_VK_PARITY=1 "
+				"(retail blit; HDR/tonemap/exposure/auto/LUT/AO/grade/bloom/AA/scale off)\n");
+		}
+		if (p6Bypass)
+		{
+			// GeneralsX @feature 23/10/2026 P6: only the HDR/tonemap part is off; AO/grade/bloom/AA
+			// still run, so this is not a full parity path (use GENERALSX_VK_PARITY for that).
+			fprintf(stderr, "[VKPOST] P6 bypass: GENERALSX_VK_P6OFF=1 "
+				"(HDR/tonemap/exposure/auto-exposure/LUT forced off)\n");
+		}
 		fflush(stderr);
 	}
 
@@ -6279,10 +6400,15 @@ W3DMaterialPipelineKey W3DMaterialInstance::MakePipelineKey(unsigned pass) const
 void W3DMaterialBinder::Bind(const W3DMaterialInstance& instance, unsigned pass)
 {
 	instance.BindAllTextures();
-	// Phase 5B.3: water is the first family whose PSO identity is the material key itself. The other
-	// families keep the legacy state-derived key so the shared cache cannot fragment until their
-	// executors are migrated in turn; a zero hash is the backend's "no material key" marker.
-	const unsigned long long pipelineKey = instance.desc.family == W3DMAT_WATER
+	// Phase 5B.3 / 6B: water, foliage, grass and sky now name their pipeline by material. The remaining
+	// families (terrain/static/skin/ui) keep the state-derived key until their executors are migrated;
+	// a zero hash is the backend's "no material key" marker. For foliage this is what stops two tree
+	// variants with different feature bits from aliasing onto one FF pipeline just because the executor
+	// left the same device state behind.
+	const bool materialKeyed = instance.desc.family == W3DMAT_WATER ||
+		instance.desc.family == W3DMAT_FOLIAGE || instance.desc.family == W3DMAT_GRASS ||
+		instance.desc.family == W3DMAT_SKY;
+	const unsigned long long pipelineKey = materialKeyed
 		? W3D_MaterialPipelineHash(instance.MakePipelineKey(pass)) : 0ull;
 	DX8Wrapper::VK_Material_Bind(instance.desc.family, instance.desc.features,
 		instance.desc.variant, pass, pipelineKey);

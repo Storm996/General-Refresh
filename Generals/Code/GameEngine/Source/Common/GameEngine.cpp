@@ -666,7 +666,17 @@ void GameEngine::init()
 		}
 
 		// load the initial shell screen
-		TheShell->push( "Menus/MainMenu.wnd" );
+		// GeneralsX @feature 25/10/2026 External launcher: -nomenu skips MainMenu.wnd; -screen
+		// pushes the requested layout instead.
+		if (TheGlobalData->m_skipMainMenu)
+		{
+			if (!TheGlobalData->m_launcherScreen.isEmpty())
+				TheShell->push(TheGlobalData->m_launcherScreen);
+		}
+		else
+		{
+			TheShell->push( "Menus/MainMenu.wnd" );
+		}
 
 		// This allows us to run a map from the command line
 		if (TheGlobalData->m_initialFile.isEmpty() == FALSE)

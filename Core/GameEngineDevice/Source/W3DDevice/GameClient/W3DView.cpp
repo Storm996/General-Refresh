@@ -1030,6 +1030,18 @@ void W3DView::reset()
 	setPitchToDefault();
 	setZoomToDefault();
 
+	// GeneralsX @debug 26/10/2026 QA: the RTS starts zoomed in, which hides atmospheric fog beyond the
+	// near fade. GENERALSX_QA_ZOOMOUT=1 pulls the camera to its maximum height for fog/terrain captures;
+	// it is read once and never written by gameplay.
+	{
+		static int s_qaZoomOut = -1;
+		if (s_qaZoomOut < 0) {
+			const char* ev = getenv("GENERALSX_QA_ZOOMOUT");
+			s_qaZoomOut = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+		}
+		if (s_qaZoomOut) setZoomToMax();
+	}
+
 	setViewFilter(FT_VIEW_DEFAULT);
 
 	Coord2D gb = { 0,0 };
@@ -1496,6 +1508,25 @@ void W3DView::update()
 	//USE_PERF_TIMER(W3DView_updateView)
 	Bool didScriptedMovement = false;
 
+	// GeneralsX @debug 26/10/2026 QA: apply the maximum zoom once the match is live. reset() runs
+	// before the map spawns and the game then repositions the camera at the default close zoom, so the
+	// reset-time hook alone was overwritten. Env-gated, never written by gameplay.
+	{
+		static int s_qaZoomMode = -1;
+		static bool s_qaZoomApplied = false;
+		if (s_qaZoomMode < 0) {
+			const char* ev = getenv("GENERALSX_QA_ZOOMOUT");
+			s_qaZoomMode = (ev != nullptr && atoi(ev) != 0) ? 1 : 0;
+		}
+		if (s_qaZoomMode != 0 && !s_qaZoomApplied && TheGameLogic != nullptr && TheGameLogic->isInGame()) {
+			setZoomToMax();
+			s_qaZoomApplied = true;
+			fprintf(stderr, "[QAZOOM] setZoomToMax applied inGame frame=%d\n",
+				TheGameLogic->getFrame());
+			fflush(stderr);
+		}
+	}
+
 #ifdef LOG_FRAME_TIMES
 	__int64 curTime64,freq64;
 	static __int64 prevTime64=0;
@@ -1803,6 +1834,122 @@ void W3DView::update()
 	if (!didScriptedMovement)
 	{
 		updateCameraAreaConstraints();
+	}
+
+	// GeneralsX @feature 24/10/2026 P15 F2/T5.2b: QA fixed camera that moves the TACTICAL VIEW, not the
+	// render camera. P7 had to delete the earlier CameraClass override because W3DDevice derives the terrain
+	// draw region, clipping and culling from this view: pinning only the render camera culled the whole
+	// heightmap away and left trees/units floating on black (user report "camera stuck inside models").
+	// Overriding the view's own pivot/angle/pitch/zoom keeps worldToScreen, getDrawRegion2D, the clip planes
+	// and m_3DCamera in one state, so camera-motion A/Bs, close-up normal-map checks and hill shadows can be
+	// captured. Applied after the constraints and before the transform so it is the last writer.
+	//   GENERALSX_VK_QA_CAM="x,y,z[,angleDeg[,pitchDeg[,zoom]]]"   (absent = no effect at all)
+	{
+		static Int s_qaState = -1;		// -1 = not parsed yet, 0 = off, 1 = active
+		static Coord3D s_qaPos;
+		static Real s_qaAngle = 0.0f, s_qaPitch = 0.0f, s_qaZoom = 0.0f;
+		static Bool s_qaHasAngle = FALSE, s_qaHasPitch = FALSE, s_qaHasZoom = FALSE;
+		if (s_qaState < 0)
+		{
+			s_qaState = 0;
+			const char* ev = getenv("GENERALSX_VK_QA_CAM");
+			if (ev != nullptr && *ev != 0)
+			{
+				float x = 0.0f, y = 0.0f, z = 0.0f, a = 0.0f, p = 0.0f, zo = 0.0f;
+				const int n = sscanf(ev, "%f,%f,%f,%f,%f,%f", &x, &y, &z, &a, &p, &zo);
+				if (n >= 3)
+				{
+					s_qaPos.set(x, y, z);
+					s_qaHasAngle = (n >= 4) ? TRUE : FALSE;	s_qaAngle = DEG_TO_RADF(a);
+					s_qaHasPitch = (n >= 5) ? TRUE : FALSE;	s_qaPitch = DEG_TO_RADF(p);
+					s_qaHasZoom = (n >= 6) ? TRUE : FALSE;	s_qaZoom = zo;
+					s_qaState = 1;
+					fprintf(stderr, "[QACAM] view override pivot=(%.1f,%.1f,%.1f) angle=%.1f pitch=%.1f zoom=%.2f (%d floats)\n",
+						x, y, z, a, p, zo, n);
+					fflush(stderr);
+				}
+				else
+				{
+					fprintf(stderr, "[QACAM] bad GENERALSX_VK_QA_CAM=\"%s\" (want x,y,z[,angle,pitch,zoom]) - ignored\n", ev);
+					fflush(stderr);
+				}
+			}
+		}
+		if (s_qaState == 1)
+		{
+			m_pos = s_qaPos;
+			if (s_qaHasAngle) m_angle = s_qaAngle;
+			if (s_qaHasPitch) m_pitch = s_qaPitch;
+			if (s_qaHasZoom) m_zoom = s_qaZoom;
+			// GeneralsX @feature 24/10/2026 P16 A5: optional slow orbit (degrees/second) around the pivot.
+			// Light popping only exists while the camera moves, so a still frame cannot measure it; this
+			// turns the same fixed camera into a deterministic pan for the per-frame selection probe.
+			{
+				static Real s_qaOrbit = -1.0f;
+				static DWORD s_qaStart = 0;
+				if (s_qaOrbit < 0.0f)
+				{
+					const char* ov = getenv("GENERALSX_VK_QA_ORBIT");
+					s_qaOrbit = (ov != nullptr && *ov != 0) ? (Real)atof(ov) : 0.0f;
+					if (s_qaOrbit != 0.0f)
+					{
+						s_qaStart = GetTickCount();
+						fprintf(stderr, "[QACAM] orbit %.2f deg/s\n", s_qaOrbit);
+						fflush(stderr);
+					}
+				}
+				if (s_qaOrbit != 0.0f)
+				{
+					const Real t = (Real)(GetTickCount() - s_qaStart) * 0.001f;
+					m_angle = s_qaAngle + DEG_TO_RADF(s_qaOrbit) * t;
+				}
+			}
+			m_recalcCamera = true;
+		}
+	}
+
+	// GeneralsX @feature 26/10/2026 unattended QA: fixed zoom without input injection. The screenshot
+	// harness used to scroll the mouse wheel and warp the desktop cursor to reach the game window, which
+	// trapped the pointer on a multi-monitor desktop. A fixed zoom value (same units as m_zoom: >1 is
+	// farther out) reproduces the wide fog-acceptance view with zero input; 0/unset keeps normal play.
+	{
+		static Real s_qaZoom = -1.0f;
+		if (s_qaZoom < 0.0f) {
+			const char* zv = getenv("GENERALSX_QA_ZOOM");
+			s_qaZoom = (zv != nullptr && *zv != 0) ? (Real)atof(zv) : 0.0f;
+			if (s_qaZoom > 0.0f) {
+				fprintf(stderr, "[QACAM] fixed zoom %.2f\n", s_qaZoom);
+				fflush(stderr);
+			}
+		}
+		if (s_qaZoom > 0.0f) {
+			m_zoom = s_qaZoom;
+			m_recalcCamera = true;
+		}
+		// GeneralsX @debug 28/10/2026 QA zoom sweep: GENERALSX_QA_ZOOM_AMP=<amp> oscillates the zoom
+		// around the fixed value above (6 s period). The sun shadow fit is derived from the visible
+		// footprint, so "shadows vanish when I zoom in" and shadow flicker are only observable while the
+		// zoom actually moves; this reproduces it with zero input, like the orbit above.
+		{
+			static Real s_qaZoomAmp = -1.0f;
+			static DWORD s_qaZoomStart = 0;
+			if (s_qaZoomAmp < 0.0f) {
+				const char* za = getenv("GENERALSX_QA_ZOOM_AMP");
+				s_qaZoomAmp = (za != nullptr && *za != 0) ? (Real)atof(za) : 0.0f;
+				if (s_qaZoomAmp > 0.0f) {
+					s_qaZoomStart = GetTickCount();
+					fprintf(stderr, "[QACAM] zoom sweep +/-%.2f\n", s_qaZoomAmp);
+					fflush(stderr);
+				}
+			}
+			if (s_qaZoomAmp > 0.0f) {
+				const Real t = (Real)(GetTickCount() - s_qaZoomStart) * 0.001f;
+				const Real base = (s_qaZoom > 0.0f) ? s_qaZoom : 1.0f;
+				m_zoom = base + s_qaZoomAmp * (Real)sin(t * 2.0f * 3.14159265f / 6.0f);
+				if (m_zoom < 0.3f) m_zoom = 0.3f;
+				m_recalcCamera = true;
+			}
+		}
 	}
 
 	// (gth) C&C3 if m_isCameraSlaved then force the camera to update each frame

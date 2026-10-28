@@ -869,6 +869,83 @@ Int parseQuickStart( char *args[], int num )
 	return 1;
 }
 
+// GeneralsX @feature 25/10/2026 Launcher contract: skip the main menu and optionally boot
+// straight into a named shell layout. The external launcher owns the front end; the engine
+// only needs to know which screen to push (MissionSelect, ChallengeMenu, SkirmishGameOptions,
+// ...). Both flags are presentation-only and never touch the simulation.
+Int parseNoMenu( char *args[], int num )
+{
+	// The intro is constructed before the shell is pushed, so it must be disabled here rather
+	// than inside GameEngine::init; otherwise a launcher boot plays the EA/Sizzle intro and
+	// GameLogic waits for the movie before starting the match.
+	parseNoLogo( args, num );
+	TheWritableGlobalData->m_skipMainMenu = TRUE;
+	return 1;
+}
+
+Int parseScreen( char *args[], int num )
+{
+	if (num > 1)
+	{
+		parseNoLogo( args, num );
+		TheWritableGlobalData->m_launcherScreen = args[1];
+		TheWritableGlobalData->m_skipMainMenu = TRUE;
+		return 2;
+	}
+	return 1;
+}
+
+// GeneralsX @feature 25/10/2026 Launcher skirmish boot. Spec format matches the existing QA
+// path: map;aiCount;difficulty;style;seed;fps. The engine queues the normal GAME_SKIRMISH
+// message, so the simulation and the original skirmish setup code stay in charge.
+Int parseSkirmish( char *args[], int num )
+{
+	if (num > 1)
+	{
+		parseNoLogo( args, num );
+		TheWritableGlobalData->m_skirmishSpec = args[1];
+		TheWritableGlobalData->m_skipMainMenu = TRUE;
+		return 2;
+	}
+	return 1;
+}
+
+// GeneralsX @feature 25/10/2026 Launcher campaign boot: campaign;mission;difficulty.
+Int parseCampaign( char *args[], int num )
+{
+	if (num > 1)
+	{
+		parseNoLogo( args, num );
+		TheWritableGlobalData->m_campaignSpec = args[1];
+		TheWritableGlobalData->m_skipMainMenu = TRUE;
+		return 2;
+	}
+	return 1;
+}
+
+// GeneralsX @feature 25/10/2026 Launcher challenge boot: personaIndex;difficulty.
+Int parseChallenge( char *args[], int num )
+{
+	if (num > 1)
+	{
+		parseNoLogo( args, num );
+		TheWritableGlobalData->m_challengeSpec = args[1];
+		TheWritableGlobalData->m_skipMainMenu = TRUE;
+		return 2;
+	}
+	return 1;
+}
+
+Int parseKeyMap( char *args[], int num )
+{
+	if (num > 1)
+	{
+		TheWritableGlobalData->m_keyMapFile = args[1];
+		return 2;
+	}
+	return 1;
+}
+
 Int parseConstantDebug( char *args[], int num )
 {
 	TheWritableGlobalData->m_constantDebugUpdate = TRUE;
@@ -1250,6 +1327,13 @@ static CommandLineParam paramsForEngineInit[] =
 	// GeneralsX @feature PS3.0 batch2 12/10/2026 shader-model ceiling for the render paths
 	{ "-shadermodel", parseShaderModel },
 	{ "-quickstart", parseQuickStart },
+	// GeneralsX @feature 25/10/2026 External launcher boot contract.
+	{ "-nomenu", parseNoMenu },
+	{ "-screen", parseScreen },
+	{ "-skirmish", parseSkirmish },
+	{ "-campaign", parseCampaign },
+	{ "-challenge", parseChallenge },
+	{ "-keymap", parseKeyMap },
 	{ "-useWaveEditor", parseUseWaveEditor },
 
 	// GeneralsX @feature Qoder 11/10/2026 Read-only AI map-logic dumper and the headless

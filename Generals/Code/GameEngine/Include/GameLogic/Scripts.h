@@ -763,6 +763,9 @@ public:
 		OBJECT_TYPE_LIST,		// String, Special case of Object Type.
 		REVEALNAME,					// String, the name of the look taking place.
 		SCIENCE_AVAILABILITY, // String, the name of the different science availabilities.
+		LEFT_OR_RIGHT,        // Int, 1=left / 2=right. GeneralsX @feature 25/10/2026 P34 F6: API parity
+		                      // with the GeneralsMD script enum so shared Core code compiles.
+		PERCENT,						// Real.  A percentage. (used by the shared MapLogicDumper)
 		NUM_ITEMS
 	};
 
@@ -1023,6 +1026,10 @@ class Template : public MemoryPoolObject
 //friend class ScriptEngine;
 public:
 	AsciiString m_name;
+	// GeneralsX @feature 25/10/2026 P34 F6: stable script id, required by the shared MapLogicDumper in
+	// Core. The base game keeps m_name as the display string (GeneralsMD renamed it m_uiName); this
+	// member is filled from m_name in ScriptEngine::init() when no authored id exists.
+	AsciiString m_internalName;
 	Int					m_numUiStrings;
 	AsciiString m_uiStrings[MAX_PARMS];
 	Int					m_numParameters;

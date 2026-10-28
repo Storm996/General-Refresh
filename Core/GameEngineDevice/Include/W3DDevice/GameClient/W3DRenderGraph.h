@@ -54,13 +54,28 @@ public:
 	typedef bool (*TargetAllocHandler)(const char* name, unsigned width, unsigned height,
 		unsigned format, bool depth);
 	typedef void (*TargetFreeHandler)(const char* name);
+	// 6B: graph-owned P6 intermediates (the five bloom levels) are described by the backend each frame,
+	// because only it knows whether bloom/auto-exposure is on and what the scene extent/format became.
+	typedef bool (*PostTargetDescHandler)(unsigned* count, unsigned* width, unsigned* height,
+		unsigned* format);
+	// 6B: the water reflection image is created by the engine's render-target wrapper, then adopted by
+	// the graph so its barrier/lifetime policy is graph-owned. The backend resolves the key and shape.
+	typedef bool (*WaterTargetDescHandler)(void** key, unsigned* width, unsigned* height,
+		unsigned* format);
+	// External targets are freed by key (the graph never allocated the image itself).
+	typedef void (*TargetFreeKeyHandler)(void* key);
 
-	static void SetTargetHandlers(TargetDescHandler desc, TargetAllocHandler alloc, TargetFreeHandler freeHandler)
+	static void SetTargetHandlers(TargetDescHandler desc, TargetAllocHandler alloc,
+		TargetFreeHandler freeHandler, TargetFreeKeyHandler freeKeyHandler)
 	{
 		s_targetDescHandler = desc;
 		s_targetAllocHandler = alloc;
 		s_targetFreeHandler = freeHandler;
+		s_targetFreeKeyHandler = freeKeyHandler;
 	}
+
+	static void SetPostTargetHandler(PostTargetDescHandler handler) { s_postTargetDescHandler = handler; }
+	static void SetWaterTargetHandler(WaterTargetDescHandler handler) { s_waterTargetDescHandler = handler; }
 
 	/// Acquire this frame's sceneColor/sceneDepth (and overlay when the P6 resolve is wanted), then
 	/// declare them as logical resources. A transient resource that is no longer wanted is freed here:
@@ -152,6 +167,7 @@ public:
 
 	bool PrepareTargets()
 	{
+		static const char* const kBloomNames[5] = { "bloom0", "bloom1", "bloom2", "bloom3", "bloom4" };
 		if (!s_targetDescHandler) return false;
 		unsigned sceneW = 0, sceneH = 0, colorFormat = 0, depthFormat = 0;
 		unsigned overlayW = 0, overlayH = 0, overlayFormat = 0;
@@ -181,7 +197,103 @@ public:
 			// Transient lifetime: the LDR overlay exists only while the P6 resolve is needed.
 			ReleaseTarget("overlay");
 		}
+
+		// 6B: P6 bloom chain (bloom0 = 1/2, .. bloom4 = 1/32). The backend decides whether the chain is
+		// needed this frame (bloom intensity or auto exposure) and the exact sizes/format. The graph owns
+		// allocation/release; VulkanDraw only records the blit chain into these images.
+		if (s_postTargetDescHandler) {
+			unsigned count = 0;
+			unsigned bw[5] = {}, bh[5] = {}, bf = 0;
+			if (s_postTargetDescHandler(&count, bw, bh, &bf) && bf) {
+				if (count > 5u) count = 5u;
+				static unsigned s_lastBloomCount = ~0u;
+				if (count != s_lastBloomCount) {
+					s_lastBloomCount = count;
+					fprintf(stderr, "[RG] bloom chain levels=%u first=%ux%u fmt=%u\n",
+						count, count ? bw[0] : 0u, count ? bh[0] : 0u, bf);
+					fflush(stderr);
+				}
+				for (unsigned i = 0; i < 5u; ++i) {
+					if (i >= count) { ReleaseTarget(kBloomNames[i]); continue; }
+					ok = EnsureTarget(kBloomNames[i], bw[i], bh[i], bf, false) && ok;
+					DeclareResource(kBloomNames[i], bw[i], bh[i], bf, true);
+				}
+			} else {
+				for (unsigned i = 0; i < 5u; ++i) ReleaseTarget(kBloomNames[i]);
+			}
+		}
+
+		// 6B: water reflection is an external target: the engine's render-target wrapper creates the
+		// image, the graph adopts the key and owns its barrier/lifetime from then on. When the water
+		// object releases it, the descriptor returns false and the graph frees the adopted image.
+		if (s_waterTargetDescHandler) {
+			void* waterKey = nullptr;
+			unsigned ww = 0, wh = 0, wf = 0;
+			if (s_waterTargetDescHandler(&waterKey, &ww, &wh, &wf) && waterKey && ww && wh) {
+				AdoptTarget("waterReflection", waterKey, ww, wh, wf, false);
+				DeclareResource("waterReflection", ww, wh, wf, true);
+			} else {
+				ReleaseTarget("waterReflection");
+			}
+		}
 		return ok;
+	}
+
+	/// 6B: adopt an image another owner created (water reflection), so the graph can record its
+	/// barriers and release it through the same lifetime path as its own targets. The image must already
+	/// exist; a shape/key change is taken as a new adoption, and ReleaseTarget frees the old key first.
+	bool AdoptTarget(const char* name, void* key, unsigned width, unsigned height,
+		unsigned format, bool depth = false)
+	{
+		if (!name || !key || !width || !height) return false;
+		AllocatedTarget* target = FindTarget(name);
+		if (target && target->created && target->external && target->key != key) {
+			ReleaseTarget(name);
+			target = FindTarget(name);
+		}
+		if (!target) {
+			if (m_targetCount >= 16u) return false;
+			target = &m_targets[m_targetCount++];
+			target->name = name;
+			target->created = false;
+			target->external = false;
+			target->key = nullptr;
+		}
+		const bool changed = !target->created || !target->external || target->width != width ||
+			target->height != height || target->format != format;
+		target->width = width;
+		target->height = height;
+		target->format = format;
+		target->depth = depth;
+		target->created = true;
+		target->external = true;
+		target->key = key;
+		if (changed) {
+			static int s_adoptLog = 0;
+			if (s_adoptLog < 4) {
+				++s_adoptLog;
+				fprintf(stderr, "[RG] adopted external target '%s' %ux%u fmt=%u\n",
+					name, width, height, format);
+				fflush(stderr);
+			}
+		}
+		return true;
+	}
+
+	/// 6B: forget every target record without touching the backend. Called when the draw layer is not
+	/// ready (device loss/recreate): the VK images behind the old keys are gone or about to be, and a
+	/// stale `created` flag would make the graph skip the reallocation on the new device.
+	void Reset()
+	{
+		for (unsigned i = 0; i < m_targetCount; ++i) {
+			m_targets[i].created = false;
+			m_targets[i].external = false;
+			m_targets[i].key = nullptr;
+		}
+		m_targetCount = 0;
+		m_resourceCount = 0;
+		m_pass = 0;
+		m_passName = nullptr;
 	}
 
 	const char* ResourceName(unsigned index) const
@@ -258,8 +370,12 @@ private:
 		unsigned width, height, format;
 		bool depth;
 		bool created;
+		// 6B: external targets are images another owner created (water reflection). The graph owns the
+		// barrier/lifetime policy but must free them by key, not by name through the allocator.
+		bool external;
+		void* key;
 	};
-	AllocatedTarget m_targets[8] = {};
+	AllocatedTarget m_targets[16] = {};
 	unsigned m_targetCount = 0;
 
 	AllocatedTarget* FindTarget(const char* name)
@@ -281,6 +397,8 @@ private:
 			target->format == format && target->depth == depth) {
 			return true;
 		}
+		// An adopted image cannot be reallocated by the graph: its owner has to publish a new key.
+		if (target && target->external) return false;
 		if (!s_targetAllocHandler(name, width, height, format, depth)) {
 			static int s_allocFailLog = 0;
 			if (s_allocFailLog < 6) {
@@ -292,9 +410,11 @@ private:
 			return false;
 		}
 		if (!target) {
-			if (m_targetCount >= 8u) return false;
+			if (m_targetCount >= 16u) return false;
 			target = &m_targets[m_targetCount++];
 			target->name = name;
+			target->external = false;
+			target->key = nullptr;
 		}
 		target->width = width;
 		target->height = height;
@@ -308,8 +428,16 @@ private:
 	{
 		AllocatedTarget* target = FindTarget(name);
 		if (target && target->created) {
-			if (s_targetFreeHandler) s_targetFreeHandler(name);
+			if (target->external) {
+				// 6B: the image exists under an owner-provided key; free through the key handler so the
+				// backend can retire (not leak) an image the graph never created.
+				if (s_targetFreeKeyHandler && target->key) s_targetFreeKeyHandler(target->key);
+			} else if (s_targetFreeHandler) {
+				s_targetFreeHandler(name);
+			}
 			target->created = false;
+			target->external = false;
+			target->key = nullptr;
 			static int s_freeLog = 0;
 			if (s_freeLog < 4) {
 				++s_freeLog;
@@ -341,12 +469,18 @@ private:
 	static TargetDescHandler s_targetDescHandler;
 	static TargetAllocHandler s_targetAllocHandler;
 	static TargetFreeHandler s_targetFreeHandler;
+	static TargetFreeKeyHandler s_targetFreeKeyHandler;
+	static PostTargetDescHandler s_postTargetDescHandler;
+	static WaterTargetDescHandler s_waterTargetDescHandler;
 };
 
 inline W3DRenderGraph::BarrierHandler W3DRenderGraph::s_barrierHandler = nullptr;
 inline W3DRenderGraph::TargetDescHandler W3DRenderGraph::s_targetDescHandler = nullptr;
 inline W3DRenderGraph::TargetAllocHandler W3DRenderGraph::s_targetAllocHandler = nullptr;
 inline W3DRenderGraph::TargetFreeHandler W3DRenderGraph::s_targetFreeHandler = nullptr;
+inline W3DRenderGraph::TargetFreeKeyHandler W3DRenderGraph::s_targetFreeKeyHandler = nullptr;
+inline W3DRenderGraph::PostTargetDescHandler W3DRenderGraph::s_postTargetDescHandler = nullptr;
+inline W3DRenderGraph::WaterTargetDescHandler W3DRenderGraph::s_waterTargetDescHandler = nullptr;
 
 class W3DRenderFrameScope
 {

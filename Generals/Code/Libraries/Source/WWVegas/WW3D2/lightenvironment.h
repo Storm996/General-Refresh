@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -26,12 +26,13 @@
  *                                                                                             *
  *              Original Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                      $Author:: Naty_h                                                      $*
+ *                      $Author:: Kenny Mitchell                                              $*
  *                                                                                             *
- *                     $Modtime:: 4/01/01 12:01a                                              $*
+ *                     $Modtime:: 06/27/02 9:23a                                              $*
  *                                                                                             *
- *                    $Revision:: 4                                                           $*
+ *                    $Revision:: 5                                                           $*
  *                                                                                             *
+ * 06/27/02 KM Shader system light environment updates                                       *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
@@ -85,6 +86,13 @@ public:
 	void					Reset(const Vector3 & object_center,const Vector3 & scene_ambient);
 	void					Add_Light(const LightClass & light);
 	void					Pre_Render_Update(const Matrix3D & camera_tm);
+	void					Add_Fill_Light();
+	void					Calculate_Fill_Light();
+	void					Set_Fill_Intensity(float intensity)			{ FillIntensity = intensity; }
+	// GeneralsX @feature Qoder 24/10/2026 P1: Modern lighting keeps a point light's contribution
+	// local (diffuse only); Retail folds its ambient into the object's ambient and tints the whole
+	// mesh. Default false = Modern; the setter exists for A/B and the Retail quality tier.
+	static void			Set_Point_Ambient_Enabled(bool enabled);
 
 	/*
 	** Accessors
@@ -96,6 +104,10 @@ public:
 	const Vector3 &	Get_Light_Diffuse(int i) const				{ return InputLights[i].Diffuse; }
 
 	bool isPointLight(int i) const {return InputLights[i].m_point;}
+	// GeneralsX @feature Qoder 20/10/2026 Forward: a point light whose diffuse was below the LOD
+	// cutoff got folded into the ambient term (Diffuse zeroed in the output list). The per-pixel
+	// point loop must not add it again, or dim lamps double-count as ambient + diffuse.
+	bool isPointDiffuseRejected(int i) const {return InputLights[i].DiffuseRejected;}
 	float getPointIrad(int i) const {return InputLights[i].m_innerRadius;}
 	float getPointOrad(int i) const {return InputLights[i].m_outerRadius;}
 	const Vector3 &	getPointDiffuse(int i) const				{ return InputLights[i].m_diffuse; }
@@ -110,10 +122,26 @@ public:
 	static float		Get_Lighting_LOD_Cutoff();
 
 	static int			Get_Max_Lights() { return MAX_LIGHTS; }
-	// GeneralsX @feature PS3.0-P3-18 14/10/2026 backport: 4 -> 8 in lockstep with the Zero Hour copy
-	// (see GeneralsMD lightenvironment.h for the consumer audit; the shared DX8Wrapper fixed-function
-	// light state was widened to 8 units and clamps the upload to the device's MaxActiveLights).
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8. The sorted-insert collection below keeps the
+	// 8 strongest contributors, so night-scene lamps survive a busy light list instead of being cut by
+	// the sun. Every consumer tracks this constant (W3DDisplay/W3DScene arrays, dx8renderer GN gate);
+	// the only hardcoded widening was DX8Wrapper's fixed-function light state (Lights/LightEnable[8],
+	// LIGHT4..7 change bits), and Set_Light_Environment clamps the upload to the device's
+	// MaxActiveLights. Calculate_Fill_Light deliberately still averages only the top 3.
 	enum { MAX_LIGHTS = 8 };	//Made this public, so other code can tell how many lights are allowed. - MW
+
+	bool operator== (const LightEnvironmentClass& that) const
+	{
+		if (LightCount!=that.LightCount) return false;
+		bool dif=!(ObjectCenter==that.ObjectCenter);
+		dif|=OutputAmbient!=that.OutputAmbient;
+		for (int i=0;i<LightCount;++i) {
+			dif|=!(OutputLights[i].Diffuse==that.OutputLights[i].Diffuse);
+			dif|=!(OutputLights[i].Direction==that.OutputLights[i].Direction);
+			if (dif) return false;
+		}
+		return true;
+	}
 
 protected:
 
@@ -130,6 +158,7 @@ protected:
 		bool				DiffuseRejected;
 
 		bool				m_point;
+		bool				m_directional;
 		Vector3			m_center;
 		float				m_innerRadius;
 		float				m_outerRadius;
@@ -151,9 +180,12 @@ protected:
 	*/
 	int					LightCount;
 	Vector3				ObjectCenter;					// center of the object to be lit
-	InputLightStruct	InputLights[MAX_LIGHTS];	// input lights
+	static bool			s_pointAmbientEnabled;		// P1: false = point ambient is not folded into the mesh
+	InputLightStruct	InputLights[MAX_LIGHTS];	// Sorted list of input lights from the greatest contributor to the least
 
 	Vector3				OutputAmbient;					// scene ambient + lights' ambients
 	OutputLightStruct	OutputLights[MAX_LIGHTS];	// output lights
 
+	InputLightStruct 	FillLight;						// Used to store the calculated fill light
+	float					FillIntensity;					// Used to determine how strong the fill light should be
 };

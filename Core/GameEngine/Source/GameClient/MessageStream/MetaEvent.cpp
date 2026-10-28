@@ -689,6 +689,149 @@ MetaMap::~MetaMap()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature 25/10/2026 Launcher key-binding export/import.
+//-------------------------------------------------------------------------------------------------
+static const char *metaMapNameForType(GameMessage::Type type)
+{
+	for (const LookupListRec *rec = GameMessageMetaTypeNames; rec->name; ++rec)
+	{
+		if ((GameMessage::Type)rec->value == type)
+			return rec->name;
+	}
+	return nullptr;
+}
+
+static const char *metaMapKeyName(MappableKeyType key)
+{
+	for (const LookupListRec *rec = KeyNames; rec->name; ++rec)
+	{
+		if (rec->value == (Int)key)
+			return rec->name;
+	}
+	return nullptr;
+}
+
+static const char *metaMapModName(MappableKeyModState mod)
+{
+	for (const LookupListRec *rec = ModifierNames; rec->name; ++rec)
+	{
+		if (rec->value == (Int)mod)
+			return rec->name;
+	}
+	return nullptr;
+}
+
+static MappableKeyType metaMapKeyFromName(const char *name)
+{
+	// Accept the older/alternate spelling written by early launcher builds.
+	if (stricmp(name, "KEY_ESCAPE") == 0)
+		name = "KEY_ESC";
+	for (const LookupListRec *rec = KeyNames; rec->name; ++rec)
+	{
+		if (stricmp(rec->name, name) == 0)
+			return (MappableKeyType)rec->value;
+	}
+	return MK_NONE;
+}
+
+static MappableKeyModState metaMapModFromName(const char *name)
+{
+	for (const LookupListRec *rec = ModifierNames; rec->name; ++rec)
+	{
+		if (stricmp(rec->name, name) == 0)
+			return (MappableKeyModState)rec->value;
+	}
+	return NONE;
+}
+
+void MetaMap::writeKeyMap(const char *path) const
+{
+	if (!path || !*path)
+		return;
+	FILE *fp = fopen(path, "w");
+	if (!fp)
+	{
+		fprintf(stderr, "[KEYMAP] cannot write '%s'\n", path);
+		fflush(stderr);
+		return;
+	}
+
+	fprintf(fp, "; GeneralRefresh key bindings: command|key|modifier\n");
+	for (const MetaMapRec *rec = m_metaMaps; rec; rec = rec->m_next)
+	{
+		const char *command = metaMapNameForType(rec->m_meta);
+		const char *key = metaMapKeyName(rec->m_key);
+		const char *mod = metaMapModName(rec->m_modState);
+		if (command && key && mod && rec->m_key != MK_NONE)
+			fprintf(fp, "%s|%s|%s\n", command, key, mod);
+	}
+	fclose(fp);
+	fprintf(stderr, "[KEYMAP] wrote '%s'\n", path);
+	fflush(stderr);
+}
+
+void MetaMap::loadKeyMap(const char *path)
+{
+	if (!path || !*path)
+		return;
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+	{
+		fprintf(stderr, "[KEYMAP] cannot read '%s'\n", path);
+		fflush(stderr);
+		return;
+	}
+
+	char line[512];
+	Int applied = 0;
+	while (fgets(line, sizeof(line), fp))
+	{
+		char *p = line;
+		while (*p == ' ' || *p == '\t')
+			++p;
+		if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n')
+			continue;
+
+		char *first = strchr(p, '|');
+		if (!first)
+			continue;
+		*first = 0;
+		char *second = strchr(first + 1, '|');
+		if (!second)
+			continue;
+		*second = 0;
+
+		char *command = p;
+		char *key = first + 1;
+		char *mod = second + 1;
+		char *end = strpbrk(command, " \t\r\n");
+		if (end)
+			*end = 0;
+		end = strpbrk(key, " \t\r\n");
+		if (end)
+			*end = 0;
+		end = strpbrk(mod, " \t\r\n");
+		if (end)
+			*end = 0;
+
+		const GameMessage::Type type = findGameMessageMetaType(command);
+		if (type == GameMessage::MSG_INVALID)
+			continue;
+		MetaMapRec *rec = getMetaMapRec(type);
+		if (!rec)
+			continue;
+
+		rec->m_key = metaMapKeyFromName(key);
+		rec->m_modState = metaMapModFromName(mod);
+		rec->m_transition = DOWN;
+		++applied;
+	}
+	fclose(fp);
+	fprintf(stderr, "[KEYMAP] applied %d bindings from '%s'\n", applied, path);
+	fflush(stderr);
+}
+
+//-------------------------------------------------------------------------------------------------
 GameMessage::Type MetaMap::findGameMessageMetaType(const char* name)
 {
 	for (const LookupListRec* metaNames = GameMessageMetaTypeNames; metaNames->name; metaNames++)

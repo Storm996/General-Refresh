@@ -103,8 +103,21 @@ references/GameServer/
 /画质升级/
 /渲染器现代化调研(vulkan)/
 /引擎改造/
+/shaders/
+/recordings/
+/scripts/
+/Launcher/
+/HDR 专项/
+/问题专项/
+/光影升级2.0/
 /游戏特性/
+/建模优化/
+/游戏特性升级/
 /运行验证/
+/光照重构/
+/assets/
+/docs/
+/Vulkan-Headers-main/
 /GeneralRefresh.exe
 /GeneralRefresh.pdb
 /docs/WORKDIR/support/IDE_IMPORTS/
@@ -147,6 +160,7 @@ references/GameServer/
 # repository, even if a future task folder forgets its own ignore rule. The
 # engine-required assets and project icons below are explicitly re-included.
 *.png
+*.ps1
 *.jpg
 *.jpeg
 *.dds

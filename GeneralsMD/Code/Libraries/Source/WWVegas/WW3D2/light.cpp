@@ -116,7 +116,8 @@ LightClass::LightClass(LightType type) :
 	SpotAngle(DEG_TO_RADF(45.0f)),
 	SpotAngleCos(0.707f),
 	SpotExponent(1.0f),
-	SpotDirection(0,0,1)//,
+	SpotDirection(0,0,1),
+	ForwardCookie(0)//,
 	//Donut (false)
 
 {

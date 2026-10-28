@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -42,6 +42,7 @@
 #include "WW3D2/proto.h"
 #include "WW3D2/w3derr.h"
 #include "WW3D2/proxy.h"
+
 
 class DistLODClass;
 class HModelClass;

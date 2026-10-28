@@ -28,6 +28,14 @@ target_link_libraries(gi_always_no_pch INTERFACE
     corei_always_no_pch # Must stay below so headers from game are included first
 )
 
+# GeneralsX @build 24/10/2026 F6: the base game had no CompatLib subdirectory at all, so the d3dx8
+# target (its Include_win copy of d3dx9math.h / the D3DX math+texture stubs) never existed for a
+# Generals-only build and WWMath failed with "cannot open d3dx9math.h". Wire the same compat layer the
+# Zero Hour tree uses; the guard keeps a both-games build from adding the target twice.
+if(NOT TARGET d3dx8)
+    add_subdirectory(CompatLib)
+endif()
+
 # Contains internal libraries
 add_subdirectory(Libraries)
 

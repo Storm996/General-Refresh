@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -22,13 +22,13 @@
  *                                                                                             *
  *                 Project Name : WW3D                                                         *
  *                                                                                             *
- *                     $Archive:: /VSS_Sync/ww3d2/shader.cpp                                  $*
+ *                     $Archive:: /Commando/Code/ww3d2/shader.cpp                             $*
  *                                                                                             *
  *                       Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                     $Modtime:: 8/29/01 7:29p                                               $*
+ *                     $Modtime:: 12/11/01 5:15p                                              $*
  *                                                                                             *
- *                    $Revision:: 18                                                          $*
+ *                    $Revision:: 21                                                          $*
  *                                                                                             *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -406,7 +406,6 @@ const Blend dstBlendLUT[ShaderClass::DSTBLEND_MAX] =
  * HISTORY:                                                                                    *
  *   4/24/2001  gth : Created.                                                                 *
  *=============================================================================================*/
-// GeneralsX @bugfix Mr. Meeseeks 18/06/2026 Align shader class rendering logic and categories with Zero Hour to fix skinned mesh infantry rendering black on Vulkan/DXVK
 void ShaderClass::Apply()
 {
 	unsigned long diff;
@@ -422,7 +421,56 @@ void ShaderClass::Apply()
 		diff=CurrentShader^ShaderBits;
 	}
 
-	if(!diff) return;
+	if(!diff)
+	{
+		// GeneralsX @bugfix Qoder 21/10/2026 STATELEAK: a raw D3D render-state write (decal, scorch,
+		// explosion and other effect passes use Set_DX8_Render_State directly) can leave
+		// ALPHABLENDENABLE/SRCBLEND/DSTBLEND/ALPHATEST different from what this shader specifies while
+		// the cached shader bits still match. ShaderClass used to return here, so the next batch that
+		// reused the same shader inherited the effect pass' multiplicative ZERO/SRCCOLOR blend and
+		// rendered as a black/odd card (tracks, propellers, shells, scorch). Compare the effective
+		// states and re-apply only the blend/alpha-test block when they no longer match.
+		ULONG planeMask = (Get_Color_Mask() != ShaderClass::COLOR_WRITE_ENABLE) ? 0u : 0xffffffu;
+		D3DBLEND wantSf, wantDf;
+		if (!planeMask) { wantSf = D3DBLEND_ZERO; wantDf = D3DBLEND_ONE; }
+		else {
+			wantSf = srcBlendLUT[int(Get_Src_Blend_Func())].func;
+			wantDf = dstBlendLUT[int(Get_Dst_Blend_Func())].func;
+		}
+		const BOOL wantBlend = (wantSf != D3DBLEND_ONE || wantDf != D3DBLEND_ZERO);
+		const BOOL wantAT = (Get_Alpha_Test() == ShaderClass::ALPHATEST_ENABLE);
+		DWORD wantAf = D3DCMP_GREATEREQUAL, wantAr = 0x60;
+		if (wantAT && wantSf == D3DBLEND_INVSRCALPHA) { wantAf = D3DCMP_LESSEQUAL; wantAr = 0xffu - 0x60u; }
+
+		bool wrong = false;
+		const unsigned curBlend = DX8Wrapper::VK_Read_RS(D3DRS_ALPHABLENDENABLE);
+		if (wantBlend) {
+			if (!curBlend
+				|| DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND) != (unsigned)wantSf
+				|| DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND) != (unsigned)wantDf) wrong = true;
+		} else if (curBlend) wrong = true;
+		const unsigned curAT = DX8Wrapper::VK_Read_RS(D3DRS_ALPHATESTENABLE);
+		if (wantAT) {
+			if (!curAT
+				|| DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC) != wantAf
+				|| (DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu) != wantAr) wrong = true;
+		} else if (curAT) wrong = true;
+
+		if (!wrong) return;
+		{
+			static int s_leakLog = 0;
+			if (s_leakLog < 48) {
+				++s_leakLog;
+				fprintf(stderr, "[STATELEAK] shader=%08lX want blend=%d %u/%u at=%d %u/%u cur blend=%u %u/%u at=%u %u/%u\n",
+					(unsigned long)ShaderBits, (int)wantBlend, (unsigned)wantSf, (unsigned)wantDf,
+					(int)wantAT, (unsigned)wantAf, (unsigned)wantAr,
+					curBlend, DX8Wrapper::VK_Read_RS(D3DRS_SRCBLEND), DX8Wrapper::VK_Read_RS(D3DRS_DESTBLEND),
+					curAT, DX8Wrapper::VK_Read_RS(D3DRS_ALPHAFUNC) & 7u, DX8Wrapper::VK_Read_RS(D3DRS_ALPHAREF) & 0xFFu);
+				fflush(stderr);
+			}
+		}
+		diff = ShaderClass::MASK_SRCBLEND | ShaderClass::MASK_DSTBLEND | ShaderClass::MASK_ALPHATEST;
+	}
 
 
 	CurrentShader=ShaderBits;
@@ -964,11 +1012,15 @@ void ShaderClass::Apply()
 				ShaderDirty=true;
 			}
 		} else {
+
+#pragma message("(gth) Generals added a feature here WW3D::Is_Coloring_Enabled() which needs to be merged properly")
+#if 0
 			if (WW3D::Is_Coloring_Enabled())
 			{
-				PricArg2=PriaArg2=D3DTA_TFACTOR;
-				PricOp=PriaOp=D3DTOP_SELECTARG2;
+				cArg2=aArg2=D3DTA_TFACTOR;
+				cOp=aOp=D3DTOP_SELECTARG2;
 			}
+#endif
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLOROP,PricOp);
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLORARG1,PricArg1);
 			DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_COLORARG2,PricArg2);
@@ -1181,22 +1233,22 @@ StringClass ShaderClass::Get_Description() const
 
 	switch (Get_Dst_Blend_Func()) {
 	case DSTBLEND_ZERO: str+="DSTBLEND_ZERO | "; break;
-	case DSTBLEND_ONE: str+="DSTBLEND_ONE | "; break;
-	case DSTBLEND_SRC_COLOR: str+="DSTBLEND_SRC_COLOR | "; break;
-	case DSTBLEND_ONE_MINUS_SRC_COLOR: str+="DSTBLEND_ONE_MINUS_SRC_COLOR | "; break;
-	case DSTBLEND_SRC_ALPHA: str+="DSTBLEND_SRC_ALPHA | "; break;
-	case DSTBLEND_ONE_MINUS_SRC_ALPHA: str+="DSTBLEND_ONE_MINUS_SRC_ALPHA | "; break;
+  	case DSTBLEND_ONE: str+="DSTBLEND_ONE | "; break;
+ 	case DSTBLEND_SRC_COLOR: str+="DSTBLEND_SRC_COLOR | "; break;
+ 	case DSTBLEND_ONE_MINUS_SRC_COLOR: str+="DSTBLEND_ONE_MINUS_SRC_COLOR | "; break;
+ 	case DSTBLEND_SRC_ALPHA: str+="DSTBLEND_SRC_ALPHA | "; break;
+ 	case DSTBLEND_ONE_MINUS_SRC_ALPHA: str+="DSTBLEND_ONE_MINUS_SRC_ALPHA | "; break;
 	}
 
 	switch (Get_Fog_Func()) {
 	case FOG_DISABLE: str+="FOG_DISABLE | "; break;
-	case FOG_ENABLE: str+="FOG_ENABLE | "; break;
-	case FOG_SCALE_FRAGMENT: str+="FOG_SCALE_FRAGMENT | "; break;
-	case FOG_WHITE: str+="FOG_WHITE | "; break;
+ 	case FOG_ENABLE: str+="FOG_ENABLE | "; break;
+ 	case FOG_SCALE_FRAGMENT: str+="FOG_SCALE_FRAGMENT | "; break;
+ 	case FOG_WHITE: str+="FOG_WHITE | "; break;
 	}
 
 	switch (Get_Primary_Gradient()) {
-	case GRADIENT_DISABLE: str+="GRADIENT_DISABLE | "; break;
+ 	case GRADIENT_DISABLE: str+="GRADIENT_DISABLE | "; break;
 	case GRADIENT_MODULATE: str+="GRADIENT_MODULATE | "; break;
 	case GRADIENT_ADD: str+="GRADIENT_ADD | "; break;
 	case GRADIENT_BUMPENVMAP: str+="GRADIENT_BUMPENVMAP | "; break;
@@ -1210,10 +1262,10 @@ StringClass ShaderClass::Get_Description() const
 	}
 
 	switch (Get_Src_Blend_Func()) {
-	case SRCBLEND_ZERO: str+="SRCBLEND_ZERO | "; break;
-	case SRCBLEND_ONE: str+="SRCBLEND_ONE | "; break;
-	case SRCBLEND_SRC_ALPHA: str+="SRCBLEND_SRC_ALPHA | "; break;
-	case SRCBLEND_ONE_MINUS_SRC_ALPHA: str+="SRCBLEND_ONE_MINUS_SRC_ALPHA | "; break;
+  	case SRCBLEND_ZERO: str+="SRCBLEND_ZERO | "; break;
+  	case SRCBLEND_ONE: str+="SRCBLEND_ONE | "; break;
+ 	case SRCBLEND_SRC_ALPHA: str+="SRCBLEND_SRC_ALPHA | "; break;
+ 	case SRCBLEND_ONE_MINUS_SRC_ALPHA: str+="SRCBLEND_ONE_MINUS_SRC_ALPHA | "; break;
 	}
 
 	switch (Get_Texturing()) {

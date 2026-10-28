@@ -6,18 +6,25 @@ add_executable(g_generals WIN32)
 set_target_properties(g_generals PROPERTIES OUTPUT_NAME GeneralsX)
 
 # GeneralsX @build BenderAI 10/03/2026 Windows-specific libraries
+# GeneralsX @build 25/10/2026 P34 F6: d3d8.lib is gone on the Vulkan-core build. DX8Wrapper::Init loads
+# d3d9.dll through GetProcAddress, and dinput8/dxguid are supplied by d3d8lib from the Windows SDK (see
+# cmake/dx8.cmake). Mirrors the GeneralsMD target, which dropped the same import library in the d3d9 port.
 if(WIN32)
     target_link_libraries(g_generals PRIVATE
         binkloader
         comctl32
-        d3d8
-        dinput8
-        dxguid
+        core_debug
         imm32
         milesloader
         vfw32
         winmm
     )
+    if(NOT (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+        target_link_libraries(g_generals PRIVATE
+            dinput8
+            dxguid
+        )
+    endif()
 endif()
 
 # Cross-platform core libraries

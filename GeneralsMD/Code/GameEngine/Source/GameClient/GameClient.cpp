@@ -453,6 +453,15 @@ void GameClient::init()
 
 	m_intro = NEW Intro;
 
+	// GeneralsX @feature 25/10/2026 Launcher boot: no intro and therefore no intro early-return
+	// in GameClient::update (which also skips the HUD). The intro object is created here, so the
+	// -nomenu flush in CommandLine may already have run; discard it explicitly.
+	if (TheGlobalData->m_skipMainMenu)
+	{
+		delete m_intro;
+		m_intro = nullptr;
+	}
+
 #ifdef PERF_TIMERS
 	TheGraphDraw = new GraphDraw;
 #endif

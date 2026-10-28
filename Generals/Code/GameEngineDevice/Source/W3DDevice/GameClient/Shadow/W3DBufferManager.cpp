@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -311,7 +311,7 @@ W3DBufferManager::W3DVertexBufferSlot * W3DBufferManager::allocateSlotStorage(VB
 
 		pVB=m_W3DVertexBuffers[fvfType];	//get new list head
 
-		// GeneralsX @bugfix Copilot 11/05/2026 Use MAX macro for cross-platform parity with Zero Hour shadow buffer sizing.
+		// GeneralsX @bugfix BenderAI 13/02/2026 Use MAX macro (cross-platform, defined in BaseTypeCore.h)
 		Int vbSize=MAX(DEFAULT_VERTEX_BUFFER_SIZE,size);
 
 		pVB->m_DX8VertexBuffer=NEW_REF(DX8VertexBufferClass,(FVFTypeIndexList[fvfType],vbSize,DX8VertexBufferClass::USAGE_DEFAULT));
@@ -435,7 +435,7 @@ W3DBufferManager::W3DIndexBufferSlot * W3DBufferManager::allocateSlotStorage(Int
 
 		pIB=m_W3DIndexBuffers;	//get new list head
 
-		// GeneralsX @bugfix Copilot 11/05/2026 Use MAX macro for cross-platform parity with Zero Hour shadow index sizing.
+		// GeneralsX @bugfix BenderAI 13/02/2026 Use MAX macro (cross-platform, defined in BaseTypeCore.h)
 		Int ibSize=MAX(DEFAULT_INDEX_BUFFER_SIZE,size);
 
 		pIB->m_DX8IndexBuffer=NEW_REF(DX8IndexBufferClass,(ibSize,DX8IndexBufferClass::USAGE_DEFAULT));

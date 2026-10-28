@@ -958,7 +958,6 @@ GlobalData::GlobalData()
 
 	m_standardPublicBones.clear();
 
-	m_antiAliasLevel = WW3D::MultiSampleModeEnum::MULTISAMPLE_MODE_NONE;
 	// GeneralsX @tweak PS3.0-P2-1 14/10/2026 Factory default raised to anisotropic+4X (trilinear
 	// equivalent + aniso, capability-gated in TextureFilterClass); was Bilinear+2X which kept
 	// MIPFILTER=POINT and caused hard mip transitions everywhere (report T3/T4). Backport of the
@@ -1016,6 +1015,14 @@ GlobalData::GlobalData()
 	m_buildMapCache = FALSE;
 	m_initialFile.clear();
 	m_pendingFile.clear();
+
+	// GeneralsX @feature 25/10/2026 Launcher boot contract defaults.
+	m_skipMainMenu = FALSE;
+	m_launcherScreen.clear();
+	m_skirmishSpec.clear();
+	m_campaignSpec.clear();
+	m_challengeSpec.clear();
+	m_keyMapFile.clear();
 
 	m_simulateReplays.clear();
 	m_simulateReplayJobs = SIMULATE_REPLAYS_SEQUENTIAL;
@@ -1253,7 +1260,6 @@ void GlobalData::parseGameDataDefinition( INI* ini )
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	TheWritableGlobalData->m_skirmishTickRate = optionPref.getSkirmishTickRate();
 
-	TheWritableGlobalData->m_antiAliasLevel = optionPref.getAntiAliasing();
 	TheWritableGlobalData->m_textureFilteringMode = optionPref.getTextureFilterMode();
 	TheWritableGlobalData->m_textureAnisotropyLevel = optionPref.getTextureAnisotropyLevel();
 

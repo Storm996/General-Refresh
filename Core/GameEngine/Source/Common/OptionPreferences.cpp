@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals Zero Hour(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -63,24 +63,24 @@ Bool OptionPreferences::loadFromIniFile()
 	{
 		AsciiString fname;
 		fname.format("Options_Instance%.2u.ini", rts::ClientInstance::getInstanceId());
-		return load(fname);
+		// GeneralsX @bugfix Qoder 24/10/2026: -replay turns on multi-instance mode (parseReplay calls
+		// ClientInstance::setMultiInstance), and the engine then keeps a reduced per-instance profile
+		// (Options_Instance02.ini) that only carries the keys it happens to write. The old code loaded
+		// that file *instead of* Options.ini, so a replay/debug instance silently lost every setting the
+		// per-instance file does not mention (HDREnabled, HDRTonemap, HDRExposure, AutoExposure,
+		// AmbientOcclusion, PostAA, RenderScale, SunShadowMapResolution, ...) and ran on built-in
+		// defaults - the "lowest preset" look a player sees in replay playback. Load the shared file
+		// first and let the per-instance file override only the keys it actually defines.
+		const Bool shared = load("Options.ini");
+		const Bool inst = load(fname);
+		if (shared || inst)
+			return TRUE;
+		return FALSE;
 	}
 
 	return load("Options.ini");
 }
 
-WW3D::MultiSampleModeEnum OptionPreferences::getAntiAliasing() const
-{
-	OptionPreferences::const_iterator it = find("AntiAliasing");
-	if (it == end())
-		return WW3D::MULTISAMPLE_MODE_NONE;
-
-	WW3D::MultiSampleModeEnum level = (WW3D::MultiSampleModeEnum)atoi(it->second.str());
-	level = clamp(WW3D::MULTISAMPLE_MODE_NONE, level, WW3D::MULTISAMPLE_MODE_8X);
-	level = highestBit(level);
-
-	return level;
-}
 
 TextureFilterClass::TextureFilterMode OptionPreferences::getTextureFilterMode() const
 {
@@ -1257,6 +1257,64 @@ Int OptionPreferences::getDistanceHazeIntensity() const
 	return tick;
 }
 
+// GeneralsX @feature 26/10/2026 volumetric fog rows. Mode and the four knobs are Options.ini only
+// (S-family: never folded into m_iniCRC, so replays/LAN are untouched), and the QA environment keeps
+// overriding them so A/B legs are reproducible without editing the player's file.
+Int OptionPreferences::getVolumetricFogMode() const
+{
+	const char* env = getenv("GENERALSX_VK_FOG");
+	Int mode = (env != nullptr && *env != 0) ? atoi(env) : getInt("VolumetricFog", 1);
+	if (mode < 0)
+		mode = 0;
+	if (mode > 3)
+		mode = 3;
+	return mode;
+}
+
+Int OptionPreferences::getVolumetricFogDensity() const
+{
+	const char* env = getenv("GENERALSX_VK_FOG_DENSITY");
+	Int tick;
+	if (env != nullptr && *env != 0)
+		tick = (Int)(atof(env) * 10000.0 + 0.5);
+	else
+		tick = getInt("VolumetricFogDensity", 40);
+	if (tick < 0) tick = 0;
+	if (tick > 100) tick = 100;
+	return tick;
+}
+
+Int OptionPreferences::getVolumetricFogHeight() const
+{
+	const char* env = getenv("GENERALSX_VK_FOG_HEIGHT");
+	Int height = (env != nullptr && *env != 0) ? (Int)(atof(env) + 0.5) : getInt("VolumetricFogHeight", 150);
+	if (height < 50) height = 50;
+	if (height > 400) height = 400;
+	return height;
+}
+
+Int OptionPreferences::getVolumetricFogStart() const
+{
+	const char* env = getenv("GENERALSX_VK_FOG_START");
+	Int start = (env != nullptr && *env != 0) ? (Int)(atof(env) + 0.5) : getInt("VolumetricFogStart", 20);
+	if (start < 0) start = 0;
+	if (start > 400) start = 400;
+	return start;
+}
+
+Int OptionPreferences::getVolumetricFogSun() const
+{
+	const char* env = getenv("GENERALSX_VK_FOG_SUN");
+	Int tick;
+	if (env != nullptr && *env != 0)
+		tick = (Int)(atof(env) * 100.0 + 0.5);
+	else
+		tick = getInt("VolumetricFogSun", 240);
+	if (tick < 0) tick = 0;
+	if (tick > 300) tick = 300;
+	return tick;
+}
+
 Int OptionPreferences::getTodPreview() const
 {
 	const char* env = getenv("GENERALSX_TOD_OVERRIDE");
@@ -1367,14 +1425,36 @@ Bool OptionPreferences::getPerPixelLighting() const
 // GeneralsX @feature 23/10/2026 P6 "底片/镜头": HDR scene, exposure, tonemap, SSAA render scale and
 // the 3D-only post-AA mode. All presentation-only, so they live in the Options.ini S-family and never
 // enter m_iniCRC. Defaults are the parity values (HDR off, 0 EV, ACES selected but unused, 100 %,
-// AA follows the legacy AntiAliasing on/off switch).
+// AA off - the Advanced "PostAA" row is the only switch; the legacy MSAA row is gone).
 //-------------------------------------------------------------------------------------------------
+// GeneralsX @feature 23/10/2026 P6: one-launch bypass for the whole P6 film chain. The filmic curve is
+// only meaningful on the HDR scene target; with HDR off but an overlay still active (3D-only AA or
+// SSAA) the curve used to run on clamped LDR and read as a fake, washed picture. QA also needs a way
+// to compare a P6 launch against the pre-P6 parity path without editing Options.ini, so this switch
+// wins over the individual GENERALSX_VK_* overrides and is deliberately not saved back.
+static Bool p6BypassRequested()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* env = getenv("GENERALSX_VK_P6OFF");
+		cached = (env != nullptr && *env != 0 && atoi(env) != 0) ? 1 : 0;
+	}
+	return cached != 0 ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getP6Bypass() const
+{
+	return p6BypassRequested();
+}
+
 Bool OptionPreferences::getHDREnabled() const
 {
 	const char* env = getenv("GENERALSX_VK_HDR");
 	if (env != nullptr && *env != 0)
 		return (atoi(env) != 0) ? TRUE : FALSE;
-	return (getInt("HDREnabled", 0) != 0) ? TRUE : FALSE;
+	// GeneralsX @feature 26/10/2026: route B is the default pipeline now (pure linear + re-light);
+	// an existing Options.ini with HDREnabled=0 still wins, so a player can keep the legacy look.
+	return (getInt("HDREnabled", 1) != 0) ? TRUE : FALSE;
 }
 
 Int OptionPreferences::getHDRExposure() const
@@ -1389,6 +1469,11 @@ Int OptionPreferences::getHDRExposure() const
 Int OptionPreferences::getHDRTonemap() const
 {
 	const char* env = getenv("GENERALSX_VK_TONEMAP");
+	// GeneralsX @tweak 24/10/2026 P1: ACES is now opt-in, not the HDR default. The scene is still
+	// gamma-space lighting, so the fitted curve reads as a stylised grade rather than a real tone map;
+	// a player who wants it selects ACES explicitly.
+	// GeneralsX @feature 26/10/2026: ACES is the default look of the linear pipeline; the player can
+	// still select 关闭 (0) for a plain exposure+encode, or Reinhard (2).
 	Int mode = (env != nullptr && *env != 0) ? atoi(env) : getInt("HDRTonemap", 1);
 	if (mode < 0) mode = 0;
 	if (mode > 2) mode = 2;
@@ -1415,11 +1500,10 @@ Int OptionPreferences::getPostAAMode() const
 		mode = atoi(env);
 	else
 	{
-		// No explicit row yet: keep the legacy AntiAliasing switch meaningful (any non-zero mode
-		// used to mean "FXAA on"), so an untouched Options.ini behaves exactly as before.
-		mode = getInt("PostAA", -1);
-		if (mode < 0)
-			mode = (getAntiAliasing() != WW3D::MULTISAMPLE_MODE_NONE) ? 1 : 0;
+		// GeneralsX @bugfix 28/10/2026: default OFF. The legacy AntiAliasing row that used to seed this
+		// ("any non-zero mode meant FXAA on") is gone, so an untouched Options.ini no longer turns AA on
+		// behind the player's back.
+		mode = getInt("PostAA", 0);
 	}
 	if (mode < 0) mode = 0;
 	if (mode > 1) mode = 1;   // SMAA reserved; until it lands, every non-zero mode is FXAA
@@ -1450,4 +1534,111 @@ Bool OptionPreferences::getColorLUT() const
 		return (atoi(env) != 0) ? TRUE : FALSE;
 	return (getInt("ColorLUT", 0) != 0) ? TRUE : FALSE;
 }
+
+Int OptionPreferences::getAmbientOcclusion() const
+{
+	const char* env = getenv("GENERALSX_VK_AO");
+	if (env != nullptr && *env != 0)
+	{
+		Real f = (Real)atof(env);
+		if (f < 0.0f) f = 0.0f;
+		if (f > 1.5f) f = 1.5f;
+		return (Int)(f * 100.0f + 0.5f);
+	}
+	Int tick = getInt("AmbientOcclusion", 50);
+	if (tick < 0) tick = 0;
+	if (tick > 150) tick = 150;
+	return tick;
+}
+
+// 光影升级2.0 A4: AO kernel quality. Default ON: the rotated 16-tap kernel is strictly smoother than
+// the 12-tap spiral it replaces, and it only runs where the player's AO strength is non-zero.
+Int OptionPreferences::getAOQuality() const
+{
+	const char* env = getenv("GENERALSX_VK_AOQ");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("AOQuality", 1);
+	return (v != 0) ? 1 : 0;
+}
+
+// 光影升级2.0 A8: screen-space sun shafts (0..100).
+Int OptionPreferences::getGodRays() const
+{
+	const char* env = getenv("GENERALSX_VK_GODRAYS");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("GodRays", 0);
+	if (v < 0) v = 0;
+	if (v > 100) v = 100;
+	return v;
+}
+
+// 光影升级2.0 A3: screen-space contact shadows. Env wins for scripted A/B legs; the ini row is the
+// shipped switch (Advanced page / launcher). 0 = off, 100 = full strength.
+Int OptionPreferences::getContactShadows() const
+{
+	const char* env = getenv("GENERALSX_VK_CONTACT");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("ContactShadows", 0);
+	if (v < 0) v = 0;
+	if (v > 100) v = 100;
+	return v;
+}
+
+// 光影升级2.0 B1: GPU particle path for additive combat effects. Capacity comes from the env when the
+// QA harness arms it; the ini row is the shipped switch (0 = retail sprites).
+Int OptionPreferences::getGpuParticles() const
+{
+	const char* env = getenv("GENERALSX_VK_GPU_FX");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("GpuParticles", 0);
+	return (v != 0) ? 1 : 0;
+}
+
+// 光影升级2.0 B2: GPU weather type, 0 off / 1 rain / 2 snow / 3 dust.
+Int OptionPreferences::getGpuWeather() const
+{
+	const char* env = getenv("GENERALSX_VK_WEATHER");
+	int v;
+	if (env != nullptr && *env != 0) {
+		v = 0;
+		if (!stricmp(env, "rain")) v = 1;
+		else if (!stricmp(env, "snow")) v = 2;
+		else if (!stricmp(env, "dust")) v = 3;
+		else v = atoi(env);
+	} else {
+		v = getInt("GpuWeather", 0);
+	}
+	if (v < 0) v = 0;
+	if (v > 3) v = 3;
+	return v;
+}
+
+// 光影升级2.0 A2: soft particles (fade against a copy of the scene depth). Off by default.
+Int OptionPreferences::getSoftParticles() const
+{
+	const char* env = getenv("GENERALSX_VK_SOFT");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("SoftParticles", 0);
+	return (v != 0) ? 1 : 0;
+}
+
+// 光影升级2.0 A7: heat haze driven by the warm additive spawns of the current frame.
+Int OptionPreferences::getHeatHaze() const
+{
+	const char* env = getenv("GENERALSX_VK_HEAT");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("HeatHaze", 0);
+	return (v != 0) ? 1 : 0;
+}
+
+// 光影升级2.0 B5: MSAA on the scene target (0/1 = off, 4 = 4x).
+Int OptionPreferences::getMSAA() const
+{
+	const char* env = getenv("GENERALSX_VK_MSAA");
+	int v = (env != nullptr && *env != 0) ? atoi(env) : getInt("MSAA", 0);
+	if (v >= 4) return 4;
+	return 0;
+}
+
+Bool OptionPreferences::getFilmGrade() const{
+	const char* env = getenv("GENERALSX_VK_GRADE");
+	if (env != nullptr && *env != 0)
+		return (atof(env) > 0.0) ? TRUE : FALSE;
+	return (getInt("FilmGrade", 0) != 0) ? TRUE : FALSE;
+}
+
 

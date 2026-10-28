@@ -5,13 +5,24 @@
 
 param(
     [string]$Configuration = 'Release',
-    [string]$Target = 'z_generals'
+    # GeneralsX @feature 24/10/2026 P34 F6: the base game (Generals) now has a build entry too, so the
+    # lighting backport can be compiled and checked instead of being "another tree nobody builds".
+    # ZeroHour keeps the canonical build/win64vk directory; Generals gets its own cache.
+    [ValidateSet('ZeroHour', 'Generals')][string]$Game = 'ZeroHour',
+    [string]$Target = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..\..')
-$buildDir = Join-Path $repoRoot 'build\win64vk'
-$exe = Join-Path $buildDir "GeneralsMD\$Configuration\GeneralRefresh.exe"
+if ($Game -eq 'Generals') {
+    $buildDir = Join-Path $repoRoot 'build\win64vk-generals'
+    if (-not $Target) { $Target = 'g_generals' }
+    $exe = Join-Path $buildDir "Generals\$Configuration\GeneralsX.exe"
+} else {
+    $buildDir = Join-Path $repoRoot 'build\win64vk'
+    if (-not $Target) { $Target = 'z_generals' }
+    $exe = Join-Path $buildDir "GeneralsMD\$Configuration\GeneralRefresh.exe"
+}
 
 # Locate Visual Studio and its CMake/Ninja (the build tree was configured with this toolchain).
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -79,11 +90,28 @@ Write-Host "Config:  $Configuration"
 Write-Host "Target:  $Target"
 Write-Host "Deps:    $($depArgs.Count)/$($depMap.Count) from $deps"
 
+# GeneralsX @bugfix 24/10/2026 DEPSCAN: cl.exe writes its /showIncludes lines in the console output
+# code page. On this Chinese-locale toolchain that was GBK while CMake stores the detected prefix as
+# UTF-8, so ninja's "deps = msvc" never matched a single include line and recorded NO header
+# dependencies: editing a header rebuilt only the files whose .cpp changed. The stale objects then
+# disagreed with the rebuilt ones about class layouts (DX8VertexBufferClass grew a member), and the
+# game corrupted its own memory pool on the first frame that destroyed a vertex buffer.
+# Running the whole configure+build under code page 65001 makes cl emit UTF-8, which is exactly the
+# encoding CMake reads and writes, so dependency tracking works from then on.
 $commands = @(
+    "chcp 65001 >nul",
     "call `"$vcvars`" >nul",
-    "`"$cmake`" --preset win64vk $configureArgs",
-    "`"$cmake`" --build `"$buildDir`" --config $Configuration --target $Target"
+    "`"$cmake`" --preset win64vk $configureArgs"
 ) -join ' && '
+if ($Game -eq 'Generals') {
+    # Reuse the canonical preset and override only the game-selection knobs plus the binary directory.
+    $commands = @(
+        "chcp 65001 >nul",
+        "call `"$vcvars`" >nul",
+        "`"$cmake`" --preset win64vk -B `"$buildDir`" -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=OFF $configureArgs"
+    ) -join ' && '
+}
+$commands += " && `"$cmake`" --build `"$buildDir`" --config $Configuration --target $Target"
 
 & cmd.exe /c $commands
 if ($LASTEXITCODE -ne 0) {

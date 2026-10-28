@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -112,6 +112,7 @@ public:
 
 	void						Set_Far_Attenuation_Range(double fStart, double fEnd)				{ FarAttenStart = fStart; FarAttenEnd = fEnd; }
 	void						Get_Far_Attenuation_Range(double& fStart, double& fEnd) const	{ fStart = FarAttenStart; fEnd = FarAttenEnd; }
+	void						Get_Far_Attenuation_Range(float & fStart, float & fEnd) const	{ fStart = FarAttenStart; fEnd = FarAttenEnd; }
 	void						Set_Near_Attenuation_Range(double nStart, double nEnd)			{ NearAttenStart = nStart; NearAttenEnd = nEnd; }
 	void						Get_Near_Attenuation_Range(double& nStart, double& nEnd)	const	{ nStart = NearAttenStart; nEnd = NearAttenEnd; }
 	float						Get_Attenuation_Range() const										{ return FarAttenEnd; }
@@ -135,6 +136,14 @@ public:
 	void						Get_Spot_Direction(Vector3 & dir) const	{ dir = SpotDirection; }
 	void						Set_Spot_Exponent(float k)						{ SpotExponent = k; }
 	float						Get_Spot_Exponent() const					{ return SpotExponent; }
+	// GeneralsX @feature 24/10/2026 P14 D2/D6: the type of a *pooled dynamic* light is now mutable so a
+	// render-side fixture (building lamp, vehicle headlight) can publish a cone on the light it already
+	// holds instead of needing a second object. Gameplay lights keep their constructed type.
+	void						Set_Type(LightType t)							{ Type = t; }
+	// GeneralsX @feature 24/10/2026 P14 D2: render-only gobo hint, 0 = no cookie. The Forward+ publisher
+	// reads it as the procedural cookie id (VkLighting::kCookie*); never serialized, never read by gameplay.
+	void						Set_Forward_Cookie(int id)					{ ForwardCookie = id; }
+	int						Get_Forward_Cookie() const					{ return ForwardCookie; }
 
 	/////////////////////////////////////////////////////////////////////////////
 	// Save/Load
@@ -171,5 +180,6 @@ protected:
 	float						SpotAngleCos;
 	float						SpotExponent;
 	Vector3					SpotDirection;
+	int						ForwardCookie;		///< GeneralsX P14: Forward+ gobo hint, 0 = none
 	//bool						Donut; ///does this light only apply at edges
 };

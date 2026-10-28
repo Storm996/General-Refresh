@@ -89,6 +89,10 @@ public:
 	void					Add_Fill_Light();
 	void					Calculate_Fill_Light();
 	void					Set_Fill_Intensity(float intensity)			{ FillIntensity = intensity; }
+	// GeneralsX @feature Qoder 24/10/2026 P1: Modern lighting keeps a point light's contribution
+	// local (diffuse only); Retail folds its ambient into the object's ambient and tints the whole
+	// mesh. Default false = Modern; the setter exists for A/B and the Retail quality tier.
+	static void			Set_Point_Ambient_Enabled(bool enabled);
 
 	/*
 	** Accessors
@@ -154,6 +158,7 @@ protected:
 		bool				DiffuseRejected;
 
 		bool				m_point;
+		bool				m_directional;
 		Vector3			m_center;
 		float				m_innerRadius;
 		float				m_outerRadius;
@@ -175,6 +180,7 @@ protected:
 	*/
 	int					LightCount;
 	Vector3				ObjectCenter;					// center of the object to be lit
+	static bool			s_pointAmbientEnabled;		// P1: false = point ambient is not folded into the mesh
 	InputLightStruct	InputLights[MAX_LIGHTS];	// Sorted list of input lights from the greatest contributor to the least
 
 	Vector3				OutputAmbient;					// scene ambient + lights' ambients

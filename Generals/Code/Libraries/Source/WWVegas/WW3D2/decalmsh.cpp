@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -63,6 +63,7 @@
 #include "WWLib/simplevec.h"
 #include "texture.h"
 #include "dx8wrapper.h"
+#include "dx8caps.h"
 
 #define DISABLE_CLIPPING	0
 
@@ -76,7 +77,7 @@
 ** verts - plug into DecalPolyClass, clip, pull back out
 ** vnorms - plug into DecalPolyClass, clip, copy back out
 ** texcoords - compute after poly is clipped
-** material - contstant for entire poly, get from generator
+** material - constant for entire poly, get from generator
 ** shader - constant for entire poly, get from generator
 ** texture - constant for entire poly, get from generator
 */
@@ -421,15 +422,16 @@ bool RigidDecalMeshClass::Create_Decal
 	// Since we can't rely on the hardware polygon offset function, I'm physically offsetting
 	// the decal polygons along the normal of the decal generator.  If we could instead rely
 	// on hardware "polygon offset" we could remove this code and we could make decals non-sorting
-#if 0
-	const float ZBIAS_DISTANCE = 0.01f;
-	Vector3 zbias_offset;
-	generator->Get_Transform().Get_Z_Vector(&zbias_offset);
-	Matrix3D invtm;
-	Parent->Get_Transform().Get_Orthogonal_Inverse(invtm);
-	Matrix3D::Rotate_Vector(invtm,zbias_offset,&zbias_offset);
-	zbias_offset *= ZBIAS_DISTANCE;
-#endif
+	Vector3 zbias_offset(0.0f,0.0f,0.0f);
+
+	if (!DX8Wrapper::Get_Current_Caps()->Support_ZBias()) {
+		const float ZBIAS_DISTANCE = 0.01f;
+		generator->Get_Transform().Get_Z_Vector(&zbias_offset);
+		Matrix3D invtm;
+		Parent->Get_Transform().Get_Orthogonal_Inverse(invtm);
+		Matrix3D::Rotate_Vector(invtm,zbias_offset,&zbias_offset);
+		zbias_offset *= ZBIAS_DISTANCE;
+	}
 
 	// NOTE: world_vertex_locs/norms should not be set for this class
 	WWASSERT(world_vertex_locs == 0);
@@ -509,7 +511,7 @@ bool RigidDecalMeshClass::Create_Decal
 			_DecalPoly0.Reset();
 			const TriIndex & poly = src_polys[apt[i]];
 			for (j=0; j<3; j++) {
-				_DecalPoly0.Add_Vertex(src_verts[poly[j]] /*+ zbias_offset*/,src_vnorms[poly[j]]);
+				_DecalPoly0.Add_Vertex(src_verts[poly[j]] + zbias_offset,src_vnorms[poly[j]]);
 			}
 
 			/*

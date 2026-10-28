@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -22,14 +22,17 @@
  *                                                                                             *
  *                 Project Name : WW3D                                                         *
  *                                                                                             *
- *                     $Archive:: /VSS_Sync/ww3d2/meshmdl.cpp                                 $*
+ *                     $Archive:: /Commando/Code/ww3d2/meshmdl.cpp                            $*
  *                                                                                             *
- *                       Author:: Greg Hjelstrom                                               *
+ *                    Org Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                     $Modtime:: 8/29/01 7:29p                                               $*
+ *                      $Author:: Kenny Mitchell                                               *
  *                                                                                             *
- *                    $Revision:: 46                                                          $*
+ *                     $Modtime:: 06/26/02 4:04p                                             $*
  *                                                                                             *
+ *                    $Revision:: 48                                                          $*
+ *                                                                                             *
+ * 06/26/02 KM Matrix name change to avoid MAX conflicts                                       *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
@@ -44,7 +47,19 @@
 #include "bwrender.h"
 #include "camera.h"
 #include "dx8renderer.h"
+#include "sunsink.h"	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map sink interface
 #include "WWLib/hashtemplate.h"
+// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): companion normal-map detection needs the
+// WW3D file factory (existence test), the DX8 caps (Support_Dot3), texture names and the
+// tangent-space generator.
+#include "texture.h"
+#include "dx8caps.h"
+#include "dx8wrapper.h"
+#include "WWLib/ffactory.h"
+#include "WWLib/WWFILE.h"
+#include "meshtangent.h"
+#include <cstdio>
+#include <cstring>
 
 
 /*
@@ -70,7 +85,10 @@ MeshModelClass::MeshModelClass() :
 	AlternateMatDesc(nullptr),
 	CurMatDesc(nullptr),
 	MatInfo(nullptr),
-	GapFiller(nullptr)
+	GapFiller(nullptr),
+	UsesNormalMap(false),
+	VertexTangent(nullptr),
+	VertexBinormal(nullptr)
 {
 	Set_Flag(DIRTY_BOUNDS,true);
 
@@ -86,7 +104,11 @@ MeshModelClass::MeshModelClass(const MeshModelClass & that) :
 	AlternateMatDesc(nullptr),
 	CurMatDesc(nullptr),
 	MatInfo(nullptr),
-	GapFiller(nullptr)
+	GapFiller(nullptr),
+	HasBeenInUse(false),
+	UsesNormalMap(false),
+	VertexTangent(nullptr),
+	VertexBinormal(nullptr)
 {
 	DefMatDesc = W3DNEW MeshMatDescClass(*(that.DefMatDesc));
 	if (that.AlternateMatDesc != nullptr) {
@@ -95,6 +117,9 @@ MeshModelClass::MeshModelClass(const MeshModelClass & that) :
 	CurMatDesc = DefMatDesc;
 
 	clone_materials(that);
+
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): replicate tangent-space basis if present.
+	Copy_Normal_Map_Data(that);
 }
 
 MeshModelClass::~MeshModelClass()
@@ -129,11 +154,15 @@ MeshModelClass & MeshModelClass::operator = (const MeshModelClass & that)
 
 		clone_materials(that);
 
+		// DMS - using appropriate deallocation method
 		delete GapFiller;
-			GapFiller=nullptr;
+		GapFiller=nullptr;
 
 		if (that.GapFiller)
 			GapFiller=W3DNEW GapFillerClass(*that.GapFiller);
+
+		// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): replicate tangent-space basis if present.
+		Copy_Normal_Map_Data(that);
 	}
 	return * this;
 }
@@ -144,6 +173,13 @@ void MeshModelClass::Reset(int polycount,int vertcount,int passcount)
 	// the number of stages and passes gets reset and the gapfiller cannot deallocate properly.
 	delete GapFiller;
 	GapFiller=nullptr;
+
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): drop any tangent-space basis with the geometry.
+	delete[] VertexTangent;
+	VertexTangent=nullptr;
+	delete[] VertexBinormal;
+	VertexBinormal=nullptr;
+	UsesNormalMap=false;
 
 	Reset_Geometry(polycount,vertcount);
 
@@ -160,8 +196,319 @@ void MeshModelClass::Reset(int polycount,int vertcount,int passcount)
 	CurMatDesc = DefMatDesc;
 }
 
+// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑)
+// Deep-copy the tangent-space basis from a source model into this one, matching the current
+// vertex count. If the source has no normal map, this model is cleared to the fixed-pipeline
+// state. Never touches GameLogic.
+void MeshModelClass::Copy_Normal_Map_Data(const MeshModelClass & srcmesh)
+{
+	delete[] VertexTangent;
+	VertexTangent = nullptr;
+	delete[] VertexBinormal;
+	VertexBinormal = nullptr;
+	UsesNormalMap = false;
+
+	if (!srcmesh.UsesNormalMap || !srcmesh.VertexTangent || !srcmesh.VertexBinormal) {
+		return;
+	}
+
+	const int vertCount = Get_Vertex_Count();
+	const int srcVerts = srcmesh.Get_Vertex_Count();
+	if (vertCount <= 0 || vertCount != srcVerts) {
+		// Vertex counts must match for a shared-geometry clone; otherwise drop the basis.
+		return;
+	}
+
+	VertexTangent = W3DNEWARRAY Vector3[vertCount];
+	VertexBinormal = W3DNEWARRAY Vector3[vertCount];
+	if (!VertexTangent || !VertexBinormal) {
+		delete[] VertexTangent;
+		delete[] VertexBinormal;
+		VertexTangent = nullptr;
+		VertexBinormal = nullptr;
+		return;
+	}
+
+	memcpy(VertexTangent, srcmesh.VertexTangent, vertCount * sizeof(Vector3));
+	memcpy(VertexBinormal, srcmesh.VertexBinormal, vertCount * sizeof(Vector3));
+	UsesNormalMap = true;
+}
+
+// GeneralsX @feature Qoder 10/10/2026 T3-0 P3: strip a state-variant suffix
+// (_d/_e/_s/_g/_r/_n and combinations like _ds/_dng with an optional digit)
+// from a texture base name, so a single base normal map serves all
+// damage/garrison/snow/night variants that share the base UV layout.
+static void Strip_State_Variant_Suffix(char* name)
+{
+	char* us = strrchr(name, '_');
+	if (us == nullptr) {
+		return;
+	}
+	char* tok = us + 1;
+	int tok_len = (int)strlen(tok);
+	while (tok_len > 0 && tok[tok_len - 1] >= '0' && tok[tok_len - 1] <= '9') {
+		tok_len--;
+	}
+	if (tok_len == 0 || tok_len > 3) {
+		return;
+	}
+	for (int i = 0; i < tok_len; ++i) {
+		const char c = tok[i];
+		if (c != 'd' && c != 'e' && c != 'g' && c != 'n' && c != 'r' && c != 's') {
+			return;
+		}
+	}
+	*us = 0;
+}
+
+// GeneralsX @bugfix Qoder 16/10/2026 #87: read the short side of a TGA or DDS from its file header
+// only - no pixel decode, no texture init - so the load probe can enforce the surface detail
+// contract before any mount flag exists. Returns false when the format is not recognised, which
+// the caller must treat as "dimension unknown", never as "reject".
+static bool Peek_Image_Min_Side(const char* filename, int& minSide)
+{
+	minSide = 0;
+	if (filename == nullptr || filename[0] == 0) {
+		return false;
+	}
+	FileClass* file = _TheFileFactory->Get_File(filename);
+	if (file == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	file->Open();
+	if (file->Is_Available()) {
+		unsigned char hdr[20];
+		if (file->Read(hdr, 20) == 20) {
+			if (hdr[0] == 'D' && hdr[1] == 'D' && hdr[2] == 'S' && hdr[3] == ' ') {
+				// DDS_HEADER: dwHeight at 12, dwWidth at 16, little-endian 32-bit.
+				const int h = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16) | (hdr[15] << 24);
+				const int w = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | (hdr[19] << 24);
+				if (w > 0 && h > 0) {
+					minSide = (w < h) ? w : h;
+					ok = true;
+				}
+			} else {
+				// TGA: fixed 18-byte header, width at 12, height at 14, little-endian 16-bit.
+				const int w = hdr[12] | (hdr[13] << 8);
+				const int h = hdr[14] | (hdr[15] << 8);
+				if (w > 0 && h > 0) {
+					minSide = (w < h) ? w : h;
+					ok = true;
+				}
+			}
+		}
+	}
+	file->Close();
+	_TheFileFactory->Return_File(file);
+	return ok;
+}
+
+// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑)
+// Look for a "_nm" companion for the pass-0 / stage-0 diffuse texture(s). Naming rule is strict:
+// only "_nm" and "_nm_ai" are recognised (NOT "_n", which Zero Hour already uses for its 124
+// night maps). When a companion exists and the device supports dot3, build the per-vertex tangent
+// basis and flag the model so Define_FVF upgrades it to the TG3 vertex format.
+void MeshModelClass::Detect_And_Build_Normal_Map()
+{
+	// Clear any prior state (Reset already did this at load time, but be defensive).
+	delete[] VertexTangent;
+	VertexTangent = nullptr;
+	delete[] VertexBinormal;
+	VertexBinormal = nullptr;
+	UsesNormalMap = false;
+
+	// GeneralsX @feature T3-0 P1: skinned meshes are no longer excluded. Their tangent basis is
+	// built in model space here; at render time the skin deformation loop transforms the basis
+	// with the same bone matrices as the normals (see DX8SkinFVFCategoryContainer::Render).
+	const DX8Caps* caps = DX8Wrapper::Get_Current_Caps();
+	if (!caps || !caps->Support_Dot3()) {
+		return;
+	}
+
+	if (Get_Pass_Count() < 1) {
+		return;
+	}
+
+	// Collect a representative stage-0 diffuse name from pass 0 (single or first non-null array entry).
+	StringClass diffuse_name;
+	TextureClass* single = Peek_Single_Texture(0, 0);
+	if (single != nullptr) {
+		diffuse_name = single->Get_Texture_Name();
+	} else if (Has_Texture_Array(0, 0)) {
+		const int polyCount = Get_Polygon_Count();
+		for (int p = 0; p < polyCount; ++p) {
+			TextureClass* t = Peek_Texture(p, 0, 0);
+			if (t != nullptr) {
+				diffuse_name = t->Get_Texture_Name();
+				break;
+			}
+		}
+	}
+
+	if (diffuse_name.Is_Empty()) {
+		return;
+	}
+
+	// Strip the extension to obtain the base name.
+	const char* raw = (const char*)diffuse_name;
+	char base[256];
+	int i = 0;
+	for (; raw[i] != 0 && i < 255; ++i) {
+		base[i] = raw[i];
+	}
+	base[i] = 0;
+	char* dot = strrchr(base, '.');
+	if (dot != nullptr) {
+		*dot = 0;
+	}
+
+	// Guard against re-probing a texture that is itself already a normal map.
+	const int baseLen = (int)strlen(base);
+	if (baseLen >= 3 && strcmp(base + baseLen - 3, "_nm") == 0) {
+		return;
+	}
+	if (baseLen >= 6 && strcmp(base + baseLen - 6, "_nm_ai") == 0) {
+		return;
+	}
+
+	static const char* const kSuffixes[] = { "_nm_ai", "_nm" };
+	// GeneralsX @tweak Qoder 11/10/2026 T3-0 P3: prefer .dds first - the offline
+	// batch bakes a RENORMALIZED full mip chain into the DDS, while the bare TGA
+	// makes the engine build mips at runtime without renormalization (causes
+	// brightness popping / shimmer on far buildings).
+	static const char* const kExtensions[] = { ".dds", ".tga" };
+
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 P3: when the literal diffuse name has
+	// no companion, retry with state-variant suffixes stripped (xxx_d -> xxx), so one
+	// base normal map serves all damage/garrison/snow/night states of a model.
+	const char* candidates[2];
+	int num_candidates = 0;
+	candidates[num_candidates++] = base;
+	char base_stripped[256];
+	strcpy(base_stripped, base);
+	Strip_State_Variant_Suffix(base_stripped);
+	if (strcmp(base_stripped, base) != 0) {
+		candidates[num_candidates++] = base_stripped;
+	}
+
+	bool companion_found = false;
+	char companion[300];
+	char tried[768];
+	tried[0] = 0;
+	for (int ci = 0; ci < num_candidates && !companion_found; ++ci) {
+		for (int s = 0; s < 2 && !companion_found; ++s) {
+			for (int e = 0; e < 2 && !companion_found; ++e) {
+				snprintf(companion, sizeof(companion), "%s%s%s", candidates[ci], kSuffixes[s], kExtensions[e]);
+				if (tried[0] != 0) strcat(tried, ",");
+				strcat(tried, companion);
+
+				FileClass* file = _TheFileFactory->Get_File(companion);
+				if (file != nullptr) {
+					file->Open();
+					companion_found = file->Is_Available();
+					file->Close();
+					_TheFileFactory->Return_File(file);
+				}
+
+				if (companion_found) {
+					fprintf(stderr, "[NM_MESH] mesh='%s' diffuse='%s' companion='%s'\n", Get_Name(), (const char*)diffuse_name, companion);
+					fflush(stderr);
+				}
+			}
+		}
+	}
+
+	if (!companion_found) {
+		// GeneralsX @debug Qoder 11/10/2026 T3-0 P3: silent misses hid the mount gap.
+		// Log every loaded mesh whose diffuse has no _nm companion so the P3 asset
+		// audit can tell "model never loaded" (no line at all) from "companion missing".
+		fprintf(stderr, "[NM_MISS] mesh='%s' diffuse='%s' tried=%s\n", Get_Name(), (const char*)diffuse_name, tried);
+		fflush(stderr);
+		return;
+	}
+
+	// GeneralsX @bugfix Qoder 16/10/2026 #87: SURFACE DETAIL CONTRACT.
+	// The full-library companion rollout gave every diffuse stem an "_nm"/"_rp" file, so
+	// "companion exists" no longer says a mesh is a lit SURFACE - it only says a file was
+	// dropped. Baked sprite parts (bayonet sparkles, glow backpacks, flag cloth, 32-64px
+	// soldier skins, 16px FX) therefore mounted dot3/PBR and got re-lit by the injected sun
+	// constants on top of their baked shading - the floating colored patches seen between
+	// facing infantry and against the sky whenever infantry spawn. Two asset-intrinsic tests
+	// replace file existence as the mount authority:
+	//   1) diffuse AND companion must be >= 128px on the short side: at battlefield zoom a
+	//      normal/RP map below that cannot resolve as surface detail - it is noise by
+	//      construction;
+	//   2) the mesh must have >= 48 polygons: anything built from a handful of quads is a
+	//      sprite/overlay/decal, not a surface, and tangent-space re-lighting there replaces
+	//      art-authored shading (unit bodies are 900+ polys, the offending parts 8-35).
+	// Class-level by construction: no per-file moves, and both feature arms stay fully on.
+	// GeneralsX @tweak Qoder 20/10/2026 TEMP EXPERIMENT: the whole #87 rejection block below is
+	// commented out (normally it refuses meshes whose diffuse/companion is < 128px on the short
+	// side or that have < 48 polygons). This is a temporary local test to see whether these
+	// meshes can mount dot3/PBR at all; the rejections are class-level asset contracts from
+	// 16/10/2026 (#68/#87) and are EXPECTED to come back - do not ship this state.
+/*
+	{
+		const int polys = Get_Polygon_Count();
+		int nmSide = 0;
+		int diffuseSide = 0;
+		const bool nmKnown = Peek_Image_Min_Side(companion, nmSide);
+		const bool diffuseKnown = Peek_Image_Min_Side((const char*)diffuse_name, diffuseSide);
+		if ((nmKnown && nmSide < 128) || (diffuseKnown && diffuseSide < 128) || polys < 48) {
+			fprintf(stderr, "[NM_MESH] mesh='%s' diffuse='%s' companion='%s' REJECT contract nmSide=%d diffuseSide=%d polys=%d\n",
+				Get_Name(), (const char*)diffuse_name, companion, nmSide, diffuseSide, polys);
+			fflush(stderr);
+			return;
+		}
+	}
+*/
+
+	if (Compute_Mesh_Tangents(this, &VertexTangent, &VertexBinormal)) {
+		UsesNormalMap = true;
+		fprintf(stderr, "[NM_MESH] mesh='%s' tangent basis built for %d vertices (TG3 vertex format requested)\n",
+			Get_Name(), Get_Vertex_Count());
+		fflush(stderr);
+	}
+}
+
+// GeneralsX @feature T3-0 P1: skin deformation for the tangent-space basis. Mirrors the batch
+// loop of MeshGeometryClass::get_deformed_vertices (vertices are pre-sorted by bone index) and
+// additionally transforms tangent/binormal with the translation-free bone matrix, exactly like
+// the normals, so the basis follows the skeleton at render time.
+void MeshModelClass::Get_Deformed_TBN(Vector3* dst_vert, Vector3* dst_norm, Vector3* dst_tan, Vector3* dst_bin, const HTreeClass* htree)
+{
+	int vertex_count = Get_Vertex_Count();
+	Vector3* src_vert = Vertex->Get_Array();
+	Vector3* src_norm = VertexNorm->Get_Array();
+	uint16* bonelink = VertexBoneLink->Get_Array();
+
+	for (int vi = 0; vi < vertex_count;) {
+		const Matrix3D& tm = htree->Get_Transform(bonelink[vi]);
+		Matrix3D mytm = tm;
+
+		int idx = bonelink[vi];
+		int cnt;
+		for (cnt = vi; cnt < vertex_count; cnt++) {
+			if (idx != bonelink[cnt]) {
+				break;
+			}
+		}
+
+		VectorProcessorClass::Transform(dst_vert + vi, src_vert + vi, mytm, cnt - vi);
+		mytm.Set_Translation(Vector3(0.0f, 0.0f, 0.0f));
+		VectorProcessorClass::Transform(dst_norm + vi, src_norm + vi, mytm, cnt - vi);
+		if (dst_tan && dst_bin && VertexTangent && VertexBinormal) {
+			VectorProcessorClass::Transform(dst_tan + vi, VertexTangent + vi, mytm, cnt - vi);
+			VectorProcessorClass::Transform(dst_bin + vi, VertexBinormal + vi, mytm, cnt - vi);
+		}
+		vi = cnt;
+	}
+}
+
 void MeshModelClass::Register_For_Rendering()
 {
+	HasBeenInUse=true;
 //WW3D::Set_NPatches_Level(1);
 	if (WW3D::Get_NPatches_Level()>1) {
 		if (WW3D::Get_NPatches_Gap_Filling_Mode()!=WW3D::NPATCHES_GAP_FILLING_DISABLED) {
@@ -254,6 +601,19 @@ DX8FVFCategoryContainer* MeshModelClass::Peek_FVF_Category_Container()
 
 void MeshModelClass::Shadow_Render(SpecialRenderInfoClass & rinfo,const Matrix3D & tm,const HTreeClass * htree)
 {
+	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map: the occluder pass reuses this
+	// same Special_Render plumbing that the (dead) BWRenderer atlas path used. The helper outputs
+	// GL-convention clip space (z in [-1,1], ortho so w==1); the sink rebases to D3D [0,1] itself.
+	if (rinfo.SunSink != nullptr) {
+		if (_TempTransformedVertexBuffer.Length() < VertexCount) _TempTransformedVertexBuffer.Resize(VertexCount);
+		Vector4* transf_ptr=&(_TempTransformedVertexBuffer[0]);
+		get_deformed_screenspace_vertices(transf_ptr,rinfo,tm,htree);
+
+		rinfo.SunSink->Submit_Screenspace_Triangles(transf_ptr,VertexCount,
+			reinterpret_cast<const unsigned short*>(Poly->Get_Array()),PolyCount);
+		return;
+	}
+
 	if (rinfo.BWRenderer != nullptr) {
 		if (_TempTransformedVertexBuffer.Length() < VertexCount) _TempTransformedVertexBuffer.Resize(VertexCount);
 		Vector4* transf_ptr=&(_TempTransformedVertexBuffer[0]);
@@ -266,142 +626,6 @@ void MeshModelClass::Shadow_Render(SpecialRenderInfoClass & rinfo,const Matrix3D
 		rinfo.BWRenderer->Set_Vertex_Locations(reinterpret_cast<Vector2*>(transf_ptr),VertexCount);
 		rinfo.BWRenderer->Render_Triangles(reinterpret_cast<const unsigned long*>(Poly->Get_Array()),PolyCount*3);
 		return;
-	}
-}
-
-// Destination pointers MUST point to arrays large enough to hold all vertices
-void MeshModelClass::get_deformed_vertices(Vector3 *dst_vert,const HTreeClass * htree)
-{
-	Vector3 * src_vert = Vertex->Get_Array();
-	uint16 * bonelink = VertexBoneLink->Get_Array();
-	for (int vi = 0; vi < Get_Vertex_Count(); vi++) {
-		const Matrix3D & tm = htree->Get_Transform(bonelink[vi]);
-		Matrix3D::Transform_Vector(tm, src_vert[vi], &(dst_vert[vi]));
-	}
-}
-
-
-// Destination pointers MUST point to arrays large enough to hold all vertices
-void MeshModelClass::get_deformed_vertices(Vector3 *dst_vert, Vector3 *dst_norm,const HTreeClass * htree)
-{
-	int vi;
-	int vertex_count=Get_Vertex_Count();
-	Vector3 * src_vert = Vertex->Get_Array();
-#if (OPTIMIZE_VNORMS)
-	Vector3 * src_norm = (Vector3 *)Get_Vertex_Normal_Array();
-#else
-	Vector3 * src_norm = VertexNorm->Get_Array();
-#endif
-	uint16 * bonelink = VertexBoneLink->Get_Array();
-
-	for (vi = 0; vi < vertex_count;) {
-		const Matrix3D & tm = htree->Get_Transform(bonelink[vi]);
-
-		// Make a copy so we can set the translation to zero
-		Matrix3D mytm=tm;
-
-		int idx=bonelink[vi];
-		int cnt;
-		for (cnt = vi; cnt < vertex_count; cnt++) {
-			if (idx!=bonelink[cnt]) {
-				break;
-			}
-		}
-
-		VectorProcessorClass::Transform(dst_vert+vi,src_vert+vi,mytm,cnt-vi);
-		mytm.Set_Translation(Vector3(0.0f,0.0f,0.0f));
-		VectorProcessorClass::Transform(dst_norm+vi,src_norm+vi,mytm,cnt-vi);
-		vi=cnt;
-	}
-}
-
-// Destination pointer MUST point to arrays large enough to hold all vertices
-void MeshModelClass::compose_deformed_vertex_buffer(
-	VertexFormatXYZNDUV2* verts,
-	const Vector2* uv0,
-	const Vector2* uv1,
-	const unsigned* diffuse,
-	const HTreeClass * htree)
-{
-	int vi;
-	int vertex_count=Get_Vertex_Count();
-	Vector3 * src_vert = Vertex->Get_Array();
-#if (OPTIMIZE_VNORMS)
-	Vector3 * src_norm = (Vector3 *)Get_Vertex_Normal_Array();
-#else
-	Vector3 * src_norm = VertexNorm->Get_Array();
-#endif
-	uint16 * bonelink = VertexBoneLink->Get_Array();
-
-	for (vi = 0; vi < vertex_count;) {
-		const Matrix3D & tm = htree->Get_Transform(bonelink[vi]);
-
-		int idx=bonelink[vi];
-		int cnt;
-		for (cnt = vi; cnt < vertex_count; cnt++) {
-			if (idx!=bonelink[cnt]) {
-				break;
-			}
-		}
-
-		for (int pidx=0;pidx<cnt-vi;++pidx) {
-			const Matrix3D& A=tm;
-			VertexFormatXYZNDUV2* out=verts+vi+pidx;
-			const Vector3& v=*(src_vert+vi+pidx);
-			out->x = (A[0][0] * v.X + A[0][1] * v.Y + A[0][2] * v.Z + A[0][3]);
-			out->y = (A[1][0] * v.X + A[1][1] * v.Y + A[1][2] * v.Z + A[1][3]);
-			out->z = (A[2][0] * v.X + A[2][1] * v.Y + A[2][2] * v.Z + A[2][3]);
-
-			const Vector3& n=*(src_norm+vi+pidx);
-			out->nx = (A[0][0] * n.X + A[0][1] * n.Y + A[0][2] * n.Z);
-			out->ny = (A[1][0] * n.X + A[1][1] * n.Y + A[1][2] * n.Z);
-			out->nz = (A[2][0] * n.X + A[2][1] * n.Y + A[2][2] * n.Z);
-
-			if (diffuse) out->diffuse=diffuse[vi+pidx];
-			else out->diffuse=0xFFFFFFFF;
-			if (uv0) reinterpret_cast<Vector2&>(verts[vi+pidx].u1)=uv0[vi+pidx];
-			else reinterpret_cast<Vector2&>(verts[vi+pidx].u2)=Vector2(0.0f,0.0f);
-		}
-
-		vi=cnt;
-	}
-}
-
-
-// Destination pointers MUST point to arrays large enough to hold all vertices
-void MeshModelClass::get_deformed_screenspace_vertices(Vector4 *dst_vert,const RenderInfoClass & rinfo,const Matrix3D & mesh_transform,const HTreeClass * htree)
-{
-	Matrix4x4 prj = rinfo.Camera.Get_Projection_Matrix() * rinfo.Camera.Get_View_Matrix() * mesh_transform;
-
-	Vector3 * src_vert = Vertex->Get_Array();
-	int vertex_count=Get_Vertex_Count();
-
-	if (Get_Flag(SKIN) && VertexBoneLink && htree) {
-		uint16 * bonelink = VertexBoneLink->Get_Array();
-		for (int vi = 0; vi < vertex_count;) {
-			int idx=bonelink[vi];
-
-			Matrix4x4 tm = prj * htree->Get_Transform(idx);
-
-			// Count equal matrices (the vertices should be pre-sorted by matrices they use)
-			int cnt = vi;
-			for (; cnt < vertex_count; cnt++) if (idx!=bonelink[cnt]) break;
-
-			// Transform to screenspace (x,y,z,w)
-			VectorProcessorClass::Transform(
-				dst_vert+vi,
-				src_vert+vi,
-				tm,
-				cnt-vi);
-
-			vi=cnt;
-		}
-	} else {
-		VectorProcessorClass::Transform(
-			dst_vert,
-			src_vert,
-			prj,
-			vertex_count);
 	}
 }
 
@@ -443,6 +667,9 @@ void MeshModelClass::Enable_Alternate_Material_Description(bool onoff)
 			if (Get_Flag(SORT) && WW3D::Is_Munge_Sort_On_Load_Enabled())
 				compute_static_sort_levels();
 
+			if (WW3D::Is_Overbright_Modify_On_Load_Enabled())
+				modify_for_overbright();
+
 			// TODO: Invalidate just this meshes DX8 data!!!
 			TheDX8MeshRenderer.Invalidate();
 		}
@@ -452,6 +679,9 @@ void MeshModelClass::Enable_Alternate_Material_Description(bool onoff)
 
 			if (Get_Flag(SORT) && WW3D::Is_Munge_Sort_On_Load_Enabled())
 				compute_static_sort_levels();
+
+			if (WW3D::Is_Overbright_Modify_On_Load_Enabled())
+				modify_for_overbright();
 
 			// TODO: Invalidate this meshes DX8 data!!!
 			TheDX8MeshRenderer.Invalidate();
@@ -476,16 +706,6 @@ bool MeshModelClass::Needs_Vertex_Normals()
 	}
 	return CurMatDesc->Do_Mappers_Need_Normals();
 }
-
-void Whatever(
-	TriIndex* added_polygon_indices,
-	unsigned& added_polygon_count,
-	const Vector3* locations,
-	unsigned vertex_count,
-	const TriIndex* polygon_indices,
-	unsigned polygon_count);
-
-
 
 struct TriangleSide
 {
@@ -571,7 +791,13 @@ HashTemplateClass<TriangleSide,SideIndexInfo> SideHash;
 
 GapFillerClass::GapFillerClass(MeshModelClass* mmc_) : mmc(nullptr), PolygonCount(0)
 {
-	REF_PTR_SET(mmc,mmc_);
+	//DMS - We cannot take a reference to the mesh model here!  This is because the mesh model
+	// class OWNS the GapFiller class (allocated via NEW).  If we take a reference here, there
+	// will be an extra reference on the parent object, which will result in the parent object
+	// not being destroyed.
+	//
+//	REF_PTR_SET(mmc,mmc_);
+	mmc = mmc_;
 
 	ArraySize=mmc->Get_Polygon_Count()*6;	// Each side of each triangle can have 2 polygons added, in the worst case
 	PolygonArray=W3DNEWARRAY TriIndex[ArraySize];
@@ -597,7 +823,13 @@ GapFillerClass::GapFillerClass(MeshModelClass* mmc_) : mmc(nullptr), PolygonCoun
 
 GapFillerClass::GapFillerClass(const GapFillerClass& that) : mmc(nullptr), PolygonCount(that.PolygonCount)
 {
-	REF_PTR_SET(mmc,that.mmc);
+	//DMS - We cannot take a reference to the mesh model here!  This is because the mesh model
+	// class OWNS the GapFiller class (allocated via NEW).  If we take a reference here, there
+	// will be an extra reference on the parent object, which will result in the parent object
+	// not being destroyed.
+	//
+//	REF_PTR_SET(mmc,that.mmc);
+	mmc = that.mmc;
 
 	ArraySize=that.ArraySize;
 	PolygonArray=W3DNEWARRAY TriIndex[ArraySize];
@@ -646,6 +878,7 @@ GapFillerClass::~GapFillerClass()
 	for (int pass=0;pass<mmc->Get_Pass_Count();++pass) {
 		for (int stage=0;stage<MeshMatDescClass::MAX_TEX_STAGES;++stage) {
 			if (TextureArray[pass][stage]) {
+
 				for (unsigned i=0;i<PolygonCount;++i) {
 					REF_PTR_RELEASE(TextureArray[pass][stage][i]);
 				}
@@ -663,7 +896,8 @@ GapFillerClass::~GapFillerClass()
 		delete[] ShaderArray[pass];
 	}
 
-	REF_PTR_RELEASE(mmc);
+	// DMS - Removed - See constructor for details.
+//	REF_PTR_RELEASE(mmc);
 }
 
 // ----------------------------------------------------------------------------
@@ -705,7 +939,7 @@ WWASSERT(loc1==loc2 || loc1==loc3 || loc2==loc3);
 
 // ----------------------------------------------------------------------------
 //
-// Resize buffers to match the polygon count exatly. After this call no more
+// Resize buffers to match the polygon count exactly. After this call no more
 // polygons can be added to the buffers.
 //
 // ----------------------------------------------------------------------------
@@ -759,6 +993,8 @@ void GapFillerClass::Shrink_Buffers()
 
 void MeshModelClass::Init_For_NPatch_Rendering()
 {
+	if (!DX8Wrapper::Get_Current_Caps()->Support_NPatches()) return;
+	if (!Get_Flag(MeshGeometryClass::ALLOW_NPATCHES)) return;
 	if (GapFiller) return;
 
 	const Vector3* locations=Get_Vertex_Array();

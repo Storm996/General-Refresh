@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -95,7 +95,7 @@ public:
 		STATE_MESH_PROCESSED,			// mesh builder has processed the mesh
 
 		MAX_PASSES = 4,					// maximum number of material passes supported
-		MAX_STAGES = 2,					// maximum number of texture stages supported in a single pass
+		MAX_STAGES = 8,					// maximum number of texture stages supported in a single pass
 	};
 
 	/*

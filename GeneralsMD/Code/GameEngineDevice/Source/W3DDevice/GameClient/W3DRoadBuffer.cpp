@@ -119,7 +119,16 @@ static Int xpSign(const Vector2 &v1, const Vector2 &v2) {
 	return 0;
 }
 
-static Bool s_dynamic = false;
+// GeneralsX @bugfix 28/10/2026 ROADTEAR: the road strips are re-uploaded from scratch every time the
+// visible road set changes, which is every time the camera moves into another draw region - i.e. exactly
+// while a cut-scene pans or the player scrolls. As USAGE_DEFAULT the Vulkan backing is one fixed region,
+// so that re-upload overwrites the bytes the frames still in flight are reading: a segment that was at
+// its old position in the index stream and its new position in the vertex stream becomes a triangle
+// stretched across the whole screen, textured with the road, for exactly one frame. That is the one-frame
+// grey "striped shadow" streak over the road. USAGE_DYNAMIC + D3DLOCK_DISCARD is the promise the D3D8
+// path was written for and what the Vulkan layer needs to rotate to a fresh region per frame (same fix
+// already applied to the tree, bridge, bib and track buffers).
+static Bool s_dynamic = true;
 
 //-----------------------------------------------------------------------------
 //         Private Class
@@ -3278,6 +3287,16 @@ void W3DRoadBuffer::updateCenter()
 void W3DRoadBuffer::drawRoads(CameraClass * camera, TextureClass *cloudTexture, TextureClass *noiseTexture, Bool wireframe,
 															Int minX, Int maxX, Int minY, Int maxY, RefRenderObjListIterator *pDynamicLightsIterator)
 {
+	// GeneralsX @debug 28/10/2026 QA: isolate the road strip geometry from the flicker report.
+	{
+		static int s_noRoads = -1;
+		if (s_noRoads < 0) {
+			const char* e = getenv("GENERALSX_NO_ROADS");
+			s_noRoads = (e && *e && atoi(e)) ? 1 : 0;
+			if (s_noRoads) { fprintf(stderr, "[ROAD] road render disabled\n"); fflush(stderr); }
+		}
+		if (s_noRoads) return;
+	}
 	IRegion2D bounds;
 	bounds.lo.x = minX*MAP_XY_FACTOR;
 	bounds.hi.x = maxX*MAP_XY_FACTOR;

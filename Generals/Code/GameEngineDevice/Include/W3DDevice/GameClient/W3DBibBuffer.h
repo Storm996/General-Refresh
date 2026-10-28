@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -99,6 +99,8 @@ public:
 	void removeHighlighting();
 	/// Draws the bibs.
 	void renderBibs();
+	/// GeneralsX @refactor 23/10/2026: rebake the per-bib static lighting after an atmosphere revision.
+	void updateLighting();
 	/// Called when the view changes, and sort key needs to be recalculated.
 	/// Normally sortKey gets calculated when a bib becomes visible.
 protected:

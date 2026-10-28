@@ -102,7 +102,6 @@ public:
 	// strength without a restart.
 	virtual void setLightPulseEnabled ( Bool enabled ) override;
 	virtual void setBloomIntensity ( Real intensity01 ) override;
-	virtual void setAntiAliasLevel ( Int level ) override;
 	virtual void setShadowMapStrength ( Real strength01 ) override;
 
 	/// draw a line on the display in screen coordinates

@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -74,6 +74,12 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		void queueSimpleDecal(W3DProjectedShadow *shadow);	///< add shadow decal to render list - decal floats on terrain.
 		void flushDecals(W3DShadowTexture *texture, ShadowType type);	///<empty queue by rendering all decals with given texture
 
+		// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map: read-only access to the caster
+		// lists so the sun depth pass can iterate every shadow's render object without touching the
+		// (dead) atlas update path.
+		W3DProjectedShadow *peekShadowList()	{return m_shadowList;}
+		W3DProjectedShadow *peekDecalList()	{return m_decalList;}
+
 	private:
 		Int renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box);	///<render shadow on map terrain.
 		void updateShadowNumbers(ShadowType shadowType, Int addNum);
@@ -111,7 +117,7 @@ class W3DProjectedShadow	: public Shadow
 		~W3DProjectedShadow();
 		void setRenderObject( RenderObjClass	*robj) {m_robj=robj;}
 		void setObjPosHistory(const Vector3 &pos)	{m_lastObjPosition=pos;}	///<position of object when projection matrix was updated.
-		void setTexture(Int lightIndex,W3DShadowTexture *texture)	{m_shadowTexture[lightIndex]=texture;}	///<textur with light's shadow
+		void setTexture(Int lightIndex,W3DShadowTexture *texture)	{m_shadowTexture[lightIndex]=texture;}	///<texture with light's shadow
 		void update();	///<updates the texture and/or projection parameters when the object or light moves.
 		void init();		///<allocates local member variables used for projection
 		void updateTexture(Vector3 &lightPos);	///<updates the shadow texture image using render object and given light position.
@@ -121,6 +127,9 @@ class W3DProjectedShadow	: public Shadow
 		virtual void getRenderCost(RenderCost & rc) const override;
 		#endif
 		W3DShadowTexture *getTexture(Int lightIndex) {return m_shadowTexture[lightIndex];}
+		// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map: list-walk accessors.
+		W3DProjectedShadow *peekNextShadow()	{return m_next;}
+		RenderObjClass *peekCaster()			{return m_robj;}
 
 
 	protected:

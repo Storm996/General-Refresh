@@ -773,9 +773,21 @@ void DX8FVFCategoryContainer::Change_Polygon_Renderer_Material(
 
 // ----------------------------------------------------------------------------
 
+// GeneralsX @bugfix 25/10/2026 MESHSORTOFF: a SORT-flagged mesh is re-uploaded through the dynamic
+// vertex ring by SortingRendererClass, and in this port the write lock and the draw bind different
+// VkBuffers - every rotor blur disc (PROPS01/02, AVCOMANCHE_PROP) vanished because of it. Until that
+// backing lifetime is fixed, SORT meshes are registered and drawn as ordinary meshes. Particles,
+// streaks, rings and other effects do not come through here and keep the sorting pool.
+// GENERALSX_MESHSORT=1 restores the pooled path for an A/B run.
+static bool Mesh_Sorting_Enabled()
+{
+	static int s_meshSort = -1;
+	if (s_meshSort < 0) s_meshSort = getenv("GENERALSX_MESHSORT") ? 1 : 0;
+	return s_meshSort != 0 && WW3D::Is_Sorting_Enabled();
+}
 unsigned DX8FVFCategoryContainer::Define_FVF(MeshModelClass* mmc,bool enable_lighting)
 {
-	if ((!!mmc->Get_Flag(MeshGeometryClass::SORT)) && WW3D::Is_Sorting_Enabled()) {
+	if ((!!mmc->Get_Flag(MeshGeometryClass::SORT)) && Mesh_Sorting_Enabled()) {
 		return dynamic_fvf_type;
 	}
 
@@ -2399,7 +2411,7 @@ void DX8TextureCategoryClass::Render()
 		//(gth) this if statement's contents are not tabbed to avoid perforce merge problems...
 		if (!DX8RendererDebugger::Is_Enabled() || !mesh->Is_Disabled_By_Debugger()) {
 
-		if ((!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)) && WW3D::Is_Sorting_Enabled()) {
+		if ((!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)) && Mesh_Sorting_Enabled()) {
 			DX8Wrapper::VK_Set_ShadowReceiver((modelInstance.desc.features & W3DMATF_RECEIVE_SHADOW) != 0);
 			DX8Wrapper::VK_Set_ShadowCaster((modelInstance.desc.features & W3DMATF_CAST_SHADOW) != 0);
 			renderer->Render_Sorted(mesh->Get_Base_Vertex_Offset(),mesh->Get_Bounding_Sphere());
@@ -2596,7 +2608,7 @@ static void Add_Rigid_Mesh_To_Container(FVFCategoryList* container_list,unsigned
 {
 	WWASSERT(container_list);
 	DX8FVFCategoryContainer * container = nullptr;
-	bool sorting=((!!mmc->Get_Flag(MeshModelClass::SORT)) && WW3D::Is_Sorting_Enabled() && (mmc->Get_Sort_Level() == SORT_LEVEL_NONE));
+	bool sorting=((!!mmc->Get_Flag(MeshModelClass::SORT)) && Mesh_Sorting_Enabled() && (mmc->Get_Sort_Level() == SORT_LEVEL_NONE));
 
 	FVFCategoryListIterator it(container_list);
 	while (!it.Is_Done()) {
@@ -2639,7 +2651,7 @@ void DX8MeshRendererClass::Register_Mesh_Type(MeshModelClass* mmc)
 	WWDEBUG_SAY(("Registering mesh: %s (%d polys, %d verts + %d gap polygons)",mmc->Get_Name(),mmc->Get_Polygon_Count(),mmc->Get_Vertex_Count(),mmc->Get_Gap_Filler_Polygon_Count()));
 #endif
 	bool skin=(mmc->Get_Flag(MeshModelClass::SKIN) && mmc->VertexBoneLink);
-	bool sorting=((!!mmc->Get_Flag(MeshModelClass::SORT)) && WW3D::Is_Sorting_Enabled() && (mmc->Get_Sort_Level() == SORT_LEVEL_NONE));
+	bool sorting=((!!mmc->Get_Flag(MeshModelClass::SORT)) && Mesh_Sorting_Enabled() && (mmc->Get_Sort_Level() == SORT_LEVEL_NONE));
 
 	if (skin) {
 

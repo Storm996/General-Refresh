@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -133,7 +133,7 @@ CameraClass::CameraClass(const CameraClass & src) :
 	ZBufferMin(src.ZBufferMin),
 	ZBufferMax(src.ZBufferMax)
 {
-	// just being paraniod in case any parent class doesn't completely copy the entire state...
+	// just being paranoid in case any parent class doesn't completely copy the entire state...
 	FrustumValid = false;
 }
 
@@ -166,7 +166,7 @@ CameraClass & CameraClass::operator = (const CameraClass & that)
 		ProjectionTransform = that.ProjectionTransform;
 		CameraInvTransform = that.CameraInvTransform;
 
-		// just being paraniod in case any parent class doesn't completely copy the entire state...
+		// just being paranoid in case any parent class doesn't completely copy the entire state...
 		FrustumValid = false;
 	}
 
@@ -749,7 +749,7 @@ void CameraClass::Apply()
 
 	Matrix4x4 d3dprojection;
 	Get_D3D_Projection_Matrix(&d3dprojection);
-	DX8Wrapper::Set_Transform(D3DTS_PROJECTION,d3dprojection);
+	DX8Wrapper::Set_Projection_Transform_With_Z_Bias(d3dprojection,ZNear,ZFar);
 	DX8Wrapper::Set_Transform(D3DTS_VIEW,CameraInvTransform);
 }
 

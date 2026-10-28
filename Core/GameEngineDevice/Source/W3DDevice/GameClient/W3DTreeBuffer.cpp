@@ -616,7 +616,7 @@ static Bool treeModelExists(const char *name)
 {
 	if (!name) return FALSE;
 	char path[_MAX_PATH];
-	snprintf(path, ARRAY_SIZE(path), "Art\W3D\%s.w3d", name);
+	snprintf(path, ARRAY_SIZE(path), "Art\\W3D\\%s.w3d", name);	// GeneralsX @bugfix Qoder 24/10/2026 escape the separators (C4129)
 	return treeFileExists(path);
 }
 
@@ -866,6 +866,17 @@ void W3DTreeBuffer::updateTexture()
 	fprintf(stderr, "[TREEATLAS] built %ux%u from %d tiles (texture=%s)\n",
 		(unsigned)m_textureWidth, (unsigned)m_textureHeight, m_numTiles,
 		(const char*)m_treeTexture->Get_Texture_Name());
+	// GeneralsX @debug Qoder 24/10/2026: name the atlas types whose UV span is not a plain square
+	// block. A half-tile sheet is upscaled to fill the whole 256px tile by readTiles(), but the UV
+	// remap still applies the retail half-tile span (u*0.5, v*0.5+0.5), so those cards sample one
+	// quarter of the image and stretch it. Missing/oversized types fall back to tileWidth 0 and
+	// sample a single texel. Both look like a smeared line, so make them visible in the log.
+	for (i = 0; i < m_numTreeTypes; ++i) {
+		if (m_treeTypes[i].m_tileWidth > 0 && !m_treeTypes[i].m_halfTile) continue;
+		fprintf(stderr, "[TREEATLAS] unusual type tex='%s' tiles=%d width=%d half=%d\n",
+			m_treeTypes[i].m_textureName.str(), m_treeTypes[i].m_numTiles,
+			m_treeTypes[i].m_tileWidth, m_treeTypes[i].m_halfTile ? 1 : 0);
+	}
 	fflush(stderr);
 
 	for (i=0; i<m_numTiles; i++) {
@@ -1049,8 +1060,6 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 
 
 			Int startVertex = m_curNumTreeVertices[bNdx];
-			m_trees[curTree].firstIndex = startVertex;
-			m_trees[curTree].bufferNdx = bNdx;
 			Int i;
 			Int numVertex = m_treeTypes[type].m_mesh->Peek_Model()->Get_Vertex_Count();
 			Vector3 *pVert = m_treeTypes[type].m_mesh->Peek_Model()->Get_Vertex_Array();
@@ -1066,6 +1075,12 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 			if (m_curNumTreeIndices[bNdx]+3*numIndex+6 >= MAX_TREE_INDEX) {
 				break;
 			}
+
+			// GeneralsX @bugfix Qoder 24/10/2026: only claim a slot once the tree is guaranteed to fit.
+			// The old order stamped bufferNdx/firstIndex even for the tree that hit the capacity break
+			// (it is retried in the next buffer), leaving a stale mapping into this one.
+			m_trees[curTree].firstIndex = startVertex;
+			m_trees[curTree].bufferNdx = bNdx;
 
 			const Vector2*uvs=m_treeTypes[type].m_mesh->Peek_Model()->Get_UV_Array_By_Index(0);
 
@@ -1149,9 +1164,16 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 				curVb->x = vLoc.X;
 				curVb->y = vLoc.Y;
 				curVb->z = vLoc.Z;
-				curVb->nx = m_trees[curTree].swayType;
-				curVb->ny = 1.0f - m_treeTypes[type].m_data->m_darkening*m_trees[curTree].pushAside;
-				curVb->nz = loc.Z;
+				// GeneralsX @bugfix 28/10/2026 foliage flicker: this channel used to carry the retired
+				// GPU-sway payload (x = sway type, y = 1 - push darkening, z = WORLD HEIGHT). The tree is
+				// drawn by the generic fixed-function material path now, which reads the normal attribute
+				// for its per-vertex lambert - so a tree's lighting changed with the terrain height and
+				// flipped whenever a unit pushed the bush aside, and a buffer rebuild (any camera move)
+				// changed it again: the "bush texture flickers in cut-scenes" report. A leaf card has no
+				// meaningful single normal, so publish the stable up-facing one the atlas shading assumes.
+				curVb->nx = 0.0f;
+				curVb->ny = 0.0f;
+				curVb->nz = 1.0f;
 				if (doVertexLighting) {
 					Vector3 normal(0.0f, 0.0f, 1.0f);
 					if (normals) {
@@ -1226,7 +1248,10 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 //=============================================================================
 // W3DTreeBuffer::updateVertexBuffer
 //=============================================================================
-/** Updates the push aside offset in vertex buffer. */
+/** Updates the push aside offset in vertex buffer.
+	* GeneralsX @bugfix Qoder 24/10/2026: NOT called any more. It relied on a D3DLOCK_DISCARD keeping the
+	* untouched vertices, which is false once the Vulkan backing rotates per frame; drawTrees() now does a
+	* full rebuild while push/topple is active (see the call site). Kept for reference only. */
 //=============================================================================
 void W3DTreeBuffer::updateVertexBuffer()
 {
@@ -1303,7 +1328,10 @@ void W3DTreeBuffer::updateVertexBuffer()
 				curVb->x = vLoc.X;
 				curVb->y = vLoc.Y;
 				curVb->z = vLoc.Z;
-				curVb->ny = 1.0f - m_treeTypes[type].m_data->m_darkening*m_trees[curTree].pushAside;
+				// Same stable up normal as the full rebuild above (this path only re-writes positions).
+				curVb->nx = 0.0f;
+				curVb->ny = 0.0f;
+				curVb->nz = 1.0f;
 				curVb++;
 			}
 		}
@@ -1496,12 +1524,42 @@ void W3DTreeBuffer::allocateTreeBuffers()
 
 	HRESULT hr;
 	hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\Trees.vso", &Declaration[0], 0, true, (void**)&m_dwTreeVertexShader);
+#if defined(SAGE_USE_VULKAN_CORE)
+	if (FAILED(hr))
+	{
+		// The card is transformed by the fixed-function vertex stage; only the pixel twin is ours.
+		m_dwTreeVertexShader = nullptr;
+	}
+#else
 	if (FAILED(hr))
 		return;
+#endif
 
 	hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\Trees.pso", &Declaration[0], 0, false, (void**)&m_dwTreePixelShader);
 	if (FAILED(hr))
+	{
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature 27/10/2026 unified lighting: the port does not ship Trees.pso, so trees used
+		// to render with baked vertex light and never moved with the sun. The translated twin
+		// (pgm_b1_tree.frag, tag 121) reads the shared rig per pixel; bind a key handle to it.
+		void* twin = nullptr;
+		const char* tp = nullptr;
+		static const char kTreeTwinKey[] = "float4 main() : COLOR { return float4(1,1,1,1); }\n";
+		if (SUCCEEDED(W3DShaderManager::compileShaderAtBestProfile(kTreeTwinKey, false, "[TREE30]",
+				&tp, &twin, 121u)) && twin != nullptr)
+		{
+			m_dwTreePixelShader = (IDirect3DPixelShader9*)twin;
+			fprintf(stderr, "[TREE30] Vulkan twin bound (tag 121): per-pixel rig foliage\n");
+			fflush(stderr);
+		}
+		else
+		{
+			fprintf(stderr, "[TREE30] Vulkan twin bind failed; the fixed-function tree stays\n");
+			fflush(stderr);
+		}
+#endif
 		return;
+	}
 }
 
 //=============================================================================
@@ -1594,7 +1652,8 @@ Int W3DTreeBuffer::addTreeType(const W3DTreeDrawModuleData *data)
 	m_treeTypes[m_numTreeTypes].m_textureName = resolvedTexture;
 	static Int s_typeLog = 0;
 	if (s_typeLog++ < 48) {
-		fprintf(stderr, "[TREETYPE] model=%s texture=%s original=%s%s\n",
+		// GeneralsX @bugfix Qoder 24/10/2026 the format had a fourth %s with no argument (C4473).
+		fprintf(stderr, "[TREETYPE] model=%s texture=%s original=%s\n",
 			resolvedModel.str(), resolvedTexture.str(), data->m_modelName.str());
 		fflush(stderr);
 	}
@@ -1902,9 +1961,14 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 			continue;
 		}
 		const W3DTreeDrawModuleData *moduleData = m_treeTypes[type].m_data;
+		// GeneralsX @bugfix Qoder 24/10/2026: this loop is what pumps the animation. updateVertexBuffer()
+		// used to re-set m_anyPushChanged itself for every tree it patched, which kept the rebuild coming
+		// frame after frame. Now that the pump is a full rebuild, the flag has to be raised here whenever
+		// a tree actually moved - otherwise a falling/sinking/pushed tree would freeze after one frame.
 		if(m_trees[curTree].m_toppleState == TOPPLE_FALLING ||
 			 m_trees[curTree].m_toppleState == TOPPLE_FOGGED) {
 			updateTopplingTree(m_trees+curTree, timeScale);
+			m_anyPushChanged = true;
 		} else if(m_trees[curTree].m_toppleState == TOPPLE_DOWN) {
 			if (moduleData->m_killWhenToppled) {
 				if (m_trees[curTree].m_sinkFramesLeft <= 0.0f) {
@@ -1915,6 +1979,7 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 				m_trees[curTree].m_sinkFramesLeft -= timeScale;
 				m_trees[curTree].location.Z -= sinkDistancePerFrame * timeScale;
 				m_trees[curTree].m_mtx.Set_Translation(m_trees[curTree].location);
+				m_anyPushChanged = true;
 			}
 		} else if (m_trees[curTree].pushAsideDelta!=0.0f) {
 			m_trees[curTree].pushAside += m_trees[curTree].pushAsideDelta;
@@ -1924,15 +1989,23 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 				m_trees[curTree].pushAsideDelta = 0.0f;
 				m_trees[curTree].pushAside = 0.0f;
 			}
+			m_anyPushChanged = true;
 		}
 	}
 
+	// GeneralsX @bugfix Qoder 24/10/2026: the vertex/index buffers are now USAGE_DYNAMIC and the Vulkan
+	// backing gives each frame its own region (see DX8VertexBufferClass::Get_Usage()). That is only valid
+	// when every region is written in full: updateVertexBuffer() used to patch just the pushed/toppling
+	// trees after a DISCARD, which in a per-frame region would leave the other trees holding stale data
+	// from three frames ago. A push/topple is a transient event, so rebuilding the whole visible set is
+	// simpler and always correct; it also refreshes lighting/UVs for the moved trees.
+	if (m_anyPushChanged) {
+		m_anyPushChanged = false;
+		m_anythingChanged = true;
+	}
 	if (m_anythingChanged) {
 		loadTreesInVertexAndIndexBuffers(pDynamicLightsIterator);
 		m_anythingChanged = false;
-	} else if (m_anyPushChanged) {
-		m_anyPushChanged = false;
-		updateVertexBuffer();
 	}
 
 //#define DEBUG_TEXTURE 1
@@ -2008,6 +2081,22 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 
 	DX8Wrapper::Set_Texture(0,m_treeTexture);
 	DX8Wrapper::Set_Texture(1,nullptr);
+	// GeneralsX @debug 28/10/2026 foliage mip A/B. The atlas mips are coverage-binarised on the CPU, so
+	// every mip transition coarsens the leaf silhouette; at close range a moving camera walks up and down
+	// that ladder and the card appears to flicker. GENERALSX_TREE_NOMIP=1 pins sampling to level 0
+	// ("always highest detail") so the hypothesis can be measured instead of argued about.
+	{
+		static int s_treeNoMip = -1;
+		if (s_treeNoMip < 0) {
+			const char* e = getenv("GENERALSX_TREE_NOMIP");
+			s_treeNoMip = (e != nullptr && *e != 0 && atoi(e) != 0) ? 1 : 0;
+			if (s_treeNoMip) { fprintf(stderr, "[TREE] sampler pinned to mip 0 (no mip transitions)\n"); fflush(stderr); }
+		}
+		if (s_treeNoMip) {
+			DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+			DX8Wrapper::Set_DX8_Sampler_State(0, D3DSAMP_MAXANISOTROPY, 1);
+		}
+	}
 	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
 	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, 1);
 	// GeneralsX @bugfix Qoder 21/10/2026 TREEALPHA: force the detailAlphaShader's exact raster state.
@@ -2114,13 +2203,16 @@ void W3DTreeBuffer::drawTrees(CameraClass * camera, RefRenderObjListIterator *pD
 		}
 
 		DX8Wrapper::Set_Vertex_Shader((UINT_PTR)m_dwTreeVertexShader);
-#if 0
-		DX8Wrapper::Set_Pixel_Shader((UINT_PTR)m_dwTreePixelShader);
-		// a.c. 6/16 - allow switching between normal and 2X mode for terrain
-		Real mulTwoX = 0.5f;
-		if(TheGlobalData && TheGlobalData->m_useOverbright)
-			mulTwoX = 1.0f;
-		DX8Wrapper::Set_Pixel_Shader_Constant(1, (const float*)D3DXVECTOR4(mulTwoX, mulTwoX, mulTwoX, mulTwoX), 1);
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature 27/10/2026 unified lighting: the translated twin owns the leaf shading
+		// (rig diffuse + shared point lights + fog), so the batch must name it. Fog/camera registers
+		// are the same ones the terrain trio uploads.
+		if (m_dwTreePixelShader != nullptr) {
+			W3DShaderManager::Upload_Fog_Constants();
+			DX8Wrapper::Set_Pixel_Shader((UINT_PTR)m_dwTreePixelShader);
+		}
+#else
+		// retail .pso path is gone in this port; the twin above is the only foliage program.
 #endif
 
 	} else {

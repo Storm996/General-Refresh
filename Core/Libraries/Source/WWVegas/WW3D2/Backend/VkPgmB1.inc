@@ -16,15 +16,28 @@
 // here: no row consumes it yet.
 #define VKPGM_HASH_KWEATHERCLOUDPS         0x9F814F0E2887CCF6ULL   // kWeatherCloudPS.hlsl (316 bytes)
 #define VKPGM_HASH_KWEATHERVEILPS          0x091DAFF0E5737B83ULL   // kWeatherVeilPS.hlsl (976 bytes)
+// GeneralsX @bugfix Qoder 24/10/2026 T5.2-terrain: measured which variant the runtime really compiles.
+// `pplReq = OptionPreferences().getTerrainPerPixel()` defaults ON, so the trio that ships is the
+// **PPL** one (kTerrainPS30*NMPPL), not the plain one - the plain/NM literals only compile with
+// TerrainPerPixel=0. The PPL literals had drifted from 文档/内联HLSL, so with PPL on every lookup missed:
+//   [VKWP1] wedge8 unmatched PS source [TERRAIN30] hash=c3032d52326a46b4 bytes=1115
+//   [TERRAIN30] ps_3_0 has no translated twin under no-d3d9; the fixed-function leg stays
+//   [TERRAIN] no pixel-shader trio (pso=0 hlsl=0); falling back to stage shaders
+// i.e. the terrain (the largest lit surface) silently ran fixed-function and none of the P1/P2/P3
+// terrain lighting could reach a pixel. The three plain rows below were briefly rewritten to these
+// values by mistake (that aliased the PPL source onto the plain twin and disabled the normal atlas);
+// they are back to the documented hashes, which a TerrainPerPixel=0 run confirms still match
+// (ed2f73a9/550bd8cf/5e5263bdb8, no "unmatched" line). Re-measure a variant by running once with the
+// matching option and reading the hash in that log line.
 #define VKPGM_HASH_KTERRAINPS30BASE        0xED2F73A9F33FA28BULL   // kTerrainPS30Base.hlsl (514 bytes)
 #define VKPGM_HASH_KTERRAINPS30NOISE       0x550BD8CFB4E1CFC2ULL   // kTerrainPS30Noise.hlsl (574 bytes)
 #define VKPGM_HASH_KTERRAINPS30NOISE12     0x5E5263BDB8ACFDE0ULL   // kTerrainPS30Noise12.hlsl (659 bytes)
 #define VKPGM_HASH_KTERRAINPS30BASENM      0xF429302880E958DFULL   // kTerrainPS30BaseNM.hlsl (713 bytes)
 #define VKPGM_HASH_KTERRAINPS30NOISENM     0x077DF8E02DC2FF4CULL   // kTerrainPS30NoiseNM.hlsl (773 bytes)
 #define VKPGM_HASH_KTERRAINPS30NOISE12NM   0xDACFBF8347EE6B10ULL   // kTerrainPS30Noise12NM.hlsl (858 bytes)
-#define VKPGM_HASH_KTERRAINPS30BASENMPPL   0x1460C7ABC1ACBDC3ULL   // kTerrainPS30BaseNMPPL.hlsl (996 bytes)
-#define VKPGM_HASH_KTERRAINPS30NOISENMPPL  0x863A4CC03913D00EULL   // kTerrainPS30NoiseNMPPL.hlsl (1056 bytes)
-#define VKPGM_HASH_KTERRAINPS30NOISE12NMPPL 0x47F9BBA89FCFC288ULL  // kTerrainPS30Noise12NMPPL.hlsl (1141 bytes)
+#define VKPGM_HASH_KTERRAINPS30BASENMPPL   0xC3032D52326A46B4ULL   // runtime PPL PS, 1115 B (was 1460C7AB...)
+#define VKPGM_HASH_KTERRAINPS30NOISENMPPL  0x4149BE5D76F1D0B1ULL   // runtime PPL PS, 1175 B (was 863A4CC0...)
+#define VKPGM_HASH_KTERRAINPS30NOISE12NMPPL 0xA86C336D1D8203DDULL  // runtime PPL PS, 1260 B (was 47F9BBA8...)
 #define VKPGM_HASH_KROADPS30               0xFE7AFB245A477C9BULL   // kRoadPS30.hlsl (526 bytes)
 #define VKPGM_HASH_KTREEPS30               0x77FCA405991559E8ULL   // kTreePS30.hlsl (518 bytes)
 #define VKPGM_HASH_KPIXELSHADERNOSTAGE1    0xF36101AF52714116ULL   // kPixelShaderNoStage1.hlsl (439 bytes)

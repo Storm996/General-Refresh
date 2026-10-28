@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -36,12 +36,16 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Common/GameUtility.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"	// GeneralsX @feature Qoder 22/10/2026 FPNIGHT: render-side TOD
 #include "Common/GlobalData.h"
+#include "Common/OptionPreferences.h"
+#include "GameClient/GameClient.h"	// GeneralsX @feature Qoder 24/10/2026 P4 D2: QA spot rig target lookup
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/TerrainLogic.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/ParticleSys.h"
 #include "GameClient/Color.h"
@@ -50,6 +54,7 @@
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
+#include "W3DDevice/GameClient/W3DSunShadowMap.h"	// GeneralsX @refactor Qoder 19/10/2026 R-05 wave 4: legacy shadow retirement gate
 #include "W3DDevice/GameClient/W3DStatusCircle.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
@@ -62,6 +67,124 @@
 #include "WW3D2/shader.h"
 #include "WW3D2/dx8caps.h"
 #include "WW3D2/colorspace.h"
+
+#include "WW3D2/shdlib.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+#include "WW3D2/Backend/VulkanForward.h"
+#endif
+
+// GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13B): splits RTS3DScene's render traversal
+// into the segments that can hold the 3.25 ms views= CPU cost measured at 4K@240: the light
+// environment prep, visibility cull, per-frame updates, the terrain pass, the drawable loop, the
+// shadow/particle queues, and the final batch flush. Same env gate as the other phase probes
+// (GENERALSX_VKFPS_PHASES). Temporary forensic instrumentation, retire with the rest.
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+namespace {
+	struct VKFphB
+	{
+		long long lightenv, vis, upd, terrain, drawables, shadowq, particles, flush, frames;
+		bool enabled, checked;
+		VKFphB() : lightenv(0), vis(0), upd(0), terrain(0), drawables(0), shadowq(0), particles(0),
+			flush(0), frames(0), enabled(false), checked(false) { }
+	};
+	VKFphB g_fphB;
+
+	inline long long fphbNowUs()
+	{
+		using namespace std::chrono;
+		return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+	}
+
+	inline bool fphbOn()
+	{
+		if (!g_fphB.checked)
+		{
+			g_fphB.checked = true;
+			g_fphB.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fphB.enabled;
+	}
+
+	struct VKFphBScope
+	{
+		long long* out;
+		long long t0;
+		VKFphBScope(long long* o) : out(o), t0(o ? fphbNowUs() : 0) { }
+		~VKFphBScope() { if (out) *out += fphbNowUs() - t0; }
+	};
+
+	inline void fphbTickAndDump()
+	{
+		if (!g_fphB.enabled) return;
+		if ((++g_fphB.frames % 300) != 0) return;
+		FILE* out = fopen("vkfps_phase13.log", "a");
+		if (out)
+		{
+			fprintf(out, "[V13B] frames=300 avg_us lightenv=%lld vis=%lld upd=%lld terrain=%lld "
+				"drawables=%lld shadowq=%lld particles=%lld flush=%lld\n",
+				(long long)(g_fphB.lightenv / 300), (long long)(g_fphB.vis / 300),
+				(long long)(g_fphB.upd / 300), (long long)(g_fphB.terrain / 300),
+				(long long)(g_fphB.drawables / 300), (long long)(g_fphB.shadowq / 300),
+				(long long)(g_fphB.particles / 300), (long long)(g_fphB.flush / 300));
+			fclose(out);
+		}
+		g_fphB.lightenv = g_fphB.vis = g_fphB.upd = g_fphB.terrain = 0;
+		g_fphB.drawables = g_fphB.shadowq = g_fphB.particles = g_fphB.flush = 0;
+	}
+
+	// GeneralsX @performance Qoder 19/10/2026 R-05 L11 probe (V13C): RTS3DScene::Flush is the scene's
+	// own submit chain (shadow prep, decals, mesh renderer, occluded/stencil, trees, static sorts,
+	// translucents, particles, sorting flush) - the phase-13 read put 4.2-6.1 ms per frame here.
+	// Split it into its twelve stages. Same env gate, dump every 600 flushes.
+	struct VKFphC
+	{
+		long long prep, decalsh, mesh, occluded, shd, trees, stencilsh, staticsort, translucent,
+			particles, sorting, del, calls;
+		bool enabled, checked;
+		VKFphC() : prep(0), decalsh(0), mesh(0), occluded(0), shd(0), trees(0), stencilsh(0),
+			staticsort(0), translucent(0), particles(0), sorting(0), del(0), calls(0),
+			enabled(false), checked(false) { }
+	};
+	VKFphC g_fphC;
+
+	inline bool fphcOn()
+	{
+		if (!g_fphC.checked)
+		{
+			g_fphC.checked = true;
+			g_fphC.enabled = (getenv("GENERALSX_VKFPS_PHASES") != nullptr);
+		}
+		return g_fphC.enabled;
+	}
+
+	struct VKFphCScope
+	{
+		long long* out;
+		long long t0;
+		VKFphCScope(long long* o) : out(o), t0(o ? fphbNowUs() : 0) { }
+		~VKFphCScope() { if (out) *out += fphbNowUs() - t0; }
+	};
+
+	inline void fphcDump()
+	{
+		if (!g_fphC.enabled) return;
+		if ((++g_fphC.calls % 600) != 0) return;
+		FILE* out = fopen("vkfps_phase13.log", "a");
+		if (out)
+		{
+			fprintf(out, "[V13C] flushes=600 avg_us prep=%.1f decalsh=%.1f mesh=%.1f occluded=%.1f shd=%.1f "
+				"trees=%.1f stencilsh=%.1f staticsort=%.1f translucent=%.1f particles=%.1f sorting=%.1f del=%.1f\n",
+				g_fphC.prep / 600.0, g_fphC.decalsh / 600.0, g_fphC.mesh / 600.0, g_fphC.occluded / 600.0,
+				g_fphC.shd / 600.0, g_fphC.trees / 600.0, g_fphC.stencilsh / 600.0, g_fphC.staticsort / 600.0,
+				g_fphC.translucent / 600.0, g_fphC.particles / 600.0, g_fphC.sorting / 600.0, g_fphC.del / 600.0);
+			fclose(out);
+		}
+		g_fphC.prep = g_fphC.decalsh = g_fphC.mesh = g_fphC.occluded = g_fphC.shd = g_fphC.trees = 0;
+		g_fphC.stencilsh = g_fphC.staticsort = g_fphC.translucent = g_fphC.particles = g_fphC.sorting = g_fphC.del = 0;
+	}
+}
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -130,6 +253,21 @@ RTS3DScene::RTS3DScene()
 	m_heatVisionOnlyPass->Set_Material(heatVisionMtl);
 	m_heatVisionOnlyPass->Set_Shader(heatVisionShader);
 
+
+//	VertexMaterialClass *frenzyMtl = NEW_REF(VertexMaterialClass,());
+//	frenzyMtl->Set_Lighting(TRUE);
+//	frenzyMtl->Set_Ambient(  0, 0, 0 );
+//	frenzyMtl->Set_Diffuse(  1.0f, 0.0f, 0.0f );
+//	frenzyMtl->Set_Emissive( 1.0f, 0.0f, 0.0f );
+//	m_frenzyMaterialPass = NEW_REF(MaterialPassClass,());
+//	m_frenzyMaterialPass->Set_Material(frenzyMtl);
+//	frenzyMtl->Release_Ref();
+//	ShaderClass frenzyShader=ShaderClass::_PresetMultiplicativeShader;
+//	frenzyShader.Set_Depth_Compare(ShaderClass::PASS_EQUAL);
+//	frenzyShader.Set_Depth_Mask(ShaderClass::DEPTH_WRITE_DISABLE);
+//	m_frenzyMaterialPass->Set_Shader(frenzyShader);
+
+
 	//Allocate memory to hold queue of visible render objects that need to be drawn last
 	//because they are forced translucent.
 	m_translucentObjectsCount = 0;
@@ -164,20 +302,20 @@ RTS3DScene::RTS3DScene()
 	shader.Set_Dst_Blend_Func(ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA);
 
 #ifdef USE_NON_STENCIL_OCCLUSION
-		for (i=0; i<MAX_PLAYER_COUNT; i++)
-		{
-			m_occludedMaterialPass[i]=NEW_REF(MaterialPassClass,());
-			VertexMaterialClass * vmtl = NEW_REF(VertexMaterialClass,());
-			vmtl->Set_Lighting(true);
-			vmtl->Set_Ambient(0,0,0);	//we're only using emissive so kill all other lights.
-			vmtl->Set_Diffuse(0,0,0);
-			m_occludedMaterialPass[i]->Set_Material(vmtl);
-			m_occludedMaterialPass[i]->Set_Shader(shader);
-			vmtl->Release_Ref();	//material pass is holding the pointer so release ref.
-		}
+	for (i=0; i<MAX_PLAYER_COUNT; i++)
+	{
+		m_occludedMaterialPass[i]=NEW_REF(MaterialPassClass,());
+		VertexMaterialClass * vmtl = NEW_REF(VertexMaterialClass,());
+		vmtl->Set_Lighting(true);
+		vmtl->Set_Ambient(0,0,0);	//we're only using emissive so kill all other lights.
+		vmtl->Set_Diffuse(0,0,0);
+		m_occludedMaterialPass[i]->Set_Material(vmtl);
+		m_occludedMaterialPass[i]->Set_Shader(shader);
+		vmtl->Release_Ref();	//material pass is holding the pointer so release ref.
+	}
 #else
-		for (i=0; i<MAX_PLAYER_COUNT; i++)
-			m_occludedMaterialPass[i]=nullptr;
+	for (i=0; i<MAX_PLAYER_COUNT; i++)
+		m_occludedMaterialPass[i]=nullptr;
 #endif
 
 }
@@ -455,24 +593,31 @@ void RTS3DScene::Visibility_Check(CameraClass * camera)
 					if (drawInfo && (draw=drawInfo->m_drawable) != nullptr)
 					{
 						if (draw->isDrawableEffectivelyHidden() || draw->getFullyObscuredByShroud())
-						{	robj->Set_Visible(false);
-							continue;
-						}
+						{
+							isVisible = FALSE;
+						  robj->Set_Visible(isVisible);
+            }
 						//assume normal rendering.
 						drawInfo->m_flags = DrawableInfo::ERF_IS_NORMAL;	//clear any rendering flags that may be in effect.
 
+            if ( ! isVisible )
+              continue;
+
 						if (draw->getEffectiveOpacity() != 1.0f && m_translucentObjectsCount < TheGlobalData->m_maxVisibleTranslucentObjects)
 						{
-							drawInfo->m_flags = DrawableInfo::ERF_IS_TRANSLUCENT;
+							drawInfo->m_flags |= DrawableInfo::ERF_IS_TRANSLUCENT;
 							m_translucentObjectsBuffer[m_translucentObjectsCount++] = robj;
 						}
-						else if (TheGlobalData->m_enableBehindBuildingMarkers && TheGameLogic && TheGameLogic->getShowBehindBuildingMarkers())
+						if (TheGlobalData->m_enableBehindBuildingMarkers && TheGameLogic && TheGameLogic->getShowBehindBuildingMarkers())
 						{
+							const Bool isTranslucent = (drawInfo->m_flags & DrawableInfo::ERF_IS_TRANSLUCENT) != 0;
 							//visible drawable. Check if it's either an occluder or occludee
 							if (draw->isKindOf(KINDOF_STRUCTURE) && m_numPotentialOccluders < TheGlobalData->m_maxVisibleOccluderObjects)
 							{
 								//object which could occlude other objects that need to be visible.
-								m_potentialOccluders[m_numPotentialOccluders++]=robj;
+								//Make sure this object is not translucent so it's not rendered twice (from m_potentialOccluders and m_translucentObjectsBuffer)
+								if (!isTranslucent)
+									m_potentialOccluders[m_numPotentialOccluders++]=robj;
 								drawInfo->m_flags |= DrawableInfo::ERF_POTENTIAL_OCCLUDER;
 							}
 							else if (draw->getObject() &&
@@ -480,13 +625,16 @@ void RTS3DScene::Visibility_Check(CameraClass * camera)
 									(draw->getObject()->getSafeOcclusionFrame()) <= currentFrame && m_numPotentialOccludees < TheGlobalData->m_maxVisibleOccludeeObjects)
 							{
 								//object which could be occluded but still needs to be visible.
+								//We process translucent units twice (also in m_translucentObjectsBuffer) because we need to see them when occluded.
 								m_potentialOccludees[m_numPotentialOccludees++]=robj;
 								drawInfo->m_flags |= DrawableInfo::ERF_POTENTIAL_OCCLUDEE;
 							}
 							else if (drawInfo->m_flags == DrawableInfo::ERF_IS_NORMAL && m_numNonOccluderOrOccludee < TheGlobalData->m_maxVisibleNonOccluderOrOccludeeObjects)
 							{
 								//regular object with no custom effects but still needs to be delayed to get the occlusion feature to work correctly.
-								m_nonOccludersOrOccludees[m_numNonOccluderOrOccludee++]=robj;
+								//Make sure this object is not translucent so it's not rendered twice (from m_nonOccludersOrOccludees and m_translucentObjectsBuffer)
+								if (!isTranslucent)
+									m_nonOccludersOrOccludees[m_numNonOccluderOrOccludee++]=robj;
 								drawInfo->m_flags |= DrawableInfo::ERF_IS_NON_OCCLUDER_OR_OCCLUDEE;
 							}
 						}
@@ -631,7 +779,6 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 
 		if (draw->isKindOf(KINDOF_INFANTRY))
 		{
-			// GeneralsX @bugfix Copilot 11/05/2026 Match Zero Hour infantry lighting path to avoid dark soldier shading on base Generals.
 			//ambient = m_infantryAmbient;  //has no effect - see comment on m_infantryAmbient
 			sceneLights = m_infantryLight;
 		}
@@ -686,22 +833,31 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 		}
 
 		//Apply custom render pass for any drawables with heatvision enabled
-		if (draw->getHeatVisionOpacity() != 0 )
+		if (draw->getSecondMaterialPassOpacity() != 0 )
 		{
-			rinfo.materialPassEmissiveOverride = draw->getHeatVisionOpacity();
-			if (draw->getStealthLook() == STEALTHLOOK_VISIBLE_DETECTED )
+			rinfo.materialPassEmissiveOverride = draw->getSecondMaterialPassOpacity();
+
+      //if ( draw->testTintStatus( TINT_STATUS_FRENZY ) )
+      //{
+			//	rinfo.Push_Material_Pass(m_heatVisionMaterialPass);
+      //}
+			//else
+      if (draw->getStealthLook() == STEALTHLOOK_VISIBLE_DETECTED )
 			{
+			  rinfo.materialPassEmissiveOverride = draw->getSecondMaterialPassOpacity();
 				// THIS WILL EXPLICITLY SKIP THE FIRST PASS SO THAT HEATVISION ONLY WILL RENDER
 				rinfo.Push_Override_Flags(RenderInfoClass::RINFO_OVERRIDE_ADDITIONAL_PASSES_ONLY);
 				rinfo.Push_Material_Pass(m_heatVisionOnlyPass);
-				doExtraFlagsPop=TRUE;
+        doExtraFlagsPop = TRUE;
 			}
 			else
 			{
 				//THIS CALLS FOR THE HEATVISION TO RENDER
+			  rinfo.materialPassEmissiveOverride = draw->getSecondMaterialPassOpacity();
 				rinfo.Push_Material_Pass(m_heatVisionMaterialPass);
 			}
-			doExtraMaterialPop=TRUE;
+
+			doExtraMaterialPop = TRUE;
 		}
 	}
 	else
@@ -742,20 +898,23 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 			}
 		}
 
-		// dynamic lights
-		RefRenderObjListIterator dynaLightIt(&m_dynamicLightList);
-		for (dynaLightIt.First(); !dynaLightIt.Is_Done(); dynaLightIt.Next())
-		{
-			W3DDynamicLight* pDyna = (W3DDynamicLight*)dynaLightIt.Peek_Obj();
-			if (!pDyna->isEnabled()) {
-				continue;
-			}
-			SphereClass lSph = pDyna->Get_Bounding_Sphere();
-			if (pDyna->Get_Type() == LightClass::POINT && !Spheres_Intersect(sph, lSph)) {
-				continue;
-			}
-			lightEnv.Add_Light(*(LightClass*)dynaLightIt.Peek_Obj());
-		}
+    if( draw && draw->getReceivesDynamicLights() )
+    {
+		  // dynamic lights
+		  RefRenderObjListIterator dynaLightIt(&m_dynamicLightList);
+		  for (dynaLightIt.First(); !dynaLightIt.Is_Done(); dynaLightIt.Next())
+		  {
+			  W3DDynamicLight* pDyna = (W3DDynamicLight*)dynaLightIt.Peek_Obj();
+			  if (!pDyna->isEnabled()) {
+				  continue;
+			  }
+			  SphereClass lSph = pDyna->Get_Bounding_Sphere();
+			  if (pDyna->Get_Type() == LightClass::POINT && !Spheres_Intersect(sph, lSph)) {
+				  continue;
+			  }
+			  lightEnv.Add_Light(*(LightClass*)dynaLightIt.Peek_Obj());
+		  }
+    }
 
 		lightEnv.Pre_Render_Update(rinfo.Camera.Get_Transform());
 		rinfo.light_environment = &lightEnv;
@@ -796,7 +955,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 	}
 
 	rinfo.light_environment = nullptr;
-	if (doExtraMaterialPop)	//check if there is an extra material on the stack from the heatvision effect.
+	if (doExtraMaterialPop)	//check if there is an extra material on the stack from the added material effect.
 		rinfo.Pop_Material_Pass();
 	if (doExtraFlagsPop)
 		rinfo.Pop_Override_Flags();	//flags used to disable base pass and only render custom heat vision pass.
@@ -807,45 +966,51 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 /**Draw everything that was submitted from this scene*/
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
+	const bool vkCc = fphcOn();
+	fphcDump();
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
-	PrepareShadows();
+	{ VKFphCScope s(vkCc ? &g_fphC.prep : nullptr); PrepareShadows(); }
 
 	//don't draw shadows in this mode because they interfere with destination alpha or are invisible (wireframe)
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
+	{ VKFphCScope s(vkCc ? &g_fphC.decalsh : nullptr); DoShadows(rinfo, false); }	//draw all non-stencil shadows (decals) since they fall under other objects.
 
-	TheDX8MeshRenderer.Flush();	//draw all non-translucent objects.
+	{ VKFphCScope s(vkCc ? &g_fphC.mesh : nullptr); TheDX8MeshRenderer.Flush(); }	//draw all non-translucent objects.
 
 	//draw all non-translucent objects which were separated because they are hidden and need custom rendering.
 #ifdef USE_NON_STENCIL_OCCLUSION
-	flushOccludedObjects(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.occluded : nullptr); flushOccludedObjects(rinfo); }
 #else
 	if (DX8Wrapper::Has_Stencil())
-		flushOccludedObjectsIntoStencil(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.occluded : nullptr); flushOccludedObjectsIntoStencil(rinfo); }
 #endif
+
+	// (gth) CNC3 Flush the shader meshes
+	{ VKFphCScope s(vkCc ? &g_fphC.shd : nullptr); SHD_FLUSH; }
+
 	// Draw the trees last so they alpha blend onto everything correctly.
-	DoTrees(rinfo);
+	{ VKFphCScope s(vkCc ? &g_fphC.trees : nullptr); DoTrees(rinfo); }
 
 	//don't draw shadows in this mode because they interfere with destination alpha
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		DoShadows(rinfo, true);	//draw all stencil shadows
+	{ VKFphCScope s(vkCc ? &g_fphC.stencilsh : nullptr); DoShadows(rinfo, true); }	//draw all stencil shadows
 
-	WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
+	{ VKFphCScope s(vkCc ? &g_fphC.staticsort : nullptr); WW3D::Render_And_Clear_Static_Sort_Lists(rinfo); }	//draws things like water
 
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-		flushTranslucentObjects(rinfo);	//draw all translucent meshes which don't need per-polygon sorting.
+	{ VKFphCScope s(vkCc ? &g_fphC.translucent : nullptr); flushTranslucentObjects(rinfo); }	//draw all translucent meshes which don't need per-polygon sorting.
 
 	{
 		//USE_PERF_TIMER(translucentRender)
 
 		//don't draw transparent in this mode because they interfere with destination alpha
 		if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
-			DoParticles(rinfo);	//queue up particles for rendering.
+		{ VKFphCScope s(vkCc ? &g_fphC.particles : nullptr); DoParticles(rinfo); }	//queue up particles for rendering.
 
-		SortingRendererClass::Flush();	//draw sorted translucent polygons like particles.
+		{ VKFphCScope s(vkCc ? &g_fphC.sorting : nullptr); SortingRendererClass::Flush(); }	//draw sorted translucent polygons like particles.
 	}
-	TheDX8MeshRenderer.Clear_Pending_Delete_Lists();
+	{ VKFphCScope s(vkCc ? &g_fphC.del : nullptr); TheDX8MeshRenderer.Clear_Pending_Delete_Lists(); }
 }
 
 /**Generate a predefined light environment(s) that will be applied to many objects.  Useful for things like totally fogged
@@ -854,17 +1019,17 @@ void RTS3DScene::updateFixedLightEnvironments(RenderInfoClass & rinfo)
 {
 	//Figure out how dimly lit fogged objects should be compared to fully lit.
 	Real foggedLightFrac = (Real)TheGlobalData->m_fogAlpha/(Real)TheGlobalData->m_clearAlpha;
-	Vector3 oldDiffuse, oldAmbient;
 	Real infantryLightScale;
 	if( TheGlobalData->m_scriptOverrideInfantryLightScale != -1.0f )
 		infantryLightScale = TheGlobalData->m_scriptOverrideInfantryLightScale;
 	else
-		infantryLightScale = TheGlobalData->m_infantryLightScale[TheGlobalData->m_timeOfDay];
+		infantryLightScale = TheGlobalData->m_infantryLightScale[W3DDisplay::getRenderTimeOfDay()];
 
 	//Generate the default light environment
 	m_defaultLightEnv.Reset(Vector3(0,0,0), Get_Ambient_Light());
 	m_foggedLightEnv.Reset(Vector3(0,0,0), Get_Ambient_Light()*foggedLightFrac);
 
+	Vector3 oldDiffuse, oldAmbient;
 	for (Int globalLightIndex = 0; globalLightIndex < m_numGlobalLights; globalLightIndex++)
 	{
 		m_defaultLightEnv.Add_Light(*m_globalLight[globalLightIndex]);
@@ -874,22 +1039,21 @@ void RTS3DScene::updateFixedLightEnvironments(RenderInfoClass & rinfo)
 
 		m_globalLight[globalLightIndex]->Get_Diffuse(&oldDiffuse);
 		m_globalLight[globalLightIndex]->Get_Ambient(&oldAmbient);
-		oldDiffuse *= infantryLightScale;
-		oldAmbient *= infantryLightScale;
-		// GeneralsX @bugfix Mr. Meeseeks 17/06/2026 Clamp infantry lighting to 1.0f to avoid shader overflows under Vulkan/DXVK
-		static Vector3 id (1.0f, 1.0f, 1.0f);
-		oldDiffuse.Cap_Absolute_To(id);
-		oldAmbient.Cap_Absolute_To(id);
-		m_infantryLight[globalLightIndex]->Set_Ambient(oldAmbient);
-		m_infantryLight[globalLightIndex]->Set_Diffuse(oldDiffuse);
+    oldDiffuse *= infantryLightScale;
+    oldAmbient *= infantryLightScale;
+    static Vector3 id (1.0f, 1.0f, 1.0f);
+    oldDiffuse.Cap_Absolute_To(id);
+    oldAmbient.Cap_Absolute_To(id);
+		m_infantryLight[globalLightIndex]->Set_Ambient(oldAmbient);//CLAMPED
+		m_infantryLight[globalLightIndex]->Set_Diffuse(oldDiffuse);//CLAMPED
 
 		//copy the normal light for fog so we can modify it
 		m_scratchLight->Set_Transform(m_globalLight[globalLightIndex]->Get_Transform());
 		//modify light with attenuated value to adjust for fog.
 		m_globalLight[globalLightIndex]->Get_Diffuse(&oldDiffuse);
 		m_scratchLight->Set_Diffuse(oldDiffuse*foggedLightFrac);
-		m_globalLight[globalLightIndex]->Get_Ambient(&oldDiffuse);
-		m_scratchLight->Set_Ambient(oldDiffuse*foggedLightFrac);
+		m_globalLight[globalLightIndex]->Get_Ambient(&oldAmbient);
+		m_scratchLight->Set_Ambient(oldAmbient*foggedLightFrac);
 		m_foggedLightEnv.Add_Light(*m_scratchLight);
 	}
 
@@ -941,10 +1105,16 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 		if (m_customPassMode == SCENE_PASS_DEFAULT)
 		{
 			//Regular rendering pass with no effects
-			updatePlayerColorPasses();///@todo: this probably doesn't need to be done each frame.
-			updateFixedLightEnvironments(rinfo);
+			{
+				VKFphBScope sLe(fphbOn() ? &g_fphB.lightenv : nullptr);
+				updatePlayerColorPasses();///@todo: this probably doesn't need to be done each frame.
+				updateFixedLightEnvironments(rinfo);
+			}
 			Customized_Render(rinfo);
-			Flush(rinfo);
+			{
+				VKFphBScope sFl(fphbOn() ? &g_fphB.flush : nullptr);
+				Flush(rinfo);
+			}
 		}
 		else if (m_customPassMode == SCENE_PASS_ALPHA_MASK)
 		{
@@ -1061,6 +1231,8 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 //=============================================================================
 void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 {
+	const bool vkB = fphbOn();
+	fphbTickAndDump();
 #ifdef DIRTY_CONDITION_FLAGS
 	StDrawableDirtyStuffLocker lockDirtyStuff;
 #endif
@@ -1075,6 +1247,7 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 
    if (!Visibility_Checked) {
       // set the visibility bit in all render objects in all layers.
+	   VKFphBScope sVis(vkB ? &g_fphB.vis : nullptr);
 	   Visibility_Check(&rinfo.Camera);
 #ifdef USE_NON_STENCIL_OCCLUSION
 	   flagOccludedObjects(&rinfo.Camera);
@@ -1085,6 +1258,8 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 
 	RefRenderObjListIterator it(&UpdateList);
 	// allow all objects in the update list to do their "every frame" processing
+	{
+	VKFphBScope sUpd(vkB ? &g_fphB.upd : nullptr);
 	for (it.First(); !it.Is_Done(); it.Next()) {
 		RenderObjClass * robj = it.Peek_Obj();
 		if (robj->Class_ID() == RenderObjClass::CLASSID_TILEMAP)
@@ -1096,10 +1271,12 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 			it.Peek_Obj()->On_Frame_Update();
 		}
 	}
+	}
 
 	//terrain needs to be rendered first
 	if (terrainObject)	// Don't check visibility - terrain is always visible. jba.
 	{
+		VKFphBScope sTer(vkB ? &g_fphB.terrain : nullptr);
 		robj=terrainObject;
 		rinfo.light_environment = nullptr;		// Terrain is self lit.
 		rinfo.Camera.Set_User_Data(this);	//pass the scene to terrain via user data.
@@ -1129,6 +1306,8 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 #endif
 
 	// loop through all render objects in the list:
+	{
+	VKFphBScope sDrw(vkB ? &g_fphB.drawables : nullptr);
 	for (it.First(&RenderList); !it.Is_Done();)
 	{
 		// get the render object
@@ -1146,25 +1325,38 @@ void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 #ifdef USE_NON_STENCIL_OCCLUSION
 			if (!(draw && drawInfo->m_flags & DrawableInfo::ERF_DELAYED_RENDER))	//model rendering is delayed for some reason until end of normal scene
 #else
-				if (!(draw && drawInfo->m_flags & (DrawableInfo::ERF_DELAYED_RENDER|DrawableInfo::ERF_POTENTIAL_OCCLUDER|DrawableInfo::ERF_IS_NON_OCCLUDER_OR_OCCLUDEE)))	//in this mode we delay almost all objects in order to do correct sorting with stencil.
+			if (!(draw && drawInfo->m_flags & (DrawableInfo::ERF_DELAYED_RENDER|DrawableInfo::ERF_POTENTIAL_OCCLUDER|DrawableInfo::ERF_IS_NON_OCCLUDER_OR_OCCLUDEE)))	//in this mode we delay almost all objects in order to do correct sorting with stencil.
 #endif
 				renderOneObject(rinfo, robj, localPlayerIndex);
 		}
 	}
+	}
 
 	//Tell shadow manager to render shadows at the end of this frame
 	//Don't draw shadows if there is no terrain present.
+	{
+	VKFphBScope sShd(vkB ? &g_fphB.shadowq : nullptr);
 	if (TheW3DShadowManager && terrainObject && !ShaderClass::Is_Backface_Culling_Inverted() &&
 		Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
-		TheW3DShadowManager->queueShadows(TRUE);
+		// GeneralsX @refactor Qoder 19/10/2026 R-05 wave 4: the phase-13 read put the legacy projected
+		// (decal) + volumetric (stencil) passes at 2.6 ms of CPU per frame inside scene Flush. The sun
+		// shadow map replaced that whole system (PS3.0 verdict: run it, keep it, retire the old path),
+		// so once its gate is on we never arm the legacy queue - isShadowScene() stays false and both
+		// DoShadows legs no-op. GENERALSX_SHADOWMAP=0 / Options.ini ShadowMap=0 restores the old path.
+		if (!W3DSunShadowMap::isWanted())
+			TheW3DShadowManager->queueShadows(TRUE);
+	}
 	}
 
 	// only render particles once per frame
+	{
+	VKFphBScope sPtc(vkB ? &g_fphB.particles : nullptr);
 	if (terrainObject != nullptr && TheParticleSystemManager != nullptr &&
 		Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
 		TheParticleSystemManager->queueParticleRender();
+	}
 	}
 }
 
@@ -1317,8 +1509,7 @@ void RTS3DScene::flushOccludedObjectsIntoStencil(RenderInfoClass & rinfo)
 	//Clear pointers into temporary arrays where each player's objects will be stored.
 	//We do this so that all objects are sorted by color which reduces the number of
 	//state changes needed when drawing them.
-	Int i=0;
-	for (; i<MAX_PLAYER_COUNT; i++)
+	for (Int i=0; i<MAX_PLAYER_COUNT; i++)
 	{
 		lastPlayerObject[i]=&playerObjects[i][0];
 		playerColorIndex[i]=-1;
@@ -1397,7 +1588,25 @@ void RTS3DScene::flushOccludedObjectsIntoStencil(RenderInfoClass & rinfo)
 				RenderObjClass **renderList=&playerObjects[k][0];
 				for (Int j=0; j<numObjects; j++)
 				{
-					renderOneObject(rinfo, (*renderList), localPlayerIndex);
+					DrawableInfo *drawInfo=((DrawableInfo *)(*renderList)->Get_User_Data());
+					if (drawInfo->m_flags & DrawableInfo::ERF_IS_TRANSLUCENT)
+					{
+						// TheSuperHackers @info This only draws the occlusion of translucent objects.
+						TheDX8MeshRenderer.Flush();	//render all the submitted meshes using current stencil function
+						SHD_FLUSH;
+						//Disable writing to color buffer since translucent objects are rendered at end of frame.
+						DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFUNC,  D3DCMP_NEVER );	//never allow frame buffer writes.
+						DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFAIL,  D3DSTENCILOP_REPLACE );	//always replace existing stencil value
+						renderOneObject(rinfo, (*renderList), localPlayerIndex);
+						TheDX8MeshRenderer.Flush();	//render all the submitted meshes using current stencil function
+						SHD_FLUSH;
+						DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
+						DX8Wrapper::Set_DX8_Render_State(D3DRS_STENCILFUNC,  D3DCMP_ALWAYS );
+					}
+					else
+					{
+						renderOneObject(rinfo, (*renderList), localPlayerIndex);
+					}
 					renderList++;	//advance to next object
 				}
 
@@ -1470,21 +1679,28 @@ void RTS3DScene::flushOccludedObjectsIntoStencil(RenderInfoClass & rinfo)
 		//objects like normal because they were skipped in the main scene traversal.
 
 		RenderObjClass **occludeeList=m_potentialOccludees;
-		for (i=0; i<m_numPotentialOccludees; i++)
+		Int k=0;
+		for (; k<m_numPotentialOccludees; k++)
 		{
-			renderOneObject(rinfo, (*occludeeList), localPlayerIndex);
+			// TheSuperHackers @bugfix xezon 18/10/2025 No longer draws translucent objects
+			// as non-translucent ones here. They are drawn in another pass.
+			DrawableInfo *drawInfo = static_cast<DrawableInfo *>((*occludeeList)->Get_User_Data());
+			if ((drawInfo->m_flags & DrawableInfo::ERF_IS_TRANSLUCENT) == 0)
+			{
+				renderOneObject(rinfo, (*occludeeList), localPlayerIndex);
+			}
 			occludeeList++;	//advance to next one
 		}
 
 		RenderObjClass **occluderList=m_potentialOccluders;
-		for (i=0; i<m_numPotentialOccluders; i++)
+		for (k=0; k<m_numPotentialOccluders; k++)
 		{
 			renderOneObject(rinfo, (*occluderList), localPlayerIndex);
 			occluderList++;	//advance to next one
 		}
 
 		RenderObjClass **nonOccluderOrOccludeeList=m_nonOccludersOrOccludees;
-		for (i=0; i<m_numNonOccluderOrOccludee; i++)
+		for (k=0; k<m_numNonOccluderOrOccludee; k++)
 		{
 			renderOneObject(rinfo, (*nonOccluderOrOccludeeList), localPlayerIndex);
 			nonOccluderOrOccludeeList++;	//advance to next one
@@ -1650,6 +1866,11 @@ W3DDynamicLight * RTS3DScene::getADynamicLight()
 	{
 		pLight = (W3DDynamicLight*)dynaLightIt.Peek_Obj();
 		if (!pLight->isEnabled()) {
+			// GeneralsX @feature 24/10/2026 P14 D2/D6: a pooled light keeps its state between owners. The
+			// lamp driver now flips its light to SPOT, so hand every borrower a neutral point light again;
+			// otherwise a muzzle flash could inherit the previous lamp's cone and gobo.
+			pLight->Set_Type(LightClass::POINT);
+			pLight->Set_Forward_Cookie(0);
 			pLight->setEnabled(true);
 			return(pLight);
 		}
@@ -1674,11 +1895,292 @@ void RTS3DScene::removeDynamicLight(W3DDynamicLight * obj)
 //=============================================================================
 // RTS3DScene::doRender
 //=============================================================================
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @feature Qoder 24/10/2026 P4 D2: publish one scene light into the Forward+ feed.
+// LightClass already carries SPOT data (direction / angle / exponent) parsed from the assets, but the
+// feed only ever accepted POINT, so a spot silently arrived as a round blob (audit A6). A spot now
+// carries its cone; cookieId stays 0 because authored gobos are a content task (T4.4 follow-up).
+static void PublishForwardLight(LightClass * light)
+{
+	if (light == nullptr)
+		return;
+	const LightClass::LightType type = light->Get_Type();
+	if (type != LightClass::POINT && type != LightClass::SPOT)
+		return;
+	Vector3 d(0.0f, 0.0f, 0.0f);
+	light->Get_Diffuse(&d);
+	const float intensity = light->Get_Intensity();
+	if (intensity <= 0.0f)
+		return;
+	float inner = 0.0f, outer = 0.0f;
+	light->Get_Far_Attenuation_Range(inner, outer);
+	const Vector3& p = light->Get_Position();
+	if (type == LightClass::SPOT)
+	{
+		Vector3 dir(0.0f, 0.0f, -1.0f);
+		light->Get_Spot_Direction(dir);
+		// Get_Spot_Angle() is the outer half-angle. The inner edge keeps 70% of it so the pool has a soft
+		// rim; SpotExponent shapes the core (0 falls back to 1 = the plain smoothstep edge).
+		const float outerAngle = light->Get_Spot_Angle();
+		const float cosOuter = (outerAngle > 0.001f) ? WWMath::Cos(outerAngle) : 0.0f;
+		const float cosInner = (outerAngle > 0.001f) ? WWMath::Cos(outerAngle * 0.7f) : 1.0f;
+		VK_Forward_Add_Spot(p.X, p.Y, p.Z, inner, outer,
+			d.X * intensity, d.Y * intensity, d.Z * intensity,
+			dir.X, dir.Y, dir.Z, cosInner, cosOuter, light->Get_Spot_Exponent(),
+			// GeneralsX @feature 24/10/2026 P14 D2: render-only gobo hint carried on the light (0 = none).
+			// Authored lamps currently publish 0/1; the procedural cookie ids live in VkLighting::kCookie*.
+			light->Get_Forward_Cookie());
+		return;
+	}
+	VK_Forward_Add_Light(p.X, p.Y, p.Z, inner, outer,
+		d.X * intensity, d.Y * intensity, d.Z * intensity);
+}
+#endif
+
+//=============================================================================
 /** Render the scene */
 //=============================================================================
 void RTS3DScene::doRender( CameraClass * cam )
 {
 	m_camera = cam;
+	// GeneralsX @note Qoder 24/10/2026 T5.2: there used to be a GENERALSX_VK_QA_CAM override here that
+	// called CameraClass::Set_Transform() with a Look_At matrix. It is removed: W3DDevice's terrain draw
+	// derives its clip/cull state from TheTacticalView, not from m_camera, so pinning only the render
+	// camera removed the terrain and left trees/units floating against a black sky (user report
+	// "camera stuck inside models"). A QA camera has to go through the tactical view; until then, a
+	// replay (-replay x.rep) already gives a stable in-game camera and is the supported capture path.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	// GeneralsX @feature Qoder 20/10/2026 Forward+: publish every active point light once per frame.
+	// The draw layer turns this list into a screen-tile index block; the per-object LightEnvironment is
+	// still built for the fixed pipeline and for the GN fallback, but no longer caps the per-pixel path
+	// at one object's top-eight lights.
+	// Graphics Options: 0 off, 1 2D tiles, 2 3D clusters; budget 32..256.
+	VK_Forward_SetMode(OptionPreferences().getForwardPlusMode());
+	VK_Forward_SetBudget(OptionPreferences().getForwardLightBudget());
+	VK_Forward_Begin();
+	// GeneralsX @feature Qoder 22/10/2026 FPSTRESS: wall-clock frame-time probe (release-visible so the
+	// 256-light leg can be measured without a debug build). Gated; one line every 120 frames.
+	{
+		static const int s_perf = (getenv("GENERALSX_VK_FP_PERF") != nullptr)
+			? atoi(getenv("GENERALSX_VK_FP_PERF")) : 0;
+		if (s_perf) {
+			static DWORD s_last = GetTickCount();
+			static int s_frames = 0;
+			if (++s_frames >= 120) {
+				const DWORD now = GetTickCount();
+				const DWORD dt = now - s_last;
+				if (dt > 0) {
+					fprintf(stderr, "[VKFPPERF] %d frames in %u ms -> %.2f fps (%.2f ms/frame)\n",
+						s_frames, (unsigned)dt, (double)s_frames * 1000.0 / (double)dt, (double)dt / (double)s_frames);
+					fflush(stderr);
+				}
+				s_last = now; s_frames = 0;
+			}
+		}
+	}
+	{
+		RefRenderObjListIterator it(&LightList);
+		for (it.First(); !it.Is_Done(); it.Next()) {
+			LightClass* light = (LightClass*)it.Peek_Obj();
+			// GeneralsX @feature Qoder 24/10/2026 P4 D2: points and spots both publish; a spot keeps
+			// its cone instead of collapsing to a point.
+			PublishForwardLight(light);
+		}
+		int lsStaticN = 0, lsDynN = 0, lsDynEnabled = 0;
+		{
+			RefRenderObjListIterator cIt(&LightList);
+			for (cIt.First(); !cIt.Is_Done(); cIt.Next()) ++lsStaticN;
+		}
+		RefRenderObjListIterator dynIt(&m_dynamicLightList);
+		for (dynIt.First(); !dynIt.Is_Done(); dynIt.Next()) {
+			W3DDynamicLight* dl = (W3DDynamicLight*)dynIt.Peek_Obj();
+			++lsDynN;
+			if (dl == nullptr || !dl->isEnabled())
+				continue;
+			++lsDynEnabled;
+			PublishForwardLight(dl);
+		}
+		{
+			// GeneralsX @debug 24/10/2026 P34 E3: names why a night scene has no Forward+ lights.
+			static int s_pubLog = 0;
+			const char* ev = getenv("GENERALSX_VK_LIGHTSHADOW_LOG");
+			if (s_pubLog < 4 && ev != nullptr && atoi(ev) != 0) {
+				++s_pubLog;
+				fprintf(stderr, "[VKFP] publish: static=%d dynamic=%d dynEnabled=%d fpsMode=%d budget=%d\n",
+					lsStaticN, lsDynN, lsDynEnabled, OptionPreferences().getForwardPlusMode(),
+					OptionPreferences().getForwardLightBudget());
+				fflush(stderr);
+			}
+		}
+		// GeneralsX @bugfix 25/10/2026 P35: both QA rigs below belong to the WORLD scene only.
+		// doRender also runs for the 3D interface scene; publishing there injected a second copy of every
+		// test light in the same frame (anchored to the other camera) and made the light-shadow pass
+		// prefer those few lights over the world scene's 166. Gate them instead of duplicating the rig.
+		if (this == W3DDisplay::m_3DScene)
+		{
+		// GeneralsX @feature Qoder 21/10/2026 FPNIGHT: vertical-slice rig. Night mode switches the
+		// global time-of-day once and injects a deterministic ring of warm/cool point lights around
+		// the camera, so the Forward+ path can be exercised (and screenshotted) without authoring a
+		// new map. Both knobs are QA-only; no shipping default touches the scene.
+		const char* nightEnv = getenv("GENERALSX_VK_FP_NIGHT");
+		const bool nightOn = nightEnv != nullptr && atoi(nightEnv) != 0;
+		// Night itself comes from the existing render-side TOD override (GENERALSX_TOD_OVERRIDE=4 or
+		// the Options TimeOfDayPreview row); keeping logic TOD untouched preserves determinism. The
+		// FPNIGHT switch adds only the synthetic point-light rig below.
+		const char* demoEnv = getenv("GENERALSX_VK_FP_DEMO_LIGHTS");
+		const int demoLights = (demoEnv != nullptr && *demoEnv) ? atoi(demoEnv) : (nightOn ? 128 : 0);
+		if (demoLights > 0)
+		{
+			const Coord3D& focus = TheTacticalView->getPosition();
+			const Vector3 eye(focus.x, focus.y, focus.z);
+			// GeneralsX @tweak 24/10/2026 P13 A6: the rig used to cap at 256 so it could never publish
+			// more lights than the Forward+ layout holds. That hid the admission path: with a 300-light
+			// rig the feed must drop 44 by strength, not by iteration order. Raise the rig cap so the
+			// stress run can exercise it; the layout cap itself stays enforced in VulkanDraw.
+			const int n = demoLights > 1024 ? 1024 : demoLights;
+			// GeneralsX @feature 24/10/2026 P13 A6: strength A/B for the admission path. With
+			// GENERALSX_VK_FP_DEMO_BIAS=10 the second half of the ring is 10x brighter, so the two
+			// selection rules give visibly different frames: publish-order keep (old) renders the dim
+			// first half, strongest-first keep (new) renders the bright second half. Same positions in
+			// both arms, so a pixel diff isolates *which* lights survived.
+			const char* biasEnv = getenv("GENERALSX_VK_FP_DEMO_BIAS");
+			const float bias = (biasEnv != nullptr && *biasEnv) ? (float)atof(biasEnv) : 1.0f;
+			for (int i = 0; i < n; ++i)
+			{
+				const float a = (float)i * 6.2831853f / (float)n;
+				const float ring = 30.0f + (float)(i % 8) * 18.0f;
+				const float x = eye.X + WWMath::Cos(a) * ring;
+				const float y = eye.Y + WWMath::Sin(a) * ring;
+				const float z = (TheTerrainLogic != nullptr)
+					? TheTerrainLogic->getGroundHeight(x, y) + 8.0f : 8.0f;
+				float r, g, b;
+				switch (i % 3) {
+					case 0: r = 1.0f; g = 0.38f; b = 0.10f; break;   // sodium warm
+					case 1: r = 0.10f; g = 0.45f; b = 1.0f; break;   // cool blue
+					default: r = 0.20f; g = 1.0f; b = 0.35f; break;  // green accent
+				}
+				const float scale = (bias > 1.0f && i >= n / 2) ? bias : 1.0f;
+				VK_Forward_Add_Light(x, y, z, 15.0f, 140.0f,
+					r * 2.5f * scale, g * 2.5f * scale, b * 2.5f * scale);
+			}
+			static int s_nightLog = 0;
+			if (s_nightLog < 4) {
+				++s_nightLog;
+				fprintf(stderr, "[FPNIGHT] injected %d demo point lights around (%.0f,%.0f,%.0f) night=%d\n",
+					n, eye.X, eye.Y, eye.Z, nightOn ? 1 : 0);
+				fflush(stderr);
+			}
+		}
+		// GeneralsX @feature Qoder 24/10/2026 P4 D2: QA rig for spot/cookie. Unlike FPNIGHT this rig is
+		// not a look - it exists so T4.4 can be screenshotted deterministically:
+		//   GENERALSX_VK_FP_DEMO_SPOTS=n      number of cone lights in front of the camera
+		//   GENERALSX_VK_FP_DEMO_COOKIE=k     0 none, 1 window grid, 2 soft radial (VkLighting::kCookie*)
+		//   GENERALSX_VK_FP_DEMO_SPOT_AS_POINT=1  publish the same rig as points, for the A/B baseline
+		// Same positions in both arms, so a pixel diff isolates the cone/cookie term.
+		const char* spotEnv = getenv("GENERALSX_VK_FP_DEMO_SPOTS");
+		const int demoSpots = (spotEnv != nullptr && *spotEnv) ? atoi(spotEnv) : 0;
+		if (demoSpots > 0)
+		{
+			const char* cookieEnv = getenv("GENERALSX_VK_FP_DEMO_COOKIE");
+			const int cookie = (cookieEnv != nullptr && *cookieEnv) ? atoi(cookieEnv) : 0;
+			const char* asPointEnv = getenv("GENERALSX_VK_FP_DEMO_SPOT_AS_POINT");
+			const bool asPoint = (asPointEnv != nullptr && atoi(asPointEnv) != 0);
+			const int n = demoSpots > 16 ? 16 : demoSpots;
+			// Anchor on the real camera, not on TheTacticalView::getPosition(): the shell-menu camera is
+			// nowhere near that (it reports 0,0,0) and the D3DTS transforms are last frame's at publish
+			// time, so unprojecting here is meaningless. The camera's own view matrix is current; its
+			// orthogonal inverse is the camera world transform (camera looks down its local -Z).
+			// GENERALSX_VK_FP_DEMO_SPOT_AT="x,y,z" overrides the anchor for QA without a rebuild.
+			Vector3 eye(0.0f, 0.0f, 0.0f);
+			Vector3 fwd(0.0f, 1.0f, 0.0f);
+			{
+				Matrix3D view;
+				cam->Get_View_Matrix(&view);
+				Matrix3D world;
+				view.Get_Orthogonal_Inverse(world);
+				eye = world.Get_Translation();
+				const Vector3 axisZ = world.Get_Z_Vector();
+				fwd = Vector3(-axisZ.X, -axisZ.Y, -axisZ.Z);
+				const float fl = WWMath::Sqrt(fwd.X * fwd.X + fwd.Y * fwd.Y + fwd.Z * fwd.Z);
+				if (fl > 1e-4f) { fwd.X /= fl; fwd.Y /= fl; fwd.Z /= fl; }
+				else fwd = Vector3(0.0f, 1.0f, 0.0f);
+			}
+			// Anchor on the ground point the camera is actually looking at. A fixed distance along the view
+			// ray and then dropping to the terrain height moves the point far below frame (the ray is still
+			// ~200 units up at that distance), which is why the QA pools never appeared in a real map.
+			// Solve for the ray/terrain intersection instead; -At still wins for a deliberate anchor.
+			float anchorX = 0.0f, anchorY = 0.0f, anchorZ = 0.0f;
+			{
+				const float dz = (fwd.Z < -1e-3f) ? fwd.Z : -1e-3f;
+				float t = eye.Z / -dz;                       // first guess: sea level
+				if (t < 80.0f) t = 80.0f;
+				float g = 0.0f;
+				for (int it = 0; it < 2; ++it) {
+					if (TheTerrainLogic != nullptr)
+						g = TheTerrainLogic->getGroundHeight(eye.X + fwd.X * t, eye.Y + fwd.Y * t);
+					t = (eye.Z - g) / -dz;
+					if (t < 80.0f) t = 80.0f;
+				}
+				anchorX = eye.X + fwd.X * t;
+				anchorY = eye.Y + fwd.Y * t;
+				anchorZ = eye.Z + fwd.Z * t;
+			}
+			if (const char* atEnv = getenv("GENERALSX_VK_FP_DEMO_SPOT_AT")) {
+				float ax = 0.0f, ay = 0.0f, az = 0.0f;
+				if (sscanf(atEnv, "%f,%f,%f", &ax, &ay, &az) == 3) {
+					anchorX = ax; anchorY = ay; anchorZ = az;
+				}
+			}
+			// Drop the anchor onto the terrain. With a real map (a replay or a skirmish) the look-at point
+			// is in the air, so an ungrounded anchor would hang the fixtures above the ground and the pools
+			// would never touch it. In the shell menu getGroundHeight() is still the sea plane, so this is
+			// harmless there.
+			if (TheTerrainLogic != nullptr)
+				anchorZ = TheTerrainLogic->getGroundHeight(anchorX, anchorY) + 5.0f;
+			for (int i = 0; i < n; ++i)
+			{
+				const float a = 6.2831853f * (float)i / (float)((n > 1) ? n : 1);
+				const float ring = 45.0f;
+				const float x = anchorX + WWMath::Cos(a) * ring;
+				const float y = anchorY + WWMath::Sin(a) * ring;
+				const float z = anchorZ + 20.0f;
+				// Aim at the target's centre height: a shallow approach keeps a useful N.L on a vertical
+				// hull, which is what the shell map and most unit meshes are made of. The ring is close
+				// on purpose - inverse-square attenuation means a demo 120 units away is invisible.
+				float dx = anchorX - x;
+				float dy = anchorY - y;
+				float dz = (anchorZ + 5.0f) - z;
+				const float dl = WWMath::Sqrt(dx * dx + dy * dy + dz * dz);
+				if (dl > 1e-4f) { dx /= dl; dy /= dl; dz /= dl; }
+				float r, g, b;
+				switch (i % 3) {
+					case 0: r = 1.0f; g = 0.72f; b = 0.42f; break;   // tungsten
+					case 1: r = 0.45f; g = 0.68f; b = 1.0f; break;   // moonlight cool
+					default: r = 1.0f; g = 0.45f; b = 0.18f; break;  // sodium
+				}
+				if (asPoint)
+					VK_Forward_Add_Light(x, y, z, 20.0f, 260.0f, r * 4.0f, g * 4.0f, b * 4.0f);
+				else
+					VK_Forward_Add_Spot(x, y, z, 20.0f, 260.0f, r * 4.0f, g * 4.0f, b * 4.0f,
+						dx, dy, dz, WWMath::Cos(0.16f), WWMath::Cos(0.42f), 1.0f, cookie);
+			}
+			static int s_spotLog = 0;
+			static unsigned long long s_spotPubs = 0ull;
+			++s_spotPubs;
+			if (s_spotLog < 4 || (s_spotPubs % 600ull) == 0ull) {
+				++s_spotLog;
+				fprintf(stderr, "[FPSPOT] pub=%llu injected %d demo %s cookie=%d eye=(%.1f,%.1f,%.1f) anchor=(%.1f,%.1f,%.1f) ground=%d\n",
+					s_spotPubs, n, asPoint ? "points" : "spots", cookie,
+					eye.X, eye.Y, eye.Z, anchorX, anchorY, anchorZ, (TheTerrainLogic != nullptr) ? 1 : 0);
+				fflush(stderr);
+			}
+		}
+		}
+	}
+	// GeneralsX @feature 24/10/2026 P34 E3: remember this scene's published lights for the light-shadow
+	// pass, which runs after the 3D interface scene has already reset the live list with Begin().
+	VK_Forward_Snapshot();
+#endif
 	DRAW();
 	m_camera = nullptr;
 

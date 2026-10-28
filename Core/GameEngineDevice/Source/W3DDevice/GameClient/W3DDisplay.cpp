@@ -82,6 +82,7 @@ static void drawFramerateBar();
 #include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "W3DDevice/GameClient/W3DProfilerFrameCapture.h"
 #include "W3DDevice/GameClient/HeightMap.h"
+#include "W3DDevice/GameClient/W3DView.h"	// GeneralsX @feature 26/10/2026 fog camera-to-world snapshot
 #include "W3DDevice/GameClient/WorldHeightMap.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DTerrainTracks.h"
@@ -137,6 +138,15 @@ static W3DDynamicLight * theDynamicLight = nullptr;
 static Real theLightXOffset = 0.1f;
 static Real theLightYOffset = 0.07f;
 static Int theFlashCount = 0;
+#endif
+
+// GeneralsX @debug 28/10/2026: the game layer (InGameUI::addMessageText) cannot see the Vulkan backend
+// symbols, so a forensic shot window is armed through this device-layer shim. No-op off Vulkan.
+#if defined(SAGE_USE_VULKAN_CORE)
+void VKCore_Shot_Arm(int frames);
+void GX_VK_Shot_Arm(int frames) { VKCore_Shot_Arm(frames); }
+#else
+void GX_VK_Shot_Arm(int) {}
 #endif
 
 // GeneralsX @feature PS3.0-4A agent 16/10/2026 forward decl of the shared pulse transport
@@ -423,6 +433,10 @@ static W3DRenderLightingState s_renderLighting = {
 	{ 0.0f, 0.0f, 1.0f },
 	{ 1.0f, 1.0f, 1.0f },
 	{ 0.0f, 0.0f, 0.0f },
+	{ 0.0f, 0.0f, 1.0f },
+	{ 0.0f, 0.0f, 0.0f },
+	{ 0.0f, 0.0f, 0.0f },
+	{ 0.0f, 0.0f, 0.0f },
 	{ 0.72f, 0.78f, 0.84f, 0.0f },
 	{ 0.0f, 0.0f, 0.0f, 0.0f },
 	{ 0.0f, 0.0f },
@@ -436,12 +450,126 @@ const W3DRenderLightingState& W3D_GetRenderLighting()
 	return s_renderLighting;
 }
 
+// GeneralsX @feature Qoder 24/10/2026 P1: one hash for the three lighting families to compare in QA.
+// It covers the values that must agree (sun, ambient, fill, fog), not the revision counter.
+unsigned W3D_LightingStateHash()
+{
+	unsigned h = 2166136261u;
+	const float* groups[5] = {
+		s_renderLighting.sunDir, s_renderLighting.sunColor, s_renderLighting.ambient,
+		s_renderLighting.fillDir, s_renderLighting.fillColor
+	};
+	for (int g = 0; g < 5; ++g) {
+		for (int i = 0; i < 3; ++i) {
+			unsigned u = 0;
+			memcpy(&u, &groups[g][i], sizeof(u));
+			h = (h ^ u) * 16777619u;
+		}
+	}
+	for (int i = 0; i < 4; ++i) {
+		unsigned u = 0;
+		memcpy(&u, &s_renderLighting.fogColor[i], sizeof(u));
+		h = (h ^ u) * 16777619u;
+	}
+	return h;
+}
+
 void W3D_SetCloudOffset(float x, float y)
 {
 	// Per-frame scroll; deliberately does not bump revision (that would rebake baked families every
 	// frame). Terrain/road texture matrices and future sky clouds read this one pair.
 	s_renderLighting.cloudOffset[0] = x;
 	s_renderLighting.cloudOffset[1] = y;
+}
+
+static void NightCoolTint(float& r, float& g, float& b, bool ambient);
+
+
+
+// GeneralsX @feature 26/10/2026 HDR: display-space colour -> linear. Values above 1 are light
+// intensities (sun gain, point lights), so extend the sRGB curve with the same power instead of
+// clamping; a colour and its intensity stay separable.
+static inline float W3D_SrgbToLinearExt(float v)
+{
+	if (v <= 0.0f) return 0.0f;
+	if (v <= 1.0f)
+		return (v <= 0.04045f) ? (v / 12.92f) : powf((v + 0.055f) / 1.055f, 2.4f);
+	return powf(v, 2.2f);
+}
+
+// GeneralsX @feature 27/10/2026 P1-2 rig chromaticity (04 T2.6): the map's light colours are
+// display-authored. Decoding them per channel is space-correct but over-reddens a warm sun; 04 T2.6
+// authored the linear rig hues directly (warm sun, cool sky, warm ground). This helper replaces the
+// map's display CHROMA with the display-encoded T2.6 hue while preserving the map's display luminance,
+// so TOD/weather intensity still drives the rig and the single decode produces the intended linear hue.
+// GeneralsX @tweak 28/10/2026: default OFF. Once the light decode was corrected (objects no longer
+// squared, sun at 2x, lights luma-preserved) the forced cool sky hue is what turned the HDR frame
+// cold: on flat ground the hemisphere ambient is the dominant fill, and T2.6 replaces the map's
+// warm-neutral ambient with a blue one (measured: turning it off lifts ground red ~7 levels at
+// unchanged luma). The authored map chroma is the art direction; the rig only carries intensity.
+// GENERALSX_VK_RIG_T26=1 re-arms the 04 hue for an A/B. Global rig change, never per family.
+enum { W3D_RIG_SUN = 0, W3D_RIG_SKY = 1, W3D_RIG_GROUND = 2 };
+
+static inline bool W3D_RigT26()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = getenv("GENERALSX_VK_RIG_T26");
+		cached = (e != nullptr && *e != 0) ? ((atoi(e) != 0) ? 1 : 0) : 0;
+	}
+	return cached != 0;
+}
+
+static inline float W3D_LinearToSrgbExt(float v)
+{
+	if (v <= 0.0f) return 0.0f;
+	if (v <= 0.0031308f) return v * 12.92f;
+	if (v <= 1.0f) return 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+	return powf(v, 1.0f / 2.2f);
+}
+
+static inline void W3D_ApplyRigHue(float& r, float& g, float& b, int kind)
+{
+	static const float sunL[3] = { 1.00f, 0.84f, 0.66f };   // 04 T2.6 linear hues
+	static const float skyL[3] = { 0.32f, 0.42f, 0.58f };
+	static const float gndL[3] = { 0.24f, 0.19f, 0.15f };
+	const float* h = (kind == W3D_RIG_SUN) ? sunL : ((kind == W3D_RIG_GROUND) ? gndL : skyL);
+	const float dr = W3D_LinearToSrgbExt(h[0]);
+	const float dg = W3D_LinearToSrgbExt(h[1]);
+	const float db = W3D_LinearToSrgbExt(h[2]);
+	const float yd = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+	const float yh = 0.2126f * dr + 0.7152f * dg + 0.0722f * db;
+	if (yh <= 1e-6f) return;
+	const float k = yd / yh;
+	r = dr * k; g = dg * k; b = db * k;
+}
+
+// GeneralsX @tweak 28/10/2026 luma-preserving light/veil decode. A light colour (sun, ambient, fill,
+// fog in-scatter) is an authored hue plus an intensity, not three independent albedo channels: decoding
+// each channel separately raises the chroma of every SUM (sky blue/red 1.8 -> 3.5), which is what turned
+// the ground/road cold while the albedo products cancelled. Decode the luminance, scale the authored
+// RGB by that gain: magnitude moves into linear, the authored chroma survives. Albedo-like colours
+// (textures, vertex tint, material diffuse) stay per-channel - there the decode IS the transfer.
+static inline void W3D_LightToLinear(float& r, float& g, float& b)
+{
+	const float yd = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+	if (yd <= 1e-6f) { r = g = b = 0.0f; return; }
+	const float k = W3D_SrgbToLinearExt(yd) / yd;
+	r *= k; g *= k; b *= k;
+}
+
+// GeneralsX @feature 26/10/2026 HDR: light colours go through the same sRGB decode as the albedo they
+// multiply. Fixed-camera A/B: decoding both matches the retail luminance (ACES k=0.65, luma 0.2367 vs
+// 0.2314); skipping the light decode lifts the scene far above it (linear-only 0.368) and washes the
+// shadows. GENERALSX_VK_LIN_LIGHT_SRGB=0 is the QA leg that treats light colours as linear multipliers.
+static inline bool W3D_LightColorsAreSrgb()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = getenv("GENERALSX_VK_LIN_LIGHT_SRGB");
+		cached = (e != nullptr && *e != 0 && atoi(e) == 0) ? 0 : 1;
+	}
+	return cached != 0;
 }
 
 void W3D_RefreshRenderLighting()
@@ -454,6 +582,49 @@ void W3D_RefreshRenderLighting()
 		tod = TheGlobalData->m_timeOfDay;
 	}
 	const GlobalData::TerrainLighting &slot = TheGlobalData->m_terrainObjectsLighting[tod][0];
+	const WeatherRenderState &wx = weatherRenderState();
+
+	// GeneralsX @feature 26/10/2026 volumetric fog tier. 0 keeps the legacy per-material haze; 1 is the
+	// analytic height-fog post pass, 2 adds 8 sun-shadow samples per pixel and 3 sixteen. The env override
+	// is read once per process so the four QA legs stay comparable; the Options.ini row will seed it when
+	// the settings page lands.
+	// Settings-page rows (Options.ini VolumetricFog*), with GENERALSX_VK_FOG* still winning inside the
+	// OptionPreferences getters for QA legs. Read once per process: the launcher saves while the game is
+	// closed, so a change takes effect on the next launch (the page marks the rows as restart-scoped).
+	static int s_vkFogMode = -1;
+	static int s_vkFogDensityTick = -1;
+	static int s_vkFogHeight = -1;
+	static int s_vkFogStart = -1;
+	static int s_vkFogSunTick = -1;
+	if (s_vkFogMode < 0) {
+		OptionPreferences prefs;
+		s_vkFogMode = prefs.getVolumetricFogMode();
+		s_vkFogDensityTick = prefs.getVolumetricFogDensity();
+		s_vkFogHeight = prefs.getVolumetricFogHeight();
+		s_vkFogStart = prefs.getVolumetricFogStart();
+		s_vkFogSunTick = prefs.getVolumetricFogSun();
+		fprintf(stderr, "[VKFOG] mode=%d densityTick=%d height=%d start=%d sunTick=%d "
+			"(Options.ini VolumetricFog*; GENERALSX_VK_FOG* wins)\n",
+			s_vkFogMode, s_vkFogDensityTick, s_vkFogHeight, s_vkFogStart, s_vkFogSunTick);
+		fflush(stderr);
+	}
+	// The post pass draws the whole atmosphere in modes 1..3. Suppressing the legacy ramp here (a flag,
+	// not the player's DistanceHaze value) is what prevents the old per-material haze from adding a
+	// second layer on top of the new one.
+	W3DShaderManager::setVolumetricFogSuppression(s_vkFogMode > 0);
+
+	// GeneralsX @tweak 24/10/2026: the extra 0.5 ambient multiplier is gone. It was a leftover debug
+	// value, and it cost the ground roughly half of the retail ambient: the object path was halved
+	// while terrain/road/tree had been reading the raw INI value, and this snapshot then handed the
+	// halved number to all of them. Ambient is now the map's raw slot0 value scaled only by weather.
+	static Real s_keyGain = -1.0f;
+	if (s_keyGain < 0.0f) {
+		const char* ev = getenv("GENERALSX_KEY_GAIN");
+		s_keyGain = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 1.0f;
+		if (s_keyGain < 1.0f) s_keyGain = 1.0f;
+		if (s_keyGain > 3.0f) s_keyGain = 3.0f;
+	}
+
 	Vector3 dir(-slot.lightPos.x, -slot.lightPos.y, -slot.lightPos.z);
 	const Real len = dir.Length();
 	if (len > 1e-6f) {
@@ -466,12 +637,92 @@ void W3D_RefreshRenderLighting()
 	s_renderLighting.sunDir[0] = dir.X;
 	s_renderLighting.sunDir[1] = dir.Y;
 	s_renderLighting.sunDir[2] = dir.Z;
-	s_renderLighting.sunColor[0] = slot.diffuse.red;
-	s_renderLighting.sunColor[1] = slot.diffuse.green;
-	s_renderLighting.sunColor[2] = slot.diffuse.blue;
-	s_renderLighting.ambient[0] = slot.ambient.red;
-	s_renderLighting.ambient[1] = slot.ambient.green;
-	s_renderLighting.ambient[2] = slot.ambient.blue;
+
+	// GeneralsX @feature Qoder 24/10/2026 P2 T2.6: low sun is warmer, sky ambient is cooler. This is
+	// a data tint on the shared snapshot, not a per-shader hack, so every family sees the same grade.
+	Real warm = 0.0f;
+	if (tod != TIME_OF_DAY_NIGHT) {
+		Real elev = dir.Z;
+		if (elev < 0.0f) elev = 0.0f;
+		if (elev > 1.0f) elev = 1.0f;
+		warm = 1.0f - elev;
+	}
+
+	float sr = slot.diffuse.red * wx.m_keyScale * s_keyGain;
+	float sg = slot.diffuse.green * wx.m_keyScale * s_keyGain;
+	float sb = slot.diffuse.blue * wx.m_keyScale * s_keyGain;
+	if (sr > 1.0f) sr = 1.0f;
+	if (sg > 1.0f) sg = 1.0f;
+	if (sb > 1.0f) sb = 1.0f;
+	if (tod == TIME_OF_DAY_NIGHT) {
+		NightCoolTint(sr, sg, sb, false);
+	} else {
+		sg *= 1.0f - 0.16f * warm;
+		sb *= 1.0f - 0.32f * warm;
+	}
+	// GeneralsX @tweak 25/10/2026 P35: user request - every level reads a little dark, raise the KEY SUN
+	// by 20% on all three channels and leave everything else (ambient, fill, tint, weather) untouched.
+	// Applied after the clamp/tint so daylight (raw 1.0) also gains: 1.0 -> 1.2. The value can exceed 1,
+	// which the shaders accept (LDR targets clip, which is the expected +20% look). This is the single
+	// snapshot that terrain, water, FF and GN all read, and T1.6 below publishes it back into
+	// m_myLight[0], so the object/FF key light moves with it instead of only the terrain.
+	{
+		static const Real kSunGain = 1.2f;
+		sr *= kSunGain;
+		sg *= kSunGain;
+		sb *= kSunGain;
+	}
+	s_renderLighting.sunColor[0] = sr;
+	s_renderLighting.sunColor[1] = sg;
+	s_renderLighting.sunColor[2] = sb;
+
+	// Object path: scene ambient = the map's raw slot0 ambient * weather ambient (no extra scale).
+	float ar = slot.ambient.red * wx.m_ambientScale;
+	float ag = slot.ambient.green * wx.m_ambientScale;
+	float ab = slot.ambient.blue * wx.m_ambientScale;
+	if (tod == TIME_OF_DAY_NIGHT) {
+		NightCoolTint(ar, ag, ab, true);
+	} else {
+		ar *= 1.0f - 0.08f * warm;
+		ab *= 1.0f + 0.20f * warm;
+	}
+	s_renderLighting.ambient[0] = ar;
+	s_renderLighting.ambient[1] = ag;
+	s_renderLighting.ambient[2] = ab;
+
+	// GeneralsX @feature Qoder 24/10/2026 P3 T3.1: split the flat ambient into a simple sky/ground
+	// hemisphere. The upper hemisphere picks up a little more blue, the lower one a little more warm
+	// bounce; terrain/road blend by the surface normal instead of using one constant.
+	s_renderLighting.skyColor[0] = ar * 0.92f;
+	s_renderLighting.skyColor[1] = ag * 1.00f;
+	s_renderLighting.skyColor[2] = ab * 1.18f;
+	s_renderLighting.groundColor[0] = ar * 1.08f;
+	s_renderLighting.groundColor[1] = ag * 0.98f;
+	s_renderLighting.groundColor[2] = ab * 0.86f;
+
+	// Map fill (slot1): objects get raw fill * weather ambient; slot2/3 are ambient-scaled later.
+	// The synthetic L1 fill rig, when enabled, overwrites slot1 with a derived colour; state keeps the
+	// data value for now, and P2 unifies the synthetic fill through this same snapshot.
+	const GlobalData::TerrainLighting &fill = TheGlobalData->m_terrainObjectsLighting[tod][1];
+	Vector3 fdir(-fill.lightPos.x, -fill.lightPos.y, -fill.lightPos.z);
+	const Real flen = fdir.Length();
+	if (flen > 1e-6f) {
+		fdir.X /= flen; fdir.Y /= flen; fdir.Z /= flen;
+	} else {
+		fdir.Set(0.0f, 0.0f, 1.0f);
+	}
+	float fr = fill.diffuse.red * wx.m_ambientScale;
+	float fg = fill.diffuse.green * wx.m_ambientScale;
+	float fb = fill.diffuse.blue * wx.m_ambientScale;
+	if (fr > 1.0f) fr = 1.0f;
+	if (fg > 1.0f) fg = 1.0f;
+	if (fb > 1.0f) fb = 1.0f;
+	s_renderLighting.fillDir[0] = fdir.X;
+	s_renderLighting.fillDir[1] = fdir.Y;
+	s_renderLighting.fillDir[2] = fdir.Z;
+	s_renderLighting.fillColor[0] = fr;
+	s_renderLighting.fillColor[1] = fg;
+	s_renderLighting.fillColor[2] = fb;
 
 	// Same haze recipe terrain/road/tree and GN already use; one snapshot means water, terrain and
 	// the weather veil cannot disagree about start/length/strength.
@@ -486,11 +737,311 @@ void W3D_RefreshRenderLighting()
 	s_renderLighting.fogRamp[1] = ramp[1];
 	s_renderLighting.fogRamp[2] = ramp[2];
 	s_renderLighting.fogRamp[3] = ramp[3];
+
+	// GeneralsX @feature 26/10/2026 volumetric fog: resolve the same TOD/weather snapshot into the post
+	// pass's POD. The legacy fogColor above intentionally keeps its shipped rgb (the sky/water tint read
+	// it even at strength 0); this block is the new atmosphere's own colour, darker and bluer at night.
+	{
+		VKAtmosphereFogParams fog = {};
+		fog.mode = s_vkFogMode;
+		float scale = wx.m_fogScale;
+		if (scale < 1.0f) scale = 1.0f;
+		if (scale > 2.4f) scale = 2.4f;
+		// Ticks come from the settings page (VolumetricFog*); weather still scales the extinction.
+		fog.density = (Real)s_vkFogDensityTick * 0.0001f * scale;
+		fog.heightFalloff = 1.0f / (Real)s_vkFogHeight;
+		// Anchor the density field to the ground under the camera pivot, not to world z=0. Maps in this game
+		// routinely sit several hundred units above zero, and with a 150-unit scale height a z=0 anchor buries
+		// the whole layer underground: measured camZ 631 / groundZ 506 gave tau 0.05 and an invisible fog.
+		// The pivot's own z is the reliable ground height here (getTerrainHeightAtPivot stays 0 until the
+		// camera is fully updated); terrain-relative height also lets valleys hold mist and ridges clear it.
+		fog.baseHeight = (TheTacticalView != nullptr) ? (float)TheTacticalView->getPosition().z : 0.0f;
+		if (!(fog.baseHeight == fog.baseHeight) || fog.baseHeight < -10000.0f || fog.baseHeight > 10000.0f)
+			fog.baseHeight = 0.0f;
+		// The tactical camera sits only a few hundred units up, so the legacy 180-unit start distance
+		// faded the whole layer out: the measured amount at the default view was 0.05. Start close and
+		// ramp quickly; the height integral, not the start gate, is what keeps near ground clear.
+		fog.startDistance = (Real)s_vkFogStart;
+		fog.fadeLength = 100.0f;
+		fog.maxOpacity = 0.80f;
+		fog.noiseScale = 0.020f;
+		fog.windSpeed = 2.0f;
+		fog.sunScatter = (Real)s_vkFogSunTick * 0.01f;
+		// The sky used to be excluded (0) because a constant-colour mix turned it into a grey lid. With
+		// transmittance + in-scatter the sky now fades into the same atmosphere as the far terrain, which
+		// is what closes the horizon seam; 0.6 leaves the art-authored sky readable.
+		fog.skyAffect = 0.6f;
+		// 光影升级2.0 A3: contact-shadow strength (0..1) rides the atmosphere block; the post pass
+		// marches the sun direction from each pixel and darkens where the depth buffer says a surface
+		// sits in the way (the short range the sun shadow map's bias cannot cover).
+		fog.contactShadows = (Real)OptionPreferences().getContactShadows() * 0.01f;
+		fog.godRays = (Real)OptionPreferences().getGodRays() * 0.01f;
+		fog.aoQuality = (Real)OptionPreferences().getAOQuality();
+		{
+			static Real s_lastContact = -1.0f;
+			if (fabsf(s_lastContact - fog.contactShadows) > 1e-4f) {
+				s_lastContact = fog.contactShadows;
+				fprintf(stderr, "[VKCONTACT] published strength=%.2f\n", (double)fog.contactShadows);
+				fflush(stderr);
+			}
+		}
+		fog.time = (TheGameLogic != nullptr ? TheGameLogic->getFrame() : 0) * 0.033f;
+
+		// Every knob above is seeded from OptionPreferences (VolumetricFog*), which keeps the
+		// GENERALSX_VK_FOG* QA overrides inside the getters - no second env read here.
+
+		float fr = haze[0], fgc = haze[1], fb = haze[2];
+		if (tod == TIME_OF_DAY_NIGHT) {
+			fr = haze[0] * 0.25f + s_renderLighting.ambient[0] * 0.75f;
+			fgc = haze[1] * 0.25f + s_renderLighting.ambient[1] * 0.75f;
+			fb = haze[2] * 0.25f + s_renderLighting.ambient[2] * 0.75f;
+		}
+		fog.color[0] = fr; fog.color[1] = fgc; fog.color[2] = fb;
+		fog.sunColor[0] = s_renderLighting.sunColor[0];
+		fog.sunColor[1] = s_renderLighting.sunColor[1];
+		fog.sunColor[2] = s_renderLighting.sunColor[2];
+		fog.sunDir[0] = s_renderLighting.sunDir[0];
+		fog.sunDir[1] = s_renderLighting.sunDir[1];
+		fog.sunDir[2] = s_renderLighting.sunDir[2];
+
+		// GeneralsX @feature 26/10/2026 HDR: the post pass mixes this colour with the scene, so it has
+		// to live in the same space. The fog owner retunes density/scatter after the HDR merge; only the
+		// transfer function changes here.
+		if (DX8Wrapper::VK_HDR_Enabled() && W3D_LightColorsAreSrgb()) {
+			// GeneralsX @bugfix 27/10/2026 HDR: the in-scatter colour is a BLEND TARGET, not a light.
+			// The legacy pass mixes it into a display-space frame, so its linear equivalent is the sRGB
+			// decode of the authored colour; RelightColor (which keeps the display luminance) is right
+			// for the sun term but leaves the haze about one gamma too bright. Measured on the fixed
+			// camera, fog on: a shadowed pad at +41% of the legacy value (+20% with fog off) and the
+			// whole frame lifted, i.e. the atmosphere was flattening the shadows it should only tint.
+			// GENERALSX_VK_LIN_FOG_SRGB=0 restores the old (relit) transfer for an A/B.
+			// Pure linear: both the in-scatter colour and the sun term are authored display colours, so
+			// both move to linear here.
+			// GeneralsX @bugfix 28/10/2026: luma-preserving, not per-channel (see W3D_LightToLinear).
+			// Decoding the veils per channel raised their chroma and put a blue veil over the whole
+			// ground/road: with fog on the fixed-camera grass read (83,86,70) against SDR's (94,78,47),
+			// and turning the fog off moved blue from 70 to 46 - the atmosphere, not the lighting, was
+			// the cold cast. A veil must carry the authored hue and only its intensity may change.
+			W3D_LightToLinear(fog.color[0], fog.color[1], fog.color[2]);
+			W3D_LightToLinear(fog.sunColor[0], fog.sunColor[1], fog.sunColor[2]);
+		}
+
+		// GeneralsX @bugfix 26/10/2026 publish the 3D camera basis for the post shader. The backend used to
+		// invert whatever D3DTS_VIEW it could read at post time, but that transform is not the 3D camera by
+		// then (it comes back identity), so the fog integrated in view space: camZ/worldZ both read 0 and
+		// every sun-shadow lookup projected the wrong point. Rows are right/up/forward with the camera
+		// position in .w - exactly the layout fogWorld() consumes.
+		if (TheTacticalView != nullptr)
+		{
+			W3DView *tv = static_cast<W3DView *>(TheTacticalView);
+			CameraClass *cam = tv->get3DCamera();
+			if (cam != nullptr)
+			{
+				const Matrix3D &xf = cam->Get_Transform();
+				const Vector3 ax = xf.Get_X_Vector();
+				const Vector3 ay = xf.Get_Y_Vector();
+				const Vector3 az = xf.Get_Z_Vector();
+				const Vector3 pos = xf.Get_Translation();
+				fog.camWorld[0] = ax.X; fog.camWorld[1] = ax.Y; fog.camWorld[2] = ax.Z; fog.camWorld[3] = pos.X;
+				fog.camWorld[4] = ay.X; fog.camWorld[5] = ay.Y; fog.camWorld[6] = ay.Z; fog.camWorld[7] = pos.Y;
+				fog.camWorld[8] = az.X; fog.camWorld[9] = az.Y; fog.camWorld[10] = az.Z; fog.camWorld[11] = pos.Z;
+				fog.camWorld[12] = 0.0f; fog.camWorld[13] = 0.0f; fog.camWorld[14] = 0.0f; fog.camWorld[15] = 1.0f;
+			}
+		}
+
+		DX8Wrapper::VK_Set_Atmosphere_Fog(fog);
+
+		// GeneralsX @feature 26/10/2026 volumetric fog: the atmosphere must touch the lighting, not only
+		// the post colour. Dim the direct sun by the vertical optical depth and hand the lost energy to
+		// the ambient term, so dense air reads as scattered light instead of a grey wash. Render-side
+		// only (no GameLogic/CRC involvement), applied before VKDraw_Set_Environment publishes it, and
+		// fog.sunColor above keeps the un-attenuated sun so the shafts stay bright.
+		{
+			const float H = 1.0f / (fog.heightFalloff > 1e-6f ? fog.heightFalloff : 1e-6f);
+			const float tauZenith = fog.density * H * 0.5f;	// 0.5 = art-tuned coupling strength
+			const float atmT = expf(-tauZenith);
+			for (int c = 0; c < 3; ++c) {
+				const float sun = s_renderLighting.sunColor[c];
+				s_renderLighting.sunColor[c] = sun * atmT;
+				s_renderLighting.ambient[c] += sun * (1.0f - atmT) * 0.5f;
+			}
+			// GeneralsX @bugfix 26/10/2026 HDR: the HDR re-light below reads the sr/ar/fr locals, and
+			// the atmosphere above only wrote the state. Re-sync or the calibration multiplies a
+			// different colour than the one it publishes (measured: amb gain 1.62 and fill gain 8 at
+			// dusk, with the sun/ambient pair no longer matching the state).
+			sr = s_renderLighting.sunColor[0]; sg = s_renderLighting.sunColor[1]; sb = s_renderLighting.sunColor[2];
+			ar = s_renderLighting.ambient[0];  ag = s_renderLighting.ambient[1];  ab = s_renderLighting.ambient[2];
+		}
+
+		static int s_fogLogMode = -1;
+		static float s_fogLogDensity = -1.0f;
+		static float s_fogLogBase = -100000.0f;
+		if (s_vkFogMode > 0 && (s_vkFogMode != s_fogLogMode || fog.density > s_fogLogDensity + 0.00001f ||
+			fog.density < s_fogLogDensity - 0.00001f || fabsf(fog.baseHeight - s_fogLogBase) > 16.0f)) {
+			s_fogLogMode = s_vkFogMode;
+			s_fogLogDensity = fog.density;
+			s_fogLogBase = fog.baseHeight;
+			fprintf(stderr, "[VKFOG] mode=%d density=%.6f height=%.1f base=%.0f start=%.0f sun=%.2f color=(%.2f,%.2f,%.2f) tod=%d\n",
+				fog.mode, fog.density, 1.0f / fog.heightFalloff, fog.baseHeight, fog.startDistance, fog.sunScatter,
+				fog.color[0], fog.color[1], fog.color[2], (int)tod);
+			fflush(stderr);
+		}
+	}
+	// GeneralsX @feature 26/10/2026 HDR: this snapshot is the single source terrain/road/tree/water/GN/FF
+	// all read. In HDR mode it carries linear colour, so every family's sums and blends happen in light
+	// space. The atmosphere block above already consumed the display-space values for its own UBO.
+	if (DX8Wrapper::VK_HDR_Enabled()) {
+		if (W3D_LightColorsAreSrgb()) {
+			// GeneralsX @feature 27/10/2026 unified linear rig: every authored light colour is decoded
+			// per channel to scene-referred linear, and nothing else. No hue-preserving re-light and no
+			// compatibility sum - the ground, objects, FF, water and fog all read THIS snapshot, so a
+			// change to sun colour/temperature/intensity reaches the whole frame through the same numbers.
+			// GeneralsX @feature 27/10/2026 P1-2: replace the map's display chroma with the 04 T2.6
+			// linear rig hue before the single decode. Luminance (TOD/weather intensity) is preserved.
+			if (W3D_RigT26()) {
+				W3D_ApplyRigHue(sr, sg, sb, W3D_RIG_SUN);
+				W3D_ApplyRigHue(ar, ag, ab, W3D_RIG_SKY);
+				W3D_ApplyRigHue(fr, fg, fb, W3D_RIG_SKY);
+				W3D_ApplyRigHue(s_renderLighting.sunColor[0], s_renderLighting.sunColor[1], s_renderLighting.sunColor[2], W3D_RIG_SUN);
+				W3D_ApplyRigHue(s_renderLighting.ambient[0], s_renderLighting.ambient[1], s_renderLighting.ambient[2], W3D_RIG_SKY);
+				W3D_ApplyRigHue(s_renderLighting.skyColor[0], s_renderLighting.skyColor[1], s_renderLighting.skyColor[2], W3D_RIG_SKY);
+				W3D_ApplyRigHue(s_renderLighting.groundColor[0], s_renderLighting.groundColor[1], s_renderLighting.groundColor[2], W3D_RIG_GROUND);
+				W3D_ApplyRigHue(s_renderLighting.fillColor[0], s_renderLighting.fillColor[1], s_renderLighting.fillColor[2], W3D_RIG_SKY);
+			}
+			// GeneralsX @tweak 28/10/2026 luma-preserving light decode (user calibration). A light colour
+			// is an authored hue plus an intensity, not three independent albedo channels: decoding each
+			// channel separately raises the chroma of every sum (sky blue/red 1.8 -> 3.5), which is what
+			// pushed the ground/road away from the SDR hue while the albedo products cancelled out.
+			// Decoding the LUMINANCE and scaling the authored RGB by that gain moves the light into
+			// linear space with its authored chroma intact, so an ambient+sun sum keeps the SDR channel
+			// ratio. Fog stays a per-channel decode: it is a blend target, not a light.
+			auto lin3 = [](float& r, float& g, float& b) { W3D_LightToLinear(r, g, b); };
+			lin3(sr, sg, sb);
+			lin3(ar, ag, ab);
+			lin3(fr, fg, fb);
+			lin3(s_renderLighting.sunColor[0], s_renderLighting.sunColor[1], s_renderLighting.sunColor[2]);
+			lin3(s_renderLighting.ambient[0], s_renderLighting.ambient[1], s_renderLighting.ambient[2]);
+			lin3(s_renderLighting.skyColor[0], s_renderLighting.skyColor[1], s_renderLighting.skyColor[2]);
+			lin3(s_renderLighting.groundColor[0], s_renderLighting.groundColor[1], s_renderLighting.groundColor[2]);
+			lin3(s_renderLighting.fillColor[0], s_renderLighting.fillColor[1], s_renderLighting.fillColor[2]);
+			W3D_LightToLinear(s_renderLighting.fogColor[0], s_renderLighting.fogColor[1], s_renderLighting.fogColor[2]);
+
+			// QA multipliers (default 1.0) so a scripted A/B can still move one leg.
+			static float s_envSun = -1.0f, s_envAmb = -1.0f, s_envFill = -1.0f;
+			if (s_envSun < 0.0f) {
+				const char* es = getenv("GENERALSX_VK_LIN_SUN_GAIN");
+				const char* ea = getenv("GENERALSX_VK_LIN_AMB_GAIN");
+				const char* ef = getenv("GENERALSX_VK_LIN_FILL_GAIN");
+				s_envSun = (es != nullptr && *es != 0) ? (float)atof(es) : 1.0f;
+				s_envAmb = (ea != nullptr && *ea != 0) ? (float)atof(ea) : 1.0f;
+				s_envFill = (ef != nullptr && *ef != 0) ? (float)atof(ef) : 1.0f;
+			}
+			const float sunGain = s_envSun, ambGain = s_envAmb, fillGain = s_envFill;
+
+			sr *= sunGain; sg *= sunGain; sb *= sunGain;
+			ar *= ambGain; ag *= ambGain; ab *= ambGain;
+			fr *= fillGain; fg *= fillGain; fb *= fillGain;
+			for (int c = 0; c < 3; ++c) {
+				s_renderLighting.sunColor[c] *= sunGain;
+				s_renderLighting.ambient[c] *= ambGain;
+				s_renderLighting.skyColor[c] *= ambGain;
+				s_renderLighting.groundColor[c] *= ambGain;
+				s_renderLighting.fillColor[c] *= fillGain;
+				s_renderLighting.fogColor[c] *= sunGain;
+			}
+			DX8Wrapper::VK_Set_Linear_Light_Gains(sunGain, ambGain, fillGain);
+		} else {
+			// QA leg: no relight colour conversion; the rig still publishes neutral gains.
+			DX8Wrapper::VK_Set_Linear_Light_Gains(1.0f, 1.0f, 1.0f);
+		}
+	}
+	// GeneralsX @tweak 28/10/2026 global sun intensity x2 - the shipped look, not a QA knob. Applied to
+	// the ONE snapshot every family reads (terrain/water/road/tree read fpEnv, objects and the fixed
+	// pipeline read the same state republished by T1.6), and placed AFTER the HDR decode so it is
+	// exactly 2x scene-referred linear in HDR and exactly 2x display in SDR - one number, both paths,
+	// no map/save edit. The retail sun/ambient ratio was too conservative on vertical facades.
+	{
+		const float kSunBoost = 2.0f;
+		sr *= kSunBoost; sg *= kSunBoost; sb *= kSunBoost;
+		for (int c = 0; c < 3; ++c) s_renderLighting.sunColor[c] *= kSunBoost;
+	}
 	s_renderLighting.cloudShadowStrength =
 		(TheGlobalData->m_useCloudMap && TheGlobalData->m_timeOfDay != TIME_OF_DAY_NIGHT)
 			? W3DShaderManager::getCloudShadowStrength() : 0.0f;
 	s_renderLighting.exposure = DX8Wrapper::VK_HDR_Exposure();
+
+	// GeneralsX @feature 27/10/2026 HDR per-TOD exposure. The volumetric atmosphere's in-scatter lifts
+	// the evening frame more than the day frame (measured 0.148 vs legacy 0.124 with fog on, 0.130
+	// with fog off), so it needs a small negative offset. This is presentation-side calibration:
+	// the light rig and the fog data are untouched.
+	// GeneralsX @tweak 27/10/2026 P1-2: the QA slots are 2 = AFTERNOON (the project's "dusk" leg) and
+	// 3 = EVENING (the project's "night" leg; NIGHT = 4 is the night slot proper). The old code only
+	// applied the offset to NIGHT, so both QA night legs ran with 0 EV - that is why the doc measured
+	// "night +25%, mostly fog" with no EV in effect. With the rig decoded once and every family on it:
+	//   afternoon 0 EV -> +6.5% against the SDR baseline (gate <= +5%)  => -0.10 EV
+	//   evening   0 EV -> +27.0% with fog, +6.3% with fog off (fog is the rest; see 体积雾专项)
+	// Day (MORNING) stays 0 EV. Two per-TOD offsets, one global knob each - never a per-family one,
+	// and do not use the EV to hide the fog (the fog is added after the tonemap, so EV cannot move it
+	// without also crushing the lit surfaces).
+	{
+		static int s_todEvInit = -1;
+		static float s_nightEv = -0.30f;
+		// GeneralsX @tweak 27/10/2026: -0.10 -> -0.28 together with ACES pre 0.80. At pre 0.80 the dusk
+		// frame read +17.8% over SDR; -0.28 brings it back to ~+3%, night stays ~0%.
+		static float s_duskEv = -0.28f;
+		if (s_todEvInit < 0) {
+			s_todEvInit = 1;
+			const char* e = getenv("GENERALSX_VK_TOD_EV_NIGHT");
+			if (e != nullptr && *e != 0) s_nightEv = (float)atof(e);
+			const char* d = getenv("GENERALSX_VK_TOD_EV_DUSK");
+			if (d != nullptr && *d != 0) s_duskEv = (float)atof(d);
+			if (s_nightEv < -1.5f) s_nightEv = -1.5f;
+			if (s_nightEv > 0.0f) s_nightEv = 0.0f;
+			if (s_duskEv < -1.5f) s_duskEv = -1.5f;
+			if (s_duskEv > 0.0f) s_duskEv = 0.0f;
+		}
+		const bool isNightSlot = (tod == TIME_OF_DAY_EVENING || tod == TIME_OF_DAY_NIGHT);
+		const bool isDuskSlot = (tod == TIME_OF_DAY_AFTERNOON);
+		DX8Wrapper::VK_Set_TOD_Exposure(isNightSlot ? s_nightEv : (isDuskSlot ? s_duskEv : 0.0f));
+	}
 	++s_renderLighting.revision;
+
+	// GeneralsX @feature 24/10/2026 P34 C4: hand the same snapshot to the Forward+ block's fpEnv[] section,
+	// which the object shaders use for the sky/environment reflection. One environment source, like every
+	// other term in this file; GENERALSX_SKY_REFLECT=0 turns the additive term off for an A/B.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	{
+		static Real s_reflectStrength = -1.0f;
+		if (s_reflectStrength < 0.0f) {
+			const char* ev = getenv("GENERALSX_SKY_REFLECT");
+			s_reflectStrength = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.5f;
+			if (s_reflectStrength < 0.0f) s_reflectStrength = 0.0f;
+			if (s_reflectStrength > 2.0f) s_reflectStrength = 2.0f;
+		}
+		const float sunDir3[3] = { (float)dir.X, (float)dir.Y, (float)dir.Z };
+		const float sunCol3[3] = { sr, sg, sb };
+		const float sky3[3] = { s_renderLighting.skyColor[0], s_renderLighting.skyColor[1], s_renderLighting.skyColor[2] };
+		const float ground3[3] = { s_renderLighting.groundColor[0], s_renderLighting.groundColor[1], s_renderLighting.groundColor[2] };
+		const float fillDir3[3] = { (float)fdir.X, (float)fdir.Y, (float)fdir.Z };
+		const float fillCol3[3] = { fr, fg, fb };
+		VKDraw_Set_Environment(sunDir3, sunCol3, sky3, ground3, fillDir3, fillCol3, (float)s_reflectStrength);
+	}
+#endif
+
+	// One line per refresh (TOD/weather changes only) so the three families can be compared.
+	static int s_stateLog = -1;
+	if (s_stateLog < 0) {
+		const char* ev = getenv("GENERALSX_LIGHT_STATE");
+		s_stateLog = (ev != nullptr && *ev != 0 && atoi(ev) != 0) ? 1 : 0;
+	}
+	if (s_stateLog) {
+		fprintf(stderr, "[LIGHTSTATE] tod=%d sun=(%.3f,%.3f,%.3f) amb=(%.3f,%.3f,%.3f) fill=(%.3f,%.3f,%.3f) "
+			"gains=(%.2f,%.2f,%.2f) hash=%08x rev=%u\n",
+			(int)tod, sr, sg, sb, ar, ag, ab, fr, fg, fb,
+			DX8Wrapper::VK_Linear_Sun_Gain(), DX8Wrapper::VK_Linear_Amb_Gain(), DX8Wrapper::VK_Linear_Fill_Gain(),
+			W3D_LightingStateHash(), s_renderLighting.revision);
+		fflush(stderr);
+	}
 }
 
 W3DDisplay::W3DDisplay()
@@ -1112,6 +1663,15 @@ void W3DDisplay::init()
 			throw ERROR_INVALID_D3D;	//failed to initialize.  User probably doesn't have DX 8.1
 		}
 
+		// GeneralsX @debug 25/10/2026 NOSORT: A/B the sorted-mesh path. With sorting off the rotor
+		// discs (PROPS01/02) draw through the plain mesh path with their own vertex/index buffers; if
+		// they appear here but not with sorting on, the loss is in SortingRendererClass's re-upload.
+		if (getenv("GENERALSX_NOSORT")) {
+			fprintf(stderr, "[NOSORT] WW3D::Enable_Sorting(false)\n");
+			fflush(stderr);
+			WW3D::Enable_Sorting(false);
+		}
+
 		// GeneralsX @bugfix felipebraz 16/02/2026 Show window after DirectX8/DXVK initialized
 		#ifndef _WIN32
 		extern SDL_Window* TheSDL3Window;
@@ -1145,6 +1705,22 @@ void W3DDisplay::init()
 	// take effect; GENERALSX_SWAPINTERVAL=0..3 still overrides inside the getter).  Injected here,
 	// before the device is created below, so Set_Render_Device consumes it without a Reset.
 	DX8Wrapper::Set_User_Present_Interval(OptionPreferences().getPresentInterval());
+
+	// GeneralsX @bugfix 28/10/2026 shadow systems were both live until the options page was applied once.
+	// VK_Real_Shadow_Enabled() defaults to true, but VK_Retail_Shadow_Off() (which DoShadows() consults)
+	// only became true when the menu called the apply hook - so a fresh launch ran the native sun shadow
+	// AND the retail projected-decal / stencil managers at the same time. The retail decals are the solid
+	// black card-shaped blobs under trees (a stale decal texture multiplied over the terrain) and they
+	// re-project every frame, which is what read as "the bush shadow flickers in cut-scenes". The two
+	// paths are meant to be complementary, so latch the option once here.
+	{
+		const char* env = getenv("GENERALSX_SHADOWMAP");
+		const Bool nativeShadow = env ? (atoi(env) > 0) : (OptionPreferences().getShadowMapEnabled() != FALSE);
+		DX8Wrapper::VK_Set_Real_Shadow_Enabled(nativeShadow != FALSE);
+		fprintf(stderr, "[SHADOWOPT] startup native=%d retailOff=%d\n",
+			(int)nativeShadow, (int)DX8Wrapper::VK_Retail_Shadow_Off());
+		fflush(stderr);
+	}
 
 		fprintf(stderr, "[DEBUG-WIN] W3DDisplay::init() - TheGlobalData->m_windowed=%d\n", (int)TheGlobalData->m_windowed);
 		setWindowed( TheGlobalData->m_windowed );
@@ -1227,9 +1803,8 @@ void W3DDisplay::init()
 			}
 			}
 
-			// TheSuperHackers @feature Mauller 13/03/2026 Add native MSAA support, must be set before creating render device
-			WW3D::Set_MSAA_Mode((WW3D::MultiSampleModeEnum)TheWritableGlobalData->m_antiAliasLevel);
-
+			// GeneralsX @bugfix 28/10/2026: the retail MSAA row is gone, so the device is created without
+			// multisampling. AA on this backend is the scene-only post pass (Advanced "PostAA" row).
 			renderDeviceError = WW3D::Set_Render_Device(
 				0,
 				getWidth(),
@@ -1241,7 +1816,6 @@ void W3DDisplay::init()
 			// TheSuperHackers @info Update the MSAA mode that was set as some GPU's may not support certain levels
 			// Texture filtering must also be updated after render device initialization
 			if (renderDeviceError == WW3D_ERROR_OK) {
-				TheWritableGlobalData->m_antiAliasLevel = (UnsignedInt)WW3D::Get_MSAA_Mode();
 				WW3D::Set_Texture_Filter(TheWritableGlobalData->m_textureFilteringMode);
 				TheWritableGlobalData->m_textureFilteringMode = WW3D::Get_Texture_Filter();
 				WW3D::Set_Anisotropy_Level(TheWritableGlobalData->m_textureAnisotropyLevel);
@@ -1398,6 +1972,23 @@ void W3DDisplay::updateAverageFPS()
 	m_averageFPS = sum / FPS_HISTORY_SIZE;
 
 	lastUpdateTime64 = time64;
+
+	// GeneralsX @feature Qoder 24/10/2026 P5 T5.3: opt-in FPS log for the performance budget.
+	// One line per ~60 frames so a 15 s menu run gives a stable average without flooding stderr.
+	static int s_fpsLog = -1;
+	if (s_fpsLog < 0) {
+		const char* ev = getenv("GENERALSX_FPS_LOG");
+		s_fpsLog = (ev != nullptr && *ev != 0 && atoi(ev) != 0) ? 1 : 0;
+	}
+	if (s_fpsLog) {
+		static unsigned s_fpsTicks = 0;
+		if ((s_fpsTicks++ % 60u) == 0u) {
+			const Real avg = (m_averageFPS > 1e-3f) ? m_averageFPS : 0.0f;
+			fprintf(stderr, "[FPS] avg=%.1f current=%.1f msec=%.2f\n",
+				avg, m_currentFPS, (avg > 0.0f) ? 1000.0f / avg : 0.0f);
+			fflush(stderr);
+		}
+	}
 }
 
 #if defined(RTS_DEBUG)	//debug hack to view object under mouse stats
@@ -2563,10 +3154,23 @@ AGAIN:
 				[](const char* name, unsigned width, unsigned height, unsigned format, bool depth) {
 					return VKDraw_Graph_Alloc_Target(name, width, height, format, depth);
 				},
-				[](const char* name) { VKDraw_Graph_Free_Target(name); });
+				[](const char* name) { VKDraw_Graph_Free_Target(name); },
+				[](void* key) { VKDraw_Graph_Free_Target_Key(key); });
+			// 6B: P6 bloom chain and the adopted water-reflection image join the same target lifecycle.
+			W3DRenderGraph::SetPostTargetHandler(
+				[](unsigned* count, unsigned* width, unsigned* height, unsigned* format) {
+					return VKDraw_Graph_Post_Target_Desc(count, width, height, format);
+				});
+			W3DRenderGraph::SetWaterTargetHandler(
+				[](void** key, unsigned* width, unsigned* height, unsigned* format) {
+					return VKDraw_Graph_Water_Target_Desc(key, width, height, format);
+				});
 			// Phase 6B: the graph owns the target lifetime. It asks the backend for this frame's exact
 			// scene/overlay shape (including render scale and HDR), allocates them, and releases the
 			// transient overlay once the P6 resolve stops being wanted.
+			// A device loss/recreate invalidates every key the graph remembers; forgetting the records
+			// (without touching the dead backend) is what makes the next PrepareTargets reallocate.
+			if (!VKDraw_Ready()) W3DRenderGraph::Get().Reset();
 			W3DRenderGraph::Get().PrepareTargets();
 #endif
 			if (TheGlobalData->m_breakTheMovie == FALSE && TheGlobalData->m_disableRender == false)
@@ -2872,8 +3476,18 @@ static void applyLightPulse(RTS3DScene* scene, const Coord3D *pos, const RGBColo
 
 	theDynamicLight->Set_Ambient( Vector3( color->red, color->green, color->blue ) );
 	theDynamicLight->Set_Diffuse( Vector3( color->red, color->green, color->blue) );
+	// GeneralsX @bugfix 25/10/2026 P35: the pool hands out lights that still carry the previous owner's
+	// intensity (a building lamp runs at ~0.4). Pulses relied on the default and therefore inherited that
+	// dim value - muzzle/explosion lights looked like they did nothing next to the lamps. A pulse is a
+	// flash: full white intensity, its colour comes from Diffuse.
+	theDynamicLight->Set_Intensity(1.0f);
 	theDynamicLight->Set_Position(Vector3(pos->x, pos->y, pos->z));
 	theDynamicLight->Set_Far_Attenuation_Range(innerRadius, innerRadius + attenuationWidth);
+	// GeneralsX @feature Qoder 24/10/2026 P4 D7: muzzle/light pulses with decay=0 snapped off in one
+	// frame. Give every zero-decay pulse a 4-frame fade; explosions already pass a longer decay.
+	if (decayFrameTime == 0) {
+		decayFrameTime = 4;
+	}
 	theDynamicLight->setFrameFade(increaseFrameTime, decayFrameTime);
 	theDynamicLight->setDecayRange();
 	theDynamicLight->setDecayColor();
@@ -2937,7 +3551,30 @@ void W3DDisplay::createLightPulse( const Coord3D *pos, const RGBColor *color,
 
 	if (m_3DScene == nullptr)
 		return;
-	if (innerRadius+attenuationWidth<2.0*PATHFIND_CELL_SIZE_F + 1.0f) {
+	// GeneralsX @bugfix 24/10/2026 P27 D8: retail drops any pulse smaller than two pathfind cells
+	// (radius < 2*PATHFIND_CELL_SIZE_F + 1) as "won't make a visible difference". That silently ate every
+	// shell-impact LightPulse - the log showed pulses only at the three tank muzzles, never at a hit -
+	// so explosions lit the ground with their sprite alone and no dynamic light reached the terrain.
+	// The floor is now a QA-tunable number (0 = accept every pulse); the default keeps retail's value so
+	// the look only changes when a case is proven to need it.
+	static Real s_minPulse = -1.0f;
+	if (s_minPulse < 0.0f)
+	{
+		const char* ev = getenv("GENERALSX_LIGHTPULSE_MIN");
+		// Default accepts every pulse. Measured on 00000017.sav: muzzle pulses are radius 27 (accepted by
+		// retail's 21 floor) while shell-impact pulses are radius 16 (dropped), so hits lit the ground with
+		// the sprite alone. GENERALSX_LIGHTPULSE_MIN=21 restores retail's floor for a comparison leg.
+		s_minPulse = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.0f;
+		if (s_minPulse < 0.0f) s_minPulse = 0.0f;
+	}
+	if (innerRadius+attenuationWidth < s_minPulse) {
+		if (s_pulseLog)
+		{
+			fprintf(stderr, "[LPULSE] drop radius=%.1f (min=%.1f) pos=(%.0f,%.0f,%.0f)\n",
+			        (double)(innerRadius + attenuationWidth), (double)s_minPulse,
+			        pos ? pos->x : 0.0f, pos ? pos->y : 0.0f, pos ? pos->z : 0.0f);
+			fflush(stderr);
+		}
 		return; // it basically won't make any visual difference.  jba.
 	}
 	if (s_pulseLog)
@@ -3187,6 +3824,12 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			if (wxGnKeyColor.Y > 1.0f) wxGnKeyColor.Y = 1.0f;
 			if (wxGnKeyColor.Z > 1.0f) wxGnKeyColor.Z = 1.0f;
 		}
+		// GeneralsX @feature 27/10/2026 P1-2: same global rig chromaticity as W3D_RefreshRenderLighting.
+		// These reach the object path's c9/c39/c40, which is why the building/wall red lived here too.
+		if (DX8Wrapper::VK_HDR_Enabled() && W3D_RigT26()) {
+			W3D_ApplyRigHue(wxGnKeyColor.X, wxGnKeyColor.Y, wxGnKeyColor.Z, W3D_RIG_SUN);
+			W3D_ApplyRigHue(wxFallbackAmbient.X, wxFallbackAmbient.Y, wxFallbackAmbient.Z, W3D_RIG_SKY);
+		}
 		DX8NormalMap::Set_Global_Fallback_Light(
 			Vector3(-sl->lightPos.x, -sl->lightPos.y, -sl->lightPos.z),
 			wxFallbackAmbient);
@@ -3341,59 +3984,11 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 		DX8GeomNormal::Set_Global_Fill_Light(dot3FillDir, dot3FillColor);
 	}
 
-	// GeneralsX @feature PS3.0 L1c 14/10/2026: dark-side crush (contrast) knob. The user A/B on the
-	// fill amplitude alone (0.02 vs 0.005) showed the shadow side barely changed: the real light
-	// "leaking" onto backfaces is NOT slot1 but (a) the slot0 scene AMBIENT fed to Set_Ambient_Light
-	// and mirrored into the GN/dot3 global feeds, and (b) the map's slot2/3 secondary lights, which
-	// the retail loop above re-installs from INI every call. GENERALSX_AMBIENT_SCALE (0..1, see the
-	// default note below) scales every non-key term at once; the key sun diffuse (slot0) is left
-	// untouched so the lit side keeps its brightness and only the shadow side crushes toward black.
-	// Idempotent: the retail loop rewrites raw INI values before us each call.
-	// GeneralsX @tweak PS3.0 L1c 14/10/2026: default promoted to 0.5 (user ruling after the live
-	// single-variable A/B: ambient 100% reproduces the retail "every face equally bright" look,
-	// 0.1~0.4 reads too dark for RTS legibility; 0.5 keeps the light/dark separation while the
-	// shadow side stays readable). Set GENERALSX_AMBIENT_SCALE=1 for retail parity.
-	{
-		static Real s_ambScale = -1.0f;
-		if (s_ambScale < 0.0f) {
-			const char* ev = getenv("GENERALSX_AMBIENT_SCALE");
-			s_ambScale = (ev != nullptr && *ev != 0) ? (Real)atof(ev) : 0.5f;
-			if (s_ambScale < 0.0f) s_ambScale = 0.0f;
-			if (s_ambScale > 1.0f) s_ambScale = 1.0f;
-		}
-		if (s_ambScale < 0.999f) {
-			const GlobalData::TerrainLighting* k0 = &TheGlobalData->m_terrainObjectsLighting[tod][0];
-			Vector3 amb(k0->ambient.red, k0->ambient.green, k0->ambient.blue);
-			amb *= s_ambScale;
-			if (wxActive) amb *= wxAmb;	// GeneralsX @feature PS3.0 Weather W1 16/10/2026: raw-derived
-			if (m_3DScene) {
-				m_3DScene->Set_Ambient_Light(amb);
-			}
-			// GN Gouraud base + dot3 fallback carry the same ambient: keep all three paths in lockstep.
-			DX8GeomNormal::Set_Global_Ambient(amb);
-			DX8NormalMap::Set_Global_Fallback_Light(
-				Vector3(-k0->lightPos.x, -k0->lightPos.y, -k0->lightPos.z), amb);
-			// Map-owned secondary lights (slot2/3): the retail loop wrote raw INI values this call,
-			// so scaling the CURRENT value is always scale-of-raw, never compounding.
-			for (Int i = 2; i < LightEnvironmentClass::MAX_LIGHTS; ++i) {
-				if (m_myLight[i] != nullptr) {
-					Vector3 d; m_myLight[i]->Get_Diffuse(&d);
-					d *= s_ambScale;
-					m_myLight[i]->Set_Diffuse(d);
-				}
-			}
-			static unsigned s_ambLogTick = 0;
-			if ((s_ambLogTick++ & 511u) == 0u) {
-				const Vector3 a0 = (m_3DScene != nullptr) ? m_3DScene->Get_Ambient_Light() : Vector3(0,0,0);
-				Vector3 d2(0,0,0), d3(0,0,0);
-				if (m_myLight[2]) m_myLight[2]->Get_Diffuse(&d2);
-				if (m_myLight[3]) m_myLight[3]->Get_Diffuse(&d3);
-				fprintf(stderr, "[L1c] ambScale=%.2f sceneAmb=(%.3f,%.3f,%.3f) slot2=(%.3f,%.3f,%.3f) slot3=(%.3f,%.3f,%.3f) n=%u\n",
-					s_ambScale, a0.X, a0.Y, a0.Z, d2.X, d2.Y, d2.Z, d3.X, d3.Y, d3.Z, s_ambLogTick);
-				fflush(stderr);
-			}
-		}
-	}
+	// GeneralsX @tweak 24/10/2026: the PS3.0 L1c ambient-crush pass (GENERALSX_AMBIENT_SCALE, default
+	// 0.5) was a debug experiment, not a shipping look, and it was the second place the ambient got
+	// halved. With it gone the raw retail numbers installed above stay untouched for every consumer:
+	// the retail loop's Set_Ambient_Light, the slot0 ambient/weather feeds that the GN and dot3 globals
+	// already took earlier in this function, and the map's own slot2/3 lights. Nothing re-scales them.
 
 	// GeneralsX @feature PS3.0 L1k 14/10/2026: key-sun gain. The user approved the MAPLIGHT recipe
 	// (crushed scene ambient + the map's own neutral fill; synthetic blue fill retired) and asked
@@ -3419,6 +4014,8 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 			if (kd.X > 1.0f) kd.X = 1.0f;
 			if (kd.Y > 1.0f) kd.Y = 1.0f;
 			if (kd.Z > 1.0f) kd.Z = 1.0f;
+			if (DX8Wrapper::VK_HDR_Enabled() && W3D_RigT26())
+				W3D_ApplyRigHue(kd.X, kd.Y, kd.Z, W3D_RIG_SUN);
 			if (m_myLight[0] != nullptr) {
 				m_myLight[0]->Set_Diffuse(kd);
 			}
@@ -3443,6 +4040,23 @@ void W3DDisplay::setTimeOfDay( TimeOfDay tod )
 	// applyWeatherToShaders refreshes the one shared lighting snapshot internally, so do not publish
 	// a second time here: the old double call bumped revision twice and scheduled duplicate rebakes.
 	W3DShaderManager::applyWeatherToShaders();
+
+	// GeneralsX @feature Qoder 24/10/2026 P1 T1.6: the object/FF install above duplicated the weather,
+	// ambient-scale and key-gain arithmetic. Publish the finished snapshot back into the scene/global
+	// lights so the fixed pipeline, GN objects and terrain all shade from the SAME numbers. The legacy
+	// block still runs first (it owns per-slot direction/intensity); this is the final value authority.
+	{
+		const W3DRenderLightingState &st = W3D_GetRenderLighting();
+		if (m_3DScene != nullptr) {
+			m_3DScene->Set_Ambient_Light(Vector3(st.ambient[0], st.ambient[1], st.ambient[2]));
+		}
+		if (m_myLight[0] != nullptr) {
+			m_myLight[0]->Set_Diffuse(Vector3(st.sunColor[0], st.sunColor[1], st.sunColor[2]));
+		}
+		if (m_myLight[1] != nullptr) {
+			m_myLight[1]->Set_Diffuse(Vector3(st.fillColor[0], st.fillColor[1], st.fillColor[2]));
+		}
+	}
 }
 
 // GeneralsX @feature Storm996 17/10/2026 PS3.0 haze user switch: hand the player's choice to the
@@ -3459,13 +4073,6 @@ void W3DDisplay::setDistanceHaze( Bool enabled, Real strength01 )
 void W3DDisplay::setBloomIntensity( Real intensity01 )
 {
 	W3DShaderManager::setBloomIntensity(intensity01);
-}
-
-// GeneralsX @feature Qoder 20/10/2026: the anti-aliasing row, live on the Vulkan backend. The D3D path
-// only consumes this level at the next device creation, so the forwarding call is a value push there.
-void W3DDisplay::setAntiAliasLevel( Int level )
-{
-	W3DShaderManager::setPostAntiAliasing(level != 0);
 }
 
 void W3DDisplay::setShadowMapStrength( Real strength01 )

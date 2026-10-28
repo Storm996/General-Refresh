@@ -103,7 +103,10 @@ public:
         VkDeviceMemory mem;
         unsigned      framesLeft;
     };
-    void Retire_Mirror(VkImage image, VkImageView view, VkDeviceMemory mem);
+    // GeneralsX @feature 26/10/2026 HDR: extraView lets one mirror own a second view (the sRGB
+    // sampling view of the same bytes). It is reaped on the same schedule as the image.
+    void Retire_Mirror(VkImage image, VkImageView view, VkDeviceMemory mem,
+                       VkImageView extraView = nullptr);
     void Reap_Mirrors();
     unsigned long long MirrorsRetired() const { return m_mirRetired; }
     unsigned long long MirrorsReaped()  const { return m_mirReaped; }
@@ -202,6 +205,8 @@ void VKCore_Luma_Poll(unsigned slot);
 // like "shot A white, shot B normal" becomes a machine-diffable time series. No-op unless
 // GENERALSX_VKSHOT=1. The queue lock is re-entrant, so both may sit inside a locked frame section.
 void VKCore_Shot_Record(void* cmd, void* sceneImage, unsigned w, unsigned h, unsigned slot, unsigned long long frame);
+// GeneralsX @debug 28/10/2026: open a shot window of N consecutive frames from a game event.
+void VKCore_Shot_Arm(int frames);
 void VKCore_Shot_RecordSwap(void* cmd, void* swapImage, unsigned w, unsigned h, unsigned slot, unsigned long long frame);
 void VKCore_Shot_Poll(unsigned slot);
 

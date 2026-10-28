@@ -56,6 +56,11 @@
 // GeneralsX @feature Qoder 17/10/2026 WP1 wedge 3.3: converge procedural water bump maps into the
 // Vulkan texture mirror (unconditional: the symbol is a no-op unless the win64vk Vulkan core is up).
 #include "WW3D2/Backend/VulkanTexMirror.h"
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+// GeneralsX @feature 24/10/2026 6B: adopt the sea reflection image into W3DRenderGraph so its barrier
+// and lifetime are graph-owned instead of being an untracked render target born inside the water object.
+#include "WW3D2/Backend/VulkanDraw.h"
+#endif
 
 #include "Common/FramePacer.h"
 #include "Common/GameState.h"
@@ -482,6 +487,14 @@ void W3DWaterMaterialInstance::Bind()
 		if (pixelShader) {
 			DX8Wrapper::Set_Pixel_Shader_Constant(0,
 				(const float*)D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
+			// GeneralsX @feature 24/10/2026 P24 B6: river/trapezoid water is what most maps actually draw
+			// (00000016.sav: only tags 232/233 are ever bound, the sea wave shader never compiles). Their
+			// Vulkan twins tint the sparkle layers with the shared sun colour, so the shoreline glints warm
+			// at dusk and cold at night like terrain/GN instead of staying white.
+			// GeneralsX @refactor 27/10/2026 P0-4: that colour now comes from the rig itself
+			// (lighting_state.glsl -> fpEnv[1]), so the private c5 copy and its upload are gone. c5 was
+			// carrying exactly this value, so the visible result is unchanged; what changed is that the
+			// shader can no longer disagree with the rest of the scene about the sun.
 			DX8Wrapper::Set_Pixel_Shader(reinterpret_cast<UINT_PTR>(pixelShader));
 		}
 		// In additive blending the river alpha darkens rgb instead of adding to it.
@@ -563,6 +576,7 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_waterType = WATER_TYPE_0_TRANSLUCENT;
 	m_tod=TIME_OF_DAY_AFTERNOON;
 	m_pReflectionTexture=nullptr;
+	m_pReflectionDepth=nullptr;
 	m_vertexBufferD3D=nullptr;
 	m_indexBufferD3D=nullptr;
 	m_vertexBufferD3DOffset=0;
@@ -1050,7 +1064,13 @@ void WaterRenderObjClass::ReleaseResources()
 
 	REF_PTR_RELEASE(m_indexBuffer);
 
+	// GeneralsX @feature 24/10/2026 6B: the graph adopted the Vulkan image behind this texture; release
+	// it through the graph before the engine handle goes away, or the mirror outlives its owner.
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+	VKDraw_Graph_Free_Target("waterReflection");
+#endif
 	REF_PTR_RELEASE(m_pReflectionTexture);
+	REF_PTR_RELEASE(m_pReflectionDepth);
 	SAFE_RELEASE(m_vertexBufferD3D);
 	SAFE_RELEASE(m_indexBufferD3D);
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 9: the mirrors describe released buffers.
@@ -1289,8 +1309,42 @@ void WaterRenderObjClass::ReAcquireResources()
 				return;
 		}
 
-		// Create reflection texture
-		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (GetSeaReflectionSize(), GetSeaReflectionSize());
+		// Create reflection texture. GeneralsX @feature 26/10/2026 HDR: the reflection pass now renders
+		// linear radiance, so an 8-bit target would clip every highlight before the water samples it.
+		// GeneralsX @bugfix 27/10/2026: the target had no matching depth, and the recorder refuses every
+		// batch drawn to a target it does not own - the mirror pass therefore wrote nothing and the wave
+		// shader sampled an image that was never rendered (its content was whatever the allocator left,
+		// which read dark in LDR and bright in the FP16 HDR target: the +90% far-sea report). Create the
+		// pair explicitly and register it with the recorder so renderMirror actually lands in this image.
+		const int reflSize = GetSeaReflectionSize();
+		const WW3DFormat reflFmt = DX8Wrapper::VK_HDR_Enabled()
+			? WW3D_FORMAT_A16B16G16R16F : WW3D_FORMAT_A8R8G8B8;
+		m_pReflectionTexture = nullptr;
+		m_pReflectionDepth = nullptr;
+		DX8Wrapper::Create_Render_Target(reflSize, reflSize, reflFmt, WW3D_ZFORMAT_D32,
+			&m_pReflectionTexture, &m_pReflectionDepth);
+#if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature 24/10/2026 6B: the engine still owns the texture wrapper (Set_Render_Target
+		// needs its surface), but the Vulkan image is adopted by the graph, which from here on owns its
+		// barriers and releases it through VKDraw_Graph_Free_Target_Key.
+		if (m_pReflectionTexture != nullptr && m_pReflectionTexture->Peek_D3D_Texture() != nullptr)
+		{
+			IDirect3DTexture9* ctex = m_pReflectionTexture->Peek_D3D_Texture();
+			D3DSURFACE_DESC cdesc = {};
+			ctex->GetLevelDesc(0, &cdesc);
+			void* dsrf = nullptr;
+			if (m_pReflectionDepth != nullptr)
+				dsrf = m_pReflectionDepth->Get_D3D_Surface_Level();
+			const bool registered = DX8Wrapper::VK_Register_Render_Target(ctex, (unsigned)reflSize,
+				(unsigned)reflSize, (int)cdesc.Format, dsrf, (int)WW3D_ZFORMAT_D32);
+			if (dsrf != nullptr)
+				((IDirect3DSurface9*)dsrf)->Release();
+			fprintf(stderr, "[WATER] reflection target registration %s (%ux%u)\n",
+				registered ? "ok" : "refused", (unsigned)reflSize, (unsigned)reflSize);
+			fflush(stderr);
+			VKDraw_Graph_Adopt_Target("waterReflection", ctex);
+		}
+#endif
 		// GeneralsX @feature PS3.0-P2-4 14/10/2026 log the reflection RT size once so the raised
 		// default (and any GENERALSX_WATERREFLECT override) is verifiable from a headless run's stderr.
 		{
@@ -1819,7 +1873,7 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	Matrix3D reflectedTransform(rRight,rUp,rN,rPos);
 
 
-	DX8Wrapper::Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture);
+	DX8Wrapper::Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture, m_pReflectionDepth);
 
 	// Clear the backbuffer
 	WW3D::Begin_Render(false,true,Vector3(0.0f,0.0f,0.0f));	//clearing only z-buffer since background always filled with clouds
@@ -2244,6 +2298,13 @@ Matrix4x4 matProj, matView, matWW3D;
 		float sunParams[4] = { sunUV[0], sunUV[1], s_waveSunDiffuse, 0.0f };
 		DX8Wrapper::Set_Pixel_Shader_Constant(0, waveParams, 1);
 		DX8Wrapper::Set_Pixel_Shader_Constant(1, sunParams, 1);
+		// GeneralsX @feature 24/10/2026 P22 B6: the glint was a colourless scalar (c0.y sparkle on a
+		// white base), so the sea sparkled the same at every TOD while terrain/GN glinted warm at dusk
+		// and cold at night. c5 now carries the shared RenderLightingState.sunColor and the wave PS
+		// multiplies the sparkle by it. The body term keeps its retail curve, so the sea is not
+		// re-graded - only the highlight picks up the sun colour.
+		// GeneralsX @refactor 27/10/2026 P0-4: the wave PS reads that colour from the rig (fpEnv[1]);
+		// the duplicate c5 upload is retired with the river/trap one above.
 
 		// GeneralsX @feature PS3.0-P3-17/P3-32 14/10/2026: cFx = (time, caustic strength, reflection
 		// blur mix, blur texel offset). Time drives the procedural caustic drift (render-only clock,
@@ -2268,6 +2329,17 @@ Matrix4x4 matProj, matView, matWW3D;
 			const Real rtSize = (Real)GetSeaReflectionSize();
 			float fxParams[4] = { timeSec, s_waveCaustic, s_waveBlur, s_waveBlur > 0.0f ? 2.0f / rtSize : 0.0f };
 			DX8Wrapper::Set_Pixel_Shader_Constant(4, fxParams, 1);
+		}
+		// QA: c5 (retired sun-colour copy) now carries the reflection-space probe flag. With it set the
+		// wave PS writes the raw reflection sample, so a capture shows whether the reflection RT holds
+		// linear radiance or display bytes in HDR. Off by default; upload costs one register.
+		{
+			static const float s_waveReflProbe = [] {
+				const char* e = getenv("GENERALSX_VK_WATER_DEBUG");
+				return (e != nullptr && *e != 0 && atoi(e) != 0) ? 1.0f : 0.0f;
+			}();
+			float probe[4] = { s_waveReflProbe, 0.0f, 0.0f, 0.0f };
+			DX8Wrapper::Set_Pixel_Shader_Constant(5, probe, 1);
 		}
 
 		// GeneralsX @refactor 23/10/2026: the sea used to own a second haze recipe (55%/45%,
@@ -2420,6 +2492,13 @@ Matrix4x4 matProj, matView, matWW3D;
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::renderWater()
 {
+	// GeneralsX @bugfix 24/10/2026: "a river replaced the water grid" is a per-frame fact - Render()
+	// tests it on the very next line - but the flag was only ever raised (drawRiverWater, :3171) and
+	// cleared on map load (enableWaterGrid, :1575). After one frame that drew a river polygon,
+	// renderWaterMesh() was skipped for the rest of the session and the animated sea surface vanished
+	// from every grid-water map (CHI03/GLA01/USA06/VidiaDemo). Clear it here, once per frame.
+	m_drawingRiver = false;
+
 	for (PolygonTrigger *pTrig=PolygonTrigger::getFirstPolygonTrigger(); pTrig; pTrig = pTrig->getNext()) {
 		if (pTrig->isWaterArea()) {
 			if (pTrig->getNumPoints()>2) {

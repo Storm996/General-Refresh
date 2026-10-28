@@ -168,6 +168,12 @@ WindowMsgHandledType GadgetComboBoxInput( GameWindow *window, UnsignedInt msg,
 					if(listBox->winIsHidden())
 					{
 						listBox->winHide(FALSE);
+						// GeneralsX @bugfix Qoder 23/10/2026 The drop-down list is a child of the combo,
+						// so it paints at the combo's own z-order. Sibling gadgets created later (the
+						// rows/buttons below the combo) were drawn on top of the open list, which made
+						// the weather and advanced-page drop-downs look truncated. Bring the combo to
+						// the top of its parent while its list is open so the list is readable.
+						window->winBringToTop();
 						window->winGetSize(&winSize.x, &winSize.y);
 						WinInstanceData *listInstData = listBox->winGetInstanceData();
 						ListboxData *listData = (ListboxData *)listBox->winGetUserData();
@@ -650,6 +656,12 @@ WindowMsgHandledType GadgetComboBoxSystem( GameWindow *window, UnsignedInt msg,
 					if(listBox->winIsHidden())
 					{
 						listBox->winHide(FALSE);
+						// GeneralsX @bugfix Qoder 23/10/2026 The drop-down list is a child of the combo,
+						// so it paints at the combo's own z-order. Sibling gadgets created later (the
+						// rows/buttons below the combo) were drawn on top of the open list, which made
+						// the weather and advanced-page drop-downs look truncated. Bring the combo to
+						// the top of its parent while its list is open so the list is readable.
+						window->winBringToTop();
 						window->winGetSize(&winSize.x, &winSize.y);
 						WinInstanceData *listInstData = listBox->winGetInstanceData();
 						ListboxData *listData = (ListboxData *)listBox->winGetUserData();

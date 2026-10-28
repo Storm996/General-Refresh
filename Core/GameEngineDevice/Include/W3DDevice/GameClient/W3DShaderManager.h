@@ -115,14 +115,15 @@ public:
 	static Int setShroudTex(Int stage);	///<Set shroud in a texture stage.
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: uploads the shared [TERRAIN30] per-pixel haze
 	// ramp into PS constants c0/c1 (haze rgb + strength / start + 1/length). Used by the HLSL
-	// terrain trio and road shader in W3DShaderManager.cpp and by the W3DTreeBuffer TREE30 path.
+	// terrain trio and road shader in W3DShaderManager.cpp, and by the foliage FF batch.
 	static void uploadPerPixelFogConstants();
 	// GeneralsX @refactor 23/10/2026: expose the one terrain/GN/tree/water haze recipe as plain
 	// float[4] pairs (rgb + strength / start + 1/length). Water used to carry its own 55%/45%, 0.7
 	// ramp, which is why a DistanceHaze=0 frame still hazed the sea while the land was clear.
 	static void getWeatherFogRamp(float haze[4], float ramp[4]);
 	// GeneralsX @feature PS3.0 batch8 G1 14/10/2026: TRUE once the ps_3_0 terrain trio is installed,
-	// meaning the shared per-pixel haze ramp is valid. The TREE30 path gates its own HLSL haze on this.
+	// meaning the shared per-pixel haze ramp is valid. The foliage FF batch gates its per-pixel haze on
+	// this too.
 	static Bool arePerPixelFogShadersActive();
 	/// GeneralsX @refactor 23/10/2026: weather-scaled native cloud-shadow strength (0.35 clear,
 	/// denser in storms). Keeps the receiver's cloud term on the same weather state as the haze.
@@ -160,7 +161,14 @@ public:
 	// compilation is Windows-only (the CompatLib shim drives d3dcompiler), and the definition is guarded
 	// accordingly - the profile getters above are available on every platform.
 	static HRESULT compileShaderAtBestProfile(const char* hlslSource, Bool ShaderType, const char* logTag,
-		const char** outProfile, void** pHandle);
+		const char** outProfile, void** pHandle, unsigned forceTag = 0u);
+
+	// GeneralsX @feature 27/10/2026 unified lighting: publish the shared haze ramp (c0/c1) and the camera
+	// position (c38) for any per-pixel twin that reads the terrain fog recipe (tree/road/static lit).
+	static void Upload_Fog_Constants();
+	// Bind the per-pixel rig twin for fixed-function textured decals that have no program of their own
+	// (bib/bridge). No-op until the road twin exists; the caller resets the pixel shader afterwards.
+	static void Bind_Lit_Static();
 
 	static Bool testMinimumRequirements(ChipsetType *videoChipType, CpuType *cpuType, Int *cpuFreq, MemValueType *numRAM, Real *intBenchIndex, Real *floatBenchIndex, Real *memBenchIndex);
 	static StaticGameLODLevel getGPUPerformanceIndex();
@@ -209,6 +217,12 @@ public:
 	static Bool isDistanceHazeEnabled();
 	static Real getDistanceHazeStrength();
 
+	// GeneralsX @feature 26/10/2026 volumetric fog: the post pass owns the whole atmosphere in modes
+	// 1..3, so the legacy per-material haze must collapse to strength 0 or every distant surface would
+	// be fogged twice. This is a suppression flag, not a user setting: the DistanceHaze rows keep
+	// their values and return untouched when the volumetric mode is switched off.
+	static void setVolumetricFogSuppression(Bool on);
+
 	// GeneralsX @feature Qoder 18/10/2026 PS3.0 live lighting knobs: the bloom composite gain and the
 	// sun shadow map darkening strength used to be latched into a function-local static the first time
 	// each ran, so the two menu rows could only be read at start-up. They now follow the haze pattern -
@@ -220,7 +234,6 @@ public:
 	// GeneralsX @feature Qoder 20/10/2026: the pure-Vulkan present pass has no MSAA to enable (every
 	// attachment is 1 sample), so the anti-aliasing row drives its FXAA instead. Same live-knob route as
 	// bloom: the options page pushes through Display, the backend reads the DX8Wrapper mirror per frame.
-	static void setPostAntiAliasing(Bool enabled);
 	static void setShadowMapStrength(Real strength01);
 	static Real getShadowMapStrength();					///< lazy seed from Options.ini / GENERALSX_SHADOWMAP_INT
 

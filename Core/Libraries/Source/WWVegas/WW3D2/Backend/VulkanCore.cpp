@@ -17,6 +17,7 @@
 #include "VkShadersDesc.h" // wedge 4: embedded SPIR-V for the descriptor/constant probe
 #include "VkShadersFF.h"   // wedge 6: embedded SPIR-V for the fixed-function vertex stage + its probe FS
 #include "VulkanFF.h"      // wedge 6: the CPU reference the probe compares against
+#include "VkLightCookieAtlas.h"   // P34 D2: baked spot-light cookie atlas (binding 9)
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -111,7 +112,7 @@ bool VulkanCore::createInstance(const char* appTag)
     const char* iext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     app.pApplicationName = appTag;
-    app.apiVersion = VK_API_VERSION_1_1;
+    app.apiVersion = VK_API_VERSION_1_2;   // B5: core depth-stencil resolve for MSAA
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = iext;
@@ -537,6 +538,13 @@ bool VulkanCore::EndFrame()
     pr = G.vkQueuePresentKHR(m_queue, &pi);
     Advance_Frame();
     vk_queue_unlock();
+    // GeneralsX @debug 28/10/2026: GENERALSX_VK_IDLEFRAME=1 serializes the GPU every frame. A flicker
+    // that survives a full device idle is not a ring/dynamic-buffer race; one that disappears is.
+    {
+        static int s_idle = -1;
+        if (s_idle < 0) { const char* e = getenv("GENERALSX_VK_IDLEFRAME"); s_idle = (e && *e && atoi(e)) ? 1 : 0; }
+        if (s_idle) G.vkDeviceWaitIdle(m_device);
+    }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) return Resize();
     return chk("present", pr);
 }
@@ -555,14 +563,24 @@ void VulkanCore::Advance_Frame()
 // Hand an image this layer no longer binds to the reaper. See VulkanCore.h: the caller has already
 // removed it from its own table, so nothing can name it again from here on - but a frame submitted
 // before that moment may still be running.
-void VulkanCore::Retire_Mirror(VkImage image, VkImageView view, VkDeviceMemory mem)
+void VulkanCore::Retire_Mirror(VkImage image, VkImageView view, VkDeviceMemory mem,
+                               VkImageView extraView)
 {
-    if (!image && !view && !mem) return;
+    if (!image && !view && !mem && !extraView) return;
     RetiredMirror r;
     r.image = image; r.view = view; r.mem = mem;
     r.framesLeft = VK_IN_FLIGHT + 1;
     m_retired.push_back(r);
     ++m_mirRetired;
+    // The sRGB sampling view shares the image's lifetime; park it in its own record so Reap_Mirrors
+    // frees it on the same frame boundary without changing the RetiredMirror layout.
+    if (extraView) {
+        RetiredMirror rv;
+        rv.image = nullptr; rv.view = extraView; rv.mem = nullptr;
+        rv.framesLeft = VK_IN_FLIGHT + 1;
+        m_retired.push_back(rv);
+        ++m_mirRetired;
+    }
 }
 
 void VulkanCore::Reap_Mirrors()
@@ -788,7 +806,7 @@ struct VKTexFmtInfo {
 // TX.vramBytes is the LIVE total (create adds, every drop/replace subtracts); without the per-entry size
 // the budget could only ever grow and, once over 3 GiB, refused every later mirror forever - the fonts
 // went white first and the next map lost every texture.
-struct VKTexImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h, levels; VkFormat vkf; VkImageView view; unsigned long long hash; unsigned reups; unsigned long long ident; unsigned long long size; };
+struct VKTexImg { void* key; VkImage img; VkDeviceMemory mem; unsigned w, h, levels; VkFormat vkf; VkImageView view; VkImageView viewSrgb; unsigned long long hash; unsigned reups; unsigned long long ident; unsigned long long size; };
 
 // GeneralsX @performance Qoder 19/10/2026 R-05 wave 9: async mirror upload ring. The R8 probe put
 // 4-16 ms of every glyph-atlas page turn inside _Copy_DX8_Rects, and the only ms-scale item that
@@ -900,6 +918,22 @@ bool vktex_fmt(int ww3d, VKTexFmtInfo& o)
     default: return false; // R3G3B2/A8R3G3B2/paletted/unsupported: mirror phase skips (counter tracks it)
     }
     return true;
+}
+
+// GeneralsX @feature 26/10/2026 HDR: the sRGB sampling view of the SAME bytes. The image keeps its
+// UNORM format, so upload verification, RT->texture copies and every format comparison stay valid;
+// only a draw that asks for linear colour binds this view. Formats without an sRGB variant return
+// UNDEFINED and keep sampling the UNORM view (they are data textures in practice: fonts, normal maps,
+// masks, SNORM, float targets).
+static VkFormat vktex_srgb_view_format(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_UNORM:       return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK:      return VK_FORMAT_BC2_SRGB_BLOCK;
+    case VK_FORMAT_BC3_UNORM_BLOCK:      return VK_FORMAT_BC3_SRGB_BLOCK;
+    default:                             return VK_FORMAT_UNDEFINED;
+    }
 }
 
 unsigned vktex_al16(unsigned x) { return (x + 15u) & ~15u; }
@@ -1157,6 +1191,7 @@ void vktex_shutdown(VkDevice dev)
 {
     if (dev) {
         for (auto& e : TX.imgs) {
+            if (e.viewSrgb) G.vkDestroyImageView(dev, e.viewSrgb, nullptr);
             if (e.view) G.vkDestroyImageView(dev, e.view, nullptr);
             if (e.img) G.vkDestroyImage(dev, e.img, nullptr);
             if (e.mem) G.vkFreeMemory(dev, e.mem, nullptr);
@@ -1214,7 +1249,7 @@ bool VKTex_Query(void* key, VKTex_Info* out)
         const unsigned long long live = vk_mirror_identity(key);
         if (e->ident != live) {
             vk_log_ident_drop("tex", key, e->ident, live);
-            g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+            g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem, e->viewSrgb);
             TX.vramBytes = (TX.vramBytes >= e->size) ? (TX.vramBytes - e->size) : 0ull;
             TX.imgs.erase(TX.imgs.begin() + (long)(e - &TX.imgs[0]));
             e = nullptr;
@@ -1223,6 +1258,7 @@ bool VKTex_Query(void* key, VKTex_Info* out)
     if (e) {
         out->image = (void*)e->img;
         out->view = (void*)e->view;
+        out->view_srgb = (void*)e->viewSrgb;
         out->format = (unsigned)e->vkf;
         out->width = e->w; out->height = e->h; out->levels = e->levels;
     }
@@ -1241,7 +1277,7 @@ void VKTex_Drop(void* key)
     vk_queue_lock();
     VKTexImg* e = vktex_find(key);
     if (e) {
-        g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem);
+        g_vulkanCore->Retire_Mirror(e->img, e->view, e->mem, e->viewSrgb);
         // GeneralsX @bugfix Qoder 21/10/2026: keep the budget honest. The image is leaving this table
         // now; the reaper only delays the actual vkFreeMemory by the in-flight window.
         TX.vramBytes = (TX.vramBytes >= e->size) ? (TX.vramBytes - e->size) : 0ull;
@@ -1271,7 +1307,7 @@ static bool vktex_upload_2d_locked(unsigned width, unsigned height, unsigned lev
         // reaper instead of being destroyed here (wedge 5 made these images live in real draw graphs).
         // GeneralsX @bugfix Qoder 20/10/2026 R-07: the identity term is the one that catches a reuse the
         // shape guard could see at all - same extent, same format, same level count, different owner.
-        g_vulkanCore->Retire_Mirror(existing->img, existing->view, existing->mem);
+        g_vulkanCore->Retire_Mirror(existing->img, existing->view, existing->mem, existing->viewSrgb);
         TX.vramBytes = (TX.vramBytes >= existing->size) ? (TX.vramBytes - existing->size) : 0ull;
         size_t idx = (size_t)(existing - &TX.imgs[0]);
         // GeneralsX @feature Qoder 19/10/2026 R-04 census: carry the lifetime reupload count through
@@ -1584,7 +1620,15 @@ static bool vktex_upload_2d_locked(unsigned width, unsigned height, unsigned lev
             ++TX.fmtSkips;
             return false;
         }
-        TX.imgs.push_back({ key, img, mem, width, height, levels, f.vkf, v, hashed ? srcHash : 0ull, carriedReups, ident, ireq.size });
+        // GeneralsX @feature 26/10/2026 HDR: a second view over the same image, declaring the stored
+        // bytes as sRGB so the sampler decodes to linear. Failure is non-fatal: the UNORM view remains
+        // the fallback and the draw keeps display-space sampling.
+        VkImageView vSrgb = nullptr;
+        const VkFormat sfmt = vktex_srgb_view_format(f.vkf);
+        if (sfmt != VK_FORMAT_UNDEFINED)
+            vSrgb = vktex_make_view(dev, img, sfmt, levels, VK_IMAGE_ASPECT_COLOR_BIT, f.map);
+        TX.imgs.push_back({ key, img, mem, width, height, levels, f.vkf, v, vSrgb,
+                            hashed ? srcHash : 0ull, carriedReups, ident, ireq.size });
         ++TX.uploads;
         TX.vramBytes += ireq.size;
     } else {
@@ -1794,7 +1838,7 @@ VKRTImg* vkrt_find(void* key)
 // Shared create path for color / depth mirrors. depth picks DEPTH_STENCIL_ATTACHMENT usage + a depth
 // format; color picks COLOR_ATTACHMENT usage. Reuse on identical shape (recycled-pointer guard);
 // destroy + recreate otherwise. Budget 1024 images / 2 GiB for the RT mirror set.
-bool vkrt_create_locked(void* key, unsigned w, unsigned h, VkFormat vkf, bool depth)
+bool vkrt_create_locked(void* key, unsigned w, unsigned h, VkFormat vkf, bool depth, unsigned samples)
 {
     VkDevice dev = g_vulkanCore->Device();
     if (!w || !h) { ++RT.fmtSkips; return false; }
@@ -1824,10 +1868,14 @@ bool vkrt_create_locked(void* key, unsigned w, unsigned h, VkFormat vkf, bool de
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = vkf;
     ici.extent = { w, h, 1 };
-    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = (VkSampleCountFlagBits)(samples ? samples : 1u);
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-              | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    // Multisampled images cannot be transfer sources/destinations; only the 1-sample mirrors need that.
+    ici.usage = (samples > 1u)
+        ? (VK_IMAGE_USAGE_SAMPLED_BIT | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        : (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+           | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImage img = nullptr; VkDeviceMemory mem = nullptr; VkMemoryRequirements ireq = {};
@@ -1888,7 +1936,7 @@ bool vkrt_readback_locked(void* key, const unsigned char* bits, unsigned pitch,
     unsigned char* sm = (unsigned char*)TX.stageMap;
     for (unsigned r = 0; r < h; ++r) memcpy(sm + (size_t)r * rowBytes, bits + (size_t)r * pitch, rowBytes);
 
-    if (!vkrt_create_locked(key, w, h, vkf, false)) return false;
+    if (!vkrt_create_locked(key, w, h, vkf, false, 1u)) return false;
     VKRTImg* e = vkrt_find(key);
     if (!e) return false;
     VkDevice dev = g_vulkanCore->Device();
@@ -2074,7 +2122,7 @@ bool VKRT_Alloc_Color(void* key, unsigned int width, unsigned int height, int ww
     VkFormat vkf;
     if (!vkrt_color_fmt(ww3d_format, vkf)) { ++RT.fmtSkips; return false; }
     vk_queue_lock();
-    bool r = vkrt_create_locked(key, width, height, vkf, false);
+    bool r = vkrt_create_locked(key, width, height, vkf, false, 1u);
     vk_queue_unlock();
     return r;
 }
@@ -2085,7 +2133,7 @@ bool VKRT_Alloc_Depth(void* key, unsigned int width, unsigned int height, int ww
     VkFormat vkf;
     if (!vkrt_depth_fmt(ww3d_zformat, vkf)) { ++RT.fmtSkips; return false; }
     vk_queue_lock();
-    bool r = vkrt_create_locked(key, width, height, vkf, true);
+    bool r = vkrt_create_locked(key, width, height, vkf, true, 1u);
     vk_queue_unlock();
     return r;
 }
@@ -2268,7 +2316,28 @@ bool VKRT_Alloc_Color_Format(void* key, unsigned int width, unsigned int height,
 {
     if (!VKRT_Ready() || !key || !width || !height) return false;
     vk_queue_lock();
-    bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, false);
+    bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, false, 1u);
+    vk_queue_unlock();
+    return r;
+}
+
+// B5 MSAA: multisampled scene targets (resolved into the 1-sample mirrors by the pass itself).
+bool VKRT_Alloc_Color_Samples(void* key, unsigned int width, unsigned int height, unsigned int vk_format,
+                              unsigned int samples)
+{
+    if (!VKRT_Ready() || !key || !width || !height) return false;
+    vk_queue_lock();
+    const bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, false, samples);
+    vk_queue_unlock();
+    return r;
+}
+
+bool VKRT_Alloc_Depth_Samples(void* key, unsigned int width, unsigned int height, unsigned int vk_format,
+                              unsigned int samples)
+{
+    if (!VKRT_Ready() || !key || !width || !height) return false;
+    vk_queue_lock();
+    const bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, true, samples);
     vk_queue_unlock();
     return r;
 }
@@ -2277,7 +2346,7 @@ bool VKRT_Alloc_Depth_Format(void* key, unsigned int width, unsigned int height,
 {
     if (!VKRT_Ready() || !key || !width || !height) return false;
     vk_queue_lock();
-    bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, true);
+    bool r = vkrt_create_locked(key, width, height, (VkFormat)vk_format, true, 1u);
     vk_queue_unlock();
     return r;
 }
@@ -2421,6 +2490,16 @@ struct VKDescStateT {
     VkImageView  whiteView = nullptr;
     // Default sampler for descriptor slots the caller leaves unspecified.
     VkSampler    defSampler = nullptr;
+    // GeneralsX @feature 24/10/2026 P34 D2/C4: two static images the scene set now binds. binding 9 is
+    // the spot-light cookie atlas (sampler2D), binding 10 the retail sky cubemap (samplerCube); the
+    // white cube is the stand-in until the sky faces are uploaded, so the binding is always valid.
+    VkImage      cookieImg = nullptr;
+    VkDeviceMemory cookieMem = nullptr;
+    VkImageView  cookieView = nullptr;
+    VkImage      whiteCubeImg = nullptr;
+    VkDeviceMemory whiteCubeMem = nullptr;
+    VkImageView  whiteCubeView = nullptr;
+    VkSampler    linearSampler = nullptr;   // clamp-to-edge linear, for cookies and the sky cube
     unsigned long long sets = 0, setsBad = 0, sampCreated = 0, sampReuse = 0, sampBad = 0, binds = 0;
     bool probeDone = false;
 };
@@ -2630,13 +2709,83 @@ bool vkdesc_build_white()
     return D4.whiteView != nullptr;
 }
 
+// GeneralsX @feature 24/10/2026 P34 D2/C4: upload a static, immutable image through the texture mirror's
+// staging buffer and park it in SHADER_READ_ONLY. Both new scene bindings need this shape: the cookie
+// atlas (512x256 R8G8B8A8, one layer) and the white cube that stands in for the sky (1x1, six layers).
+bool vkdesc_upload_static(VkFormat fmt, unsigned w, unsigned h, unsigned layers, bool cube,
+                          const void* pixels, size_t bytes,
+                          VkImage* outImg, VkDeviceMemory* outMem, VkImageView* outView)
+{
+    VkDevice dev = g_vulkanCore->Device();
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    if (cube) ici.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = { w, h, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = layers; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!chk("CreateImage(static)", G.vkCreateImage(dev, &ici, nullptr, outImg))) return false;
+    VkMemoryRequirements req; G.vkGetImageMemoryRequirements(dev, *outImg, &req);
+    const uint32_t mt = vktex_memtype(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
+    if (mt == ~0u || !chk("AllocMemory(static)", G.vkAllocateMemory(dev, &mai, nullptr, outMem)) ||
+        !chk("BindMemory(static)", G.vkBindImageMemory(dev, *outImg, *outMem, 0))) return false;
+    if (!vktex_ensure_stage((unsigned long long)bytes)) return false;
+    memcpy(TX.stageMap, pixels, bytes);
+
+    VkCommandBuffer cb = nullptr;
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = g_vulkanCore->Pool(); cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    if (!chk("AllocCmd(static)", G.vkAllocateCommandBuffers(dev, &cai, &cb))) return false;
+    VkCommandBufferBeginInfo bb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    G.vkBeginCommandBuffer(cb, &bb);
+    vkrt_cmd_barrier(cb, *outImg, layers, false, false,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const size_t layerBytes = bytes / (size_t)layers;
+    VkBufferImageCopy cp[6] = {};
+    for (unsigned l = 0; l < layers; ++l) {
+        cp[l].bufferOffset = (VkDeviceSize)layerBytes * l;
+        cp[l].imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, l, 1 };
+        cp[l].imageExtent = { w, h, 1 };
+    }
+    G.vkCmdCopyBufferToImage(cb, TX.stage, *outImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layers, cp);
+    vkrt_cmd_barrier(cb, *outImg, layers, false, false,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    bool ok = chk("EndCmd(static)", G.vkEndCommandBuffer(cb));
+    if (ok) {
+        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkFence fence = nullptr;
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        ok = chk("CreateFence(static)", G.vkCreateFence(dev, &fi, nullptr, &fence)) &&
+             chk("Submit(static)", G.vkQueueSubmit(g_vulkanCore->Queue(), 1, &si, fence)) &&
+             chk("Wait(static)", G.vkWaitForFences(dev, 1, &fence, VK_TRUE, ~0ull));
+        if (fence) G.vkDestroyFence(dev, fence, nullptr);
+    }
+    G.vkFreeCommandBuffers(dev, g_vulkanCore->Pool(), 1, &cb);
+    if (!ok) return false;
+
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = *outImg;
+    vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = fmt;
+    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
+    return chk("CreateImageView(static)", G.vkCreateImageView(dev, &vci, nullptr, outView));
+}
+
 bool vkdesc_build()
 {
     if (D4.built) return true;
     VkDevice dev = g_vulkanCore->Device();
 
     // ---- descriptor set layout: the one engine-wide binding surface ----
-    VkDescriptorSetLayoutBinding b[6] = {};
+    VkDescriptorSetLayoutBinding b[11] = {};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     // GeneralsX @feature Qoder 18/10/2026 Wedge 8: eight texture slots (was four) so terrain NM
     // can sample register s4. Existing twins that declare u_tex[4] stay legal: binding a shader
@@ -2654,40 +2803,50 @@ bool vkdesc_build()
     // wording; wedge 6 declares the block as a uniform block in GLSL.
     b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    // GeneralsX @feature Qoder 22/10/2026 Forward+ night: binding 4 is the Forward+ light block for
-    // programs that share binding 3 with another stage. The PS-only terrain programs are paired with
-    // vkff.vert, which reads its fixed-function state from binding 3; a fragment program cannot also
-    // read the light block there without feeding the vertex stage the wrong bytes. Binding 4 is a
-    // static-offset UBO because the per-frame slot address is fixed for the whole slot (the set cache
-    // is per slot), so it adds no dynamic offset to any bind call.
-    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    // GeneralsX @feature Qoder 24/10/2026 P0: binding 4 is the Forward+ light buffer. It is a
+    // read-only SSBO, not a UBO: the block is 90,272 bytes and NVIDIA's maxUniformBufferRange is
+    // 65,536. The per-slot address is fixed, so the draw path caches one descriptor set per slot.
+    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[4].descriptorCount = 1; b[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    // GeneralsX @feature Qoder 22/10/2026 light shadows: binding 5 samples the strongest dynamic
-    // light's own depth map. Always written (white fallback), so a shader may declare it unconditionally.
-    b[5].binding = 5; b[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b[5].descriptorCount = 1; b[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // GeneralsX @feature Qoder 22/10/2026 light shadows: binding 5 samples the light's own depth map.
+    // GeneralsX @feature 24/10/2026 P34 E3: bindings 5..8 are four separate maps, one per light-list
+    // slot. A sampler array would need dynamically uniform indexing (the slot varies per pixel inside a
+    // cluster), so the shaders declare four bindings and dispatch with an if-chain.
+    // Always written (white fallback), so a shader may declare them unconditionally.
+    for (int m = 0; m < (int)VkLighting::kShadowMaps; ++m) {
+        b[5 + m].binding = (uint32_t)(5 + m);
+        b[5 + m].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[5 + m].descriptorCount = 1; b[5 + m].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    // GeneralsX @feature 24/10/2026 P34 D2: binding 9 = baked cookie atlas (sampler2D, 512x256, 8 tiles).
+    b[9].binding = 9; b[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[9].descriptorCount = 1; b[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // GeneralsX @feature 24/10/2026 P34 C4: binding 10 = the retail sky cubemap for environment
+    // reflections. The white cube keeps the binding legal before the sky faces are uploaded.
+    b[10].binding = 10; b[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[10].descriptorCount = 1; b[10].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 6; lci.pBindings = b;
+    lci.bindingCount = 11; lci.pBindings = b;
     if (!chk("CreateDescriptorSetLayout", G.vkCreateDescriptorSetLayout(dev, &lci, nullptr, &D4.setLayout))) return false;
 
     // ---- pool ----
     const unsigned MAXSETS = 4096;
     VkDescriptorPoolSize ps[4] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXSETS * 8u },
+        // binding 0 (8 texture slots) plus bindings 5..10 (6 static samplers) per set.
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXSETS * 14u },
         // Three dynamic uniform bindings per set: vertex constants, pixel constants, lights.
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAXSETS * 3u },
-        // One static uniform binding per set: the Forward+ block at binding 4.
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAXSETS * 1u },
-        // Light-shadow map at binding 5 (one combined image sampler per set).
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXSETS * 1u },
+        // One static storage binding per set: the Forward+ light buffer at binding 4.
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAXSETS * 1u },
     };
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     // GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 6: poolSizeCount named three sizes while the
     // array holds two - the ring split is vertex/pixel/lights but lights share the DYNAMIC_UNIFORM pool
     // size, so the third entry was a read past the end of ps[] (garbage type + count, and the loader
-    // happily consumed it because validation layers are not installed on this host).
-    pci.maxSets = MAXSETS; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
+    // happily consumed it because validation layers are not installed on this host). The array now holds
+    // exactly three entries again (the second sampler entry was folded into the first).
+    pci.maxSets = MAXSETS; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
     if (!chk("CreateDescriptorPool", G.vkCreateDescriptorPool(dev, &pci, nullptr, &D4.pool))) return false;
 
     // ---- constant rings ----
@@ -2699,7 +2858,7 @@ bool vkdesc_build()
     bool ringsOK =
         vkdesc_build_ring(VKDESC_RING_VERTEX, 8ull << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, ALIGN_U) &&
         vkdesc_build_ring(VKDESC_RING_PIXEL,  8ull << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, ALIGN_U) &&
-        vkdesc_build_ring(VKDESC_RING_LIGHTS, 2ull << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, ALIGN_U);
+        vkdesc_build_ring(VKDESC_RING_LIGHTS, 2ull << 20, (VkBufferUsageFlags)(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT), ALIGN_U);
     if (!ringsOK) return false;
 
     if (!vkdesc_build_white()) return false;
@@ -2710,9 +2869,33 @@ bool vkdesc_build()
     D4.defSampler = vkdesc_make_sampler(3, 3, 3, 2, 2, 1, 1);
     if (!D4.defSampler) return false;
 
+    // GeneralsX @feature 24/10/2026 P34 D2/C4: the two static images the scene set binds every frame.
+    // Both use one clamp-to-edge linear sampler (cookie tiles need filtering, the sky cube is low
+    // frequency); if either upload fails the binding falls back to the 1x1 white image, which is a
+    // legal "no-op" for the cookie and an analytic-sky fallback for the reflection.
+    D4.linearSampler = vkdesc_make_sampler(3, 3, 3, 2, 2, 0, 1);
+    if (!D4.linearSampler) return false;
+    {
+        const unsigned char white6[6 * 4] = {
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+        };
+        if (!vkdesc_upload_static(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 6, true, white6, sizeof(white6),
+                                  &D4.whiteCubeImg, &D4.whiteCubeMem, &D4.whiteCubeView)) {
+            VKWP1_LOG("desc: white cube fallback failed; sky reflection will use fpEnv colours");
+        }
+        if (!vkdesc_upload_static(VK_FORMAT_R8G8B8A8_UNORM, VK_COOKIE_ATLAS_W, VK_COOKIE_ATLAS_H, 1, false,
+                                  VK_COOKIE_ATLAS_RGBA32, sizeof(VK_COOKIE_ATLAS_RGBA32),
+                                  &D4.cookieImg, &D4.cookieMem, &D4.cookieView)) {
+            VKWP1_LOG("desc: cookie atlas upload failed; procedural cookies stay active");
+        }
+    }
+
     D4.built = true;
-    VKWP1_LOG("desc layer ok: setlayout+pool(%u sets), rings vtx=%llu MiB pix=%llu MiB lights=%llu MiB, white view=%p",
-        MAXSETS, D4.ring[0].cap >> 20, D4.ring[1].cap >> 20, D4.ring[2].cap >> 20, (void*)D4.whiteView);
+    VKWP1_LOG("desc layer ok: setlayout+pool(%u sets), rings vtx=%llu MiB pix=%llu MiB lights=%llu MiB, "
+              "white view=%p cookie=%p whiteCube=%p",
+        MAXSETS, D4.ring[0].cap >> 20, D4.ring[1].cap >> 20, D4.ring[2].cap >> 20,
+        (void*)D4.whiteView, (void*)D4.cookieView, (void*)D4.whiteCubeView);
     return true;
 }
 
@@ -2760,7 +2943,7 @@ bool vkdesc_write_set(VkDescriptorSet set, void* const views[8], void* const sam
         img[i].imageView = v;
         img[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    VkWriteDescriptorSet w[6] = {};
+    VkWriteDescriptorSet w[11] = {};
     unsigned n = 0;
     w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     w[n].dstSet = set; w[n].dstBinding = 0; w[n].descriptorCount = 8;
@@ -2781,22 +2964,42 @@ bool vkdesc_write_set(VkDescriptorSet set, void* const views[8], void* const sam
         w[n].dstSet = set; w[n].dstBinding = (uint32_t)(1 + i); w[n].descriptorCount = 1;
         w[n].descriptorType = typeOf[i]; w[n].pBufferInfo = &bi[i]; ++n;
     }
-    // GeneralsX @feature Qoder 22/10/2026: binding 4 must be written too (unwritten descriptors in a
-    // bound set are undefined). The probes' shaders do not declare it; any valid range from the lights
-    // ring satisfies the layout, and the draw path overwrites this binding with the real FP block.
+    // GeneralsX @feature Qoder 24/10/2026 P0: binding 4 must be written too (unwritten descriptors in
+    // a bound set are undefined). The probes' shaders do not declare it; the lights ring now carries
+    // STORAGE usage so this placeholder is a legal storage descriptor. The draw path overwrites it
+    // with the real per-slot light buffer.
     VkDescriptorBufferInfo bfp = { D4.ring[VKDESC_RING_LIGHTS].buf, 0, 16 };
     w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     w[n].dstSet = set; w[n].dstBinding = 4; w[n].descriptorCount = 1;
-    w[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[n].pBufferInfo = &bfp; ++n;
-    // Binding 5: the light-shadow map. The probes never declare it; the built-in white is a valid
-    // descriptor and the draw path overwrites this binding with the real map.
-    VkDescriptorImageInfo lsImg = {};
-    lsImg.sampler = D4.defSampler;
-    lsImg.imageView = D4.whiteView;
-    lsImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    w[n].dstSet = set; w[n].dstBinding = 5; w[n].descriptorCount = 1;
-    w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &lsImg; ++n;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[n].pBufferInfo = &bfp; ++n;
+    // GeneralsX @feature 24/10/2026 P34 E3/D2/C4: bindings 5..10 must be written as well. The draw path
+    // overwrites 5..8 with this frame's light maps and 10 with the sky cube; 9 is static. Everything
+    // starts on the 1x1 white image so a probe set or a frame with no sky is still legal.
+    VkDescriptorImageInfo extraImg[6] = {};
+    for (int k = 0; k < 6; ++k) {
+        extraImg[k].sampler = D4.linearSampler ? D4.linearSampler : D4.defSampler;
+        extraImg[k].imageView = D4.whiteView;
+        extraImg[k].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    if (D4.cookieView) {
+        extraImg[4].sampler = D4.linearSampler ? D4.linearSampler : D4.defSampler;
+        extraImg[4].imageView = D4.cookieView;
+    }
+    if (D4.whiteCubeView) {
+        extraImg[5].imageView = D4.whiteCubeView;   // sky slot: a legal cube until the real one is ready
+    }
+    // Binding 5..8 are four single light-shadow maps; 9 and 10 are the cookie atlas and the sky cube.
+    for (int k = 0; k < 4; ++k) extraImg[k].sampler = D4.defSampler;
+    for (int k = 0; k < 4; ++k) {
+        w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w[n].dstSet = set; w[n].dstBinding = (uint32_t)(5 + k); w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &extraImg[k]; ++n;
+    }
+    for (int k = 4; k < 6; ++k) {
+        w[n] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w[n].dstSet = set; w[n].dstBinding = (uint32_t)(k == 4 ? 9 : 10); w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &extraImg[k]; ++n;
+    }
     G.vkUpdateDescriptorSets(dev, n, w, 0, nullptr);
     return true;
 }
@@ -2827,8 +3030,8 @@ void vkdesc_probe_locked()
     bool lutDedup = false;
 
     // ---- resources: color + depth RT mirrors, and a 1x1 white texture through the tex mirror ----
-    if (!vkrt_create_locked(g_probeColorKey, P, P, VK_FORMAT_B8G8R8A8_UNORM, false) ||
-        !vkrt_create_locked(g_probeDepthKey, P, P, VK_FORMAT_D32_SFLOAT, true)) {
+    if (!vkrt_create_locked(g_probeColorKey, P, P, VK_FORMAT_B8G8R8A8_UNORM, false, 1u) ||
+        !vkrt_create_locked(g_probeDepthKey, P, P, VK_FORMAT_D32_SFLOAT, true, 1u)) {
         VKWP1_LOG("VKDESC probe FAIL: rt mirror alloc"); return;
     }
     VKRTImg* col = vkrt_find(g_probeColorKey);
@@ -3792,7 +3995,7 @@ void vkff_probe_locked()
     if (!rigOK) { VKWP1_LOG("VKFF probe FAILED before the draw: one or more rigs are not corner-constant"); return; }
 
     // ---- target, vertex storage, constants ------------------------------------------------------
-    if (!vkrt_create_locked(g_ffProbeColorKey, FFPROBE_W, FFPROBE_H, fmt, false)) {
+    if (!vkrt_create_locked(g_ffProbeColorKey, FFPROBE_W, FFPROBE_H, fmt, false, 1u)) {
         VKWP1_LOG("VKFF probe FAIL: rt mirror alloc (%s %ux%u)", fmtName, FFPROBE_W, FFPROBE_H);
         return;
     }
@@ -4754,7 +4957,7 @@ void vkffpix_probe_locked()
     }
 
     // ---- target, textures, vertex storage, constants -------------------------------------------
-    if (!vkrt_create_locked(g_ffpixColorKey, FFPIX_W, FFPIX_H, fmt, false)) {
+    if (!vkrt_create_locked(g_ffpixColorKey, FFPIX_W, FFPIX_H, fmt, false, 1u)) {
         VKWP1_LOG("VKFFPIX probe FAIL: rt mirror alloc (%s %ux%u)", fmtName, FFPIX_W, FFPIX_H);
         return;
     }
@@ -5559,6 +5762,16 @@ void vkshot_barrier(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to,
 
 } // anon
 
+// GeneralsX @debug 28/10/2026 shot window armed by a game event (in-game message). -1 = idle, >0 = the
+// number of consecutive frames still to capture, 0 = the window just closed. The cadence below cannot
+// hit a transient event reliably at 190 fps, so the event opens its own window instead.
+static int g_vkShotArm = -1;
+void VKCore_Shot_Arm(int frames)
+{
+    if (frames <= 0) { g_vkShotArm = 0; return; }
+    if (g_vkShotArm <= 0) { g_vkShotArm = frames; fprintf(stderr, "[VKSHOT] window armed for %d frames\n", frames); fflush(stderr); }
+}
+
 void VKCore_Shot_Record(void* cmd_, void* sceneImage_, unsigned w, unsigned h, unsigned slot, unsigned long long frame)
 {
     if (!g_vulkanCore || !g_vulkanCore->IsReady() || slot > 2u) return;
@@ -5567,12 +5780,32 @@ void VKCore_Shot_Record(void* cmd_, void* sceneImage_, unsigned w, unsigned h, u
     // GENERALSX_VKSHOT_EVERY=N keeps every Nth frame (default 1 = the historical behaviour).
     {
         static unsigned s_every = 0;
+        static unsigned s_max = 0;
+        static unsigned s_taken = 0;
+        static unsigned s_delay = 0;
+        static DWORD s_t0 = 0;
         if (!s_every)
         {
             const char* ev = getenv("GENERALSX_VKSHOT_EVERY");
             s_every = (ev && atoi(ev) > 0) ? (unsigned)atoi(ev) : 1u;
+            const char* em = getenv("GENERALSX_VKSHOT_MAX");
+            s_max = (em && atoi(em) > 0) ? (unsigned)atoi(em) : 0u;
+            // GeneralsX @debug 28/10/2026: skip the splash/loading frames. A frame-sequence forensic run
+            // needs consecutive GAMEPLAY frames, and the map is up ~25-30 s after launch.
+            if (getenv("GENERALSX_VKSHOT_ONMSG") != nullptr) g_vkShotArm = 0;   // capture only inside the event window
+            const char* ed = getenv("GENERALSX_VKSHOT_DELAY_MS");
+            s_delay = (ed && atoi(ed) > 0) ? (unsigned)atoi(ed) : 0u;
+            s_t0 = GetTickCount();
         }
+        if (s_delay && (GetTickCount() - s_t0) < s_delay) return;
+        if (g_vkShotArm >= 0) {
+            if (g_vkShotArm == 0) return;
+            --g_vkShotArm;
+            if (g_vkShotArm == 0) { fprintf(stderr, "[VKSHOT] window closed\n"); fflush(stderr); }
+        }
+        if (s_max && s_taken >= s_max) return;
         if (s_every > 1u && (frame % s_every) != 0ull) return;
+        ++s_taken;
     }
     vk_queue_lock();
     if (!vkshot_build_locked()) { vk_queue_unlock(); return; }
@@ -5615,12 +5848,32 @@ void VKCore_Shot_RecordSwap(void* cmd_, void* swapImage_, unsigned w, unsigned h
     if (!g_vulkanCore || !g_vulkanCore->IsReady() || slot > 2u) return;
     {
         static unsigned s_every = 0;
+        static unsigned s_max = 0;
+        static unsigned s_taken = 0;
+        static unsigned s_delay = 0;
+        static DWORD s_t0 = 0;
         if (!s_every)
         {
             const char* ev = getenv("GENERALSX_VKSHOT_EVERY");
             s_every = (ev && atoi(ev) > 0) ? (unsigned)atoi(ev) : 1u;
+            const char* em = getenv("GENERALSX_VKSHOT_MAX");
+            s_max = (em && atoi(em) > 0) ? (unsigned)atoi(em) : 0u;
+            // GeneralsX @debug 28/10/2026: skip the splash/loading frames. A frame-sequence forensic run
+            // needs consecutive GAMEPLAY frames, and the map is up ~25-30 s after launch.
+            if (getenv("GENERALSX_VKSHOT_ONMSG") != nullptr) g_vkShotArm = 0;   // capture only inside the event window
+            const char* ed = getenv("GENERALSX_VKSHOT_DELAY_MS");
+            s_delay = (ed && atoi(ed) > 0) ? (unsigned)atoi(ed) : 0u;
+            s_t0 = GetTickCount();
         }
+        if (s_delay && (GetTickCount() - s_t0) < s_delay) return;
+        if (g_vkShotArm >= 0) {
+            if (g_vkShotArm == 0) return;
+            --g_vkShotArm;
+            if (g_vkShotArm == 0) { fprintf(stderr, "[VKSHOT] window closed\n"); fflush(stderr); }
+        }
+        if (s_max && s_taken >= s_max) return;
         if (s_every > 1u && (frame % s_every) != 0ull) return;
+        ++s_taken;
     }
     vk_queue_lock();
     if (!vkshot_build_locked()) { vk_queue_unlock(); return; }
@@ -5784,6 +6037,9 @@ void VKCore_Shot_Poll(unsigned slot)
 void* VKDesc_Set_Layout()       { return D4.built ? (void*)D4.setLayout : nullptr; }
 void* VKDesc_White_View()       { return D4.built ? (void*)D4.whiteView : nullptr; }
 void* VKDesc_Default_Sampler()  { return D4.built ? (void*)D4.defSampler : nullptr; }
+void* VKDesc_Cookie_View()      { return D4.built ? (void*)D4.cookieView : nullptr; }
+void* VKDesc_Cookie_Sampler()   { return D4.built ? (void*)(D4.linearSampler ? D4.linearSampler : D4.defSampler) : nullptr; }
+void* VKDesc_White_Cube_View()  { return D4.built ? (void*)D4.whiteCubeView : nullptr; }
 
 // The co-created core for the other Vulkan translation units (declared in VulkanCore.h).
 VulkanCore* VulkanCore_Get() { return g_vulkanCore; }

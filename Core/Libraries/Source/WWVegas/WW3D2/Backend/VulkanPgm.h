@@ -51,6 +51,11 @@ const VKPgm_Program* VKPgm_Program_At(unsigned index);
 // integrator needs to add the row.
 unsigned VKPgm_Note_Compiled(void* handle, int isPixel, const char* hlslSource, const char* logTag);
 
+// GeneralsX @feature 27/10/2026 unified lighting: bind a compiled handle straight to a known tag,
+// bypassing the source hash. Needed for the families whose retail byte code is not shipped (road/tree
+// .pso): the translated twin is the program, and the engine still needs a handle to name it.
+unsigned VKPgm_Bind_Tag(void* handle, int isPixel, unsigned tag);
+
 // Called by the draw facade for every batch that names a custom shader. 0 = no translation, so refuse and
 // let the D3D9 call run.
 unsigned VKPgm_Tag_For_Handle(void* handle, int isPixel);

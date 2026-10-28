@@ -56,7 +56,7 @@ extern VkInstance g_impInst;
     VKFN(vkGetDeviceQueue) VKFN(vkCreateSwapchainKHR) VKFN(vkGetSwapchainImagesKHR) \
     VKFN(vkAcquireNextImageKHR) VKFN(vkQueuePresentKHR) VKFN(vkDestroySwapchainKHR) \
     VKFN(vkCreateImageView) VKFN(vkDestroyImageView) VKFN(vkCreateFramebuffer) VKFN(vkDestroyFramebuffer) \
-    VKFN(vkCreateRenderPass) VKFN(vkDestroyRenderPass) \
+    VKFN(vkCreateRenderPass) VKFN(vkCreateRenderPass2) VKFN(vkDestroyRenderPass) \
     VKFN(vkCreateCommandPool) VKFN(vkDestroyCommandPool) VKFN(vkAllocateCommandBuffers) \
     VKFN(vkBeginCommandBuffer) VKFN(vkEndCommandBuffer) VKFN(vkResetCommandBuffer) \
     VKFN(vkCmdBeginRenderPass) VKFN(vkCmdEndRenderPass) \
@@ -67,11 +67,12 @@ extern VkInstance g_impInst;
     VKFN(vkBindBufferMemory) VKFN(vkMapMemory) VKFN(vkUnmapMemory) \
     VKFN(vkCreateImage) VKFN(vkGetImageMemoryRequirements) VKFN(vkDestroyImage) \
     VKFN(vkBindImageMemory) \
-    VKFN(vkCmdCopyBufferToImage) VKFN(vkCmdCopyImageToBuffer) VKFN(vkCmdPipelineBarrier) \
+    VKFN(vkCmdCopyBufferToImage) VKFN(vkCmdCopyImageToBuffer) VKFN(vkCmdCopyImage) VKFN(vkCmdPipelineBarrier) \
     VKFN(vkCmdClearColorImage) VKFN(vkCmdClearDepthStencilImage) \
     VKFN(vkCreateShaderModule) VKFN(vkDestroyShaderModule) \
     VKFN(vkCreatePipelineLayout) VKFN(vkDestroyPipelineLayout) \
     VKFN(vkCreateGraphicsPipelines) VKFN(vkDestroyPipeline) \
+    VKFN(vkCreateComputePipelines) VKFN(vkCmdDispatch) VKFN(vkCmdDrawIndirect) \
     VKFN(vkCmdBindPipeline) VKFN(vkCmdDraw) VKFN(vkCmdSetViewport) VKFN(vkCmdSetScissor) \
     VKFN(vkCmdBindVertexBuffers) VKFN(vkCmdBindIndexBuffer) VKFN(vkCmdDrawIndexed) \
     VKFN(vkCmdClearAttachments) VKFN(vkCmdBlitImage) VKFN(vkCmdPushConstants) \

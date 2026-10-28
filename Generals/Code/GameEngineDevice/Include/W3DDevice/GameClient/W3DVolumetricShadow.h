@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -124,7 +124,7 @@ class W3DVolumetricShadow	: public Shadow
 		void updateMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform, const AABoxClass &meshBox, float floorZ);///<update shadow volume of this mesh.
 
 		// rendering interface
-		void RenderVolume(Int meshIndex, Int lightIndex);	///<renders a specifc volume from the model hierarchy
+		void RenderVolume(Int meshIndex, Int lightIndex);	///<renders a specific volume from the model hierarchy
 		///render single mesh which could belong to a larger hierarchy (optimized for static meshes).
 		void RenderMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform);
 		///render single mesh which could belong to a larger hierarchy (optimized for animated meshes).

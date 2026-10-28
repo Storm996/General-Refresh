@@ -100,6 +100,12 @@ set(WW3D2_SRC
     lightenvironment.h
     #line3d.cpp
     #line3d.h
+    # GeneralsX @feature 25/10/2026 P34 F6: the shared Core WW3D2 objects (part_buf, meshmdl) reference
+    # LineGroupClass and Compute_Mesh_Tangents. Both live in this per-game tree (copied from GeneralsMD)
+    # and were simply not part of the base game's source list, so the link failed with unresolved
+    # externals. Same names as the GeneralsMD list.
+    linegrp.cpp
+    linegrp.h
     mapper.cpp
     mapper.h
     #matinfo.cpp
@@ -121,6 +127,10 @@ set(WW3D2_SRC
     meshmdl.cpp
     meshmdl.h
     meshmdlio.cpp
+    # GeneralsX @feature 25/10/2026 P34 F6: Compute_Mesh_Tangents, used by the shared
+    # MeshModelClass::Detect_And_Build_Normal_Map. Present in this tree but missing from the base list.
+    meshtangent.cpp
+    meshtangent.h
     #metalmap.cpp
     #metalmap.h
     #missingtexture.cpp

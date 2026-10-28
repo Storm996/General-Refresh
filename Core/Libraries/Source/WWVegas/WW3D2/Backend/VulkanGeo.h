@@ -113,6 +113,11 @@ struct VKRT_Info {
 // The wedge-5 scene target has no WW3D format to translate from - it is a resource this layer owns -
 // so it comes in through these instead of the WW3DFormat-taking factories above.
 bool VKRT_Alloc_Color_Format(void* key, unsigned int width, unsigned int height, unsigned int vk_format);
+// B5 MSAA: multisampled scene targets, resolved into the 1-sample mirrors by the render pass itself.
+bool VKRT_Alloc_Color_Samples(void* key, unsigned int width, unsigned int height, unsigned int vk_format,
+                              unsigned int samples);
+bool VKRT_Alloc_Depth_Samples(void* key, unsigned int width, unsigned int height, unsigned int vk_format,
+                              unsigned int samples);
 bool VKRT_Alloc_Depth_Format(void* key, unsigned int width, unsigned int height, unsigned int vk_format);
 // Release a mirror (used by graph-owned transient targets). The image goes through the retire queue,
 // so a frame still in flight can finish naming it.
@@ -134,6 +139,7 @@ void VKRT_Set_Layout(void* key, int to);
 struct VKTex_Info {
     void*    image;
     void*    view;
+    void*    view_srgb;     // GeneralsX @feature 26/10/2026 HDR: sRGB view of the same image, or null
     unsigned format;
     unsigned width, height, levels;
 };
@@ -191,6 +197,7 @@ void VKD3D_Live_Stats(unsigned* used, unsigned* cap, unsigned long long* insertF
 // flight. nullptr means the layer is down or the allocation failed - the caller keeps writing the
 // D3D9 resource in that case.
 void* VKGeo_Back_Lock(void* key, unsigned int bytes, unsigned int stride, int dynamic, int discard);
+
 
 // Where a draw has to bind what VKGeo_Back_Lock just filled. *offset is the device offset of the
 // region, *stride the vertex stride recorded at lock time.

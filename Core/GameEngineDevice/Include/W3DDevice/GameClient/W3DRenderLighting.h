@@ -13,6 +13,10 @@ struct W3DRenderLightingState
 	float sunDir[3];		///< world-space direction TOWARD the sun, normalized
 	float sunColor[3];		///< RGB of the key light (terrain/object lighting table)
 	float ambient[3];		///< ambient RGB of the same slot
+	float fillDir[3];		///< world-space direction TOWARD the map fill, normalized (P1)
+	float fillColor[3];		///< RGB of the map fill, weather-scaled (P1)
+	float skyColor[3];		///< P3 hemisphere ambient, upper hemisphere
+	float groundColor[3];	///< P3 hemisphere ambient, lower hemisphere
 	float fogColor[4];		///< rgb = haze colour, w = blend strength (0 disables)
 	float fogRamp[4];		///< x = eye-depth start, y = 1/ramp length, zw unused
 	float cloudOffset[2];	///< scrolling cloud UV offset, shared by terrain/road/sky consumers
@@ -23,4 +27,5 @@ struct W3DRenderLightingState
 
 const W3DRenderLightingState& W3D_GetRenderLighting();
 void W3D_RefreshRenderLighting();
+unsigned W3D_LightingStateHash();
 void W3D_SetCloudOffset(float x, float y);

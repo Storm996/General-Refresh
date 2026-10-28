@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -25,6 +25,7 @@
 #include "dx8wrapper.h"
 #include "bitmaphandler.h"
 #include "colorspace.h"
+
 // GeneralsX @build fbraz 10/02/2026 DirectDraw header Windows-only
 // Linux: Define DDS constants locally (fighter19 pattern)
 #ifdef _WIN32
@@ -168,15 +169,6 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 		if (MipLevels>2)
 			CubeFaceSize+=16;
 	}
-	// Verify we read through the whole file (not more, not less).
-#if 0
-	// This code is commented out because it complains for all our files, but it doesn't seem to actually
-	// be a problem. The new version of ddsfile from Vegas actually has removed this check entirely.
-	int expected_size=level_offset+SurfaceDesc.Size+4;
-	if (expected_size!=file->Size()) {
-		WWDEBUG_SAY(("Warning: file % size is not consistent with the data (file size should be %d but was %d)",Name,expected_size,file->Size()));
-	}
-#endif
 	file->Close();
 }
 
@@ -506,10 +498,6 @@ void DDSFileClass::Copy_Level_To_Surface
 					WWDEBUG_SAY(("Warning: DXT1 format should not contain alpha information - file %s",Name));
 				}
 			}
-		}
-		// TODO: Scaling not handled...
-		else {
-			//int a=0;
 		}
 	}
 }

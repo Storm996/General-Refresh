@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -24,12 +24,15 @@
  *                                                                                             *
  *                     $Archive:: /Commando/Code/ww3d2/rinfo.cpp                              $*
  *                                                                                             *
- *                       Author:: Greg Hjelstrom                                               *
+ *                   Org Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                     $Modtime:: 8/24/01 3:31p                                               $*
+ *                       Author : Kenny Mitchell                                               *
  *                                                                                             *
- *                    $Revision:: 13                                                          $*
+ *                     $Modtime:: 06/27/02 1:27p                                              $*
  *                                                                                             *
+ *                    $Revision:: 15                                                          $*
+ *                                                                                             *
+ * 06/27/02 KM Render to shadow buffer texture support														*
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
@@ -70,21 +73,29 @@ RenderInfoClass::~RenderInfoClass()
 void RenderInfoClass::Push_Material_Pass(MaterialPassClass * matpass)
 {
 	// add to the end of the array
-	if (matpass) {
-		matpass->Add_Ref();
+	if (AdditionalMaterialPassCount<MAX_ADDITIONAL_MATERIAL_PASSES-1) {
+
+		if (matpass) {
+			matpass->Add_Ref();
+		}
+		AdditionalMaterialPassArray[AdditionalMaterialPassCount++]=matpass;
+	} else {
+		RejectedMaterialPasses++;
 	}
-	WWASSERT(AdditionalMaterialPassCount<MAX_ADDITIONAL_MATERIAL_PASSES);
-	AdditionalMaterialPassArray[AdditionalMaterialPassCount++]=matpass;
 }
 
 void RenderInfoClass::Pop_Material_Pass()
 {
-	// remove from the end of the array
-	WWASSERT(AdditionalMaterialPassCount>0);
-	AdditionalMaterialPassCount--;
-	MaterialPassClass * mpass = AdditionalMaterialPassArray[AdditionalMaterialPassCount];
-	if (mpass != nullptr) {
-		mpass->Release_Ref();
+	if (RejectedMaterialPasses == 0) {
+		// remove from the end of the array
+		WWASSERT(AdditionalMaterialPassCount>0);
+		AdditionalMaterialPassCount--;
+		MaterialPassClass * mpass = AdditionalMaterialPassArray[AdditionalMaterialPassCount];
+		if (mpass != nullptr) {
+			mpass->Release_Ref();
+		}
+	} else {
+		RejectedMaterialPasses--;
 	}
 }
 
@@ -129,7 +140,8 @@ SpecialRenderInfoClass::SpecialRenderInfoClass(CameraClass & cam,int render_type
 	RenderInfoClass(cam),
 	RenderType(render_type),
 	VisRasterizer(nullptr),
-	BWRenderer(nullptr)
+	BWRenderer(nullptr),
+	SunSink(nullptr)	// GeneralsX @feature Qoder 13/10/2026 PS3.0 T6 sun shadow map
 {
 }
 

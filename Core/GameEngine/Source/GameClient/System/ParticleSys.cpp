@@ -3291,6 +3291,16 @@ void ParticleSystemManager::update()
 // ------------------------------------------------------------------------------------------------
 void ParticleSystemManager::draw()
 {
+	// GeneralsX @debug 28/10/2026 QA: GENERALSX_NO_PARTICLES=1 skips the particle pass entirely, to
+	// separate "a moving sprite" from "a flickering surface" in the foliage/vehicle flicker reports.
+	{
+		static int s_noParticles = -1;
+		if (s_noParticles < 0) {
+			const char* e = getenv("GENERALSX_NO_PARTICLES");
+			s_noParticles = (e != nullptr && *e != 0 && atoi(e) != 0) ? 1 : 0;
+		}
+		if (s_noParticles) return;
+	}
 	// TheSuperHackers @tweak Integrate the part of the logic frame that the render time
 	// has advanced into since the last render update.
 	const Real logicFramePhase = TheFramePacer->getLogicFramePhase();

@@ -29,6 +29,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdlib.h>
 
 #include "Common/Debug.h"
 #include "Common/GlobalData.h"
@@ -434,6 +435,18 @@ void Win32Mouse::setCursor( MouseCursor cursor )
 //-------------------------------------------------------------------------------------------------
 void Win32Mouse::capture()
 {
+	// GeneralsX @bugfix 26/10/2026 unattended capture runs must never trap the desktop cursor. ClipCursor
+	// pins the pointer to the game window for as long as the game has focus, which on a multi-monitor
+	// setup means the user cannot move the mouse to another screen until the process exits. The QA
+	// screenshot harness sets GENERALSX_NO_CLIP_CURSOR=1 so a background test instance stays visible but
+	// never steals the pointer; normal play is untouched (unset).
+	static int s_noClipCursor = -1;
+	if (s_noClipCursor < 0) {
+		const char* ev = getenv("GENERALSX_NO_CLIP_CURSOR");
+		s_noClipCursor = (ev != nullptr && *ev != 0 && atoi(ev) != 0) ? 1 : 0;
+	}
+	if (s_noClipCursor != 0)
+		return;
 
 	RECT rect;
 	::GetClientRect(ApplicationHWnd, &rect);

@@ -49,6 +49,10 @@ public:
 		/// Create texture for a height map.
 		TerrainTextureClass(int height);
 
+		// GeneralsX @feature 24/10/2026 P25 C8: normal-atlas variant. mipChain=false builds a single
+		// level, so the mip chain cannot average normals across the gutter-less tile edges.
+		TerrainTextureClass(int height, bool mipChain);
+
 		/// Create texture for a height map.
 		TerrainTextureClass(int height, int width);
 

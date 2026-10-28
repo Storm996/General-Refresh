@@ -342,6 +342,18 @@ static void doGameStart()
 	isShuttingDown = TRUE;
 }
 
+// GeneralsX @feature 25/10/2026 Launcher mode: MissionSelect is pushed directly by -screen and
+// pops itself before calling prepareCampaignGame(). With -nomenu there is no MainMenuUpdate on the
+// stack to consume the startGame flag, so the mission would never start. Commit it here instead;
+// startGame is cleared by doGameStart(), so the normal main-menu path cannot start twice.
+void CommitCampaignGameStart()
+{
+	// Only the launcher boot needs this: the normal main-menu path keeps consuming startGame in
+	// MainMenuUpdate, including its transition/fade timing.
+	if (TheGlobalData->m_skipMainMenu && startGame)
+		doGameStart();
+}
+
 static void shutdownComplete( WindowLayout *layout )
 {
 	isShuttingDown = FALSE;

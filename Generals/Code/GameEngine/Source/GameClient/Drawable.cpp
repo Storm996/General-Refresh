@@ -393,6 +393,9 @@ Drawable::Drawable( const ThingTemplate *thingTemplate, DrawableStatusBits statu
 
 	m_stealthLook = STEALTHLOOK_NONE;
 
+	// GeneralsX @feature 25/10/2026 P34 F6: see Drawable.h - 0 means "no extra material pass".
+	m_secondMaterialPassOpacity = 0.0f;
+
 	m_flashCount = 0;
 
 	m_locoInfo = nullptr;

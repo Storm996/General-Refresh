@@ -45,6 +45,7 @@
 
 // GeneralsX @feature Qoder 13/10/2026 getenv() for the shader-model override precedence check.
 #include <cstdlib>
+#include <cstring>
 
 #include "GameClient/ClientInstance.h"
 #include "GameClient/GameClient.h"
@@ -240,6 +241,37 @@ struct GameOptionDesc
 	void (*apply)(Int value);         // runtime side effect; called on save, and at startup only when the key exists
 };
 
+// GeneralsX @bugfix 24/10/2026 P1: the startup apply runs after W3DShaderManager::init and used to
+// re-apply the raw ini value over the env-aware seed. That is how GENERALSX_VK_AA=1 became aa=0 (and
+// auto=1 became 0) halfway through startup. Any row with a QA env override is now left to the seed,
+// and the options page neither saves nor re-applies it.
+static const char *gameOptionEnvOverride(const char *iniKey)
+{
+	if (iniKey == nullptr)
+		return nullptr;
+	if (strcmp(iniKey, "HDREnabled") == 0)      return "GENERALSX_VK_HDR";
+	if (strcmp(iniKey, "HDRExposure") == 0)     return "GENERALSX_VK_EXPOSURE";
+	if (strcmp(iniKey, "HDRTonemap") == 0)      return "GENERALSX_VK_TONEMAP";
+	if (strcmp(iniKey, "RenderScale") == 0)     return "GENERALSX_VK_SCALE";
+	if (strcmp(iniKey, "PostAA") == 0)          return "GENERALSX_VK_AA";
+	if (strcmp(iniKey, "AutoExposure") == 0)    return "GENERALSX_VK_AUTOEXPOSURE";
+	if (strcmp(iniKey, "Sharpen") == 0)         return "GENERALSX_VK_SHARPEN";
+	if (strcmp(iniKey, "ColorLUT") == 0)        return "GENERALSX_VK_COLORLUT";
+	if (strcmp(iniKey, "AmbientOcclusion") == 0) return "GENERALSX_VK_AO";
+	if (strcmp(iniKey, "FilmGrade") == 0)       return "GENERALSX_VK_GRADE";
+	if (strcmp(iniKey, "BloomIntensity") == 0)  return "GENERALSX_BLOOM_INTENSITY";
+	return nullptr;
+}
+
+static bool gameOptionEnvOwns(const GameOptionDesc &desc)
+{
+	const char *env = gameOptionEnvOverride(desc.iniKey);
+	if (env == nullptr)
+		return false;
+	const char *value = getenv(env);
+	return value != nullptr && *value != 0;
+}
+
 static Int gameOptionFallback_FpsLimit()
 {
 	return TheGlobalData ? TheGlobalData->m_framesPerSecondLimit : 60;
@@ -266,21 +298,9 @@ static void gameOptionApply_NormalMapping(Int enabled)
 	DX8NormalMap::Set_Enabled(enabled != 0);
 }
 
-static Int gameOptionFallback_AntiAliasing()
-{
-	return TheGlobalData ? TheGlobalData->m_antiAliasLevel : 0;
-}
-
-// The stored value is the WW3D multisample level (0/2/4/8), same domain the retail chain wrote,
-// so the startup read in GlobalData.cpp and this apply agree on the Options.ini encoding.
-static void gameOptionApply_AntiAliasing(Int level)
-{
-	TheWritableGlobalData->m_antiAliasLevel = level;
-	// GeneralsX @feature Qoder 20/10/2026: the Vulkan present pass resolves this live (FXAA); on D3D the
-	// value still waits for the next device creation, exactly as the row always did.
-	if (TheDisplay != nullptr)
-		TheDisplay->setAntiAliasLevel(level);
-}
+// GeneralsX @bugfix 28/10/2026: the retail "AntiAliasing" (MSAA Off/2X/4X/8X) row and its fallback/apply
+// pair are removed. The Vulkan backend has no multisampling, and the row's only effect was a full-image
+// present pass that also blurred the HUD. Scene-only AA is the Advanced page's "PostAA" row.
 
 //-------------------------------------------------------------------------------------------------
 // GeneralsX @tweak Qoder 13/10/2026 The options-menu pixel-shader ceiling row was removed at the
@@ -294,8 +314,6 @@ static const wchar_t *const s_fpsLimitTexts[] = { L"30 FPS", L"60 FPS", L"120 FP
 
 // GeneralsX @feature Qoder 12/10/2026 Anti aliasing moved onto the registry; the retail combo
 // lived hidden in VideoParent with CSF-built entries, now the gadget is relabeled/refilled here.
-static const Int s_antiAliasingValues[] = { 0, 2, 4, 8 };
-static const wchar_t *const s_antiAliasingTexts[] = { L"Off", L"2X", L"4X", L"8X" };
 
 //-------------------------------------------------------------------------------------------------
 // GeneralsX @feature Qoder 13/10/2026 PS3.0 lighting parameters on the registry (引擎改造/设置参数交接说明 §8).
@@ -322,7 +340,7 @@ static Int gameOptionFallback_Bloom()
 // one key at a time; reading the ini again inside an apply would see the previous sibling value.
 static Int   s_hdrEnabled = 0;
 static Int   s_hdrExposure = 0;
-static Int   s_hdrTonemap = 1;
+static Int   s_hdrTonemap = 0;
 static Int   s_hdrScale = 100;
 static Int   s_hdrAA = 0;
 // HDR and RenderScale rebuild the scene target and the passes that reference its format. The shadow
@@ -334,16 +352,49 @@ static Int   s_hdrScaleLive = 100;
 static Int   s_autoExposure = 0;
 static Int   s_sharpen = 0;
 static Int   s_colorLut = 0;
+static Int   s_ao = 0;          // P0: AO strength ticks (0..150), default 0
+static Int   s_filmGrade = 0;   // P0: contrast grade, default off
+
+static void pushAoGrade()
+{
+	DX8Wrapper::VK_Set_AO_Grade((Real)s_ao * 0.01f, s_filmGrade != 0);
+}
 
 static void pushPostExtras()
 {
 	DX8Wrapper::VK_Set_Post_Extras(s_autoExposure, (Real)s_sharpen * 0.01f, s_colorLut);
 }
 
+// GeneralsX @bugfix 26/10/2026 HDR: the startup option apply runs after W3DShaderManager::init seeded
+// the renderer from Options.ini/env. A sibling row's apply used to call pushHdrKnobs() before any HDR
+// row had loaded its fallback, so the zero-initialised mirrors overwrote the seed (env HDR=1 became 0,
+// tonemap 1 became 0). Fill the mirrors from the same env-aware getters once, before the first push.
+static void ensureHdrMirrors()
+{
+	static bool s_ready = false;
+	if (s_ready) return;
+	s_ready = true;
+	OptionPreferences p;
+	s_hdrEnabled = (p.getHDREnabled() != FALSE) ? 1 : 0;
+	s_hdrExposure = p.getHDRExposure();
+	s_hdrTonemap = p.getHDRTonemap();
+	s_hdrScale = p.getRenderScale();
+	s_hdrAA = p.getPostAAMode();
+	s_autoExposure = (p.getAutoExposure() != FALSE) ? 1 : 0;
+	s_sharpen = p.getSharpen();
+	s_colorLut = (p.getColorLUT() != FALSE) ? 1 : 0;
+	// Restart-only knobs: the live renderer value is what is actually running.
+	s_hdrLive = DX8Wrapper::VK_HDR_Enabled() ? 1 : 0;
+	s_hdrScaleLive = DX8Wrapper::VK_Render_Scale();
+}
+
 static void pushHdrKnobs()
 {
-	DX8Wrapper::VK_Set_HDR_Knobs(s_hdrLive, (Real)s_hdrExposure * 0.01f,
-		s_hdrTonemap, s_hdrAA, s_hdrScaleLive);
+	ensureHdrMirrors();
+	// HDR and render scale cannot change live; always publish what the renderer is running so a
+	// sibling row's apply can never flip the mode. Exposure/tonemap/AA remain live mirrors.
+	DX8Wrapper::VK_Set_HDR_Knobs(DX8Wrapper::VK_HDR_Enabled() ? 1 : 0, (Real)s_hdrExposure * 0.01f,
+		s_hdrTonemap, s_hdrAA, DX8Wrapper::VK_Render_Scale());
 	pushPostExtras();
 	fprintf(stderr, "[HDR] apply hdr=%d exposure=%.2f tonemap=%d scale=%d aa=%d auto=%d sharp=%d lut=%d\n",
 		s_hdrLive, (double)s_hdrExposure * 0.01f, s_hdrTonemap, s_hdrScaleLive, s_hdrAA,
@@ -465,6 +516,32 @@ static void gameOptionApply_ColorLUT(Int on)
 {
 	s_colorLut = on != 0 ? 1 : 0;
 	pushPostExtras();
+}
+
+static Int gameOptionFallback_AO()
+{
+	OptionPreferences p;
+	s_ao = p.getAmbientOcclusion();
+	return s_ao;
+}
+
+static void gameOptionApply_AO(Int tick)
+{
+	s_ao = tick;
+	pushAoGrade();
+}
+
+static Int gameOptionFallback_FilmGrade()
+{
+	OptionPreferences p;
+	s_filmGrade = p.getFilmGrade() != FALSE ? 1 : 0;
+	return s_filmGrade;
+}
+
+static void gameOptionApply_FilmGrade(Int on)
+{
+	s_filmGrade = on != 0 ? 1 : 0;
+	pushAoGrade();
 }
 
 static const Int s_tonemapValues[] = { 0, 1, 2 };
@@ -825,12 +902,10 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 		s_roughnessValues, s_roughnessTexts, (Int)ARRAY_SIZE(s_roughnessValues), 0, 0,
 		gameOptionFallback_Roughness, gameOptionApply_Roughness,
 	},
-	{
-		GAME_OPTION_COMBO, "AntiAliasing", "ComboBoxAntiAliasing",
-		"StaticTextAntiAliasing", L"\u6297\u952f\u9f7f",
-		s_antiAliasingValues, s_antiAliasingTexts, (Int)ARRAY_SIZE(s_antiAliasingValues), 0, 0,
-		gameOptionFallback_AntiAliasing, gameOptionApply_AntiAliasing,
-	},
+	// GeneralsX @bugfix 28/10/2026: the retail "AntiAliasing" (MSAA Off/2X/4X/8X) row is deleted here and
+	// from GraphicsOptions.wnd. The Vulkan backend has no multisampling; the row's only reachable effect
+	// was a full-image present pass that also blurred the HUD. Scene-only AA is the Advanced page's
+	// "PostAA" row, which resolves the 3D scene before the UI is drawn.
 	// GeneralsX @feature Qoder 13/10/2026 Lighting option rows. After the popup crash bisect the
 	// seven gadgets live directly on the options page (inline layout in OptionsMenu.wnd); the
 	// generic init/save loops below drive them, so each row stays one table entry.
@@ -851,7 +926,7 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 	// tonemap and AA are plain uniforms.
 	{
 		GAME_OPTION_BOOL, "HDREnabled", "CheckHDR",
-		nullptr, L"HDR \u5e95\u7247",
+		nullptr, L"HDR \u6e32\u67d3\uff08\u91cd\u542f\u751f\u6548\uff09",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_HDR, gameOptionApply_HDR,
 	},
@@ -863,46 +938,61 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 	},
 	{
 		GAME_OPTION_COMBO, "HDRTonemap", "ComboBoxTonemap",
-		"StaticTextTonemap", L"Tonemap",
+		"StaticTextTonemap", L"\u8272\u8c03\u6620\u5c04\uff08\u98ce\u683c\u66f2\u7ebf\uff09",
 		s_tonemapValues, s_tonemapTexts, (Int)ARRAY_SIZE(s_tonemapValues), 0, 0,
 		gameOptionFallback_Tonemap, gameOptionApply_Tonemap,
 	},
 	{
 		GAME_OPTION_COMBO, "RenderScale", "ComboBoxRenderScale",
-		"StaticTextRenderScale", L"Render Scale",
+		"StaticTextRenderScale", L"\u6e32\u67d3\u7f29\u653e\uff08\u91cd\u542f\u751f\u6548\uff09",
 		s_renderScaleValues, s_renderScaleTexts, (Int)ARRAY_SIZE(s_renderScaleValues), 0, 0,
 		gameOptionFallback_RenderScale, gameOptionApply_RenderScale,
 	},
 	{
 		GAME_OPTION_COMBO, "PostAA", "ComboBoxPostAA",
-		"StaticTextPostAA", L"Post AA",
+		"StaticTextPostAA", L"\u540e\u5904\u7406\u6297\u952f\u9f7f",
 		s_postAAValues, s_postAATexts, (Int)ARRAY_SIZE(s_postAAValues), 0, 0,
 		gameOptionFallback_PostAA, gameOptionApply_PostAA,
 	},
 	{
 		GAME_OPTION_BOOL, "AutoExposure", "CheckAutoExposure",
-		nullptr, L"Auto Exposure",
+		nullptr, L"\u81ea\u52a8\u66dd\u5149",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_AutoExposure, gameOptionApply_AutoExposure,
 	},
 	{
 		GAME_OPTION_SLIDER, "Sharpen", "SliderSharpen",
-		"StaticTextSharpen", L"Sharpen (CAS)",
+		"StaticTextSharpen", L"\u9510\u5316\uff08CAS\uff09",
 		nullptr, nullptr, 0, 0, 200,
 		gameOptionFallback_Sharpen, gameOptionApply_Sharpen,
 	},
 	{
 		GAME_OPTION_BOOL, "ColorLUT", "CheckColorLUT",
-		nullptr, L"Color LUT",
+		nullptr, L"\u8272\u5f69 LUT",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_ColorLUT, gameOptionApply_ColorLUT,
+	},
+	// GeneralsX @feature 24/10/2026 P0: the two post defaults that used to be hard-coded are now rows.
+	// Both default to 0 so "Advanced all off" is the retail picture; AO 0.55 / grade on were the hidden
+	// reasons the image looked contrasty even with every other effect disabled.
+	{
+		GAME_OPTION_SLIDER, "AmbientOcclusion", "SliderAO",
+		"StaticTextAO", L"\u73af\u5883\u5149\u906e\u853d (AO)",
+		nullptr, nullptr, 0, 0, 150,
+		gameOptionFallback_AO, gameOptionApply_AO,
+	},
+	{
+		GAME_OPTION_BOOL, "FilmGrade", "CheckFilmGrade",
+		nullptr, L"\u80f6\u7247\u8c03\u8272 (\u5bf9\u6bd4/\u9971\u548c)",
+		nullptr, nullptr, 0, 0, 0,
+		gameOptionFallback_FilmGrade, gameOptionApply_FilmGrade,
 	},
 	// GeneralsX @refactor Qoder 20/10/2026: the sun-shadow rows (阴影浓度 / 阴影分辨率) are gone with
 	// W3DSunShadowMap. Both gadgets fed only that pass, so leaving them on the page would have been two
 	// dead knobs; the retail projected/volumetric shadow rows above remain live.
 	{
 		GAME_OPTION_BOOL, "ShadowMap", "CheckShadowMap",
-		nullptr, L"\u771f\u5b9e\u9634\u5f71\uff08\u5b9e\u9a8c\uff09",
+		nullptr, L"\u592a\u9633\u9634\u5f71",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_ShadowMap, gameOptionApply_ShadowMap,
 	},
@@ -930,7 +1020,7 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 	},
 	{
 		GAME_OPTION_COMBO, "TimeOfDayPreview", "ComboBoxTodPreview",
-		"StaticTextTodPreview", L"\u65f6\u523b\u9884\u89c8",
+		"StaticTextTodPreview", L"\u65f6\u523b\u9884\u89c8\uff08\u91cd\u542f\u751f\u6548\uff09",
 		s_todPreviewValues, s_todPreviewTexts, (Int)ARRAY_SIZE(s_todPreviewValues), 0, 0,
 		gameOptionFallback_TodPreview, nullptr,
 	},
@@ -952,7 +1042,7 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 	// so it showed as a checkbox that changed nothing. TerrainPerPixel is the single terrain switch.
 	{
 		GAME_OPTION_BOOL, "TerrainPerPixel", "CheckTerrainPerPixel",
-		nullptr, L"\u5730\u5f62\u9010\u50cf\u7d20\u5149\u7167\uff08\u5b9e\u9a8c\uff09",
+		nullptr, L"\u5730\u5f62\u9010\u50cf\u7d20\u5149\u7167",
 		nullptr, nullptr, 0, 0, 0,
 		gameOptionFallback_TerrainPerPixel, nullptr,
 	},
@@ -1039,15 +1129,13 @@ static const GameOptionDesc s_gameOptionRegistry[] =
 
 #define GAME_OPTION_COUNT (Int)ARRAY_SIZE(s_gameOptionRegistry)
 
-// GeneralsX @feature Qoder 13/10/2026 Slot set for the standalone GraphicsOptions.wnd page. The
-// graphics rows moved out of the retail options menu (.wnd blocks removed at the user's request),
-// so this is the only page driving the registry gadgets any more; the retail page keeps its own
-// hand-written controls untouched.
-static GameWindow *s_graphicsOptionControls[GAME_OPTION_COUNT] = { nullptr };
-
-static void initGameOptionControls( const OptionPreferences *optionsPref,
+// GeneralsX @feature Qoder 13/10/2026 Slot owner for the standalone graphics pages. Each page keeps
+// its own array (see GraphicsPageState below): both pages can be alive at once, and a shared array
+// would bind the Advanced rows to the graphics page windows underneath.
+static Int initGameOptionControls( const OptionPreferences *optionsPref,
 	const GameOptionDesc *registry, Int count, GameWindow **slots, const char *layoutPrefix )
 {
+	Int bound = 0;
 	for (Int i = 0; i < count; ++i)
 	{
 		const GameOptionDesc &desc = registry[i];
@@ -1057,11 +1145,9 @@ static void initGameOptionControls( const OptionPreferences *optionsPref,
 			TheNameKeyGenerator->nameToKey( fullName ) );
 		slots[i] = control;
 		if (!control)
-		{
-			fprintf( stderr, "[GFXOPT] missing gadget %s\n", fullName.str() );
-			fflush( stderr );
 			continue; // layout variant without this gadget: safe no-op
-		}
+
+		++bound;
 
 		if (desc.labelText)
 		{
@@ -1116,6 +1202,7 @@ static void initGameOptionControls( const OptionPreferences *optionsPref,
 			GadgetSliderSetPosition( control, value );
 		}
 	}
+	return bound;
 }
 
 static void saveGameOptionControls( OptionPreferences *optionsPref,
@@ -1128,6 +1215,8 @@ static void saveGameOptionControls( OptionPreferences *optionsPref,
 		slots[i] = nullptr; // consumed for this page session; init repopulates on the next open
 		if (!control)
 			continue;
+		if (gameOptionEnvOwns(desc))
+			continue; // QA env override: do not persist it into Options.ini
 
 		Int value = 0;
 		if (desc.type == GAME_OPTION_COMBO)
@@ -1165,6 +1254,8 @@ void ApplyGameOptionRegistryAtStartup()
 		const GameOptionDesc &desc = s_gameOptionRegistry[i];
 		if (!desc.apply)
 			continue;
+		if (gameOptionEnvOwns(desc))
+			continue; // env override wins over the saved key
 		if (optionsPref.getAsciiString( desc.iniKey, AsciiString() ).isEmpty() )
 			continue;
 		desc.apply( optionsPref.getInt( desc.iniKey, desc.globalFallback() ) );
@@ -1172,165 +1263,345 @@ void ApplyGameOptionRegistryAtStartup()
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options page (menu rework plan S1b).
-// Shared preferences handle (declared here, further down this file, for the graphics page
-// callbacks below; definition moved up because the new callbacks run the registry save loop).
+// GeneralsX @feature Qoder 13/10/2026 Standalone graphics options pages (menu rework plan S1b).
+// Two pages can be alive at the same time: GraphicsOptions.wnd and the Advanced page stacked on top
+// of it. Each keeps its own gadget slots, because the registry is shared and one slot array would
+// bind the Advanced rows to the (still allocated) graphics page windows.
 static OptionPreferences *pref = nullptr;
 
-//-------------------------------------------------------------------------------------------------
-// GeneralsX @feature Qoder 13/10/2026 The in-game pause menu opens the graphics page as a persistent
-// overlay - exactly like the retail options page (getOptionsLayout + bringForward) - and NOT as a
-// shell-stack push. Inside a live match the shell stack still has the shell main menu linked under it,
-// so a "@push"/"@pop" there popped back onto that screen and flung the player out to the main menu. The
-// overlay is stacked over the pause menu and merely destroyed on close, so we return to whatever was
-// underneath. The main-menu entry keeps the declarative @push/@pop stack path (unchanged).
-static WindowLayout *s_graphicsLayout = nullptr;
-
-void OpenGraphicsOptionsLayout()
+struct GraphicsPageState
 {
-	// GeneralsX @feature 23/10/2026 P6 QA: GENERALSX_GFX_ADV_TEST=1 opens the advanced page directly,
-	// so the new rows can be smoke-tested without a mouse. The shipping path is unchanged.
-	static const char* s_advTest = getenv("GENERALSX_GFX_ADV_TEST");
-	const char* layoutName = (s_advTest && *s_advTest && atoi(s_advTest) != 0)
-		? "Menus/GraphicsAdvanced.wnd" : "Menus/GraphicsOptions.wnd";
-	if (!s_graphicsLayout)
-		s_graphicsLayout = TheWindowManager->winCreateLayout( layoutName );
-	if (!s_graphicsLayout)
-	{
-		fprintf( stderr, "[GFXOPT] winCreateLayout(%s) FAILED\n", layoutName );
-		fflush( stderr );
+	WindowLayout *layout;
+	GameWindow *controls[GAME_OPTION_COUNT];
+};
+
+static GraphicsPageState s_graphicsPage = { nullptr, { nullptr } };
+static GraphicsPageState s_advancedPage = { nullptr, { nullptr } };
+
+// TRUE when the graphics page was created by OpenGraphicsOptionsLayout() (in-game pause menu / QA
+// hook) instead of being pushed on the shell stack by the main menu.
+static Bool s_graphicsPageIsOverlay = FALSE;
+
+// Last weather row applied live, so re-selecting the same row does not rebuild the weather.
+static Int s_weatherLastSelection = -999;
+
+static const char *const s_graphicsPageName = "GraphicsOptions.wnd";
+static const char *const s_advancedPageName = "GraphicsAdvanced.wnd";
+
+static Bool layoutIsAdvancedGraphics( const WindowLayout *layout )
+{
+	return layout != nullptr && layout->getFilename().endsWithNoCase( s_advancedPageName );
+}
+
+static GameWindow *graphicsPageControl( const char *pageName, const char *controlName )
+{
+	AsciiString fullName;
+	fullName.format( "%s:%s", pageName, controlName );
+	return TheWindowManager->winGetWindowFromId( nullptr,
+		TheNameKeyGenerator->nameToKey( fullName ) );
+}
+
+static NameKeyType graphicsPageButton( const char *pageName, const char *buttonName )
+{
+	AsciiString fullName;
+	fullName.format( "%s:%s", pageName, buttonName );
+	return TheNameKeyGenerator->nameToKey( fullName );
+}
+
+// The layout a window belongs to. Only root windows carry the layout pointer (see GameWindow.h).
+static WindowLayout *controlLayout( GameWindow *control )
+{
+	while( control && control->winGetParent() )
+		control = control->winGetParent();
+	return control ? control->winGetLayout() : nullptr;
+}
+
+static void releaseGraphicsPreferencesIfUnused()
+{
+	if( s_graphicsPage.layout || s_advancedPage.layout )
 		return;
+	if( pref )
+	{
+		delete pref;
+		pref = nullptr;
 	}
+}
 
-	fprintf( stderr, "[GFXOPT] layout=%p runInit start\n", (void *)s_graphicsLayout );
-	fflush( stderr );
-	s_graphicsLayout->runInit();
-	s_graphicsLayout->hide( FALSE );
-	s_graphicsLayout->bringForward();
-	fprintf( stderr, "[GFXOPT] runInit done\n" );
-	fflush( stderr );
+// Live vegetation/weather preview shared by the checkbox, slider and combo paths. The gadgets are
+// resolved on every call: caching them in statics handed the graphics page pointers into the
+// Advanced page's windows, and those die when the Advanced page closes.
+static void syncGraphicsPreviewControls()
+{
+	GameWindow *checkVegetation = graphicsPageControl( s_graphicsPageName, "CheckVegetation" );
+	GameWindow *checkGrass = graphicsPageControl( s_graphicsPageName, "CheckGrass" );
+	GameWindow *checkRocks = graphicsPageControl( s_graphicsPageName, "CheckRocks" );
+	GameWindow *sliderDensity = graphicsPageControl( s_graphicsPageName, "SliderGrassDensity" );
+	GameWindow *sliderHeight = graphicsPageControl( s_graphicsPageName, "SliderGrassHeight" );
+	GameWindow *sliderDistance = graphicsPageControl( s_graphicsPageName, "SliderGrassDistance" );
+	GameWindow *sliderRockDensity = graphicsPageControl( s_graphicsPageName, "SliderRockDensity" );
+	GameWindow *comboWeather = graphicsPageControl( s_graphicsPageName, "ComboBoxWeather" );
 
-	GameWindow *root = s_graphicsLayout->getFirstWindow();
-	if (root)
+	if( checkVegetation ) g_vegetationRenderOptions.enabled = GadgetCheckBoxIsChecked( checkVegetation ) ? TRUE : FALSE;
+	if( checkGrass )      g_vegetationRenderOptions.grassEnabled = GadgetCheckBoxIsChecked( checkGrass ) ? TRUE : FALSE;
+	if( checkRocks )      g_vegetationRenderOptions.rocksEnabled = GadgetCheckBoxIsChecked( checkRocks ) ? TRUE : FALSE;
+	if( sliderDensity )   g_vegetationRenderOptions.grassDensity = (Real)GadgetSliderGetPosition( sliderDensity );
+	if( sliderHeight )    g_vegetationRenderOptions.grassHeightScale = (Real)GadgetSliderGetPosition( sliderHeight );
+	if( sliderDistance )  g_vegetationRenderOptions.grassDistanceScale = (Real)GadgetSliderGetPosition( sliderDistance );
+	if( sliderRockDensity ) g_vegetationRenderOptions.rockDensity = (Real)GadgetSliderGetPosition( sliderRockDensity );
+
+	if( comboWeather )
+	{
+		Int sel = 0;
+		GadgetComboBoxGetSelectedPos( comboWeather, &sel );
+		if( sel != s_weatherLastSelection )
+		{
+			s_weatherLastSelection = sel;
+			if( TheSnowManager )
+				TheSnowManager->setUserWeatherOverride( sel - 1 );	// entry 0 = follow map
+		}
+	}
+}
+
+static void showGraphicsLayout( WindowLayout *layout )
+{
+	if( !layout )
+		return;
+
+	layout->hide( FALSE );
+	layout->bringForward();
+
+	GameWindow *root = layout->getFirstWindow();
+	if( root )
 	{
 		TheWindowManager->winSetModal( root );
 		TheWindowManager->winSetFocus( root );
 	}
 }
 
-static void CloseGraphicsOptionsLayout( Bool save )
+// GeneralsX @bugfix Qoder 23/10/2026 The Advanced page is a stacked overlay, never a shell screen.
+// Closing it destroys only itself and uncovers the graphics page underneath; the shell stack is not
+// touched, so a pop can no longer land on the hidden main menu.
+static void closeAdvancedGraphicsLayout( Bool save )
 {
-	if (save)
+	WindowLayout *layout = s_advancedPage.layout;
+
+	fprintf( stderr, "[GFXOPT] close %s save=%d below=%p\n",
+		s_advancedPageName, save ? 1 : 0, (void *)s_graphicsPage.layout );
+	fflush( stderr );
+
+	if( layout )
 	{
-		saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls );
-		if (pref)
+		if( save && pref )
 		{
+			saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_advancedPage.controls );
 			pref->write();
-			delete pref;
-			pref = nullptr;
 		}
-	}
-	else if (pref)
-	{
-		delete pref;
-		pref = nullptr;
+
+		for( Int i = 0; i < GAME_OPTION_COUNT; ++i )
+			s_advancedPage.controls[i] = nullptr;
+
+		layout->destroyWindows();
+		deleteInstance( layout );
+		s_advancedPage.layout = nullptr;
 	}
 
-	if (s_graphicsLayout)
+	// Return to the graphics page that opened this one. It was only hidden, so its gadget values and
+	// live previews are still the ones the player left there.
+	if( s_graphicsPage.layout )
 	{
-		s_graphicsLayout->destroyWindows();
-		deleteInstance( s_graphicsLayout );
-		s_graphicsLayout = nullptr;
+		showGraphicsLayout( s_graphicsPage.layout );
+		return;
 	}
 
-	// the gadget pointers dangled the moment the windows were freed
-	for (Int i = 0; i < GAME_OPTION_COUNT; ++i)
-		s_graphicsOptionControls[i] = nullptr;
+	releaseGraphicsPreferencesIfUnused();
 }
 
-// A second entry over the SAME registry rows, opened from the new main-menu button via the
-// declarative "@push Menus/GraphicsOptions.wnd" verb. The layout clones every graphics gadget with
-// the GraphicsOptions.wnd: prefix, so init/save just re-run the generic loops against a second
-// slot array; both pages write identical Options.ini keys and stay consistent because Shell
-// push/pop unloads the page below, and each reopen re-reads the ini through its own init.
-void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
+static void openAdvancedGraphicsLayout()
 {
-	fprintf( stderr, "[GFXOPT] GraphicsOptionsMenuInit start quitting=%d pref=%p\n",
-		TheGameEngine ? (int)TheGameEngine->getQuitting() : -1, (void *)pref );
-	fflush( stderr );
-	if (TheGameEngine->getQuitting())
+	if( s_advancedPage.layout )
+	{
+		showGraphicsLayout( s_advancedPage.layout );
 		return;
+	}
 
-	if (!pref)
+	if( !pref )
 		pref = NEW OptionPreferences;
 
-	initGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls,
-		"GraphicsOptions.wnd" );
-	fprintf( stderr, "[GFXOPT] GraphicsOptionsMenuInit controls done\n" );
+	fprintf( stderr, "[GFXOPT] opening Menus/GraphicsAdvanced.wnd\n" );
 	fflush( stderr );
 
-	// Title label comes from code: the localized string table lives inside a BIG, so the loose
-	// layout keeps TEXT = "[None]" (same pattern as the main-menu Chinese button labels).
-	GameWindow *title = TheWindowManager->winGetWindowFromId( nullptr,
-		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:StaticTextTitle" ) );
-	if (title)
-		GadgetStaticTextSetText( title, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
-	GameWindow *advTitle = TheWindowManager->winGetWindowFromId( nullptr,
-		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:StaticTextAdvTitle" ) );
-	if (advTitle)
-		GadgetStaticTextSetText( advTitle, UnicodeString( L"Advanced Graphics" ) );
-	GameWindow *advButton = TheWindowManager->winGetWindowFromId( nullptr,
-		TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonAdvanced@push Menus/GraphicsAdvanced.wnd" ) );
-	if (advButton)
-		GadgetButtonSetText( advButton, UnicodeString( L"Advanced" ) );
+	WindowLayout *layout = TheWindowManager->winCreateLayout( "Menus/GraphicsAdvanced.wnd" );
+	if( !layout )
+	{
+		fprintf( stderr, "[GFXOPT] winCreateLayout(Menus/GraphicsAdvanced.wnd) FAILED\n" );
+		fflush( stderr );
+		releaseGraphicsPreferencesIfUnused();
+		return;
+	}
+
+	layout->runInit();
+	showGraphicsLayout( layout );
+
+	// The page below stays alive (and keeps its unsaved gadget values); it is only hidden so the
+	// Advanced overlay is the only page drawn and the only page receiving input.
+	if( s_graphicsPage.layout )
+		s_graphicsPage.layout->hide( TRUE );
+}
+
+void OpenGraphicsOptionsLayout()
+{
+	// GeneralsX @feature 23/10/2026 P6 QA: GENERALSX_GFX_ADV_TEST=1 opens the advanced page directly,
+	// so the new rows can be smoke-tested without a mouse. The shipping path is unchanged.
+	static const char *s_advTest = getenv( "GENERALSX_GFX_ADV_TEST" );
+	if( s_advTest && *s_advTest && atoi( s_advTest ) != 0 )
+	{
+		openAdvancedGraphicsLayout();
+		return;
+	}
+
+	if( s_graphicsPage.layout )
+	{
+		showGraphicsLayout( s_graphicsPage.layout );
+		return;
+	}
+
+	if( !pref )
+		pref = NEW OptionPreferences;
+
+	fprintf( stderr, "[GFXOPT] opening Menus/GraphicsOptions.wnd as an overlay\n" );
+	fflush( stderr );
+
+	WindowLayout *layout = TheWindowManager->winCreateLayout( "Menus/GraphicsOptions.wnd" );
+	if( !layout )
+	{
+		fprintf( stderr, "[GFXOPT] winCreateLayout(Menus/GraphicsOptions.wnd) FAILED\n" );
+		fflush( stderr );
+		releaseGraphicsPreferencesIfUnused();
+		return;
+	}
+
+	s_graphicsPageIsOverlay = TRUE;
+	layout->runInit();
+	showGraphicsLayout( layout );
+}
+
+static void CloseGraphicsOptionsLayout( Bool save )
+{
+	fprintf( stderr, "[GFXOPT] close %s save=%d\n", s_graphicsPageName, save ? 1 : 0 );
+	fflush( stderr );
+
+	if( s_graphicsPage.layout )
+	{
+		if( save && pref )
+		{
+			saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsPage.controls );
+			pref->write();
+		}
+
+		for( Int i = 0; i < GAME_OPTION_COUNT; ++i )
+			s_graphicsPage.controls[i] = nullptr;
+
+		s_graphicsPage.layout->destroyWindows();
+		deleteInstance( s_graphicsPage.layout );
+		s_graphicsPage.layout = nullptr;
+	}
+
+	s_graphicsPageIsOverlay = FALSE;
+	releaseGraphicsPreferencesIfUnused();
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsX @bugfix Qoder 13/10/2026 Shell::pop() only completes when the layout's shutdown
-// callback reports back via Shell::shutdownComplete(); the retail options page routes its back
-// button through DestroyOptionsLayout instead, so the generated graphics page (pure @pop/@push
-// navigation) hung with every exit button dead until this LAYOUTSHUTDOWN existed.
+// GeneralsX @bugfix Qoder 23/10/2026 A shell-pushed page restores itself here. Shell::doPop() only
+// re-runs LAYOUTINIT and never calls hide(FALSE), so without this the graphics page stayed hidden
+// after the Advanced page closed and the whole options window appeared to disappear.
+void GraphicsOptionsMenuInit( WindowLayout *layout, void *userData )
+{
+	const Bool advanced = layoutIsAdvancedGraphics( layout );
+
+	if( TheGameEngine->getQuitting() )
+		return;
+
+	if( !pref )
+		pref = NEW OptionPreferences;
+
+	GraphicsPageState &page = advanced ? s_advancedPage : s_graphicsPage;
+	page.layout = layout;
+
+	const char *prefix = advanced ? s_advancedPageName : s_graphicsPageName;
+	const Int bound = initGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, page.controls, prefix );
+	s_weatherLastSelection = -999;
+
+	fprintf( stderr, "[GFXOPT] init %s layout=%p pref=%p gadgets=%d/%d\n",
+		prefix, (void *)layout, (void *)pref, bound, GAME_OPTION_COUNT );
+	fflush( stderr );
+
+	// Title labels come from code: the localized string table lives inside a BIG, so the loose
+	// layout keeps TEXT = "[None]" (same pattern as the main-menu Chinese button labels).
+	GameWindow *title = graphicsPageControl( prefix, "StaticTextTitle" );
+	if( title )
+		GadgetStaticTextSetText( title, UnicodeString( L"\u56fe\u5f62\u9009\u9879" ) );
+
+	GameWindow *advTitle = graphicsPageControl( prefix, "StaticTextAdvTitle" );
+	if( advTitle )
+		GadgetStaticTextSetText( advTitle, UnicodeString( L"Advanced Graphics" ) );
+
+	GameWindow *advButton = graphicsPageControl( prefix, "ButtonAdvanced" );
+	if( advButton )
+		GadgetButtonSetText( advButton, UnicodeString( L"Advanced" ) );
+
+	layout->hide( FALSE );
+	layout->bringForward();
+}
+
+//-------------------------------------------------------------------------------------------------
 void GraphicsOptionsMenuShutdown( WindowLayout *layout, void *userData )
 {
-	// the gadgets die with the layout: drop the cached pointers before the windows are freed
-	for (Int i = 0; i < GAME_OPTION_COUNT; ++i)
-		s_graphicsOptionControls[i] = nullptr;
+	const Bool advanced = layoutIsAdvancedGraphics( layout );
+	GraphicsPageState &page = advanced ? s_advancedPage : s_graphicsPage;
 
-	// the preferences handle is only persisted on Accept; any other exit discards it
-	if (pref)
-	{
-		delete pref;
-		pref = nullptr;
-	}
+	fprintf( stderr, "[GFXOPT] shutdown %s\n", advanced ? s_advancedPageName : s_graphicsPageName );
+	fflush( stderr );
+
+	for( Int i = 0; i < GAME_OPTION_COUNT; ++i )
+		page.controls[i] = nullptr;
+	if( page.layout == layout )
+		page.layout = nullptr;
+	if( !advanced )
+		s_graphicsPageIsOverlay = FALSE;
 
 	layout->hide( TRUE );
+
+	// The shell only shuts down the graphics page; the Advanced page is destroyed directly by
+	// closeAdvancedGraphicsLayout(). Drop any leftover first, so it cannot outlive its parent.
+	if( s_advancedPage.layout )
+		closeAdvancedGraphicsLayout( FALSE );
+
+	releaseGraphicsPreferencesIfUnused();
+
 	TheShell->shutdownComplete( layout );
 }
 
 //-------------------------------------------------------------------------------------------------
-/** graphics options menu window input callback - Esc routes to the @pop back button */
+/** graphics options menu window input callback - Esc closes the topmost page */
 //-------------------------------------------------------------------------------------------------
 WindowMsgHandledType GraphicsOptionsMenuInput( GameWindow *window, UnsignedInt msg,
 																				 WindowMsgData mData1, WindowMsgData mData2 )
 {
-	if (msg == GWM_CHAR && mData1 == KEY_ESC)
+	if( msg == GWM_CHAR && mData1 == KEY_ESC )
 	{
-		if (BitIsSet((Byte)mData2, KEY_STATE_UP))
+		if( BitIsSet( (Byte)mData2, KEY_STATE_UP ) )
 		{
-			// GeneralsX @bugfix Qoder 13/10/2026 In-game the page is a persistent overlay, so Esc
-			// destroys it (back to the pause menu). Only the main-menu shell entry routes Esc to the
-			// "@pop" back button, because there the page really is on the shell stack.
-			if (TheGameLogic && TheGameLogic->isInGame()
-				&& TheGameLogic->getGameMode() != GAME_SHELL)
+			// GeneralsX @bugfix Qoder 23/10/2026 Close the page that is actually on top: the Advanced
+			// overlay first, otherwise the graphics page (overlay or shell screen).
+			if( s_advancedPage.layout )
+				closeAdvancedGraphicsLayout( FALSE );
+			else if( s_graphicsPage.layout )
 			{
-				CloseGraphicsOptionsLayout( FALSE );
-				return MSG_HANDLED;
+				if( s_graphicsPageIsOverlay )
+					CloseGraphicsOptionsLayout( FALSE );
+				else
+					TheShell->pop();
 			}
-
-			NameKeyType buttonID = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonBack@pop" );
-			GameWindow *button = TheWindowManager->winGetWindowFromId( nullptr, buttonID );
-			TheWindowManager->winSendSystemMsg( window, GBM_SELECTED,
-				(WindowMsgData)button, buttonID );
 		}
 		return MSG_HANDLED;
 	}
@@ -1343,67 +1614,20 @@ WindowMsgHandledType GraphicsOptionsMenuInput( GameWindow *window, UnsignedInt m
 WindowMsgHandledType GraphicsOptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 																					WindowMsgData mData1, WindowMsgData mData2 )
 {
-	static NameKeyType buttonGraphicsAccept = NAMEKEY_INVALID;
-	static NameKeyType buttonGraphicsBack = NAMEKEY_INVALID;
-	// GeneralsX @feature Qoder 21/10/2026 live vegetation/weather controls.
-	static GameWindow *vegCheckVegetation = nullptr, *vegCheckGrass = nullptr, *vegCheckRocks = nullptr;
-	static GameWindow *vegSliderDensity = nullptr, *vegSliderHeight = nullptr;
-	static GameWindow *vegSliderDistance = nullptr, *vegSliderRockDensity = nullptr;
-	static GameWindow *vegComboWeather = nullptr;
-	static Int vegLastWeather = -999;
-
 	switch( msg )
 	{
-		case GWM_CREATE:
-			buttonGraphicsAccept = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonGraphicsAccept" );
-			buttonGraphicsBack = TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ButtonBack@pop" );
-			vegCheckVegetation = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckVegetation" ) );
-			vegCheckGrass = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckGrass" ) );
-			vegCheckRocks = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:CheckRocks" ) );
-			vegSliderDensity = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassDensity" ) );
-			vegSliderHeight = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassHeight" ) );
-			vegSliderDistance = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderGrassDistance" ) );
-			vegSliderRockDensity = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:SliderRockDensity" ) );
-			vegComboWeather = TheWindowManager->winGetWindowFromId( nullptr,
-				TheNameKeyGenerator->nameToKey( "GraphicsOptions.wnd:ComboBoxWeather" ) );
-			break;
-
+		// GeneralsX @bugfix Qoder 23/10/2026 Resolve the preview gadgets on every message instead of
+		// caching pointers at GWM_CREATE: opening the Advanced page used to overwrite the cache with
+		// that page's (mostly missing) gadgets, so the graphics page lost live preview afterwards.
 		case GSM_SLIDER_TRACK:
 		case GSM_SLIDER_DONE:
-		{
-			// Preview density/height/distance while the thumb moves; Accept writes the same values.
-			if (vegSliderDensity && GadgetSliderGetPosition(vegSliderDensity) >= 0)
-				g_vegetationRenderOptions.grassDensity = (Real)GadgetSliderGetPosition(vegSliderDensity);
-			if (vegSliderHeight && GadgetSliderGetPosition(vegSliderHeight) >= 0)
-				g_vegetationRenderOptions.grassHeightScale = (Real)GadgetSliderGetPosition(vegSliderHeight);
-			if (vegSliderDistance && GadgetSliderGetPosition(vegSliderDistance) >= 0)
-				g_vegetationRenderOptions.grassDistanceScale = (Real)GadgetSliderGetPosition(vegSliderDistance);
-			if (vegSliderRockDensity && GadgetSliderGetPosition(vegSliderRockDensity) >= 0)
-				g_vegetationRenderOptions.rockDensity = (Real)GadgetSliderGetPosition(vegSliderRockDensity);
+			syncGraphicsPreviewControls();
 			break;
-		}
 
 		case GCM_SELECTED:
-			// GeneralsX @feature Qoder 21/10/2026: the combo commits its row selection to the owner as
-			// GCM_SELECTED (not GBM_SELECTED), so the weather preset must be applied here to be instant.
-			if (vegComboWeather)
-			{
-				Int sel = 0;
-				GadgetComboBoxGetSelectedPos(vegComboWeather, &sel);
-				if (sel != vegLastWeather)
-				{
-					vegLastWeather = sel;
-					if (TheSnowManager)
-						TheSnowManager->setUserWeatherOverride(sel - 1);
-				}
-			}
+			// The combo commits its row selection to the owner as GCM_SELECTED (not GBM_SELECTED),
+			// so the weather preset must be applied here to be instant.
+			syncGraphicsPreviewControls();
 			break;
 
 		case GWM_INPUT_FOCUS:
@@ -1417,65 +1641,59 @@ WindowMsgHandledType GraphicsOptionsMenuSystem( GameWindow *window, UnsignedInt 
 			if( !control )
 				break;
 
-			// GeneralsX @feature Qoder 21/10/2026 live sync for the vegetation/weather rows. Reading the
-			// gadgets (not the click target) covers checkboxes, sliders and the combo's listbox alike.
-			if (vegCheckVegetation) g_vegetationRenderOptions.enabled = GadgetCheckBoxIsChecked(vegCheckVegetation) ? TRUE : FALSE;
-			if (vegCheckGrass)      g_vegetationRenderOptions.grassEnabled = GadgetCheckBoxIsChecked(vegCheckGrass) ? TRUE : FALSE;
-			if (vegCheckRocks)      g_vegetationRenderOptions.rocksEnabled = GadgetCheckBoxIsChecked(vegCheckRocks) ? TRUE : FALSE;
-			if (vegSliderDensity)   g_vegetationRenderOptions.grassDensity = (Real)GadgetSliderGetPosition(vegSliderDensity);
-			if (vegSliderHeight)    g_vegetationRenderOptions.grassHeightScale = (Real)GadgetSliderGetPosition(vegSliderHeight);
-			if (vegSliderDistance)  g_vegetationRenderOptions.grassDistanceScale = (Real)GadgetSliderGetPosition(vegSliderDistance);
-			if (vegSliderRockDensity) g_vegetationRenderOptions.rockDensity = (Real)GadgetSliderGetPosition(vegSliderRockDensity);
-			if (vegComboWeather)
+			const Bool onAdvancedPage = layoutIsAdvancedGraphics( controlLayout( control ) );
+			const Int controlID = control->winGetWindowId();
+
+			// GeneralsX @bugfix Qoder 23/10/2026 Open the Advanced page as an overlay handled in code,
+			// not via the old "@push Menus/GraphicsAdvanced.wnd" verb. In-game that push polluted the
+			// shell stack, and popping it returned to the hidden main menu instead of this page.
+			if( !onAdvancedPage
+				&& controlID == graphicsPageButton( s_graphicsPageName, "ButtonAdvanced" ) )
 			{
-				Int sel = 0;
-				GadgetComboBoxGetSelectedPos(vegComboWeather, &sel);
-				if (sel != vegLastWeather)
-				{
-					vegLastWeather = sel;
-					if (TheSnowManager)
-						TheSnowManager->setUserWeatherOverride(sel - 1);	// entry 0 = follow map
-				}
+				openAdvancedGraphicsLayout();
+				return MSG_HANDLED;
 			}
 
-			// GeneralsX @bugfix Qoder 13/10/2026 In-game the page is a persistent overlay over the
-			// pause menu, so Accept/Back destroy that overlay instead of popping the shell stack (a
-			// shell pop here would expose the shell main menu still linked underneath and kick the
-			// player out to it). Only the main-menu (shell) entry uses the @pop / TheShell->pop path.
-			if (TheGameLogic && TheGameLogic->isInGame()
-				&& TheGameLogic->getGameMode() != GAME_SHELL)
+			if( onAdvancedPage )
 			{
-				Int inGameControlID = control->winGetWindowId();
-				if (inGameControlID == buttonGraphicsAccept)
-				{
+				if( controlID == graphicsPageButton( s_advancedPageName, "ButtonGraphicsAccept" ) )
+					closeAdvancedGraphicsLayout( TRUE );
+				else if( controlID == graphicsPageButton( s_advancedPageName, "ButtonBack" ) )
+					closeAdvancedGraphicsLayout( FALSE );
+				// checkboxes/sliders/combos keep their own gadget handling
+				break;
+			}
+
+			syncGraphicsPreviewControls();
+
+			if( controlID == graphicsPageButton( s_graphicsPageName, "ButtonGraphicsAccept" ) )
+			{
+				if( s_graphicsPageIsOverlay )
 					CloseGraphicsOptionsLayout( TRUE );
-					return MSG_HANDLED;
-				}
-				if (inGameControlID == buttonGraphicsBack)
+				else
 				{
-					CloseGraphicsOptionsLayout( FALSE );
-					return MSG_HANDLED;
+					if( pref )
+					{
+						saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsPage.controls );
+						pref->write();
+					}
+					TheShell->pop();
 				}
-				// combos / checkboxes / sliders keep their own gadget handling
-				return MSG_IGNORED;
+				return MSG_HANDLED;
 			}
 
-			// Declarative "@pop" back button (framework verb, no per-button C++ needed).
+			if( controlID == graphicsPageButton( s_graphicsPageName, "ButtonBack" ) )
+			{
+				if( s_graphicsPageIsOverlay )
+					CloseGraphicsOptionsLayout( FALSE );
+				else
+					TheShell->pop();
+				return MSG_HANDLED;
+			}
+
+			// Declarative "@verb args" buttons keep working (none on these two pages today).
 			if( MenuCommandRegistry::dispatchControl( control ) )
 				return MSG_HANDLED;
-
-			if( control->winGetWindowId() == buttonGraphicsAccept )
-			{
-				saveGameOptionControls( pref, s_gameOptionRegistry, GAME_OPTION_COUNT, s_graphicsOptionControls );
-				if (pref)
-				{
-					pref->write();
-					delete pref;
-					pref = nullptr;
-				}
-				TheShell->pop();
-				return MSG_HANDLED;
-			}
 			break;
 		}
 

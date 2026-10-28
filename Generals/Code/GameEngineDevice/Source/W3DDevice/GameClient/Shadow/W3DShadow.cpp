@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -72,18 +72,24 @@ void PrepareShadows()
 void DoShadows(RenderInfoClass & rinfo, Bool stencilPass)
 {
 	//USE_PERF_TIMER(shadowsRender)
+
 	shadowCameraFrustum=&rinfo.Camera.Get_Frustum();
 	Int projectionCount=0;
 
+	// GeneralsX @feature Qoder 20/10/2026: the options-page "ShadowMap" row owns the sun shadow. When it
+	// is on, VK_Retail_Shadow_Off() mutes both retail managers and the native Vulkan pass draws the sun
+	// instead. The end-of-frame reset below still runs so the shadow scene flag does not stick.
+	const Bool retailOff = DX8Wrapper::VK_Retail_Shadow_Off();
+
 	//Projected shadows render first because they may fill the stencil buffer
 	//which will be used by the shadow volumes
-	if (stencilPass == FALSE  && TheW3DProjectedShadowManager)
+	if (stencilPass == FALSE  && TheW3DProjectedShadowManager && !retailOff)
 	{
 			if (TheW3DShadowManager->isShadowScene())
 				projectionCount=TheW3DProjectedShadowManager->renderShadows(rinfo);
 	}
 
-	if (stencilPass == TRUE && TheW3DVolumetricShadowManager)
+	if (stencilPass == TRUE && TheW3DVolumetricShadowManager && !retailOff)
 	{
 
 //		TheW3DShadowManager->loadTerrainShadows();
@@ -106,6 +112,10 @@ W3DShadowManager::W3DShadowManager()
 	m_shadowColor = 0x7fa0a0a0;
 	m_isShadowScene = FALSE;
 	m_stencilShadowMask = 0;	//all bits can be used for storing shadows.
+
+	// GeneralsX @refactor Qoder 20/10/2026: the retail path is fixed again. Density and tint no longer
+	// come from Options.ini - those two rows now drive the native sun shadow, and the retail managers
+	// keep the original constants so this path renders exactly like the retail game.
 
 	Vector3 lightRay(-TheGlobalData->m_terrainLightPos[0].x,
 		-TheGlobalData->m_terrainLightPos[0].y, -TheGlobalData->m_terrainLightPos[0].z);
@@ -183,7 +193,19 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	if (shadowInfo)
 		type = shadowInfo->m_type;
 
-	// GeneralsX @bugfix Copilot 11/05/2026 ShadowType is bitmask; route by mask instead of exact enum value.
+	// GeneralsX @debug Qoder 11/10/2026 T3-0 shadow-bug probe: identify which shadow
+	// system serves each object (infantry square shadows). First N registrations only.
+	{
+		static Int probeCount = 0;
+		if (probeCount < 300) {
+			++probeCount;
+			fprintf(stderr, "[SHADOWPROBE] addShadow type=0x%02x name=%s\n", (unsigned)type,
+				(robj && robj->Get_Name()) ? robj->Get_Name() : "?");
+			fflush(stderr);
+		}
+	}
+
+	// GeneralsX @bugfix BenderAI 21/03/2026 ShadowType contains bit flags; route by mask instead of exact enum value.
 	if (type & SHADOW_VOLUME)
 	{
 		if (TheW3DVolumetricShadowManager)

@@ -402,6 +402,12 @@ public:
 	void verifyMetaMap();
 
 	const MetaMapRec *getFirstMetaMapRec() const { return m_metaMaps; }
+
+	// GeneralsX @feature 25/10/2026 Launcher key-binding contract. The file uses one line per
+	// command: commandName|keyName|modifierName. Unknown names are ignored so an older file stays
+	// usable after a command-table update.
+	void writeKeyMap(const char *path) const;
+	void loadKeyMap(const char *path);
 };
 
 extern MetaMap *TheMetaMap;

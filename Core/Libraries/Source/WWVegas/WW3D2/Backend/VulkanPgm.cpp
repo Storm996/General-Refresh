@@ -277,6 +277,39 @@ unsigned VKPgm_Note_Compiled(void* handle, int isPixel, const char* hlslSource, 
     return p->tag;
 }
 
+unsigned VKPgm_Bind_Tag(void* handle, int isPixel, unsigned tag)
+{
+    if (!VKPgm_On() || !handle || !tag) return 0u;
+    const unsigned pix = (unsigned)(isPixel ? 1 : 0);
+    const VKPgm_Program* p = nullptr;
+    const unsigned n = program_count_total();
+    for (unsigned i = 0; i < n; ++i) {
+        const VKPgm_Program* q = program_at_total(i);
+        if (q->tag == tag && q->is_pixel == pix) { p = q; break; }
+    }
+    if (!p) {
+        VKWP1_LOG("wedge8 forced binding: tag %u has no %s program", tag, isPixel ? "PS" : "VS");
+        return 0u;
+    }
+    for (unsigned i = 0; i < sBindCount; ++i) {
+        if (sBind[i].handle == handle && sBind[i].is_pixel == pix) {
+            sBind[i].tag = p->tag;
+            return p->tag;
+        }
+    }
+    if (sBindCount >= VKPGM_MAX_BINDINGS) {
+        VKWP1_LOG("wedge8 binding table full (%u) - forced %s stays on the D3D9 path", sBindCount, p->name);
+        return 0u;
+    }
+    sBind[sBindCount].handle = handle;
+    sBind[sBindCount].tag = p->tag;
+    sBind[sBindCount].is_pixel = pix;
+    ++sBindCount;
+    ++sStats.matched;
+    VKWP1_LOG("wedge8 program forced: %s tag=%u handle=%p", p->name, p->tag, handle);
+    return p->tag;
+}
+
 unsigned VKPgm_Tag_For_Handle(void* handle, int isPixel)
 {
     if (!VKPgm_On() || !handle) return 0u;
@@ -374,6 +407,7 @@ bool VKPgm_On() { return false; }
 unsigned VKPgm_Program_Count() { return 0u; }
 const VKPgm_Program* VKPgm_Program_At(unsigned) { return nullptr; }
 unsigned VKPgm_Note_Compiled(void*, int, const char*, const char*) { return 0u; }
+unsigned VKPgm_Bind_Tag(void*, int, unsigned) { return 0u; }
 unsigned VKPgm_Tag_For_Handle(void*, int) { return 0u; }
 void VKPgm_Reset_All() {}
 

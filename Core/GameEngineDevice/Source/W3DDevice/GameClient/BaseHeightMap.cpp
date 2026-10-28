@@ -2874,6 +2874,16 @@ void BaseHeightMapRenderObjClass::renderTrees(CameraClass * camera)
 #endif
 	if (m_map==nullptr) return;
 	if (Scene==nullptr) return;
+	// GeneralsX @debug 28/10/2026 QA: isolate the tree/bush path from the flicker report.
+	{
+		static int s_noTrees = -1;
+		if (s_noTrees < 0) {
+			const char* e = getenv("GENERALSX_NO_TREES");
+			s_noTrees = (e && *e && atoi(e)) ? 1 : 0;
+			if (s_noTrees) { fprintf(stderr, "[TREEBUF] tree render disabled\n"); fflush(stderr); }
+		}
+		if (s_noTrees) return;
+	}
 	if (m_treeBuffer) {
 		DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);
 		DX8Wrapper::Set_Material(m_vertexMaterialClass);

@@ -234,7 +234,15 @@ VertexBufferClass::WriteLockClass::WriteLockClass(VertexBufferClass* VertexBuffe
 			// batch needs the (VkBuffer, offset) THIS lock wrote, and it has to stay valid until the draw
 			// reads it - wedge 3.1's shared bump ring gave every lock a new offset and can't back that.
 			// The per-object backing is keyed by the WW3D buffer object itself.
-			Vertices = VKGeo_Back_Lock(VertexBuffer, geo_size, VertexBuffer->FVF_Info().Get_FVF_Size(), 0,
+			// GeneralsX @bugfix Qoder 24/10/2026: a USAGE_DYNAMIC buffer is rewritten while the previous
+			// 1-2 frames may still be reading its vertices (3 frames in flight). Keeping such a buffer in
+			// one in-place region tore the live tree/bush vertex buffer: the old frames fetched a mix of
+			// old and new trees, which showed as flickering foliage and occasional stretched triangles.
+			// Reporting the dynamic usage here gives the backing its per-frame slots, so DISCARD really
+			// renames instead of overwriting memory the GPU still reads.
+			const int geo_dynamic =
+				(static_cast<DX8VertexBufferClass*>(VertexBuffer)->Get_Usage() & DX8VertexBufferClass::USAGE_DYNAMIC) ? 1 : 0;
+			Vertices = VKGeo_Back_Lock(VertexBuffer, geo_size, VertexBuffer->FVF_Info().Get_FVF_Size(), geo_dynamic,
 				(flags & D3DLOCK_DISCARD) != 0);
 			if (Vertices) {
 				vk_mirrored = true;
@@ -535,6 +543,9 @@ void DX8VertexBufferClass::Create_Vertex_Buffer(UsageType usage)
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(!VertexBuffer);
+	// GeneralsX @bugfix Qoder 24/10/2026: remember the usage so the lock classes can give a
+	// USAGE_DYNAMIC buffer real DISCARD semantics in the Vulkan backing (see Get_Usage()).
+	m_usage = usage;
 
 #ifdef VERTEX_BUFFER_LOG
 	StringClass fvf_name;
@@ -1074,8 +1085,7 @@ DynamicVBAccessClass::WriteLockClass::WriteLockClass(DynamicVBAccessClass* dynam
 				vk_mirrored = true;
 				Vertices = (VertexFormatXYZNDUV2*)(slot + DynamicVBAccess->VertexBufferOffset * fvf_size);
 				break;
-			}
-		}
+			}		}
 #endif
 		// Lock with discard contents if the buffer offset is zero
 		// GeneralsX @bugfix Qoder 18/10/2026 pure-Vulkan wedge 9.J2d: the stride used to come from

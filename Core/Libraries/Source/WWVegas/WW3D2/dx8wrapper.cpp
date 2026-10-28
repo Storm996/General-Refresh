@@ -3994,7 +3994,43 @@ namespace {
 
 	// Uploaded art answers through VKTex; a target the recorder wrote answers through VKRT. Both are
 	// valid sampled sources, so a texture slot accepts either. Depth mirrors are attachment-only.
-	void* vk_texture_view(void* key)
+	// GeneralsX @feature 26/10/2026 HDR linear stage: a colour texture is sampled through its sRGB view
+	// (hardware decode to linear); data textures keep the UNORM view. The table names the roles the
+	// programmable families actually use; everything not listed stays data. psTag 0 is the fixed-function
+	// path, where only stage 0 is colour and multiplicative shroud/shadow batches are masks.
+	static bool vk_pgm_stage_color(unsigned psTag, unsigned stage)
+	{
+		// QA: GENERALSX_VK_LIN_TERRAIN_LM=0 keeps the baked lightmap in UNORM (it is a shading mask in
+		// some maps, a radiance bake in others). Default decodes it.
+		static const bool s_terrainLm = [] {
+			const char* e = getenv("GENERALSX_VK_LIN_TERRAIN_LM");
+			return !(e != nullptr && *e != 0 && atoi(e) == 0);
+		}();
+		switch (psTag) {
+		case 8: case 10: case 201: case 203: case 211: case 221:
+			return stage == 0;                       // albedo
+		case 110: case 111: case 112: case 113: case 114:
+		case 115: case 116: case 117: case 118:
+			// terrain: 0 base albedo, 1 detail, 3 baked lightmap; 2 cloud mask and 4 normal stay data
+			return stage == 0 || stage == 1 || (stage == 3 && s_terrainLm);
+		case 120: return stage == 0;                 // road albedo; noise layers are data
+		case 121: return stage == 0;                 // leaf albedo; stage 1 is the shroud mask
+		case 232: case 233: return stage == 0;       // water colour; sparkle/noise/shroud are data
+		default: return false;
+		}
+	}
+
+	static bool vk_ff_stage_color(unsigned stage, unsigned srcBlend, unsigned dstBlend)
+	{
+		if (stage != 0u) return false;
+		// D3DBLEND_ZERO(1)/SRCCOLOR(3) is the shroud; DESTCOLOR(9)/ZERO(1) is a projected-shadow decal.
+		// Both sample coverage masks, not colours.
+		if (srcBlend == 1u && dstBlend == 3u) return false;
+		if (srcBlend == 9u && dstBlend == 1u) return false;
+		return true;
+	}
+
+	void* vk_texture_view(void* key, bool linear = false)
 	{
 		VKTex_Info ti;
 		if (VKTex_Query(key, &ti) && ti.view) {
@@ -4002,7 +4038,23 @@ namespace {
 				VKRT_Info ri;
 				vk_note_bind_resolution(key, ti.view, 1, (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) ? 1 : 0);
 			}
-			return ti.view;
+			// GeneralsX @debug 27/10/2026 HDR: a colour stage that asks for the linear view but has no
+			// sRGB twin silently samples display-space bytes. Opt-in (GENERALSX_VKSRGB_LOG=1) because it
+			// fires for every 16-bit font/UI texture that legitimately has no sRGB variant.
+			if (linear && ti.view_srgb == nullptr) {
+				static int s_srgbLog = -1, s_srgbMiss = 0;
+				if (s_srgbLog < 0) {
+					const char* e = getenv("GENERALSX_VKSRGB_LOG");
+					s_srgbLog = (e != nullptr && *e != 0 && atoi(e) != 0) ? 1 : 0;
+				}
+				if (s_srgbLog && s_srgbMiss < 16) {
+					++s_srgbMiss;
+					fprintf(stderr, "[VKSRGB] linear request without sRGB view: %ux%u fmt=%u key=%p\n",
+						ti.width, ti.height, ti.format, key);
+					fflush(stderr);
+				}
+			}
+			return (linear && ti.view_srgb) ? ti.view_srgb : ti.view;
 		}
 		VKRT_Info ri;
 		const int rtHit = (VKRT_Query(key, &ri) && ri.view && !ri.is_depth) ? 1 : 0;
@@ -4275,12 +4327,66 @@ bool DX8Wrapper::VK_Bind_Vegetation_Material()
 // property D3D9 never gave this engine: the state a batch is drawn with is now *named* at submit time
 // instead of being whatever the device happens to hold. Each group is a whole number of vec4s so the C++
 // offsets equal the std140 offsets of the block in shaders/vkff.vert by construction.
+// GeneralsX @feature 26/10/2026 HDR: the FF block carries colours, not just numbers, so the packer is
+// where the display-space sources become linear light. Values above 1 (sun gain, light intensity) are
+// extended with the same power instead of clamped.
+static inline float vk_color_to_linear(float v)
+{
+	if (v <= 0.0f) return 0.0f;
+	if (v <= 1.0f)
+		return (v <= 0.04045f) ? (v / 12.92f) : powf((v + 0.055f) / 1.055f, 2.4f);
+	return powf(v, 2.2f);
+}
+
+static inline void vk_color3_to_linear(float* c)
+{
+	c[0] = vk_color_to_linear(c[0]);
+	c[1] = vk_color_to_linear(c[1]);
+	c[2] = vk_color_to_linear(c[2]);
+}
+
+// GeneralsX @tweak 28/10/2026: light colours use the luma-preserving decode (same rule as the rig and
+// the GN fallback) - decode the luminance, scale the authored RGB by that gain, so a lamp keeps the
+// chroma the artist authored instead of having its channel ratio raised by the gamma.
+static inline void vk_color3_light_to_linear(float* c)
+{
+	const float yd = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+	if (yd <= 1e-6f) { c[0] = c[1] = c[2] = 0.0f; return; }
+	const float k = vk_color_to_linear(yd) / yd;
+	c[0] *= k; c[1] *= k; c[2] *= k;
+}
+
+static inline float vk_sun_gain() { return DX8Wrapper::VK_Linear_Sun_Gain(); }
+static inline float vk_amb_gain() { return DX8Wrapper::VK_Linear_Amb_Gain(); }
+static inline float vk_fill_gain() { return DX8Wrapper::VK_Linear_Fill_Gain(); }
+
+static inline void vk_color3_scale(float* c, float k)
+{
+	c[0] *= k; c[1] *= k; c[2] *= k;
+}
+
+// GeneralsX @feature 26/10/2026 HDR: see the note in W3DDisplay.cpp. Default decodes; the env leg
+// GENERALSX_VK_LIN_LIGHT_SRGB=0 keeps light colours as linear multipliers for A/B.
+static inline bool vk_light_colors_are_srgb()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = getenv("GENERALSX_VK_LIN_LIGHT_SRGB");
+		cached = (e != nullptr && *e != 0 && atoi(e) == 0) ? 0 : 1;
+	}
+	return cached != 0;
+}
+
 void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 {
 	if (!out) return;
 	VKDraw_FF_State& ff = *out;
 	memset(&ff, 0, sizeof(ff));
 
+	const bool linear = VK_HDR_Enabled() && VKDraw_Linear_Scene_Active();
+	// GeneralsX @feature 27/10/2026 unified linear rig: the FF packer decodes every authored colour
+	// (materials, scene ambient, the eight lights) per channel, exactly like the GN/terrain/water paths.
+	const bool linearLights = linear && vk_light_colors_are_srgb();
 	const unsigned fvf = info.Get_FVF();
 	const unsigned texcount = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
 
@@ -4335,6 +4441,12 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 		memcpy(&ff.mat_specular[0],  &m.Specular, sizeof(float) * 4);
 		memcpy(&ff.mat_emissive[0],  &m.Emissive, sizeof(float) * 4);
 		ff.mat_power[0] = m.Power;
+		if (linear) {
+			vk_color3_to_linear(ff.mat_diffuse);
+			vk_color3_to_linear(ff.mat_ambient);
+			vk_color3_to_linear(ff.mat_specular);
+			vk_color3_to_linear(ff.mat_emissive);
+		}
 	}
 
 	// ---- per-light colours, scene ambient and fog ---------------------------------------------
@@ -4344,7 +4456,8 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 		ff.scene_ambient[0] = float((amb >> 16) & 0xFFu) / 255.0f;
 		ff.scene_ambient[1] = float((amb >> 8) & 0xFFu) / 255.0f;
 		ff.scene_ambient[2] = float(amb & 0xFFu) / 255.0f;
-		ff.scene_ambient[3] = 1.0f;
+		// GeneralsX @refactor 28/10/2026: w is reserved (the retired HDR object lift lived here).
+		ff.scene_ambient[3] = 0.0f;
 
 		const unsigned fogc = VK_Read_RS(D3DRS_FOGCOLOR);
 		ff.fog_color[0] = float((fogc >> 16) & 0xFFu) / 255.0f;
@@ -4361,6 +4474,17 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 		ff.tex_factor[1] = float((tf >> 8) & 0xFFu) / 255.0f;
 		ff.tex_factor[2] = float(tf & 0xFFu) / 255.0f;
 		ff.tex_factor[3] = float((tf >> 24) & 0xFFu) / 255.0f;
+		// Every authored colour is decoded per channel; the atmosphere colour is a blend target too.
+		if (linear) {
+			vk_color3_to_linear(ff.fog_color);
+			vk_color3_scale(ff.fog_color, vk_sun_gain());   // the global rig gain rides on the sun slot
+		}
+		// GeneralsX @bugfix 28/10/2026 HDR double decode: the scene ambient packed here comes from
+		// LightEnvironmentClass::Get_Equivalent_Ambient(), which W3DDisplay's T1.6 pass refills from the
+		// finished rig snapshot - already scene-referred linear in HDR. Decoding it again squared it and
+		// left every fixed-function lit object 4x darker than the rig-lit ground. Taken as-is now; the
+		// rig already applied the QA ambient gain to the snapshot.
+		if (linear) vk_color3_to_linear(ff.tex_factor);   // RGB only; alpha is a coverage factor
 	}
 
 	// ---- the eight light slots ---------------------------------------------------------------
@@ -4393,6 +4517,16 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 		memcpy(&dl.ambient[0],  &l.Ambient,  sizeof(float) * 4);
 		memcpy(&dl.diffuse[0],  &l.Diffuse,  sizeof(float) * 4);
 		memcpy(&dl.specular[0], &l.Specular, sizeof(float) * 4);
+		// GeneralsX @bugfix 28/10/2026 HDR double decode: DIRECTIONAL slots carry the rig snapshot
+		// (T1.6 publishes the finished linear sun/fill into m_myLight[0..1]), so decoding them again
+		// squared the key light exactly like the GN path did. Point/spot lights are still authored
+		// display colours (lamps, explosions) and keep the decode.
+		if (linearLights && l.Type != D3DLIGHT_DIRECTIONAL) {
+			vk_color3_light_to_linear(dl.ambient);
+			vk_color3_scale(dl.ambient, vk_amb_gain());
+			vk_color3_light_to_linear(dl.diffuse);
+			vk_color3_light_to_linear(dl.specular);
+		}
 	}
 
 	// ---- the flags ---------------------------------------------------------------------------
@@ -4411,6 +4545,7 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 	// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan step 9.I: the point-sprite UV source. The size
 	// registers travel in the two point slots below; this bit is only the coordinate decision.
 	if (VK_Read_RS(D3DRS_POINTSPRITEENABLE)) fx |= VKFF_FLAG_POINT_SPRITE;
+	if (linear) fx |= VKFF_FLAG_LINEAR;
 	// GeneralsX @bugfix Qoder 19/10/2026 R-02 vColor forensics: GENERALSX_VKVCOL raises a spare flags.x
 	// bit (11) that vkff.frag reads as "paint the interpolated vertex colour, scaled by a quarter, and
 	// nothing else". The i/j censuses proved the engine-side arithmetic cannot reach pure white, so the
@@ -4541,6 +4676,21 @@ void DX8Wrapper::VK_FF_Pack(VKDraw_FF_State* out, const FVFInfoClass& info)
 			maxStage = s + 1u;
 	}
 	ff.flags[3] = maxStage;
+
+	// GeneralsX @feature 24/10/2026 P34 E4: the FF pixel stage gets the same light-shadow maps the
+	// Forward+ receivers sample. It matches a map to a light by position instead of by list index,
+	// because this block's light list is the mesh's own LightEnvironment; an unmatched slot keeps gate 0.
+	memset(ff.light_shadow, 0, sizeof(ff.light_shadow));
+	for (int slot = 0; slot < (int)VkLighting::kShadowMaps; ++slot) {
+		float lsVP[16], lsPR[4];
+		if (!VK_LightShadow_Info(slot, lsVP, lsPR)) continue;
+		for (int r = 0; r < 4; ++r)
+			memcpy(&ff.light_shadow[slot * 20 + r * 4], &lsVP[r * 4], sizeof(float) * 4);
+		ff.light_shadow[slot * 20 + 16] = lsPR[0];
+		ff.light_shadow[slot * 20 + 17] = lsPR[1];
+		ff.light_shadow[slot * 20 + 18] = lsPR[2];
+		ff.light_shadow[slot * 20 + 19] = lsPR[3];
+	}
 
 	// GeneralsX @bugfix Qoder 19/10/2026 BUG-03 layer4: the maroon footprint patches stay even though
 	// W3DProjectedShadow::flushDecals never draws a non-empty batch, so they come from some other
@@ -4703,12 +4853,18 @@ float DX8Wrapper::VK_Sun_Shadow_Penumbra()
 // (no halo, no FXAA) so a build whose options were never pushed keeps the exact old present path; the
 // first filtered frame and the two options apply hooks replace them with the player's values.
 static float g_vkPostBloom = 0.0f;
-static bool  g_vkPostAA = false;
 
-void DX8Wrapper::VK_Set_Post_Knobs(float bloom, bool aa)
+// Defined with the P6 knobs below; declared here because the post knobs are seeded first.
+static bool p6BypassOn();
+static bool p6ParityOn();
+
+void DX8Wrapper::VK_Set_Post_Knobs(float bloom)
 {
+	if (p6ParityOn()) {
+		g_vkPostBloom = 0.0f;
+		return;
+	}
 	g_vkPostBloom = bloom < 0.0f ? 0.0f : (bloom > 1.0f ? 1.0f : bloom);
-	g_vkPostAA = aa;
 }
 
 float DX8Wrapper::VK_Post_Bloom()
@@ -4716,9 +4872,30 @@ float DX8Wrapper::VK_Post_Bloom()
 	return g_vkPostBloom;
 }
 
-bool DX8Wrapper::VK_Post_AA()
+// GeneralsX @feature 26/10/2026 volumetric fog: defaults are the shipped clear-day haze, mode 0 keeps
+// the legacy per-material path. The game layer overwrites this once per lighting refresh; the Vulkan
+// post pass reads it without needing any game headers.
+static VKAtmosphereFogParams g_vkAtmosphereFog = {
+	1, 0.0040f, 1.0f / 150.0f, 0.0f, 20.0f, 100.0f, 0.80f,
+	{ 0.72f, 0.78f, 0.84f },
+	{ 1.0f, 1.0f, 1.0f },
+	{ 0.0f, 0.0f, 1.0f },
+	2.40f, 0.020f, 2.0f, 0.0f, 0.6f,
+	0.0f,   // contact shadows: off until the game layer publishes the player's choice
+	0.0f,   // god rays: same
+	0.0f,   // AO quality: the game layer publishes 1 when the player has AO enabled
+	{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+	  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f }
+};
+
+void DX8Wrapper::VK_Set_Atmosphere_Fog(const VKAtmosphereFogParams& params)
 {
-	return g_vkPostAA;
+	g_vkAtmosphereFog = params;
+}
+
+const VKAtmosphereFogParams& DX8Wrapper::VK_Atmosphere_Fog()
+{
+	return g_vkAtmosphereFog;
 }
 
 // GeneralsX @feature 23/10/2026 P6 "底片/镜头": the HDR/AA pack. HDR and render scale change the scene
@@ -4730,20 +4907,112 @@ static int   g_vkHdrTonemap = 1;
 static int   g_vkPostAaMode = 0;
 static int   g_vkRenderScale = 100;
 
+// GeneralsX @feature 23/10/2026 P6: one-launch bypass for the film chain. It is read here, at the
+// draw-layer setter, rather than in OptionPreferences, so the options page keeps showing (and saving)
+// the player's real values; the bypass can never leak back into Options.ini. `GENERALSX_VK_P6OFF=1`
+// makes every HDR/tonemap/exposure/auto-exposure/LUT push collapse to the parity values, while AA and
+// render scale stay under the player's control.
+static bool p6BypassOn()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* env = getenv("GENERALSX_VK_P6OFF");
+		cached = (env != nullptr && *env != 0 && atoi(env) != 0) ? 1 : 0;
+	}
+	return cached != 0;
+}
+
+// GeneralsX @feature 23/10/2026 P6 follow-up: full presentation parity for A/B. P6OFF only removes
+// the HDR/tonemap part; AO (0.55), grade (contrast 1.06), legacy bloom and FXAA stay on unless every
+// knob is zeroed. This switch does exactly that and also forces render scale/AA off so the overlay
+// path cannot stay alive, which is what makes the "retail vs post-processed" comparison reliable.
+static bool p6ParityOn()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* env = getenv("GENERALSX_VK_PARITY");
+		cached = (env != nullptr && *env != 0 && atoi(env) != 0) ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 void DX8Wrapper::VK_Set_HDR_Knobs(int hdr, float exposure, int tonemap, int aa_mode, int scale)
 {
-	g_vkHdrEnabled = hdr != 0 ? 1 : 0;
-	g_vkHdrExposure = exposure < -4.0f ? -4.0f : (exposure > 4.0f ? 4.0f : exposure);
-	g_vkHdrTonemap = tonemap < 0 ? 0 : (tonemap > 2 ? 2 : tonemap);
+	if (p6ParityOn()) {
+		g_vkHdrEnabled = 0;
+		g_vkHdrExposure = 0.0f;
+		g_vkHdrTonemap = 0;
+		g_vkPostAaMode = 0;
+		g_vkRenderScale = 100;
+		return;
+	}
+	const bool bypass = p6BypassOn();
+	g_vkHdrEnabled = (!bypass && hdr != 0) ? 1 : 0;
+	g_vkHdrExposure = bypass ? 0.0f : (exposure < -4.0f ? -4.0f : (exposure > 4.0f ? 4.0f : exposure));
+	g_vkHdrTonemap = bypass ? 0 : (tonemap < 0 ? 0 : (tonemap > 2 ? 2 : tonemap));
 	g_vkPostAaMode = aa_mode < 0 ? 0 : (aa_mode > 1 ? 1 : aa_mode);
 	g_vkRenderScale = (scale <= 100) ? 100 : (scale <= 125 ? 125 : (scale <= 150 ? 150 : 200));
 }
 
 bool DX8Wrapper::VK_HDR_Enabled() { return g_vkHdrEnabled != 0; }
 float DX8Wrapper::VK_HDR_Exposure() { return g_vkHdrExposure; }
+
+// GeneralsX @feature 27/10/2026 HDR per-TOD exposure offset. The game layer owns the TOD and sets this
+// before the draw layer seeds the frame; the post pass adds it to the player's EV slider.
+static float g_vkTodExposure = 0.0f;
+void DX8Wrapper::VK_Set_TOD_Exposure(float ev)
+{
+	g_vkTodExposure = (ev < -1.5f) ? -1.5f : ((ev > 1.5f) ? 1.5f : ev);
+}
+float DX8Wrapper::VK_TOD_Exposure() { return g_vkTodExposure; }
 int DX8Wrapper::VK_HDR_Tonemap() { return g_vkHdrTonemap; }
 int DX8Wrapper::VK_Post_AA_Mode() { return g_vkPostAaMode; }
 int DX8Wrapper::VK_Render_Scale() { return g_vkRenderScale; }
+
+// GeneralsX @feature 26/10/2026 HDR re-light rig. Computed per refresh from the legacy display
+// luminance ratios (see W3D_RefreshRenderLighting); the consumers never guess these again.
+static float g_vkLinearSunGain = 1.0f;
+static float g_vkLinearAmbGain = 1.0f;
+static float g_vkLinearFillGain = 1.0f;
+
+void DX8Wrapper::VK_Set_Linear_Light_Gains(float sun, float amb, float fill)
+{
+	const float lo = 0.05f, hi = 8.0f;
+	g_vkLinearSunGain = (sun < lo) ? lo : ((sun > hi) ? hi : sun);
+	g_vkLinearAmbGain = (amb < lo) ? lo : ((amb > hi) ? hi : amb);
+	g_vkLinearFillGain = (fill < lo) ? lo : ((fill > hi) ? hi : fill);
+}
+
+float DX8Wrapper::VK_Linear_Sun_Gain() { return g_vkLinearSunGain; }
+
+// GeneralsX @debug 27/10/2026 live sun sweep: GENERALSX_VK_SUN_SWEEP=<seconds> returns the directional
+// contribution as 0 -> 1 -> 0 on that period (0 = ambient only) so the sun's role can be inspected with
+// the naked eye. Time-based on purpose: W3D_RefreshRenderLighting only runs on TOD/weather changes, so a
+// factor baked into the published state would freeze at whatever phase the refresh happened to see.
+// Every consumer that runs per draw or per frame calls this instead.
+static float g_vkSunSweepPeriod = -1.0f;
+static std::chrono::steady_clock::time_point g_vkSunSweepStart;
+float DX8Wrapper::VK_Sun_Sweep()
+{
+	if (g_vkSunSweepPeriod < 0.0f) {
+		const char* e = getenv("GENERALSX_VK_SUN_SWEEP");
+		g_vkSunSweepPeriod = (e != nullptr && *e != 0) ? (float)atof(e) : 0.0f;
+		if (g_vkSunSweepPeriod < 0.0f) g_vkSunSweepPeriod = 0.0f;
+		g_vkSunSweepStart = std::chrono::steady_clock::now();
+		if (g_vkSunSweepPeriod > 0.0f) {
+			fprintf(stderr, "[SUNSWEEP] period=%.1fs (sun 0 -> 1 -> 0; ambient/fill/fog untouched)\n",
+				(double)g_vkSunSweepPeriod);
+			fflush(stderr);
+		}
+	}
+	if (g_vkSunSweepPeriod <= 0.0f) return 1.0f;
+	const double t = std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - g_vkSunSweepStart).count();
+	const double ph = fmod(t / (double)g_vkSunSweepPeriod, 1.0);
+	return (float)(0.5 - 0.5 * cos(6.283185307179586 * ph));
+}
+float DX8Wrapper::VK_Linear_Amb_Gain() { return g_vkLinearAmbGain; }
+float DX8Wrapper::VK_Linear_Fill_Gain() { return g_vkLinearFillGain; }
 
 static int   g_vkAutoExposure = 0;
 static float g_vkSharpen = 0.0f;
@@ -4751,20 +5020,40 @@ static int   g_vkColorLut = 0;
 
 void DX8Wrapper::VK_Set_Post_Extras(int auto_exposure, float sharpen, int color_lut)
 {
-	g_vkAutoExposure = auto_exposure != 0 ? 1 : 0;
+	const bool bypass = p6BypassOn() || p6ParityOn();
+	g_vkAutoExposure = (!bypass && auto_exposure != 0) ? 1 : 0;
 	g_vkSharpen = sharpen < 0.0f ? 0.0f : (sharpen > 2.0f ? 2.0f : sharpen);
-	g_vkColorLut = color_lut != 0 ? 1 : 0;
+	g_vkColorLut = (!bypass && color_lut != 0) ? 1 : 0;
 }
 
 bool DX8Wrapper::VK_Auto_Exposure() { return g_vkAutoExposure != 0; }
 float DX8Wrapper::VK_Sharpen() { return g_vkSharpen; }
 bool DX8Wrapper::VK_Color_LUT() { return g_vkColorLut != 0; }
 
+// GeneralsX @feature 24/10/2026 P0: AO/grade defaults. Both are off unless the player enables them
+// (or an env override is set); parity forces them off as part of the retail blit.
+static float g_vkAoStrength = 0.0f;
+static bool  g_vkFilmGrade = false;
+
+void DX8Wrapper::VK_Set_AO_Grade(float ao_strength, bool grade)
+{
+	if (p6ParityOn()) {
+		g_vkAoStrength = 0.0f;
+		g_vkFilmGrade = false;
+		return;
+	}
+	g_vkAoStrength = ao_strength < 0.0f ? 0.0f : (ao_strength > 1.5f ? 1.5f : ao_strength);
+	g_vkFilmGrade = grade;
+}
+
+float DX8Wrapper::VK_AO_Strength() { return g_vkAoStrength; }
+bool DX8Wrapper::VK_Film_Grade() { return g_vkFilmGrade; }
+
 // GeneralsX @feature Qoder 21/10/2026 in-game GPU vegetation bridge (see VulkanDraw.h).
-bool DX8Wrapper::VK_LightShadow_Info(float vp[16], float pos_range[4])
+bool DX8Wrapper::VK_LightShadow_Info(int slot, float vp[16], float pos_range[4])
 {
 #if defined(_WIN32) && defined(SAGE_USE_VULKAN_CORE)
-	return VKDraw_LightShadow_Info(vp, pos_range);
+	return VKDraw_LightShadow_Info(slot, vp, pos_range);
 #else
 	(void)vp; (void)pos_range;
 	return false;
@@ -4890,12 +5179,20 @@ void DX8Wrapper::VK_Fill_Submit_State(VKDraw_Submit& s, VKDraw_FF_State& ffState
 	// Textures the D3D path had bound are handed over as views so the descriptor set is the real one; an
 	// unmirrored or empty slot falls to the layer's built-in white, which is the passthrough the D3D
 	// combiners used there.
+	const bool sceneLinear = VKDraw_Linear_Scene_Active();
 	for (unsigned t = 0; t < VKDRAW_MAX_TEX_SLOTS; ++t) {
 		if (!Textures[t]) continue;
 		// Generated art and engine render targets are both sampled here. The latter has no upload
 		// mirror by construction - its content was written by the recorder - so the lookup falls back
 		// to the render-target mirror instead of silently binding the white texel.
-		s.texture_views[t] = vk_texture_view((void*)Textures[t]);
+		// GeneralsX @feature 26/10/2026 HDR: in the linear scene, colour stages bind the sRGB view;
+		// the UI overlay keeps display-space sampling for every stage.
+		bool wantLinear = false;
+		if (sceneLinear) {
+			if (psTag == 0u) wantLinear = vk_ff_stage_color(t, s.key.src_blend, s.key.dst_blend);
+			else             wantLinear = vk_pgm_stage_color(psTag, t);
+		}
+		s.texture_views[t] = vk_texture_view((void*)Textures[t], wantLinear);
 	}
 	vkf17::add(vkf17::F_VIEW, t17f);
 
@@ -5655,6 +5952,19 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 		if (Pixel_Shader)  psTag = VKPgm_Tag_For_Handle((void*)(UINT_PTR)Pixel_Shader, 1);
 		if ((Vertex_Shader && !vsTag) || (Pixel_Shader && !psTag)) { ++VKF.programmable; return false; }
 	}
+	// GeneralsX @debug 24/10/2026 ROTORPROBE: the pool draws the rotor from the sorting pass, after the
+	// model batches. If a custom program is still mounted here it pairs with the pool's FVF and the
+	// batch reads its vertices through the wrong layout - name it.
+	{
+		static int s_rotorTags = 0;
+		if (s_rotorTags < 12 && polygon_count == 12 && vertex_count == 24) {
+			++s_rotorTags;
+			fprintf(stderr, "[ROTORTAGS] vs=%p ps=%p vsTag=%u psTag=%u\n",
+				(void*)(UINT_PTR)Vertex_Shader, (void*)(UINT_PTR)Pixel_Shader,
+				(unsigned)vsTag, (unsigned)psTag);
+			fflush(stderr);
+		}
+	}
 
 	vkf17::add(vkf17::E_TAGS, t17);
 
@@ -5693,6 +6003,22 @@ bool DX8Wrapper::VK_Emit_Indexed_Draw(void* vb_, void* ib_, unsigned primitive_t
 	VKDraw_FF_State ffState;
 	VK_Fill_Submit_State(s, ffState, info, vsTag, psTag, primitive_type);
 	if (!s.attr_count) { ++VKF.refused; return false; }
+
+	// GeneralsX @debug 24/10/2026 ROTORPROBE: the submit's own rectangle and layout, so an accepted-but-
+	// invisible rotor can be told apart from a scissored or zero-size one.
+	{
+		static int s_rotorRect = 0;
+		if (s_rotorRect < 8 && polygon_count == 12 && vertex_count == 24) {
+			++s_rotorRect;
+			fprintf(stderr, "[ROTORRECT] vp=(%u,%u,%u,%u) sci=(%u,%u,%u,%u) attrs=%u fvf=%08x stride=%u depth=%d/%d/%d blend=%u/%u/%u\n",
+				s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3],
+				s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3],
+				s.attr_count, (unsigned)s.key.fvf, (unsigned)s.streams[0].stride,
+				(int)s.key.depth_test, (int)s.key.depth_write, (int)s.key.depth_cmp,
+				(unsigned)s.key.blend_enable, (unsigned)s.key.src_blend, (unsigned)s.key.dst_blend);
+			fflush(stderr);
+		}
+	}
 
 	vkf17::add(vkf17::E_FILL, t17);
 
@@ -5952,26 +6278,41 @@ bool DX8Wrapper::VK_Real_Shadow_Enabled() { return false; }
 void DX8Wrapper::VK_Set_Sun_Shadow_Knobs(float, float) {}
 float DX8Wrapper::VK_Sun_Shadow_Strength() { return 0.58f; }
 float DX8Wrapper::VK_Sun_Shadow_Penumbra() { return 1.0f; }
-void DX8Wrapper::VK_Set_Post_Knobs(float, bool) {}
+void DX8Wrapper::VK_Set_Post_Knobs(float) {}
 float DX8Wrapper::VK_Post_Bloom() { return 0.0f; }
-bool DX8Wrapper::VK_Post_AA() { return false; }
+void DX8Wrapper::VK_Set_Atmosphere_Fog(const VKAtmosphereFogParams&) {}
+const VKAtmosphereFogParams& DX8Wrapper::VK_Atmosphere_Fog()
+{
+	static VKAtmosphereFogParams p = { 0 };
+	return p;
+}
 void DX8Wrapper::VK_Set_HDR_Knobs(int, float, int, int, int) {}
 bool DX8Wrapper::VK_HDR_Enabled() { return false; }
 float DX8Wrapper::VK_HDR_Exposure() { return 0.0f; }
+void DX8Wrapper::VK_Set_TOD_Exposure(float) {}
+float DX8Wrapper::VK_TOD_Exposure() { return 0.0f; }
 int DX8Wrapper::VK_HDR_Tonemap() { return 1; }
 int DX8Wrapper::VK_Post_AA_Mode() { return 0; }
 int DX8Wrapper::VK_Render_Scale() { return 100; }
+void DX8Wrapper::VK_Set_Linear_Light_Gains(float, float, float) {}
+float DX8Wrapper::VK_Linear_Sun_Gain() { return 1.0f; }
+float DX8Wrapper::VK_Sun_Sweep() { return 1.0f; }
+float DX8Wrapper::VK_Linear_Amb_Gain() { return 1.0f; }
+float DX8Wrapper::VK_Linear_Fill_Gain() { return 1.0f; }
 void DX8Wrapper::VK_Set_Post_Extras(int, float, int) {}
 bool DX8Wrapper::VK_Auto_Exposure() { return false; }
 float DX8Wrapper::VK_Sharpen() { return 0.0f; }
 bool DX8Wrapper::VK_Color_LUT() { return false; }
+void DX8Wrapper::VK_Set_AO_Grade(float, bool) {}
+float DX8Wrapper::VK_AO_Strength() { return 0.0f; }
+bool DX8Wrapper::VK_Film_Grade() { return false; }
 bool DX8Wrapper::VK_Vegetation_Ready() { return false; }
 bool DX8Wrapper::VK_Vegetation_Draw(const void*, unsigned, const void*, unsigned,
 	const float[16], const float[3], float, const float[3], const float[3], float, float, float)
 {
 	return false;
 }
-bool DX8Wrapper::VK_LightShadow_Info(float[16], float[4]) { return false; }
+bool DX8Wrapper::VK_LightShadow_Info(int, float[16], float[4]) { return false; }
 
 #endif // _WIN32 && SAGE_USE_VULKAN_CORE
 
@@ -6234,6 +6575,25 @@ void DX8Wrapper::Draw(
 					min_vertex_index,
 					vertex_count,
 					(unsigned long long)(render_state.index_base_offset+render_state.vba_offset));
+				// GeneralsX @debug 24/10/2026 ROTORPROBE: the rotor discs are the only 12-poly/24-vertex
+				// sorted batch in the shell map; name the exact indexed submit so an invisible one can be
+				// told apart from a refused one.
+				{
+					static int s_rotorDraw = 0;
+					if (s_rotorDraw < 24 && primitive_type == D3DPT_TRIANGLELIST &&
+						polygon_count == 12 && vertex_count == 24) {
+						++s_rotorDraw;
+						fprintf(stderr, "[ROTORDRAW] first=%u polys=%u minv=%u vcnt=%u base=%llu "
+							"iboff=%u vboff=%u took=%d vtype=%u itype=%u\n",
+							(unsigned)(start_index+render_state.iba_offset), (unsigned)polygon_count,
+							(unsigned)min_vertex_index, (unsigned)vertex_count,
+							(unsigned long long)(render_state.index_base_offset+render_state.vba_offset),
+							(unsigned)render_state.iba_offset, (unsigned)render_state.vba_offset,
+							(int)vkTook16, (unsigned)render_state.vertex_buffer_types[0],
+							(unsigned)render_state.index_buffer_type);
+						fflush(stderr);
+					}
+				}
 				if (vk16) { s16Emit += s16Now() - t16; s16EmitCalls++; if (vkTook16) s16Took++; }
 				if (vkTook16) {
 					break;

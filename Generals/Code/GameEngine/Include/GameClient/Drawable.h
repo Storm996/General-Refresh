@@ -343,6 +343,12 @@ public:
 	void setStealthLook(StealthLookType look);
 	StealthLookType getStealthLook() const { return m_stealthLook; }
 
+	// GeneralsX @feature 25/10/2026 P34 F6: the shared renderer (W3DScene -> rinfo.materialPassEmissiveOverride)
+	// reads the extra-material-pass opacity the GeneralsMD drawable carries. The base game has no producer
+	// for it yet, so it stays 0 (no override) but the renderer compiles and behaves exactly as before.
+	Real getSecondMaterialPassOpacity() const { return m_secondMaterialPassOpacity; }
+	void setSecondMaterialPassOpacity( Real op ) { m_secondMaterialPassOpacity = op; }
+
 	void updateDrawableClipStatus( UnsignedInt shotsRemaining, UnsignedInt maxShots, WeaponSlotType slot ); ///< This will do the show/hide work if ProjectileBoneFeedbackEnabled is set.
 	void updateDrawableSupplyStatus( Int maxSupply, Int currentSupply ); ///< This will do visual feedback on Supplies carried
 
@@ -701,6 +707,9 @@ private:
 	Module** m_modules[NUM_DRAWABLE_MODULE_TYPES];
 
 	StealthLookType m_stealthLook;
+
+	/// GeneralsX @feature 25/10/2026 P34 F6: extra-material-pass opacity (0 = no extra pass).
+	Real m_secondMaterialPassOpacity;
 
 	Int m_flashCount;           ///< number of times to flash the drawable
 	Color m_flashColor;					///< color to flash the drawable

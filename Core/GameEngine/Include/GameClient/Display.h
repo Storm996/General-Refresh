@@ -148,7 +148,6 @@ public:
 	virtual void setBloomIntensity( Real intensity01 ) {};		///< programmable bloom composite gain
 	// GeneralsX @feature Qoder 20/10/2026: the anti-aliasing row feeds this. The 3D display forwards it to
 	// the present pass, whose FXAA is the only anti-aliasing the pure-Vulkan backend has; no-op elsewhere.
-	virtual void setAntiAliasLevel( Int level ) {};				///< 0 = off, any other value = present-side AA on
 	virtual void setShadowMapStrength( Real strength01 ) {};	///< sun shadow map darkening strength
 	virtual void createLightPulse( const Coord3D *pos, const RGBColor *color, Real innerRadius,Real attenuationWidth,
 																 UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime//, Bool donut = FALSE

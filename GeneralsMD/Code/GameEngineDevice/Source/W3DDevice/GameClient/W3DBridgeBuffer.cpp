@@ -132,8 +132,20 @@ void W3DBridge::renderBridge(Bool wireframe)
 {
 	if (m_visible && m_numPolygons && m_numVertex) {
 		if (!wireframe) DX8Wrapper::Set_Texture(0,m_bridgeTexture);
+#if defined(SAGE_USE_VULKAN_CORE)
+		// GeneralsX @feature 27/10/2026 unified lighting: bridge decks were fixed-function lit; the
+		// per-pixel rig twin reads the same atmosphere as terrain/road/objects.
+		if (!wireframe) {
+			DX8Wrapper::Set_Texture(1, nullptr);
+			DX8Wrapper::Set_Texture(2, nullptr);
+			W3DShaderManager::Bind_Lit_Static();
+		}
+#endif
 		// Draw all the bridges.
 		DX8Wrapper::Draw_Triangles(	m_firstIndex, m_numPolygons, m_firstVertex,	m_numVertex);
+#if defined(SAGE_USE_VULKAN_CORE)
+		if (!wireframe) DX8Wrapper::Set_Pixel_Shader(0);
+#endif
 	}
 }
 

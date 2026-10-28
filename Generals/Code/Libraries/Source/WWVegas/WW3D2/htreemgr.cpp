@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -16,7 +16,7 @@
 **	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-/* $Header: /Commando/Code/ww3d2/htreemgr.cpp 1     1/22/01 3:36p Greg_h $ */
+/* $Header: /Commando/Code/ww3d2/htreemgr.cpp 2     9/19/01 6:17p Jani_p $ */
 /***********************************************************************************************
  ***                            Confidential - Westwood Studios                              ***
  ***********************************************************************************************
@@ -27,9 +27,9 @@
  *                                                                                             *
  *                       Author:: Byon_g                                                       *
  *                                                                                             *
- *                     $Modtime:: 1/08/01 10:04a                                              $*
+ *                     $Modtime:: 9/14/01 12:01p                                              $*
  *                                                                                             *
- *                    $Revision:: 1                                                           $*
+ *                    $Revision:: 2                                                           $*
  *                                                                                             *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -119,6 +119,9 @@ void HTreeManagerClass::Free()
  *=============================================================================================*/
 void HTreeManagerClass::Free_All_Trees()
 {
+	// Clear the hash table
+	TreeHash.Remove_All();
+
 	for (int treeidx=0; treeidx < MAX_TREES; treeidx++) {
 		delete TreePtr[treeidx];
 		TreePtr[treeidx] = nullptr;
@@ -163,6 +166,18 @@ void HTreeManagerClass::Free_All_Trees_With_Exclusion_List(const W3DExclusionLis
 		}
 	}
 	NumTrees = new_tail;
+
+	// Clear the hash table
+	TreeHash.Remove_All();
+
+	// Add back any trees that were not deleted
+	for (treeidx=0; treeidx < new_tail; treeidx++)
+	{
+		// Insert to hash table for fast name based search
+		StringClass lower_case_name(TreePtr[treeidx]->Get_Name(),true);
+		_strlwr(lower_case_name.Peek_Buffer());
+		TreeHash.Insert(lower_case_name,TreePtr[treeidx]);
+	}
 }
 
 /***********************************************************************************************
@@ -203,6 +218,11 @@ int HTreeManagerClass::Load_Tree(ChunkLoadClass & cload)
 		// ok, accept this hierarchy tree!
 		TreePtr[NumTrees] = newtree;
 		NumTrees++;
+
+		// Insert to hash table for fast name based search
+		StringClass lower_case_name(newtree->Get_Name(),true);
+		_strlwr(lower_case_name.Peek_Buffer());
+		TreeHash.Insert(lower_case_name,newtree);
 	}
 
 	return 0;
@@ -274,13 +294,17 @@ char *HTreeManagerClass::Get_Tree_Name(const int idx)
  *=============================================================================================*/
 HTreeClass * HTreeManagerClass::Get_Tree(const char * name)
 {
-	for (int i=0; i<NumTrees; i++) {
-		if (TreePtr[i] && (stricmp(name,TreePtr[i]->Get_Name()) == 0)) {
+	StringClass lower_case_name(name,true);
+	_strlwr(lower_case_name.Peek_Buffer());
+	return TreeHash.Get(lower_case_name);
 
-			return TreePtr[i];
-		}
-	}
-	return nullptr;
+//	for (int i=0; i<NumTrees; i++) {
+//		if (TreePtr[i] && (stricmp(name,TreePtr[i]->Get_Name()) == 0)) {
+//
+//			return TreePtr[i];
+//		}
+//	}
+//	return nullptr;
 }
 
 

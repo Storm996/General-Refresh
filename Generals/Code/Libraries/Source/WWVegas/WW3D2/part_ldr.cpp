@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -22,13 +22,13 @@
  *                                                                                             *
  *                 Project Name : WW3D                                                         *
  *                                                                                             *
- *                     $Archive:: /Commando/Code/ww3d2/part_ldr.cpp         $*
+ *                     $Archive:: /VSS_Sync/ww3d2/part_ldr.cpp              $*
  *                                                                                             *
  *                       Author:: Patrick Smith
  *                                                                                             *
- *                     $Modtime:: 8/01/01 3:35p                                               $*
+ *                     $Modtime:: 10/26/01 2:57p                                              $*
  *                                                                                             *
- *                    $Revision:: 9                                                           $*
+ *                    $Revision:: 11                                                          $*
  *                                                                                             *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
@@ -315,7 +315,7 @@ ParticleEmitterDefClass::Normalize_Filename ()
 		// Increment past the directory deliminator
 		filename ++;
 
-		// Now copy the filename protion of the path to the structure
+		// Now copy the filename portion of the path to the structure
 		::lstrcpy (m_Info.TextureFilename, filename);
 	}
 }
@@ -381,7 +381,6 @@ ParticleEmitterDefClass::Load_W3D (ChunkLoadClass &chunk_load)
 			case W3D_CHUNK_EMITTER_EXTRA_INFO:
 				ret_val = Read_Extra_Info(chunk_load);
 				break;
-
 
 			default:
 				WWDEBUG_SAY(("Unhandled Chunk! File: %s Line: %d",__FILE__,__LINE__));
@@ -1110,6 +1109,27 @@ ParticleEmitterDefClass::Read_Blur_Time_Keyframes (ChunkLoadClass &chunk_load)
 
 //////////////////////////////////////////////////////////////////////////////////
 //
+//	Read_Extra_Info
+//
+WW3DErrorType
+ParticleEmitterDefClass::Read_Extra_Info (ChunkLoadClass &chunk_load)
+{
+	// Assume error
+	WW3DErrorType ret_val = WW3D_ERROR_LOAD_FAILED;
+
+	// Read the chunk straight into our member structure
+	::memset (&m_ExtraInfo, 0, sizeof (m_ExtraInfo));
+	if (chunk_load.Read (&m_ExtraInfo, sizeof (m_ExtraInfo)) == sizeof (m_ExtraInfo)) {
+		// Success!
+		ret_val = WW3D_ERROR_OK;
+	}
+
+	// Return the WW3DErrorType return code
+	return ret_val;
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+//
 //	Save
 //
 WW3DErrorType
@@ -1131,7 +1151,8 @@ ParticleEmitterDefClass::Save_W3D (ChunkSaveClass &chunk_save)
 			 (Save_Rotation_Keyframes (chunk_save) == WW3D_ERROR_OK) &&
 			 (Save_Frame_Keyframes (chunk_save) == WW3D_ERROR_OK) &&
 			 (Save_Blur_Time_Keyframes (chunk_save) == WW3D_ERROR_OK) &&
-			 (Save_Extra_Info (chunk_save) == WW3D_ERROR_OK))
+			 (Save_Extra_Info (chunk_save) == WW3D_ERROR_OK)
+			)
 		{
 			// Success!
 			ret_val = WW3D_ERROR_OK;
@@ -1194,7 +1215,7 @@ ParticleEmitterDefClass::Save_User_Data (ChunkSaveClass &chunk_save)
 	// Begin a chunk that contains user information
 	if (chunk_save.Begin_Chunk (W3D_CHUNK_EMITTER_USER_DATA) == TRUE) {
 
-		// GeneralsX @build Copilot 11/05/2026 Keep osdep macro path active on non-Windows by avoiding explicit ::lstrlen.
+		// GeneralsX @build BenderAI 10/02/2026 - Remove :: prefix so osdep.h macro applies
 		DWORD string_len = m_pUserString ? (lstrlen (m_pUserString) + 1) : 0;
 
 		// Fill the header structure
@@ -1618,30 +1639,17 @@ ParticleEmitterDefClass::Save_Blur_Time_Keyframes (ChunkSaveClass & chunk_save)
 }
 
 WW3DErrorType
-ParticleEmitterDefClass::Read_Extra_Info (ChunkLoadClass &chunk_load)
-{
-	// Assume error
-	WW3DErrorType ret_val = WW3D_ERROR_LOAD_FAILED;
-
-	// GeneralsX @bugfix Copilot 11/05/2026 Read optional emitter extra metadata when present.
-	::memset (&m_ExtraInfo, 0, sizeof (m_ExtraInfo));
-	if (chunk_load.Read (&m_ExtraInfo, sizeof (m_ExtraInfo)) == sizeof (m_ExtraInfo)) {
-		ret_val = WW3D_ERROR_OK;
-	}
-
-	return ret_val;
-}
-
-WW3DErrorType
 ParticleEmitterDefClass::Save_Extra_Info (ChunkSaveClass & chunk_save)
 {
 	// Assume error
 	WW3DErrorType ret_val = WW3D_ERROR_SAVE_FAILED;
 
+	// Begin a chunk that identifies the extra info
 	if (chunk_save.Begin_Chunk (W3D_CHUNK_EMITTER_EXTRA_INFO) == TRUE) {
+
 		W3dEmitterExtraInfoStruct data;
 
-		::memset(&data, 0, sizeof(data));
+		memset(&data, 0, sizeof(data));
 		data.FutureStartTime = Get_Future_Start_Time();
 		bool success = (chunk_save.Write (&data, sizeof (data)) == sizeof (data));
 		ret_val = success ? WW3D_ERROR_OK : WW3D_ERROR_SAVE_FAILED;

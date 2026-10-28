@@ -540,7 +540,9 @@ void Shell::showShell( Bool runInit )
 	//	}
 
 
-	if (!TheGlobalData->m_shellMapOn && m_screenCount == 0)
+	// GeneralsX @feature 25/10/2026 Launcher mode: do not silently recreate the main menu after
+	// an intro / save load. -nomenu means the external launcher owns the front end.
+	if (!TheGlobalData->m_shellMapOn && m_screenCount == 0 && !TheGlobalData->m_skipMainMenu)
   {
 #ifdef RTS_PROFILE_LEGACY
     Profile::StopRange("init");

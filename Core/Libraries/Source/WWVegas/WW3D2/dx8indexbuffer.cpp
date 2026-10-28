@@ -220,7 +220,12 @@ IndexBufferClass::WriteLockClass::WriteLockClass(IndexBufferClass* index_buffer_
 			// GeneralsX @feature Qoder 18/10/2026 pure-Vulkan wedge 5.1: per-object backing first - a draw
 			// binds the (VkBuffer, offset) of this very index buffer, which wedge 3.1's shared ring cannot
 			// offer. The ring stays as the mirror-only fallback while GENERALSX_VKDRAW is off.
-			indices = (unsigned short*)VKGeo_Back_Lock(index_buffer, geo_size, 0, 0,
+			// GeneralsX @bugfix Qoder 24/10/2026: same per-frame-slot rule as the vertex buffer - a
+			// USAGE_DYNAMIC index buffer is rewritten every frame (the tree/bush buffer is), so it must
+			// not share one region with the frames still in flight.
+			const int geo_dynamic =
+				(static_cast<DX8IndexBufferClass*>(index_buffer)->Get_Usage() & DX8IndexBufferClass::USAGE_DYNAMIC) ? 1 : 0;
+			indices = (unsigned short*)VKGeo_Back_Lock(index_buffer, geo_size, 0, geo_dynamic,
 				(flags & D3DLOCK_DISCARD) != 0);
 			if (indices) {
 				vk_mirrored = true;
@@ -363,6 +368,7 @@ DX8IndexBufferClass::DX8IndexBufferClass(unsigned short index_count_,UsageType u
 {
 	DX8_THREAD_ASSERT();
 	WWASSERT(index_count);
+	m_usage = usage;	// GeneralsX @bugfix Qoder 24/10/2026 see Get_Usage()
 	unsigned usage_flags=
 		D3DUSAGE_WRITEONLY|
 		((usage&USAGE_DYNAMIC) ? D3DUSAGE_DYNAMIC : 0)|

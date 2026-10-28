@@ -232,6 +232,11 @@ public:
 
 	IDirect3DVertexBuffer9* Get_DX8_Vertex_Buffer() { return VertexBuffer; }
 
+	// GeneralsX @bugfix Qoder 24/10/2026: the Vulkan backing needs to know whether this buffer is
+	// rewritten while earlier frames may still read it. USAGE_DYNAMIC is exactly that promise, so the
+	// lock classes can ask for per-frame regions instead of one shared in-place region.
+	UsageType Get_Usage() const { return m_usage; }
+
 	void Copy(const Vector3* loc, unsigned first_vertex, unsigned count);
 	void Copy(const Vector3* loc, const Vector2* uv, unsigned first_vertex, unsigned count);
 	void Copy(const Vector3* loc, const Vector3* norm, unsigned first_vertex, unsigned count);
@@ -241,6 +246,7 @@ public:
 
 protected:
 	IDirect3DVertexBuffer9*		VertexBuffer;
+	UsageType								m_usage = USAGE_DEFAULT;	///< GeneralsX @bugfix Qoder 24/10/2026 see Get_Usage()
 
 	void Create_Vertex_Buffer(UsageType usage);
 };

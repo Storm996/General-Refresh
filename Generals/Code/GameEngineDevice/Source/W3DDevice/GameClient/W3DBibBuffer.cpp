@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -83,6 +83,13 @@ static ShaderClass detailAlphaShader(SC_ALPHA_DETAIL);
 //=============================================================================
 /** Loads the bibs into the vertex buffer for drawing. */
 //=============================================================================
+void W3DBibBuffer::updateLighting()
+{
+	// Static shade is baked into VertexFormatXYZDUV1; force the reload path.
+	m_anythingChanged = TRUE;
+	loadBibsInVertexAndIndexBuffers();
+}
+
 void W3DBibBuffer::loadBibsInVertexAndIndexBuffers()
 {
 	if (!m_indexBib || !m_vertexBib || !m_initialized) {
@@ -104,8 +111,8 @@ void W3DBibBuffer::loadBibsInVertexAndIndexBuffers()
 	VertexFormatXYZDUV1 *vb;
 	UnsignedShort *ib;
 	// Lock the buffers.
-	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexBib);
-	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexBib);
+	DX8IndexBufferClass::WriteLockClass lockIdxBuffer(m_indexBib, D3DLOCK_DISCARD);
+	DX8VertexBufferClass::WriteLockClass lockVtxBuffer(m_vertexBib, D3DLOCK_DISCARD);
 	vb=(VertexFormatXYZDUV1*)lockVtxBuffer.Get_Vertex_Array();
 	ib = lockIdxBuffer.Get_Index_Array();
 	// Add to the index buffer & vertex buffer.

@@ -192,6 +192,22 @@ texture of the desired height and mip level. */
 // A1R5G5B5 halves the atlas footprint while keeping the mip chain for
 // distant terrain sampling.
 // GeneralsX @feature PS3.0-P3-6 supersedes that fixed choice with the measured ladder above.
+// GeneralsX @feature 24/10/2026 P25 C8: the normal atlas is packed without a per-tile gutter, so a mip
+// chain averages texels across the tile edges and smears unrelated normals into whole tiles - that is
+// the "dark grid every 2 cells" the earlier note blamed on bilinear alone. This ctor builds the atlas
+// with a single level (mip 0 only); the terrain PS already fades the normal perturbation out with
+// distance (nmFade, 400..900 units), which is exactly the range where the mips mattered. Callers that
+// want the old behaviour pass mipChain=false and keep the chain.
+TerrainTextureClass::TerrainTextureClass(int height, bool mipChain) :
+	TextureClass(TEXTURE_WIDTH, height,
+		Choose_Terrain_Atlas_Format(TEXTURE_WIDTH, height, "nm"),
+		mipChain ? MIP_LEVELS_ALL : MIP_LEVELS_1)
+{
+	fprintf(stderr, "[TERRAIN] ctor: normal atlas %d x %d mips=%s\n",
+		TEXTURE_WIDTH, height, mipChain ? "all" : "none");
+	fflush(stderr);
+}
+
 TerrainTextureClass::TerrainTextureClass(int height) :
 	TextureClass(TEXTURE_WIDTH, height,
 		Choose_Terrain_Atlas_Format(TEXTURE_WIDTH, height, "blend"), MIP_LEVELS_ALL )

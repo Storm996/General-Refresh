@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -26,11 +26,11 @@
  *                                                                                             *
  *              Original Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                      $Author:: Jani_p                                                      $*
+ *                      $Author:: Greg_h                                                      $*
  *                                                                                             *
- *                     $Modtime:: 7/13/01 1:38p                                               $*
+ *                     $Modtime:: 1/18/02 8:03p                                               $*
  *                                                                                             *
- *                    $Revision:: 20                                                          $*
+ *                    $Revision:: 28                                                          $*
  *                                                                                             *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -42,6 +42,7 @@
 #include "WWLib/realcrc.h"
 #include	"dx8wrapper.h"
 #include "dx8caps.h"
+#include "meshmdl.h"
 
 
 /**************************************************************************************************
@@ -647,6 +648,7 @@ void MeshMatDescClass::Post_Load_Process(bool lighting_enabled,MeshModelClass * 
 	** Configure all vertex materials to source the uv coordinates and colors from the correct arrays
 	** Pre-multiply the vertex color arrays.
 	*/
+	bool set_lighting_to_false=true;
 	int pass=0;
 	for (; pass<PassCount; pass++) {
 
@@ -815,77 +817,110 @@ void MeshMatDescClass::Post_Load_Process(bool lighting_enabled,MeshModelClass * 
 					mtl->Set_Ambient_Color_Source(VertexMaterialClass::MATERIAL);
 					mtl->Set_Diffuse_Color_Source(VertexMaterialClass::COLOR1);
 					mtl->Set_Emissive_Color_Source(VertexMaterialClass::MATERIAL);
-//MW:  Vegas guys asked me to disable this because it can cause z-fighting if lighting is disabled in multi-pass
 //					mtl->Set_Lighting(false);
 				}
-
+				else {
+					if (PassCount!=1) {
+						set_lighting_to_false=false;		// Lighting can only be set to false if ALL passes and ALL materials are requesting it
+					}
+				}
 			}
 		}
+	}
 
 
+	/*
+	** HACK: Kill BUMPENV passes on hardware that doesn't support BUMPENV
+	** HACK: Set lighting to false on all passes if all passes are of type NO DIFFUSE, NO AMBIENT, YES EMISSIVE
+	*/
+	for (pass=0; pass<PassCount; pass++) {
+		bool kill_pass = false;
 
 		/*
-		** If a DCG array is present, pre multiply the alpha value from the material into
-		** the vertex color array.  Experimentation on GeForce hardware showed that we
-		** don't need to pre-multiply the color values; hopefully this is the behavior on
-		** other hardware as well!
+		// HY: Earth and beyond uses a different fallback from Renegade with regards to bump environment maps
+		// we keep the pass but change it to an unbumped environment
+		if ( (Shader[pass].Get_Primary_Gradient() == ShaderClass::GRADIENT_BUMPENVMAP) &&
+			  (!DX8Wrapper::Is_Initted() || DX8Wrapper::Get_Current_Caps()->Support_Bump_Envmap() == false) )
+		{
+			kill_pass = true;
+		}
+
+		if ( (Shader[pass].Get_Primary_Gradient() == ShaderClass::GRADIENT_BUMPENVMAPLUMINANCE) &&
+			  (!DX8Wrapper::Is_Initted() || DX8Wrapper::Get_Current_Caps()->Support_Bump_Envmap_Luminance() == false) )
+		{
+			kill_pass = true;
+		}
 		*/
-/*		if ((DCGSource[pass] != VertexMaterialClass::MATERIAL) && (ColorArray[0] != nullptr)) {
-			unsigned * diffuse_array = ColorArray[0]->Get_Array();
-			Vector3 mtl_diffuse;
-			float mtl_opacity = 1.0f;
 
-			VertexMaterialClass * prev_mtl = nullptr;
-			VertexMaterialClass * mtl = Peek_Material(0,pass);
+		if (kill_pass) {
+			if (Material[pass] != nullptr) {
+				Material[pass]->Set_Ambient(0,0,0);
+				Material[pass]->Set_Diffuse(0,0,0);
+				Material[pass]->Set_Emissive(0,0,0);
+				Material[pass]->Set_Specular(0,0,0);
+			}
 
-			for (int vidx=0; vidx<VertexCount; vidx++) {
+			Shader[pass].Set_Texturing(ShaderClass::TEXTURING_DISABLE);
+			Shader[pass].Set_Post_Detail_Color_Func(ShaderClass::DETAILCOLOR_DISABLE);
+			Shader[pass].Set_Post_Detail_Alpha_Func(ShaderClass::DETAILALPHA_DISABLE);
+		}
+		// Set lighting to false if requested in all passes...
+		else if (set_lighting_to_false) {
+			bool diffuse_used=false;
+			bool ambient_used=false;
+			bool emissive_used=false;
 
-				mtl = Peek_Material(vidx,pass);
-				if (mtl != prev_mtl) {
+			VertexMaterialClass* prev_mtl = nullptr;
+			for (int vidx=0; vidx<VertexCount; vidx++)
+			{
+				VertexMaterialClass* mtl = Peek_Material(vidx,pass);
+				if (mtl == nullptr)
+				{
+					continue;
+				}
+
+				if (mtl != prev_mtl)
+				{
 					prev_mtl = mtl;
+					Vector3 mtl_diffuse;
+					Vector3 mtl_ambient;
+					Vector3 mtl_emissive;
 					mtl->Get_Diffuse(&mtl_diffuse);
-					mtl_opacity = mtl->Get_Opacity();
-				}
-
-				Vector4 diffuse=DX8Wrapper::Convert_Color(diffuse_array[vidx]);
-				diffuse.X *= mtl_diffuse.X;
-				diffuse.Y *= mtl_diffuse.Y;
-				diffuse.Z *= mtl_diffuse.Z;
-				diffuse.W *= mtl_opacity;
-				diffuse_array[vidx]=DX8Wrapper::Convert_Color(diffuse);
-
-			}
-		}
-*/		/*
-		** If needed, pre-multiply the emissive color array with the material color
-		*/
-/*		if ((DIGSource[pass] != VertexMaterialClass::MATERIAL) && (ColorArray[1] != nullptr)) {
-
-			unsigned * emissive_array = ColorArray[1]->Get_Array();
-			Vector3 mtl_emissive;
-
-			VertexMaterialClass * prev_mtl = nullptr;
-			VertexMaterialClass * mtl = Peek_Material(0,pass);
-
-			for (int vidx=0; vidx<VertexCount; vidx++) {
-				mtl = Peek_Material(vidx,pass);
-				if (mtl != prev_mtl) {
-					prev_mtl = mtl;
+					mtl->Get_Ambient(&mtl_ambient);
 					mtl->Get_Emissive(&mtl_emissive);
+
+					diffuse_used = diffuse_used || mtl_diffuse.X || mtl_diffuse.Y || mtl_diffuse.Z;
+					ambient_used = ambient_used || mtl_ambient.X || mtl_ambient.Y || mtl_ambient.Z;
+					emissive_used = emissive_used || mtl_emissive.X || mtl_emissive.Y || mtl_emissive.Z;
+
+					if (diffuse_used && ambient_used && emissive_used)
+					{
+						break;
+					}
 				}
+			}
 
-				Vector4 emissive=DX8Wrapper::Convert_Color(emissive_array[vidx]);
-				emissive.X *= mtl_emissive.X;
-				emissive.Y *= mtl_emissive.Y;
-				emissive.Z *= mtl_emissive.Z;
-				emissive_array[vidx]=DX8Wrapper::Convert_Color(emissive);
+			// Turn off lighting only for emissive-only materials using vertex colors.
+			if (!diffuse_used && !ambient_used && emissive_used &&
+				(DCGSource[pass] != VertexMaterialClass::MATERIAL) && (ColorArray[0] != nullptr))
+			{
+				VertexMaterialClass* prev_mtl = nullptr;
+				for (int vidx=0; vidx<VertexCount; vidx++)
+				{
+					VertexMaterialClass* mtl = Peek_Material(vidx,pass);
+					if (mtl == nullptr)
+					{
+						continue;
+					}
 
+					if (mtl != prev_mtl)
+					{
+						prev_mtl = mtl;
+						mtl->Set_Lighting(false);
+					}
+				}
 			}
 		}
-
-
-*/
-
 	}
 }
 
@@ -907,7 +942,7 @@ void MeshMatDescClass::Configure_Material(VertexMaterialClass * mtl,int pass,boo
 
 bool MeshMatDescClass::Do_Mappers_Need_Normals()
 {
-	if (DX8Wrapper::Get_Current_Caps()->Support_NPatches() && WW3D::Get_NPatches_Level()>1) return true;
+	if (DX8Wrapper::Is_Initted() && DX8Wrapper::Get_Current_Caps()->Support_NPatches() && WW3D::Get_NPatches_Level()>1) return true;
 
 	for (int pass=0; pass<PassCount; pass++) {
 		/*

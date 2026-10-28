@@ -78,7 +78,11 @@ IDB_LOAD_SCREEN         BITMAP  DISCARDABLE     "Install_Final.bmp"
 //
 // Generated from the TEXTINCLUDE 3 resource.
 //
-1 TYPELIB "../Libraries/Include/EABrowserDispatch/BrowserDispatch.tlb"
+// GeneralsX @build 24/10/2026 F6: the EA browser-dispatch type library is not part of this repository
+// (Zero Hour's RC has no such line either) and the browser bridge it describes belongs to the retired
+// GameSpy/EA online stack - NGMP is the only online target. Keeping the reference made a Generals-only
+// build fail in rc.exe with "file not found: BrowserDispatch.tlb".
+// 1 TYPELIB "../Libraries/Include/EABrowserDispatch/BrowserDispatch.tlb"
 
 
 /////////////////////////////////////////////////////////////////////////////

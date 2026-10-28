@@ -42,6 +42,58 @@
 #include "Backend/VulkanForward.h"
 #endif
 
+// GeneralsX @feature 26/10/2026 HDR: the display-space colours this module receives (Global_* setters,
+// LightEnvironment diffuse, material diffuse) become linear light. Values above 1 are intensities and
+// are extended with the same power, so colour and intensity stay separable.
+static inline float GXColorToLinear(float v)
+{
+	if (v <= 0.0f) return 0.0f;
+	if (v <= 1.0f)
+		return (v <= 0.04045f) ? (v / 12.92f) : powf((v + 0.055f) / 1.055f, 2.4f);
+	return powf(v, 2.2f);
+}
+
+static inline Vector3 GXColorToLinear(const Vector3& c)
+{
+	return Vector3(GXColorToLinear(c.X), GXColorToLinear(c.Y), GXColorToLinear(c.Z));
+}
+
+// GeneralsX @tweak 28/10/2026: LIGHT colours use the luma-preserving decode (same rule as
+// W3D_RefreshRenderLighting): decode the luminance, scale the authored RGB by that gain. Per-channel
+// decoding raised the chroma of every light sum (sky blue/red 1.8 -> 3.5) and pulled the ground/road
+// away from the SDR hue. Material colours keep the per-channel decode - they behave like albedo.
+static inline Vector3 GXLightToLinear(const Vector3& c)
+{
+	const float yd = 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
+	if (yd <= 1e-6f) return Vector3(0.0f, 0.0f, 0.0f);
+	const float k = GXColorToLinear(yd) / yd;
+	return Vector3(c.X * k, c.Y * k, c.Z * k);
+}
+
+// GeneralsX @feature 26/10/2026 HDR: see the note in W3DDisplay.cpp. Default decodes light colours
+// together with the albedo (matches retail luminance); GENERALSX_VK_LIN_LIGHT_SRGB=0 keeps them as
+// linear multipliers for the A/B leg.
+static inline bool GXLightColorsAreSrgb()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = getenv("GENERALSX_VK_LIN_LIGHT_SRGB");
+		cached = (e != nullptr && *e != 0 && atoi(e) == 0) ? 0 : 1;
+	}
+	return cached != 0;
+}
+
+// GeneralsX @feature 26/10/2026 HDR re-light intensities: read the per-TOD rig W3D_RefreshRenderLighting
+// published, so terrain/water/tree, per-object GN/lenv lights and FF lights move together.
+static inline float GXSunGain() { return DX8Wrapper::VK_Linear_Sun_Gain(); }
+static inline float GXAmbGain() { return DX8Wrapper::VK_Linear_Amb_Gain(); }
+static inline float GXFillGain() { return DX8Wrapper::VK_Linear_Fill_Gain(); }
+
+static inline Vector3 GXScale(const Vector3& c, float k)
+{
+	return Vector3(c.X * k, c.Y * k, c.Z * k);
+}
+
 namespace
 {
 	bool vkPresentOwnsFrame()
@@ -68,30 +120,6 @@ namespace
 		}
 		return false;
 	}
-}
-
-// GeneralsX @feature PS3.0-P3-12 14/10/2026: hemispherical ambient strength (master report L5).
-// The engine's ambient is a flat constant; multiplying an ambient*hemiscale tint by the WORLD-up
-// component of the pixel normal (W3D is Z-up - see DX8NormalMap's g_FallbackDir) lifts sky-facing
-// surfaces and leaves downward faces on the plain ambient, so shadowed ground no longer reads as
-// the same value as an upward-lit wall. Uploaded as the GN-family PS c16 hemi rgb.
-// READ ONCE per process; GENERALSX_HEMI=0 restores the flat-ambient look bit-for-bit.
-// GeneralsX @tweak Qoder 17/10/2026 P0 of the per-pixel master switch (光影T0阶段/调研/
-// 2026-10-17_逐像素光照总闸_施工调研.md): 0.35 was the showcase value and, together with the
-// 0.35 GN spec, whitened every light-coloured building/vehicle top under the RTS camera (the
-// 14/10 verdict that pinned GENERALSX_GEOMNORMAL=0 in the user's HKCU). 0.15 keeps the
-// up-vs-down-face separation without lifting shadowed tops into haze; user-confirmed value for
-// the master-switch batch. GENERALSX_HEMI still wins for A/B forensics.
-static float Hemi_Ambient_K()
-{
-	static float cached = -1.0f;
-	if (cached < 0.0f) {
-		cached = 0.15f;
-		const char* ev = getenv("GENERALSX_HEMI");
-		if (ev != nullptr && *ev != 0) cached = (float)atof(ev);
-		if (cached < 0.0f) cached = 0.0f;
-	}
-	return cached;
 }
 
 // GeneralsX @feature PS3.0-P3-14 14/10/2026: per-pixel distance fog for the GN family
@@ -186,7 +214,8 @@ namespace DX8NormalMap
 	void Set_Global_Fallback_Light(const Vector3& world_dir, const Vector3& ambient)
 	{
 		g_FallbackDir = world_dir;
-		g_FallbackAmbient = ambient;
+		g_FallbackAmbient = (DX8Wrapper::VK_HDR_Enabled() && GXLightColorsAreSrgb())
+			? GXScale(GXLightToLinear(ambient), GXAmbGain()) : ambient;
 		// GeneralsX @feature PS3.0 probe round 6 16/10/2026: one-shot console proof of the injected
 		// probe sun (was it ever called on mission load, and with which vector?). Release-safe log.
 		fprintf(stderr, "[FALLBACK] dir=(%.3f,%.3f,%.3f) amb=(%.3f,%.3f,%.3f)\n",
@@ -236,7 +265,8 @@ namespace DX8NormalMap
 	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color)
 	{
 		g_FillDir = world_dir;
-		g_FillColor = color;
+		g_FillColor = (DX8Wrapper::VK_HDR_Enabled() && GXLightColorsAreSrgb())
+			? GXScale(GXLightToLinear(color), GXFillGain()) : color;
 	}
 
 	// GeneralsX @feature PS3.0-P3-14 14/10/2026: store the injected fog pair (see file-scope g_Fog*
@@ -750,21 +780,32 @@ namespace DX8GeomNormal
 		return g_Enabled && g_SunPS != 0 && (g_SunVS_DUV1 != 0 || g_SunVS_DUV2 != 0);
 	}
 
+	// GeneralsX @tweak 28/10/2026: the same global sun-intensity multiplier W3D_RefreshRenderLighting
+	// applies to its snapshot (2x, shipped). Used here so the no-light-environment fallback key light
+	// moves with the published one instead of staying darker.
+	static const float GX_SUN_BOOST = 2.0f;
+
 	void Set_Global_Key_Light(const Vector3& world_dir, const Vector3& color)
 	{
 		g_KeyDir = world_dir;
-		g_KeyColor = color;
+		const bool decode = DX8Wrapper::VK_HDR_Enabled() && GXLightColorsAreSrgb();
+		Vector3 c = decode ? GXLightToLinear(color) : color;
+		c = GXScale(c, GX_SUN_BOOST);
+		if (decode) c = GXScale(c, GXSunGain());
+		g_KeyColor = c;
 	}
 
 	void Set_Global_Fill_Light(const Vector3& world_dir, const Vector3& color)
 	{
 		g_FillDir = world_dir;
-		g_FillColor = color;
+		g_FillColor = (DX8Wrapper::VK_HDR_Enabled() && GXLightColorsAreSrgb())
+			? GXScale(GXLightToLinear(color), GXFillGain()) : color;
 	}
 
 	void Set_Global_Ambient(const Vector3& ambient)
 	{
-		g_Ambient = ambient;
+		g_Ambient = (DX8Wrapper::VK_HDR_Enabled() && GXLightColorsAreSrgb())
+			? GXScale(GXLightToLinear(ambient), GXAmbGain()) : ambient;
 	}
 
 	static void Normalize(Vector3& v)
@@ -933,6 +974,20 @@ namespace DX8GeomNormal
 		Vector3 ma(0.0f, 0.0f, 0.0f);
 		Vector3 me(0.0f, 0.0f, 0.0f);
 		if (vm != nullptr) { vm->Get_Diffuse(&md); vm->Get_Ambient(&ma); vm->Get_Emissive(&me); }
+		// GeneralsX @feature 26/10/2026 HDR: material colours are display values; the light list below
+		// may come from a LightEnvironment that is still display-space, so both sides move to linear.
+		// GeneralsX @feature 27/10/2026 unified linear rig: materials and lights are decoded per channel
+		// once, here, and every family's sum is linear from then on. No per-family fallback.
+		const bool linearColor = DX8Wrapper::VK_HDR_Enabled();
+		const bool linearLights = linearColor && GXLightColorsAreSrgb();
+		// GeneralsX @debug 27/10/2026 live sun sweep (QA, default 1.0): the object key light is the only
+		// per-draw directional source here, so it has to follow the same phase as the ground rig.
+		const float sunSweep = DX8Wrapper::VK_Sun_Sweep();
+		if (linearColor) {
+			md = GXColorToLinear(md);
+			ma = GXColorToLinear(ma);
+			me = GXColorToLinear(me);
+		}
 
 		// GeneralsX @feature PS3.0-P3-18 14/10/2026: 4 -> 8 slots, mirroring the widened MAX_LIGHTS.
 		// PS layout: dirs c5..c8 + c17..c20, matDiffuse-scaled colors c9..c12 + c21..c24 (c13..c16
@@ -951,9 +1006,21 @@ namespace DX8GeomNormal
 #endif
 		Vector3 amb(0.0f, 0.0f, 0.0f);
 		int n = 0;
+		int dbgNp = 0;
+		Vector3 dbgEnvAmb(0.0f, 0.0f, 0.0f);
+		Vector3 dbgLightRaw(0.0f, 0.0f, 0.0f);
 
 		if (lenv != nullptr) {
-			const Vector3& envAmb = lenv->Get_Equivalent_Ambient();
+			// GeneralsX @bugfix 28/10/2026 HDR double decode: W3DDisplay's T1.6 pass publishes the FINAL
+			// rig snapshot into the scene lights (Set_Ambient_Light / m_myLight[0..1]), and that snapshot
+			// is already scene-referred linear in HDR (W3D_RefreshRenderLighting decodes every light
+			// colour exactly once, before publishing). Decoding again here squared the light: a facade
+			// facing the sun read sun^2.2 (~0.109 instead of 0.364) while the terrain, which reads the
+			// rig directly, kept the right value - that is why buildings/vehicles were 3-4x darker than
+			// the ground and did not answer any ambient/key gain. Object lights and the per-mesh
+			// ambient are therefore taken as-is; only material colours (display-authored) are decoded.
+			Vector3 envAmb = lenv->Get_Equivalent_Ambient();
+			dbgEnvAmb = envAmb;
 			amb.X = ma.X * envAmb.X + me.X;
 			amb.Y = ma.Y * envAmb.Y + me.Y;
 			amb.Z = ma.Z * envAmb.Z + me.Z;
@@ -968,7 +1035,8 @@ namespace DX8GeomNormal
 					// when the object's center is outside the radius.
 					if (np < 8 && !lenv->isPointDiffuseRejected(li)) {
 						const Vector3& c = lenv->getPointCenter(li);
-						const Vector3& pd = lenv->getPointDiffuse(li);   // intensity-scaled, unattenuated
+						Vector3 pd = lenv->getPointDiffuse(li);   // intensity-scaled, unattenuated
+						if (linearLights) pd = GXLightToLinear(pd);
 						pts[np * 2]     = Vector4(c.X, c.Y, c.Z, lenv->getPointIrad(li));
 						pts[np * 2 + 1] = Vector4(pd.X * md.X, pd.Y * md.Y, pd.Z * md.Z, lenv->getPointOrad(li));
 						++np;
@@ -977,7 +1045,11 @@ namespace DX8GeomNormal
 				}
 				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
 				Normalize(d);
-				const Vector3& c = lenv->Get_Light_Diffuse(li);
+				Vector3 c = lenv->Get_Light_Diffuse(li);
+				if (n == 0) dbgLightRaw = c;
+				// GeneralsX @bugfix 28/10/2026: already scene-referred linear (see the lenv note above);
+				// the rig applied GXSunGain() to the snapshot, so only the QA sweep is per-draw.
+				if (sunSweep != 1.0f) c = GXScale(c, sunSweep);
 				dirs[n] = Vector4(d.X, d.Y, d.Z, 0.0f);
 				cols[n] = Vector4(c.X * md.X, c.Y * md.Y, c.Z * md.Z, 0.0f);
 				++n;
@@ -986,7 +1058,11 @@ namespace DX8GeomNormal
 			for (int li = 0; li < lc; ++li) {
 				Vector3 d = lenv->Get_Light_Direction(li);   // world dir TOWARD the light
 				Normalize(d);
-				const Vector3& c = lenv->Get_Light_Diffuse(li);
+				Vector3 c = lenv->Get_Light_Diffuse(li);
+				if (n == 0) dbgLightRaw = c;
+				// GeneralsX @bugfix 28/10/2026: already scene-referred linear (see the lenv note above);
+				// the rig applied GXSunGain() to the snapshot, so only the QA sweep is per-draw.
+				if (sunSweep != 1.0f) c = GXScale(c, sunSweep);
 				dirs[li] = Vector4(d.X, d.Y, d.Z, 0.0f);
 				cols[li] = Vector4(c.X * md.X, c.Y * md.Y, c.Z * md.Z, 0.0f);
 			}
@@ -999,7 +1075,8 @@ namespace DX8GeomNormal
 			amb.Z = ma.Z * g_Ambient.Z + me.Z;
 			Vector3 key = g_KeyDir; Normalize(key);
 			dirs[0] = Vector4(key.X, key.Y, key.Z, 0.0f);
-			cols[0] = Vector4(g_KeyColor.X * md.X, g_KeyColor.Y * md.Y, g_KeyColor.Z * md.Z, 0.0f);
+			cols[0] = Vector4(g_KeyColor.X * md.X * sunSweep, g_KeyColor.Y * md.Y * sunSweep,
+				g_KeyColor.Z * md.Z * sunSweep, 0.0f);
 			n = 1;
 			Vector3 fill = g_FillDir;
 			const float fl2 = fill.X * fill.X + fill.Y * fill.Y + fill.Z * fill.Z;
@@ -1015,6 +1092,44 @@ namespace DX8GeomNormal
 		for (int li = n; li < 8; ++li) {
 			dirs[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
 			cols[li] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
+#if defined(SAGE_USE_VULKAN_CORE)
+		dbgNp = np;
+#endif
+
+		// GeneralsX @debug 28/10/2026 object-lighting forensic dump (GENERALSX_GN_DUMP=1). One line per
+		// distinct diffuse texture: the material terms, the light colour and the two constants the object
+		// shaders actually shade with (c4 ambient, c9 sun) - so a dark object family can be traced to a
+		// specific zero instead of guessed at.
+		{
+			static int s_dump = -1;
+			if (s_dump < 0) { const char* e = getenv("GENERALSX_GN_DUMP"); s_dump = (e && *e && atoi(e)) ? 1 : 0; }
+			if (s_dump) {
+				static char seen[24][64];
+				static int seen_n = 0;
+				const char* nmstr = diffuse ? (const char*)diffuse->Get_Texture_Name() : "(none)";
+				bool dup = false;
+				for (int i = 0; i < seen_n; ++i) if (strcmp(seen[i], nmstr) == 0) { dup = true; break; }
+				if (!dup && seen_n < 24) {
+					strncpy(seen[seen_n], nmstr, sizeof(seen[0]) - 1);
+					seen[seen_n][sizeof(seen[0]) - 1] = 0;
+					++seen_n;
+					fprintf(stderr,
+						"[GNDUMP] tex=%s md=(%.3f,%.3f,%.3f) ma=(%.3f,%.3f,%.3f) me=(%.3f,%.3f,%.3f) "
+						"envAmb=(%.3f,%.3f,%.3f) c4=(%.3f,%.3f,%.3f) lightRaw=(%.3f,%.3f,%.3f) "
+						"c9=(%.3f,%.3f,%.3f) dir0=(%.2f,%.2f,%.2f) np=%d lin=%d linL=%d sweep=%.2f hdr=%d gain=%.2f\n",
+						nmstr,
+						md.X, md.Y, md.Z, ma.X, ma.Y, ma.Z, me.X, me.Y, me.Z,
+						dbgEnvAmb.X, dbgEnvAmb.Y, dbgEnvAmb.Z,
+						amb.X, amb.Y, amb.Z,
+						dbgLightRaw.X, dbgLightRaw.Y, dbgLightRaw.Z,
+						cols[0].X, cols[0].Y, cols[0].Z,
+						dirs[0].X, dirs[0].Y, dirs[0].Z, dbgNp,
+						linearColor ? 1 : 0, linearLights ? 1 : 0, (double)sunSweep,
+						DX8Wrapper::VK_HDR_Enabled() ? 1 : 0, (double)GXSunGain());
+					fflush(stderr);
+				}
+			}
 		}
 
 		// GeneralsX @feature PS3.0-#75 16/10/2026: render-time sun probe for this GN batch. The tag
@@ -1032,6 +1147,31 @@ namespace DX8GeomNormal
 
 		Vector4 c4amb(amb.X, amb.Y, amb.Z, 1.0f);
 		DX8Wrapper::Set_Pixel_Shader_Constant(4, &c4amb, 1);          // PS c4 = material-scaled ambient
+		// GeneralsX @feature Qoder 24/10/2026 P3 T3.1b: object hemisphere ambient. c39/c40 are the
+		// unscaled sky/ground, derived from the same global ambient the game injects; the shader keeps
+		// c4's material scale by ratio, so this adds direction without changing the material tint.
+		// GeneralsX @refactor 27/10/2026 P1-1b (deferred): these are a DIFFERENT ambient source from the
+		// rig's fpEnv[2]/[3] - measured amb=(0.502,0.400,0.302) here against the rig's
+		// (0.614,0.497,0.417) - so the two halves of the scene do not respond alike. Feeding the object
+		// family from the rig was tried and reverted: it washed the shadows out (platform +72%, crate
+		// +117%, legs H4/H5 in HDR 专项/shots/qa), because the ground family's value is the brighter one
+		// and the object sum has no baked-occlusion term to compensate. The unification needs the two
+		// sources reconciled (one value, one space), not just this upload swapped.
+		Vector4 c39sky(g_Ambient.X * 0.92f, g_Ambient.Y * 1.00f, g_Ambient.Z * 1.18f, 0.0f);
+		Vector4 c40ground(g_Ambient.X * 1.08f, g_Ambient.Y * 0.98f, g_Ambient.Z * 0.86f, 0.0f);
+		DX8Wrapper::Set_Pixel_Shader_Constant(39, &c39sky, 1);
+		DX8Wrapper::Set_Pixel_Shader_Constant(40, &c40ground, 1);
+		// GeneralsX @refactor 27/10/2026 P1-1b: the PS c39/c40 object-hemisphere pair is retired. It
+		// carried the state's sky/ground colours with the same tilts W3DDisplay publishes into the rig,
+		// but the shaders re-weighted them by the material ambient (c4) while ground/road/tree read
+		// gxAmbient(N) straight from fpEnv - two ambient models for one scene. Every object family now
+		// calls gxAmbient(n), so the rig is the only ambient source and an ambient/TOD change moves the
+		// whole frame by one curve. c4 stays uploaded: it is the retail GN material-ambient register and
+		// costs one constant per batch, and the register pair is documented as reserved from here on.
+		// GeneralsX @refactor 24/10/2026 P34 E3: the light-shadow matrices moved out of the pixel constant
+		// ring and into the Forward+ block (fpLightShadow[], offset 98464). The old c41..c45 upload also
+		// collided with the eight-light block below (c33..c48), which zeroed the shadow gate whenever the
+		// per-object point-light list was empty - object shadows could never open in Forward+ mode.
 		DX8Wrapper::Set_Pixel_Shader_Constant(5, &dirs[0], 4);        // PS c5..c8 = world light dirs 0..3
 		DX8Wrapper::Set_Pixel_Shader_Constant(9, &cols[0], 4);        // PS c9..c12 = matDiffuse-scaled colors 0..3
 		DX8Wrapper::Set_Pixel_Shader_Constant(17, &dirs[4], 4);       // PS c17..c20 = world light dirs 4..7 (P3-18)
@@ -1053,7 +1193,23 @@ namespace DX8GeomNormal
 		{
 			Vector4 c29(md.X, md.Y, md.Z, 0.0f);
 			DX8Wrapper::Set_Pixel_Shader_Constant(29, &c29, 1);
-			Vector4 c31((float)(VK_Forward_Active() ? 1 : 0), 0.0f, 0.0f, 0.0f);
+			// GeneralsX @debug 24/10/2026 P0: temporary light-debug gate. c31.y=1 makes the GN/GNM
+			// twins output the raw point-light sum so a screenshot proves whether the SSBO cluster
+			// table reached the pixel. Remove with the P0 debug pass.
+			static int s_lightDebug = -1;
+			if (s_lightDebug < 0) {
+				const char* ev = getenv("GENERALSX_LIGHT_DEBUG");
+				s_lightDebug = (ev != nullptr && *ev != 0) ? (atoi(ev) ? 1 : 0) : 0;
+			}
+			// GeneralsX @debug 24/10/2026 P0: c31.y=1 selects the raw point-light view used by the
+			// P0 screenshot check. Default 0; only the QA env GENERALSX_LIGHT_DEBUG turns it on.
+			// c31.z = linear pipeline (HDR): gnm/skin/pbr decode the D3DCOLOR vertex attribute with it.
+			// GeneralsX @refactor 28/10/2026: the temporary whole-object ambient gain (c31.w) is gone. It
+			// existed to compensate for a light that was being sRGB-decoded twice here (see the lenv note
+			// in Apply); with the decode fixed the objects read the same numbers as the ground and need no
+			// per-family multiplier. c31.w stays reserved and is written as 0.
+			Vector4 c31((float)(VK_Forward_Active() ? 1 : 0), (float)s_lightDebug,
+				DX8Wrapper::VK_HDR_Enabled() ? 1.0f : 0.0f, 0.0f);
 			DX8Wrapper::Set_Pixel_Shader_Constant(31, &c31, 1);
 			// GeneralsX @bugfix Qoder 21/10/2026 GNATEST: the GN family is mounted on NUV1/NUV2
 			// vegetation (hedges, dogwood, tree drawables) whose textures are alpha-cut. A custom PS
@@ -1079,14 +1235,10 @@ namespace DX8GeomNormal
 			}
 		}
 #endif
-		// GeneralsX @feature PS3.0-P3-12 14/10/2026: PS c16 = hemi ambient rgb, multiplied by the
-		// world-up component (n.z) in the GN/GNS/GNS5 shaders. GENERALSX_HEMI=0 zeroes it and the
-		// extra term is a numerical no-op (flat-ambient parity).
-		{
-			const float hk = Hemi_Ambient_K();
-			Vector4 c16hemi(amb.X * hk, amb.Y * hk, amb.Z * hk, 0.0f);
-			DX8Wrapper::Set_Pixel_Shader_Constant(16, &c16hemi, 1);   // PS c16 = hemi ambient
-		}
+		// GeneralsX @refactor 27/10/2026 P1-1: the PS c16 hemi upload is retired. The object families
+		// take their hemisphere ambient from the per-object c39/c40 pair (published by the material
+		// instance pass, sky/ground split), so the old flat-ambient * n.z term, its 0.15 strength and
+		// the GENERALSX_HEMI A/B knob had no reader left. c16 stays reserved; nothing writes it.
 		// GeneralsX @feature PS3.0-P3-14 14/10/2026: PS c25/c26 = eye-depth fog ramp for the GN
 		// shaders. Injected state (DX8NormalMap::Set_Fog); w=0 is the exact pre-fog pixel.
 		DX8Wrapper::Set_Pixel_Shader_Constant(25, &g_FogColorStrength, 1);
@@ -1129,6 +1281,11 @@ namespace DX8GeomNormal
 			DX8Wrapper::Set_Pixel_Shader_Constant(13, &c13eye, 1);    // PS c13 = world eye dir, w = spec power
 			Vector4 c14spec(specInt, specInt, specInt, 0.0f);
 			DX8Wrapper::Set_Pixel_Shader_Constant(14, &c14spec, 1);   // PS c14 = spec intensity (0 = off)
+			// GeneralsX @feature Qoder 24/10/2026 P2: camera world position for the per-pixel V.
+			// The view matrix is row-vector; its inverse's Row[3] is the eye position.
+			const Matrix4x4 invView = view.Inverse();
+			Vector4 c38cam(invView[3].X, invView[3].Y, invView[3].Z, 0.0f);
+			DX8Wrapper::Set_Pixel_Shader_Constant(38, &c38cam, 1);    // PS c38 = camera world position
 		}
 
 		// GeneralsX @feature Qoder 17/10/2026 P3 (逐像素光照总闸): merged-pair layer contract uploads.

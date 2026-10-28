@@ -57,6 +57,7 @@
 #include <WWMath/colmath.h>
 #include <WW3D2/coltest.h>
 #include <WW3D2/rinfo.h>
+#include <WW3D2/Backend/VulkanForward.h>
 #include <WW3D2/camera.h>
 #include <d3dx9core.h>
 #include "Common/GlobalData.h"
@@ -1432,6 +1433,14 @@ void HeightMapRenderObjClass::On_Frame_Update()
 				fflush(stderr);
 			}
 		}
+		return;
+	}
+
+	// GeneralsX @feature Qoder 24/10/2026 P1: Forward+ terrain PS reads point lights from the SSBO and
+	// no longer reads vColor.rgb. Rewriting the vertex buffers every frame for dynamic lights was pure
+	// CPU work; skip it when the feed is enabled. The fixed-function fallback (VK_Forward_Enabled()==0)
+	// keeps the old bake.
+	if (VK_Forward_Enabled()) {
 		return;
 	}
 

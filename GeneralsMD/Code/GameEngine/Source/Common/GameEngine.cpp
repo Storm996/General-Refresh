@@ -35,6 +35,7 @@
 #include "Common/FramePacer.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
+#include "Common/Money.h"
 #include "Common/Team.h"
 #include "Common/PlayerList.h"
 #include "Common/GameAudio.h"
@@ -65,6 +66,7 @@
 #include "Common/TerrainTypes.h"
 #include "Common/Upgrade.h"
 #include "Common/OptionPreferences.h"
+#include "Common/SkirmishPreferences.h"	// GeneralsX @feature 25/10/2026 -skirmish player identity
 #include "Common/Xfer.h"
 #include "Common/XferCRC.h"
 #include "Common/GameLOD.h"
@@ -87,6 +89,8 @@
 
 #include "GameClient/ClientInstance.h"
 #include "GameClient/FXList.h"
+#include "GameClient/CampaignManager.h"
+#include "GameClient/ChallengeGenerals.h"
 // GeneralsX @feature Storm996 16/10/2026 PS3.0 4B: building lamp lights
 #include "GameClient/LampList.h"
 #include "GameClient/GameClient.h"
@@ -378,9 +382,30 @@ Bool GameEngine::isGameHalted()
 // [AITEAM] trace lines. This only feeds the normal MSG_NEW_GAME path - no gameplay code,
 // no new serialized state, determinism untouched for every other launch.
 static Bool s_qaSkirmishClaimed = FALSE;
-static void checkQAAutoSkirmish()
+
+// Parses a comma-separated per-slot integer list for -skirmish. Returns the number of values
+// written; an absent list becomes one fallback value.
+static Int parseSlotList(const char *text, Int *values, Int maxValues, Int fallback)
 {
-	const char *spec = getenv("GENERALX_QA_SKIRMISH");
+	Int count = 0;
+	if (text && *text && maxValues > 0)
+	{
+		const char *p = text;
+		while (p && *p && count < maxValues)
+		{
+			values[count++] = atoi(p);
+			p = strchr(p, ',');
+			if (p)
+				++p;
+		}
+	}
+	if (count == 0 && maxValues > 0)
+		values[count++] = fallback;
+	return count;
+}
+
+static void startAutoSkirmish(const char *spec)
+{
 	if (!spec || !*spec)
 		return;
 
@@ -438,6 +463,19 @@ static void checkQAAutoSkirmish()
 			fpsCap = v;
 	}
 
+	// GeneralsX @feature 25/10/2026 Optional launcher fields after fps:
+	// playerFaction;aiFaction;playerColor;startingCash;aiFactions;aiTeams;aiColors;playerTeam.
+	// Template indices come from PlayerTemplate.ini; -1 keeps the SkirmishPreferences/random
+	// default. The comma lists are one value per AI slot, enabling the launcher's per-slot setup.
+	const char *playerFactionTok = strtok(nullptr, ";");
+	const char *aiFactionTok = strtok(nullptr, ";");
+	const char *playerColorTok = strtok(nullptr, ";");
+	const char *startingCashTok = strtok(nullptr, ";");
+	const char *aiFactionsTok = strtok(nullptr, ";");
+	const char *aiTeamsTok = strtok(nullptr, ";");
+	const char *aiColorsTok = strtok(nullptr, ";");
+	const char *playerTeamTok = strtok(nullptr, ";");
+
 	// GeneralsX @feature ai-upgrade 15/10/2026 The style field now accepts a comma-separated
 	// per-slot list (e.g. "4,6" = slot1 Rush vs slot2 Horde). A single value still applies
 	// to every AI slot, so existing 12/13-script specs are unchanged. Pure integer scan,
@@ -469,13 +507,68 @@ static void checkQAAutoSkirmish()
 	sgi->setLocalIP(sgi->getSlot(0)->getIP());
 	sgi->enterGame();
 
+	SkirmishPreferences skirmishPrefs;
 	GameSlot humanSlot;
-	UnicodeString humanName;
-	humanName.set(L"QA");
+	UnicodeString humanName = skirmishPrefs.getUserName();
+	if (humanName.isEmpty())
+		humanName.set(L"Player");
+
+	Int humanFaction = skirmishPrefs.getPreferredFaction();
+	if (!ThePlayerTemplateStore || humanFaction < PLAYERTEMPLATE_MIN ||
+		humanFaction >= ThePlayerTemplateStore->getPlayerTemplateCount())
+	{
+		humanFaction = PLAYERTEMPLATE_RANDOM;
+	}
+	if (playerFactionTok)
+	{
+		const Int v = atoi(playerFactionTok);
+		if (ThePlayerTemplateStore && v >= PLAYERTEMPLATE_MIN &&
+			v < ThePlayerTemplateStore->getPlayerTemplateCount())
+			humanFaction = v;
+	}
+
+	Int aiFaction = PLAYERTEMPLATE_RANDOM;
+	if (aiFactionTok)
+	{
+		const Int v = atoi(aiFactionTok);
+		if (ThePlayerTemplateStore && v >= PLAYERTEMPLATE_MIN &&
+			v < ThePlayerTemplateStore->getPlayerTemplateCount())
+			aiFaction = v;
+	}
+
+	Int aiFactions[MAX_SLOTS];
+	Int aiTeams[MAX_SLOTS];
+	Int aiColors[MAX_SLOTS];
+	const Int nAiFactions = parseSlotList(aiFactionsTok, aiFactions, MAX_SLOTS, aiFaction);
+	const Int nAiTeams = parseSlotList(aiTeamsTok, aiTeams, MAX_SLOTS, -1);
+	const Int nAiColors = parseSlotList(aiColorsTok, aiColors, MAX_SLOTS, -1);
+
+	Int humanColor = skirmishPrefs.getPreferredColor();
+	if (!TheMultiplayerSettings || humanColor < 0 ||
+		humanColor >= TheMultiplayerSettings->getNumColors())
+	{
+		humanColor = 0;
+	}
+	if (playerColorTok && TheMultiplayerSettings)
+	{
+		const Int v = atoi(playerColorTok);
+		if (v >= 0 && v < TheMultiplayerSettings->getNumColors())
+			humanColor = v;
+	}
+	Int humanTeam = -1;
+	if (playerTeamTok)
+	{
+		const Int v = atoi(playerTeamTok);
+		if (v >= 0)
+			humanTeam = v;
+	}
+
 	humanSlot.setState(SLOT_PLAYER, humanName);
-	humanSlot.setColor(0);
-	humanSlot.setPlayerTemplate(PLAYERTEMPLATE_RANDOM);
+	humanSlot.setColor(humanColor);
+	humanSlot.setPlayerTemplate(humanFaction);
 	humanSlot.setStartPos(0);
+	if (humanTeam >= 0)
+		humanSlot.setTeamNumber(humanTeam);
 	humanSlot.setAccept();
 	sgi->setSlot(0, humanSlot);
 
@@ -483,8 +576,22 @@ static void checkQAAutoSkirmish()
 	{
 		GameSlot aiSlot;
 		aiSlot.setState(aiState);
-		aiSlot.setColor(i);
-		aiSlot.setPlayerTemplate(PLAYERTEMPLATE_RANDOM);
+
+		Int slotFaction = (i - 1 < nAiFactions) ? aiFactions[i - 1] : aiFaction;
+		if (!ThePlayerTemplateStore || slotFaction < PLAYERTEMPLATE_MIN ||
+			slotFaction >= ThePlayerTemplateStore->getPlayerTemplateCount())
+			slotFaction = PLAYERTEMPLATE_RANDOM;
+		aiSlot.setPlayerTemplate(slotFaction);
+
+		Int slotColor = (i - 1 < nAiColors) ? aiColors[i - 1] : i;
+		if (!TheMultiplayerSettings || slotColor < 0 ||
+			slotColor >= TheMultiplayerSettings->getNumColors())
+			slotColor = i;
+		aiSlot.setColor(slotColor);
+
+		if (i - 1 < nAiTeams && aiTeams[i - 1] >= 0)
+			aiSlot.setTeamNumber(aiTeams[i - 1]);
+
 		aiSlot.setStartPos(i);
 		aiSlot.setAIStyle((nStyles > 1 && (i - 1) < nStyles) ? styles[i - 1] : styles[0]);
 		aiSlot.setAccept();
@@ -492,7 +599,18 @@ static void checkQAAutoSkirmish()
 	}
 
 	sgi->setSeed(seed);
-	sgi->setSuperweaponRestriction(1);
+	sgi->setSuperweaponRestriction(skirmishPrefs.getSuperweaponRestricted() ? 1 : 0);
+	sgi->setStartingCash(skirmishPrefs.getStartingCash());
+	if (startingCashTok)
+	{
+		const Int cash = atoi(startingCashTok);
+		if (cash >= 0)
+		{
+			Money cashMoney;
+			cashMoney.setStartingCash((UnsignedInt)cash);
+			sgi->setStartingCash(cashMoney);
+		}
+	}
 	AsciiString mapName(mapTok);
 	sgi->setMap(mapName);
 	const MapMetaData *md = TheMapCache ? TheMapCache->findMap(mapName) : nullptr;
@@ -501,6 +619,12 @@ static void checkQAAutoSkirmish()
 		sgi->setMapCRC(md->m_CRC);
 		sgi->setMapSize(md->m_filesize);
 	}
+
+	// GeneralsX @feature 25/10/2026 The skirmish UI calls startGame(0) before queueing
+	// MSG_NEW_GAME; without it GameLogic loads the terrain but never advances the match (frame
+	// stays 0 and the HUD never appears).
+	TheWritableGlobalData->m_mapName = mapName;
+	sgi->startGame(0);
 
 	// GeneralsX @bugfix ai-upgrade 15/10/2026 Suppress the 3D shell map. onNewGame() rejects any
 	// MSG_NEW_GAME that arrives while the shell map is still loading (isInGame()/isLoadingMap()
@@ -512,6 +636,7 @@ static void checkQAAutoSkirmish()
 	s_qaSkirmishClaimed = TRUE;	// keeps the -file auto-start block below from double-queuing
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
 	TheWritableGlobalData->m_pendingFile = mapName;
 
 	InitRandom(seed);
@@ -522,9 +647,206 @@ static void checkQAAutoSkirmish()
 	msg->appendIntegerArgument(0);
 	msg->appendIntegerArgument(fpsCap);							// 1000 = QA full speed; 30 = retail pacing
 
-	fprintf(stderr, "[QASKIRM] auto-start map=%s aiCount=%d diff=%d style=%d(%s) seed=%d fps=%d\n",
-		mapTok, aiCount, (Int)aiState, aiStyle, styleTok ? styleTok : "-", seed, fpsCap);
+	fprintf(stderr, "[QASKIRM] auto-start map=%s aiCount=%d diff=%d style=%d(%s) seed=%d fps=%d playerFaction=%d aiFaction=%d\n",
+		mapTok, aiCount, (Int)aiState, aiStyle, styleTok ? styleTok : "-", seed, fpsCap, humanFaction, aiFaction);
 	fflush(stderr);
+}
+
+// GeneralsX @feature 25/10/2026 External launcher campaign boot. The launcher already owns the
+// campaign/mission picker, so jump straight into the chosen mission instead of pushing
+// MissionSelect.wnd. This mirrors MissionSelect's start path: set campaign/mission + difficulty,
+// make the mission map the pending/initial file, suppress the shell map, then queue a normal
+// GAME_SINGLE_PLAYER message.
+static void startLauncherCampaign(const char *spec)
+{
+	if (!spec || !*spec || !TheCampaignManager)
+		return;
+	if (!TheGlobalData->m_initialFile.isEmpty())
+		return;
+
+	char work[512];
+	Int wi = 0;
+	while (spec[wi] != 0 && wi < (Int)sizeof(work) - 1)
+	{
+		work[wi] = spec[wi];
+		++wi;
+	}
+	work[wi] = 0;
+
+	char *campaignTok = strtok(work, ";");
+	char *missionTok = strtok(nullptr, ";");
+	char *diffTok = strtok(nullptr, ";");
+	if (!campaignTok || !missionTok)
+	{
+		fprintf(stderr, "[LAUNCHER] bad campaign spec '%s' (want campaign;mission;difficulty)\n", spec);
+		fflush(stderr);
+		return;
+	}
+
+	Int difficulty = diffTok ? atoi(diffTok) : (Int)DIFFICULTY_NORMAL;
+	if (difficulty < (Int)DIFFICULTY_EASY)
+		difficulty = (Int)DIFFICULTY_EASY;
+	if (difficulty > (Int)DIFFICULTY_HARD)
+		difficulty = (Int)DIFFICULTY_HARD;
+
+	AsciiString missionName(missionTok);
+	missionName.toLower();
+	TheCampaignManager->setCampaignAndMission(AsciiString(campaignTok), missionName);
+	AsciiString mapName = TheCampaignManager->getCurrentMap();
+	if (mapName.isEmpty())
+	{
+		fprintf(stderr, "[LAUNCHER] campaign mission not found: %s / %s\n", campaignTok, missionTok);
+		fflush(stderr);
+		return;
+	}
+
+	TheCampaignManager->setGameDifficulty((GameDifficulty)difficulty);
+	TheScriptEngine->setGlobalDifficulty((GameDifficulty)difficulty);
+
+	TheWritableGlobalData->m_pendingFile = mapName;
+	TheWritableGlobalData->m_initialFile = mapName;
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	TheWritableGlobalData->m_skipMainMenu = TRUE;
+	s_qaSkirmishClaimed = TRUE;
+
+	InitRandom(0);
+
+	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
+	msg->appendIntegerArgument(GAME_SINGLE_PLAYER);
+	msg->appendIntegerArgument(difficulty);
+	msg->appendIntegerArgument(TheCampaignManager->getRankPoints());
+	msg->appendIntegerArgument(TheGlobalData->m_framesPerSecondLimit);
+
+	fprintf(stderr, "[LAUNCHER] campaign start %s / %s difficulty=%d map=%s\n",
+		campaignTok, missionTok, difficulty, mapName.str());
+	fflush(stderr);
+}
+
+// GeneralsX @feature 25/10/2026 External launcher challenge boot. ChallengeMenu normally creates
+// TheChallengeGameInfo and calls setGeneralCampaign(); do the same headlessly, then queue the
+// GAME_SINGLE_PLAYER message with the selected persona/difficulty.
+extern void setGeneralCampaign(Int buttonIndex);
+extern SkirmishGameInfo *TheChallengeGameInfo;
+
+static void startLauncherChallenge(const char *spec)
+{
+	if (!spec || !*spec || !TheChallengeGenerals || !TheCampaignManager)
+		return;
+	if (!TheGlobalData->m_initialFile.isEmpty())
+		return;
+
+	char work[128];
+	Int wi = 0;
+	while (spec[wi] != 0 && wi < (Int)sizeof(work) - 1)
+	{
+		work[wi] = spec[wi];
+		++wi;
+	}
+	work[wi] = 0;
+
+	char *indexTok = strtok(work, ";");
+	char *diffTok = strtok(nullptr, ";");
+	char *stageTok = strtok(nullptr, ";");
+	if (!indexTok)
+	{
+		fprintf(stderr, "[LAUNCHER] bad challenge spec '%s' (want personaIndex;difficulty;stage)\n", spec);
+		fflush(stderr);
+		return;
+	}
+
+	Int stage = stageTok ? atoi(stageTok) : 1;
+	if (stage < 1)
+		stage = 1;
+	if (stage > 7)
+		stage = 7;
+
+	const Int personaIndex = atoi(indexTok);
+	if (personaIndex < 0 || personaIndex >= NUM_GENERALS)
+	{
+		fprintf(stderr, "[LAUNCHER] challenge persona out of range: %d\n", personaIndex);
+		fflush(stderr);
+		return;
+	}
+
+	Int difficulty = diffTok ? atoi(diffTok) : (Int)DIFFICULTY_NORMAL;
+	if (difficulty < (Int)DIFFICULTY_EASY)
+		difficulty = (Int)DIFFICULTY_EASY;
+	if (difficulty > (Int)DIFFICULTY_HARD)
+		difficulty = (Int)DIFFICULTY_HARD;
+
+	if (!TheChallengeGameInfo)
+	{
+		TheChallengeGameInfo = NEW SkirmishGameInfo;
+		TheChallengeGameInfo->init();
+		TheChallengeGameInfo->clearSlotList();
+		TheChallengeGameInfo->reset();
+		TheChallengeGameInfo->enterGame();
+	}
+
+	setGeneralCampaign(personaIndex);
+	if (stage > 1)
+	{
+		Campaign *campaign = TheCampaignManager->getCurrentCampaign();
+		Mission *mission = campaign ? campaign->getMissionByIndex(stage - 1) : nullptr;
+		if (campaign && mission)
+		{
+			TheCampaignManager->setCampaignAndMission(campaign->m_name, mission->m_name);
+			fprintf(stderr, "[LAUNCHER] challenge stage select persona=%d stage=%d mission=%s\n",
+				personaIndex, stage, mission->m_name.str());
+			fflush(stderr);
+		}
+		else
+		{
+			fprintf(stderr, "[LAUNCHER] challenge stage %d not found, using first mission\n", stage);
+			fflush(stderr);
+		}
+	}
+	TheChallengeGenerals->setCurrentDifficulty((GameDifficulty)difficulty);
+	TheCampaignManager->setGameDifficulty((GameDifficulty)difficulty);
+	TheScriptEngine->setGlobalDifficulty((GameDifficulty)difficulty);
+
+	AsciiString mapName = TheCampaignManager->getCurrentMap();
+	if (mapName.isEmpty())
+	{
+		fprintf(stderr, "[LAUNCHER] challenge persona %d has no campaign map\n", personaIndex);
+		fflush(stderr);
+		return;
+	}
+	TheChallengeGameInfo->setMap(mapName);
+	TheWritableGlobalData->m_mapName = mapName;
+	TheChallengeGameInfo->startGame(0);
+
+	TheWritableGlobalData->m_pendingFile = mapName;
+	TheWritableGlobalData->m_initialFile = mapName;
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	TheWritableGlobalData->m_skipMainMenu = TRUE;
+	s_qaSkirmishClaimed = TRUE;
+
+	InitRandom(0);
+
+	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
+	msg->appendIntegerArgument(GAME_SINGLE_PLAYER);
+	msg->appendIntegerArgument(difficulty);
+	msg->appendIntegerArgument(TheCampaignManager->getRankPoints());
+	msg->appendIntegerArgument(TheGlobalData->m_framesPerSecondLimit);
+
+	fprintf(stderr, "[LAUNCHER] challenge start persona=%d difficulty=%d map=%s\n",
+		personaIndex, difficulty, mapName.str());
+	fflush(stderr);
+}
+
+// GeneralsX @feature 25/10/2026 The external launcher passes -skirmish <spec> instead of the QA
+// environment variable. The spec format is identical, so the tested QA launch path is reused;
+// player name/faction/colour/cash still come from the normal SkirmishPreferences.
+static void checkQAAutoSkirmish()
+{
+	const char *spec = getenv("GENERALX_QA_SKIRMISH");
+	if (spec && *spec)
+		startAutoSkirmish(spec);
 }
 
 /** -----------------------------------------------------------------------------------------------
@@ -923,6 +1245,10 @@ void GameEngine::init()
 		TheMetaMap->generateMetaMap();
 		TheMetaMap->verifyMetaMap();
 
+		// GeneralsX @feature 25/10/2026 Launcher key-binding overrides.
+		if (!TheGlobalData->m_keyMapFile.isEmpty())
+			TheMetaMap->loadKeyMap(TheGlobalData->m_keyMapFile.str());
+
 
 		initSubsystem(TheActionManager,"TheActionManager", MSGNEW("GameEngineSubsystem") ActionManager(), nullptr);
 		//initSubsystem((CComObject<WebBrowser> *)TheWebBrowser,"(CComObject<WebBrowser> *)TheWebBrowser", (CComObject<WebBrowser> *)createWebBrowser(), nullptr);
@@ -1002,10 +1328,35 @@ void GameEngine::init()
 		// the push loses the race - the shell's GAME_SHELL message is first in the list, consumes
 		// our m_pendingFile as its background map, and onNewGame() then rejects our message via
 		// the isLoadingMap() guard (RETAIL_COMPATIBLE_CRC==0), stranding the launch on the menu.
-		checkQAAutoSkirmish();
+		// GeneralsX @feature 25/10/2026 Launcher boots skip the shell/MainMenu callback that would
+		// normally carry the first WM_ACTIVATE into the engine. Without this the game is running but
+		// GameEngine::isActive() stays FALSE, so ToggleQuitMenu() rejects ESC with no visible result.
+		if (TheGlobalData->m_skipMainMenu)
+			setIsActive(TRUE);
+
+		// GeneralsX @feature 25/10/2026 The launcher's campaign/challenge/skirmish specs win over
+		// the QA env var.
+		if (!TheGlobalData->m_campaignSpec.isEmpty())
+			startLauncherCampaign(TheGlobalData->m_campaignSpec.str());
+		else if (!TheGlobalData->m_challengeSpec.isEmpty())
+			startLauncherChallenge(TheGlobalData->m_challengeSpec.str());
+		else if (!TheGlobalData->m_skirmishSpec.isEmpty())
+			startAutoSkirmish(TheGlobalData->m_skirmishSpec.str());
+		else
+			checkQAAutoSkirmish();
 
 		// load the initial shell screen
-		TheShell->push( "Menus/MainMenu.wnd" );
+		// GeneralsX @feature 25/10/2026 External launcher: -nomenu skips MainMenu.wnd; -screen
+		// pushes the requested layout instead (MissionSelect, ChallengeMenu, SkirmishGameOptions).
+		if (TheGlobalData->m_skipMainMenu)
+		{
+			if (!TheGlobalData->m_launcherScreen.isEmpty())
+				TheShell->push(TheGlobalData->m_launcherScreen);
+		}
+		else
+		{
+			TheShell->push( "Menus/MainMenu.wnd" );
+		}
 
 		// This allows us to run a map from the command line
 		// GeneralsX @bugfix ai-upgrade 15/10/2026 skip when the QA skirmish hook already

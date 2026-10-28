@@ -179,8 +179,13 @@ public:
 
 	IDirect3DIndexBuffer9* Get_DX8_Index_Buffer()	{ return index_buffer; }
 
+	// GeneralsX @bugfix Qoder 24/10/2026: the Vulkan backing needs to know whether this buffer is
+	// rewritten while earlier frames may still read it (see DX8VertexBufferClass::Get_Usage()).
+	UsageType Get_Usage() const { return m_usage; }
+
 private:
 	IDirect3DIndexBuffer9*	index_buffer;		// actual dx8 index buffer
+	UsageType								m_usage = USAGE_DEFAULT;	///< GeneralsX @bugfix Qoder 24/10/2026
 };
 
 

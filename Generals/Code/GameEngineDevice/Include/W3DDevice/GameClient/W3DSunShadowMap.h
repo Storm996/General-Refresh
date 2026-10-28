@@ -1,5 +1,5 @@
-/*
-**	Command & Conquer Generals Zero Hour(tm)
+﻿/*
+**	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
 **	This program is free software: you can redistribute it and/or modify
@@ -24,10 +24,10 @@
 
 // FILE: W3DSunShadowMap.h ////////////////////////////////////////////////////
 //
-// GeneralsX @feature PS3.0 T6 sun shadow map - base-game stub.
-//
-// The shared Core W3DDisplay.cpp calls the two frame hooks; the real depth-map pass ships with
-// Zero Hour only, so this target links inline no-ops and the retail shadow path is untouched.
+// GeneralsX @refactor Qoder 20/10/2026: the T6 depth-buffered sun shadow map is retired from the
+// build. The shared Core W3DDisplay.cpp still calls the two frame hooks, so this target links the
+// same inline no-op stub the base game uses; the retail projected (decal) and volumetric (stencil)
+// shadow managers own shadows again because isWanted() now reports false.
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -42,8 +42,9 @@ class W3DSunShadowMap
 		static void renderTerrainReceiver(CameraClass *) {}
 		static void releaseResources() {}
 		static void reAcquireResources() {}
-		// GeneralsX @feature PS3.0-P3-23 14/10/2026: no-op stubs for the S4 composition queries
-		// (base game never runs the sun-map pass, so reception is always inactive).
 		static bool isReceptionActive() { return false; }
 		static float receptionStrength() { return 0.0f; }
+
+		// False = the legacy shadow managers arm their queue (W3DScene.cpp) instead of standing down.
+		static bool isWanted() { return false; }
 };

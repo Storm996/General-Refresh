@@ -2395,6 +2395,20 @@ void InGameUI::messageColor( const RGBColor *rgbColor, UnicodeString format, ...
 //-------------------------------------------------------------------------------------------------
 void InGameUI::addMessageText( const UnicodeString& formattedMessage, const RGBColor *rgbColor )
 {
+	// GeneralsX @debug 28/10/2026 QA hook: an on-screen message is the marker the user gave for the
+	// foliage flicker window, and a 190 fps cadence cannot land on it. Arm N consecutive forensic
+	// frames at the first message; GENERALSX_VKSHOT_ONMSG=<frames> (default 240 when set to 1).
+	// The device layer owns the Vulkan symbol (this target does not get SAGE_USE_VULKAN_CORE), so it
+	// forwards through GX_VK_Shot_Arm, which is a no-op outside the Vulkan build.
+	{
+		extern void GX_VK_Shot_Arm(int frames);
+		static int s_armFrames = -1;
+		if (s_armFrames < 0) {
+			const char* e = getenv("GENERALSX_VKSHOT_ONMSG");
+			s_armFrames = (e != nullptr && *e != 0) ? (atoi(e) > 0 ? atoi(e) : 240) : 0;
+		}
+		if (s_armFrames > 0) GX_VK_Shot_Arm(s_armFrames);
+	}
 	Int i;
 	Color color1 = m_messageColor1;
 	Color color2 = m_messageColor2;

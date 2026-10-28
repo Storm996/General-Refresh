@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -133,13 +133,10 @@ public:
 
 	bool								Contains(const Vector3 &point);
 
-	void								Compose_Deformed_Vertex_Buffer(
-											VertexFormatXYZNDUV2* verts,
-											const Vector2* uv0,
-											const Vector2* uv1,
-											const unsigned* diffuse);
 	void								Get_Deformed_Vertices(Vector3 *dst_vert, Vector3 *dst_norm);
 	void								Get_Deformed_Vertices(Vector3 *dst_vert);
+	// GeneralsX @feature T3-0 P1: skin deformation including the model-space tangent basis.
+	void								Get_Deformed_Vertices(Vector3 *dst_vert, Vector3 *dst_norm, Vector3 *dst_tan, Vector3 *dst_bin);
 
 	void								Set_Lighting_Environment(LightEnvironmentClass * light_env) { if (light_env) {m_localLightEnv=*light_env;LightEnvironment = &m_localLightEnv;} else {LightEnvironment = nullptr;} }
 	LightEnvironmentClass *		Get_Lighting_Environment() { return LightEnvironment; }

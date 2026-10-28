@@ -4536,6 +4536,21 @@ void ScriptEngine::init()
 	curTemplate->m_uiStrings[1] = " has lost an object of type ";
 	curTemplate->m_uiStrings[2] = " (can be an object type list).";
 
+	// GeneralsX @feature 25/10/2026 P34 F6: the base game's template table never carried the stable
+	// internal name that the shared MapLogicDumper (Core/GameEngine/.../MapLogicDumper.cpp) prints for
+	// every action/condition. The GeneralsMD table assigns one per template; the base table does not, so
+	// fall back to the display name - the dumper then still identifies the action instead of printing
+	// "<unknown_action>" for every line. Content that needs the real stable ids can author them later.
+	for (Int i = 0; i < ScriptAction::NUM_ITEMS; ++i) {
+		if (m_actionTemplates[i].m_internalName.isEmpty()) {
+			m_actionTemplates[i].m_internalName = m_actionTemplates[i].m_name;
+		}
+	}
+	for (Int i = 0; i < Condition::NUM_ITEMS; ++i) {
+		if (m_conditionTemplates[i].m_internalName.isEmpty()) {
+			m_conditionTemplates[i].m_internalName = m_conditionTemplates[i].m_name;
+		}
+	}
 
 	reset();
 

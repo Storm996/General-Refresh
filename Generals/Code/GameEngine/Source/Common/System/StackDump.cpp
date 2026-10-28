@@ -34,10 +34,38 @@
 #include "DbgHelpLoader.h"
 
 //*****************************************************************************
+//	Architecture helpers
+//*****************************************************************************
+// GeneralsX @build win64 11/10/2026 The CONTEXT register names differ per architecture; MSVC has
+// no inline assembler on x64, so the instruction pointer/stack pointer are captured through
+// RtlCaptureContext instead of the historic "lea/mov" sequence.
+#ifdef _WIN64
+	#define SD_CTX_IP(c) ((c)->Rip)
+	#define SD_CTX_SP(c) ((c)->Rsp)
+	#define SD_CTX_BP(c) ((c)->Rbp)
+	#define SD_CTX_AX(c) ((c)->Rax)
+	#define SD_CTX_BX(c) ((c)->Rbx)
+	#define SD_CTX_CX(c) ((c)->Rcx)
+	#define SD_CTX_DX(c) ((c)->Rdx)
+	#define SD_CTX_SI(c) ((c)->Rsi)
+	#define SD_CTX_DI(c) ((c)->Rdi)
+#else
+	#define SD_CTX_IP(c) ((c)->Eip)
+	#define SD_CTX_SP(c) ((c)->Esp)
+	#define SD_CTX_BP(c) ((c)->Ebp)
+	#define SD_CTX_AX(c) ((c)->Eax)
+	#define SD_CTX_BX(c) ((c)->Ebx)
+	#define SD_CTX_CX(c) ((c)->Ecx)
+	#define SD_CTX_DX(c) ((c)->Edx)
+	#define SD_CTX_SI(c) ((c)->Esi)
+	#define SD_CTX_DI(c) ((c)->Edi)
+#endif
+
+//*****************************************************************************
 //	Prototypes
 //*****************************************************************************
 BOOL InitSymbolInfo();
-void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*));
+void MakeStackTrace(UINT_PTR myeip,UINT_PTR myesp,UINT_PTR myebp, int skipFrames, void (*callback)(const char*));
 void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address);
 void WriteStackLine(void*address, void (*callback)(const char*));
 
@@ -67,9 +95,17 @@ void StackDump(void (*callback)(const char*))
 	if (!InitSymbolInfo())
 		return;
 
-	DWORD myeip,myesp,myebp;
+	UINT_PTR myeip,myesp,myebp;
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_WIN64)
+	{
+		CONTEXT capture;
+		RtlCaptureContext(&capture);
+		myeip = capture.Rip;
+		myesp = capture.Rsp;
+		myebp = capture.Rbp;
+	}
+#elif defined(_MSC_VER)
 _asm
 {
 MYEIP1:
@@ -102,7 +138,7 @@ MYEIP1:
 
 //*****************************************************************************
 //*****************************************************************************
-void StackDumpFromContext(DWORD eip,DWORD esp,DWORD ebp, void (*callback)(const char*))
+void StackDumpFromContext(UINT_PTR eip,UINT_PTR esp,UINT_PTR ebp, void (*callback)(const char*))
 {
 	if (callback == nullptr)
 	{
@@ -170,7 +206,7 @@ BOOL InitSymbolInfo()
 
 //*****************************************************************************
 //*****************************************************************************
-void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*))
+void MakeStackTrace(UINT_PTR myeip,UINT_PTR myesp,UINT_PTR myebp, int skipFrames, void (*callback)(const char*))
 {
 STACKFRAME      stack_frame;
 BOOL            b_ret = TRUE;
@@ -208,7 +244,7 @@ stack_frame.AddrFrame.Offset = myebp;
 			unsigned int skip = skipFrames;
 			while (b_ret&&skip)
 			{
-					b_ret = DbgHelp::StackWalk(      IMAGE_FILE_MACHINE_I386,
+					b_ret = DbgHelp::StackWalk(      DBGHELP_MACHINE_TYPE,
 											process,
 											thread,
 											&stack_frame,
@@ -224,7 +260,7 @@ stack_frame.AddrFrame.Offset = myebp;
 			while(b_ret&&skip)
 			{
 
-					b_ret = DbgHelp::StackWalk(      IMAGE_FILE_MACHINE_I386,
+					b_ret = DbgHelp::StackWalk(      DBGHELP_MACHINE_TYPE,
 											process,
 											thread,
 											&stack_frame,
@@ -267,18 +303,20 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 		*address = 0xFFFFFFFF;
 	}
 
-	ULONG displacement = 0;
+	// GeneralsX @build win64 11/10/2026 Address-sized displacement and symbol record, the 32-bit
+	// layouts are not accepted by the *64 dbghelp entry points
+	DbghelpAddr displacement = 0;
 
     HANDLE process = ::GetCurrentProcess();
 
-    char symbol_buffer[512 + sizeof(IMAGEHLP_SYMBOL)];
+    char symbol_buffer[512 + sizeof(DbghelpSymbol)];
     memset(symbol_buffer, 0, sizeof(symbol_buffer));
 
-    PIMAGEHLP_SYMBOL psymbol = (PIMAGEHLP_SYMBOL)symbol_buffer;
+    DbghelpSymbolPtr psymbol = (DbghelpSymbolPtr)symbol_buffer;
     psymbol->SizeOfStruct = sizeof(symbol_buffer);
     psymbol->MaxNameLength = 512;
 
-	if (DbgHelp::SymGetSymFromAddr(process, (DWORD) pointer, &displacement, psymbol))
+	if (DbgHelp::SymGetSymFromAddr(process, (DbghelpAddr) pointer, &displacement, psymbol))
 	{
 		if (name)
 		{
@@ -292,7 +330,7 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 		memset(&line,0,sizeof(line));
 		line.SizeOfStruct = sizeof(line);
 
-		if (DbgHelp::SymGetLineFromAddr(process, (DWORD) pointer, &displacement, &line))
+		if (DbgHelp::SymGetLineFromAddr(process, (DbghelpAddr) pointer, &displacement, &line))
 		{
 			if (filename)
 			{
@@ -328,8 +366,16 @@ void FillStackAddresses(void**addresses, unsigned int count, unsigned int skip)
     memset(&gsContext, 0, sizeof(CONTEXT));
     gsContext.ContextFlags = CONTEXT_FULL;
 
-	DWORD myeip,myesp,myebp;
-#if defined(_MSC_VER)
+	UINT_PTR myeip,myesp,myebp;
+#if defined(_MSC_VER) && defined(_WIN64)
+	{
+		CONTEXT capture;
+		RtlCaptureContext(&capture);
+		myeip = capture.Rip;
+		myesp = capture.Rsp;
+		myebp = capture.Rbp;
+	}
+#elif defined(_MSC_VER)
 _asm
 {
 MYEIP2:
@@ -383,7 +429,7 @@ stack_frame.AddrFrame.Offset = myebp;
 		// Skip some?
 		while (stillgoing&&skip)
 		{
-			stillgoing = DbgHelp::StackWalk(IMAGE_FILE_MACHINE_I386,
+			stillgoing = DbgHelp::StackWalk(DBGHELP_MACHINE_TYPE,
 								process,
 								thread,
 								&stack_frame,
@@ -397,7 +443,7 @@ stack_frame.AddrFrame.Offset = myebp;
 
 		while(stillgoing&&count)
 		{
-			stillgoing = DbgHelp::StackWalk(IMAGE_FILE_MACHINE_I386,
+			stillgoing = DbgHelp::StackWalk(DBGHELP_MACHINE_TYPE,
 								process,
 								thread,
 								&stack_frame,
@@ -543,7 +589,7 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	** The following are set for access violation only
 	*/
 	int access_read_write=-1;
-	unsigned long access_address = 0;
+	uintptr_t access_address = 0;
 	AsciiString msg;
 
 // DOUBLE_DEBUG does a DEBUG_LOG, and concats to g_LastErrorDump.  jba.
@@ -589,7 +635,7 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	}
 
 	DOUBLE_DEBUG (("\nStack Dump:"));
-	StackDumpFromContext(context->Eip, context->Esp, context->Ebp, nullptr);
+	StackDumpFromContext(SD_CTX_IP(context), SD_CTX_SP(context), SD_CTX_BP(context), nullptr);
 
 	DOUBLE_DEBUG (("\nDetails:"));
 
@@ -598,9 +644,9 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	/*
 	** Dump the registers.
 	*/
-	DOUBLE_DEBUG ( ( "Eip:%08X\tEsp:%08X\tEbp:%08X", context->Eip, context->Esp, context->Ebp));
-	DOUBLE_DEBUG ( ( "Eax:%08X\tEbx:%08X\tEcx:%08X", context->Eax, context->Ebx, context->Ecx));
-	DOUBLE_DEBUG ( ( "Edx:%08X\tEsi:%08X\tEdi:%08X", context->Edx, context->Esi, context->Edi));
+	DOUBLE_DEBUG ( ( "Eip:%016llX\tEsp:%016llX\tEbp:%016llX", (unsigned long long)SD_CTX_IP(context), (unsigned long long)SD_CTX_SP(context), (unsigned long long)SD_CTX_BP(context)));
+	DOUBLE_DEBUG ( ( "Eax:%016llX\tEbx:%016llX\tEcx:%016llX", (unsigned long long)SD_CTX_AX(context), (unsigned long long)SD_CTX_BX(context), (unsigned long long)SD_CTX_CX(context)));
+	DOUBLE_DEBUG ( ( "Edx:%016llX\tEsi:%016llX\tEdi:%016llX", (unsigned long long)SD_CTX_DX(context), (unsigned long long)SD_CTX_SI(context), (unsigned long long)SD_CTX_DI(context)));
 	DOUBLE_DEBUG ( ( "EFlags:%08X ", context->EFlags));
 	DOUBLE_DEBUG ( ( "CS:%04x  SS:%04x  DS:%04x  ES:%04x  FS:%04x  GS:%04x", context->SegCs, context->SegSs, context->SegDs, context->SegEs, context->SegFs, context->SegGs));
 
@@ -609,9 +655,9 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	*/
 	char scrap[512];
 	DOUBLE_DEBUG ( ("EIP bytes dump..."));
-	wsprintf (scrap, "\nBytes at CS:EIP (%08X)  : ", context->Eip);
+	wsprintf (scrap, "\nBytes at CS:EIP (%08X)  : ", (unsigned)SD_CTX_IP(context));
 
-	unsigned char *eip_ptr = (unsigned char *) (context->Eip);
+	unsigned char *eip_ptr = (unsigned char *) (uintptr_t) SD_CTX_IP(context);
 	char bytestr[32];
 
 	for (int c = 0 ; c < 32 ; c++)
@@ -645,5 +691,5 @@ void FillStackAddresses(void** addresses, unsigned int count, unsigned int skip)
 void DumpExceptionInfo(unsigned int u, EXCEPTION_POINTERS* e_info) {}
 void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* linenumber, unsigned int* address) {}
 
-#endif // (defined(RTS_DEBUG) || defined(IG_DEBUG_STACKTRACE)) && defined(_WIN32)
+#endif
 

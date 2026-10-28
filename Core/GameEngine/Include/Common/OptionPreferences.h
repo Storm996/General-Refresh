@@ -47,18 +47,11 @@ public:
 	OptionPreferences();
 	virtual ~OptionPreferences() override;
 
-	enum AntiAliasingMode CPP_11(: Int)
-	{
-		AntiAliasingMode_OFF = 0,
-		AntiAliasingMode_MSAA_2X,
-		AntiAliasingMode_MSAA_4X,
-		AntiAliasingMode_MSAA_8X,
-		AntiAliasingMode_Count
-	};
-
 	Bool loadFromIniFile();
 
-	WW3D::MultiSampleModeEnum getAntiAliasing() const;
+	// GeneralsX @bugfix 28/10/2026: the retail MSAA row (AntiAliasing / AntiAliasingMode_*) is gone. The
+	// Vulkan backend has no multisampling, and the row could only reach a full-image present pass that
+	// blurred the HUD. AA is the Advanced page's "PostAA" row: getPostAAMode() below.
 	TextureFilterClass::TextureFilterMode getTextureFilterMode() const;
 	TextureFilterClass::AnisotropicFilterMode getTextureAnisotropyLevel() const;
 	UnsignedInt getLANIPAddress();
@@ -170,6 +163,17 @@ public:
 	// never edit the user's file, and 0 there means "off AND strength 0" for a bit-exact parity run.
 	Bool getDistanceHazeEnabled() const;
 	Int getDistanceHazeIntensity() const;		///< 0-100 percent haze blend at the far end of the ramp.
+	// GeneralsX @feature 26/10/2026 volumetric fog page rows. Mode is the tier: 0 keeps the retail
+	// DistanceHaze, 1 the analytic height fog, 2 adds 8 sun-shadow samples, 3 sixteen. The knobs are
+	// integer ticks so the launcher and the engine agree without locale-sensitive floats:
+	// density tick 0-100 = 0.0000-0.0100 extinction (default 40 = 0.0040), height 50-400 world units
+	// (default 150), start 0-400 world units (default 20), sun 0-300 = 0.00-3.00 scatter (default 240).
+	// GENERALSX_VK_FOG* keeps winning inside these getters so QA legs never edit Options.ini.
+	Int getVolumetricFogMode() const;
+	Int getVolumetricFogDensity() const;
+	Int getVolumetricFogHeight() const;
+	Int getVolumetricFogStart() const;
+	Int getVolumetricFogSun() const;
 	Int getTodPreview() const;					///< 4C time-of-day preview 0 = follow the map, 1..4 force a slot; env GENERALSX_TOD_OVERRIDE wins, else ini TimeOfDayPreview
 	// GeneralsX @feature PS3.0 L2.2 17/10/2026: HLSL terrain trio (TERRAIN30). Since the 20/10/2026 merge
 	// this is no longer a page row; env GENERALSX_TERRAIN30 keeps winning for QA legs, else the legacy ini
@@ -193,13 +197,38 @@ public:
 	// replay/LAN contract. GENERALSX_VK_* env overrides stay available for scripted A/B legs.
 	Bool getHDREnabled() const;					///< HDR scene target + tonemap; default off (parity)
 	Int getHDRExposure() const;					///< -200..200 ticks, returned /100 as EV; default 0
-	Int getHDRTonemap() const;					///< 0 none / 1 ACES / 2 Reinhard; default 1
+	Int getHDRTonemap() const;					///< 0 none / 1 ACES / 2 Reinhard; default 0 (opt-in)
 	Int getRenderScale() const;					///< 100/125/150/200 percent SSAA; default 100
-	Int getPostAAMode() const;					///< 0 off / 1 FXAA (SMAA reserved); default follows AntiAliasing
+	/// 光影升级2.0 A3: post-pass contact-shadow strength, 0..100 (0 = off).
+	Int getContactShadows() const;
+	/// 光影升级2.0 A8: screen-space sun shafts, 0..100 (0 = off).
+	Int getGodRays() const;
+	/// 光影升级2.0 A4: better AO kernel (rotated 16-tap); 0 = legacy 12-tap.
+	Int getAOQuality() const;
+	/// 光影升级2.0 B1: GPU particle path for additive combat effects; 0 = retail sprites (default).
+	Int getGpuParticles() const;
+	/// 光影升级2.0 B2: GPU weather, 0 off / 1 rain / 2 snow / 3 dust storm.
+	Int getGpuWeather() const;
+	/// 光影升级2.0 A2: depth-faded particles (needs the GPU particle path); 0 = off (default).
+	Int getSoftParticles() const;
+	/// 光影升级2.0 A7: screen-space heat haze around warm additive effects; 0 = off (default).
+	Int getHeatHaze() const;
+	/// 光影升级2.0 B5: scene MSAA sample count, 0/1 = off, 4 = 4x (default off).
+	Int getMSAA() const;
+	Int getPostAAMode() const;					///< 0 off / 1 FXAA (SMAA reserved); the scene-only AA
 	// P6 remaining film-stock controls (post-processing only, S-family).
 	Bool getAutoExposure() const;				///< per-frame auto EV from the bloom mip average; default off
 	Int getSharpen() const;						///< CAS sharpness ticks 0..200 = 0.0..2.0; default 0
 	Bool getColorLUT() const;					///< generated film-grade LUT; default off
+	// GeneralsX @feature 24/10/2026 P0: the two post defaults that used to be hard-coded (AO 0.55 and
+	// the contrast grade) are now player-visible options, default OFF so "everything off" is the
+	// retail picture. Ticks are /100; GENERALSX_VK_AO / GENERALSX_VK_GRADE remain QA overrides.
+	Int getAmbientOcclusion() const;			///< 0..150 ticks = 0.0..1.5 SSAO strength; default 0
+	Bool getFilmGrade() const;					///< contrast/saturation grade; default off
+	// GeneralsX @feature 23/10/2026 P6: GENERALSX_VK_P6OFF=1 forces the pre-P6 presentation path for
+	// one launch (HDR/tonemap/exposure/auto-exposure/LUT off) without touching Options.ini. Ignored by
+	// the options page on save; use it for A/B legs and for temporarily hiding the filmic look.
+	Bool getP6Bypass() const;
 	// GeneralsX @feature felipebraz 17/09/2026 Skirmish simulation tick rate configuration (#281)
 	Int getSkirmishTickRate() const;
 };

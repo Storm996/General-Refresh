@@ -47,6 +47,7 @@
 //-----------------------------------------------------------------------------
 
 #include "W3DDevice/GameClient/W3DBibBuffer.h"
+#include "W3DDevice/GameClient/W3DShaderManager.h"
 
 #include <WW3D2/assetmgr.h>
 #include <WW3D2/texture.h>
@@ -434,6 +435,14 @@ void W3DBibBuffer::renderBibs()
 	DX8Wrapper::Set_Index_Buffer(m_indexBib,0);
 	DX8Wrapper::Set_Vertex_Buffer(m_vertexBib);
 	DX8Wrapper::Set_Shader(detailAlphaShader);
+	// GeneralsX @feature 27/10/2026 unified lighting: bibs were fixed-function (texture x baked vertex
+	// light). Use the per-pixel rig twin (the road program: albedo x shared rig + fog); the two unused
+	// texture slots must be empty so the program sees the layer's white.
+#if defined(SAGE_USE_VULKAN_CORE)
+	DX8Wrapper::Set_Texture(1, nullptr);
+	DX8Wrapper::Set_Texture(2, nullptr);
+	W3DShaderManager::Bind_Lit_Static();
+#endif
 	if (m_curNumNormalBibIndices) {
 		DX8Wrapper::Set_Texture(0,m_bibTexture);
 		DX8Wrapper::Draw_Triangles(	0, m_curNumNormalBibIndices/3, 0,	m_curNumNormalBibVertex);
@@ -443,6 +452,9 @@ void W3DBibBuffer::renderBibs()
 		DX8Wrapper::Draw_Triangles(	m_curNumNormalBibIndices, (m_curNumBibIndices-m_curNumNormalBibIndices)/3,
 						m_curNumNormalBibVertex,	m_curNumBibVertices-m_curNumNormalBibVertex);
 	}
+#if defined(SAGE_USE_VULKAN_CORE)
+	DX8Wrapper::Set_Pixel_Shader(0);
+#endif
 }
 
 

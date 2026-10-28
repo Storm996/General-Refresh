@@ -1,4 +1,4 @@
-﻿/*
+/*
 **	Command & Conquer Generals Zero Hour(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -60,6 +60,9 @@
 // so we do not duplicate the (delicate) campaign start sequence. See DifficultySelect.cpp for the
 // same forward-declaration pattern.
 extern void prepareCampaignGame( GameDifficulty diff );
+// GeneralsX @feature 25/10/2026 Launcher mode: consume the startGame flag that MainMenuUpdate would
+// normally handle, so a mission selected from a -screen MissionSelect boot actually starts.
+extern void CommitCampaignGameStart();
 
 // Widget IDs
 static NameKeyType listboxMissionsID = NAMEKEY_INVALID;
@@ -119,7 +122,7 @@ static UnicodeString campaignDisplayName( const Campaign *camp )
 		disp.translate( camp->m_name );
 
 	// GeneralsX @feature Qoder 07/10/2026 Tag the migrated Generals campaigns so they read as
-	// "【将军原版】<name>" and stay visually distinct from the native ZH campaigns in the list.
+	// "[General original] <name>" and stay visually distinct from the native ZH campaigns in the list.
 	// The label itself is shared with ZH (CAMPAIGN:USA etc.), so the prefix is applied here.
 	// Wide-char escapes keep this source free of code-page-dependent literals.
 	if( camp->m_name.startsWithNoCase( "GEN_" ) )
@@ -152,7 +155,7 @@ static void populateDifficultyCombo( void )
 //-------------------------------------------------------------------------------------------------
 // GeneralsX @feature Qoder 07/10/2026 Build the vertical grouped list: for each main campaign a
 // colored header row (marked PACKED_HEADER, never launchable) followed by its numbered missions.
-// Mission text uses common CJK glyphs ("第N关") that the retail font atlas is known to carry;
+// Mission text uses common CJK glyphs ("Mission N") that the retail font atlas is known to carry;
 // the header reuses the already-localized campaign name from the string manager.
 static void populateMissionList( void )
 {
@@ -182,7 +185,7 @@ static void populateMissionList( void )
 				continue;
 
 			UnicodeString label;
-			label.format( L"第%d关", m + 1 );
+			label.format( L"\u7b2c%d\u5173", m + 1 );
 			Int mrow = GadgetListBoxAddEntryText( listboxMissions, label, missionColor, -1, 0 );
 			GadgetListBoxSetItemData( listboxMissions, (void *)(intptr_t)packCampMission( i, m ), mrow, 0 );
 		}
@@ -247,6 +250,10 @@ void MissionSelectInit( WindowLayout *layout, void *userData )
 
 	populateMissionList();
 	populateDifficultyCombo();
+
+	// GeneralsX @bugfix Qoder 23/10/2026 Shell pages restore themselves in LAYOUTINIT: the layout
+	// must be visible both on its first push and when an in-place re-init is used.
+	layout->hide( FALSE );
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -262,6 +269,12 @@ void MissionSelectShutdown( WindowLayout *layout, void *userData )
 	winMapPreview = nullptr;
 	comboBoxDifficulty = nullptr;
 	s_lastPreviewRow = -1;
+
+	// GeneralsX @bugfix Qoder 23/10/2026 Shell::pop() only finishes when the layout reports back
+	// through shutdownComplete(); without this the ESC key left a pending pop that never ran, so the
+	// page stayed on screen (and could fire later on an unrelated shutdown).
+	layout->hide( TRUE );
+	TheShell->shutdownComplete( layout );
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -305,6 +318,7 @@ static void startSelectedMission( void )
 	// the post-game menu into a dead black screen.
 	TheShell->popImmediate();
 	prepareCampaignGame( diff );
+	CommitCampaignGameStart();
 }
 
 //-------------------------------------------------------------------------------------------------

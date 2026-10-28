@@ -48,6 +48,15 @@
 */
 const float DIFFUSE_TO_AMBIENT_FRACTION = 1.0f;
 
+// GeneralsX @feature Qoder 24/10/2026 P1: false = Modern. Point lights contribute via the per-pixel
+// loop and no longer tint the whole mesh through the ambient term. Retail can re-enable this.
+bool LightEnvironmentClass::s_pointAmbientEnabled = false;
+
+void LightEnvironmentClass::Set_Point_Ambient_Enabled(bool enabled)
+{
+	s_pointAmbientEnabled = enabled;
+}
+
 
 /*
 ** Static variables
@@ -71,6 +80,7 @@ void LightEnvironmentClass::InputLightStruct::Init
 )
 {
 	m_point = false;
+	m_directional = false;
 	switch(light.Get_Type())
 	{
 	case LightClass::POINT:
@@ -180,6 +190,7 @@ void LightEnvironmentClass::InputLightStruct::Init_From_Directional_Light
 {
 	Direction = -light.Get_Transform().Get_Z_Vector();
 
+	m_directional = true;
 	DiffuseRejected = false;
 	light.Get_Ambient(&Ambient);
 	light.Get_Diffuse(&Diffuse);
@@ -188,7 +199,10 @@ void LightEnvironmentClass::InputLightStruct::Init_From_Directional_Light
 
 float LightEnvironmentClass::InputLightStruct::Contribution()
 {
-	return Diffuse.Length2();
+	// GeneralsX @feature Qoder 24/10/2026 P1: keep the sun/fill in the eight slots when a bright
+	// muzzle flash or lamp is present. Directional lights get a 4x selection weight; the actual
+	// shading still uses their true diffuse.
+	return Diffuse.Length2() * (m_directional ? 4.0f : 1.0f);
 }
 
 
@@ -266,7 +280,9 @@ void LightEnvironmentClass::Add_Light(const LightClass & light)
 	/*
 	** Add in the ambient component
 	*/
-	OutputAmbient += new_light.Ambient;
+	if (!new_light.m_point || s_pointAmbientEnabled) {
+		OutputAmbient += new_light.Ambient;
+	}
 
 	/*
 	** If not rejected, add the directional component to the active lights

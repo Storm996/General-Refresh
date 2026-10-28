@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -24,12 +24,16 @@
  *                                                                                             *
  *                     $Archive:: /VSS_Sync/ww3d2/scene.cpp                                   $*
  *                                                                                             *
- *                       Author:: Greg_h                                                       *
+ *                   Org Author:: Greg_h                                                       *
  *                                                                                             *
- *                     $Modtime:: 8/29/01 7:29p                                               $*
+ *                       Author : Kenny Mitchell                                               *
  *                                                                                             *
- *                    $Revision:: 22                                                          $*
+ *                     $Modtime:: 07/01/02 12:55p                                              $*
  *                                                                                             *
+ *                    $Revision:: 24                                                          $*
+ *                                                                                             *
+ * 06/27/02 KM Shader system light environment updates                                       *
+ * 07/01/02 KM Coltype enum change to avoid MAX conflicts									   *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
  *   SceneClass::SceneClass -- constructor                                                     *
@@ -45,11 +49,11 @@
  *   SimpleSceneClass::~SimpleSceneClass -- destructor                                         *
  *   SimpleSceneClass::Add_Render_Object -- add a render object to the scene                   *
  *   SimpleSceneClass::Remove_Render_Object -- remove a render object from this scene          *
- *   SimpleSceneClass::Visiblity_Check -- set the visibility status of the render objects      *
+ *   SimpleSceneClass::Visibility_Check -- set the visibility status of the render objects     *
  *   SimpleSceneClass::Render -- internal scene rendering function                             *
  *   SimpleSceneClass::Render -- Render this scene                                             *
  *   SimpleSceneClass::Create_Iterator -- create an iterator for this scene                    *
- *   SimpleSceneClass::Destroy_Iterator -- destroy an iterater of this scene                   *
+ *   SimpleSceneClass::Destroy_Iterator -- destroy an iterator of this scene                   *
  *   SceneClass::Save -- saves scene settings into a chunk                                     *
  *   SceneClass::Load -- loads scene settings from a chunk                                     *
  *   SimpleSceneClass::Compute_Point_Visibility -- returns visibility of a point               *
@@ -208,6 +212,9 @@ void SceneClass::Remove_Render_Object(RenderObjClass * obj)
  *=============================================================================================*/
 void SceneClass::Render(RenderInfoClass & rinfo)
 {
+	// Any stuff that needs to get done before anything else
+	Pre_Render_Processing(rinfo);
+
 	DX8Wrapper::Set_Fog(FogEnabled, FogColor, FogStart, FogEnd);
 
 	if (Get_Extra_Pass_Polygon_Mode()==EXTRA_PASS_DISABLE) {
@@ -236,6 +243,9 @@ void SceneClass::Render(RenderInfoClass & rinfo)
 
 		WW3D::Enable_Texturing(old_enable);
 	}
+
+	// Any stuff that needs to get done after anything else
+	Post_Render_Processing(rinfo);
 }
 
 /***********************************************************************************************
@@ -404,7 +414,7 @@ void SimpleSceneClass::Register(RenderObjClass * obj,RegType for_what)
 			UpdateList.Add(obj);
 			break;
 		case LIGHT:
-			LightList.Add(obj);
+			LightList.Add_Tail(obj);
 			break;
 		case RELEASE:
 			ReleaseList.Add(obj);
@@ -430,7 +440,7 @@ void SimpleSceneClass::Unregister(RenderObjClass * obj,RegType for_what)
 
 
 /***********************************************************************************************
- * SimpleSceneClass::Visiblity_Check -- set the visibility status of the render objects        *
+ * SimpleSceneClass::Visibility_Check -- set the visibility status of the render objects       *
  *                                                                                             *
  * INPUT:                                                                                      *
  *                                                                                             *
@@ -459,7 +469,7 @@ void SimpleSceneClass::Visibility_Check(CameraClass * camera)
 		}
 
 		// Prepare visible objects for LOD:
-		if (robj->Is_Really_Visible()) {
+		if(robj->Is_Really_Visible() && !robj->Is_Ignoring_LOD_Cost()) {
 			robj->Prepare_LOD(*camera);
 		}
 	}
@@ -519,7 +529,8 @@ float SimpleSceneClass::Compute_Point_Visibility
  * WARNINGS:                                                                                   *
  *                                                                                             *
  * HISTORY:                                                                                    *
- *   12/10/98   GTH : Created.                                                                 *
+ *   12/10/98  GTH : Created.                                                                 *
+ *   06/27/02	KM Shader system light environment updates                                       *
  *=============================================================================================*/
 void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 {
@@ -545,8 +556,8 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 	// derived classes should use light environment
 	WWASSERT(rinfo.light_environment==nullptr);
 	// Turn off lights in case we have none
-	// GeneralsX @feature PS3.0-P3-18 14/10/2026 backport: null the whole widened DX8Wrapper unit range
-	// (4 -> 8) so this light_environment-free scene path cannot leave a stale enabled unit behind.
+	// GeneralsX @feature PS3.0-P3-18 14/10/2026: null the whole widened unit range (4 -> 8). This
+	// light_environment-free scene path must leave no enabled unit behind for the fixed pipeline.
 	DX8Wrapper::Set_Light(0,nullptr);
 	DX8Wrapper::Set_Light(1,nullptr);
 	DX8Wrapper::Set_Light(2,nullptr);
@@ -555,6 +566,11 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 	DX8Wrapper::Set_Light(5,nullptr);
 	DX8Wrapper::Set_Light(6,nullptr);
 	DX8Wrapper::Set_Light(7,nullptr);
+
+// (gth) WWShade only works with light environments.  We need to upgrade LightEnvironment to
+// support real point lights, etc.  It will likely just evolve into "the n most important" lights
+// rather than optimizing lights into directional lights...
+#if 0
 	int count=0;
 	for (it.First(&LightList); !it.Is_Done(); it.Next())
 	{
@@ -568,6 +584,24 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 		}
 		count++;
 	}
+#endif
+
+	// adding light environment for new shader system
+	if (!rinfo.light_environment)
+	{
+		static LightEnvironmentClass lenv;
+
+		lenv.Reset(Vector3(0,0,0),AmbientLight);
+
+		for (it.First(&LightList); !it.Is_Done(); it.Next())
+		{
+			lenv.Add_Light(*(LightClass*)it.Peek_Obj());
+		}
+		lenv.Pre_Render_Update(rinfo.Camera.Get_Transform());
+
+		rinfo.light_environment=&lenv;
+	}
+
 
 	// loop through all render objects in the list:
 	for (it.First(&RenderList); !it.Is_Done(); it.Next()) {
@@ -576,8 +610,14 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 		RenderObjClass * robj = it.Peek_Obj();
 
 		if (robj->Is_Really_Visible()) {
-
-			robj->Render(rinfo);
+			if (robj->Get_Render_Hook()) {
+				if (robj->Get_Render_Hook()->Pre_Render(robj, rinfo)) {
+					robj->Render(rinfo);
+				}
+				robj->Get_Render_Hook()->Post_Render(robj, rinfo);
+			} else {
+				robj->Render(rinfo);
+			}
 		}
 	}
 }
@@ -623,7 +663,7 @@ SceneIterator * SimpleSceneClass::Create_Iterator(bool onlyvisible)
 
 
 /***********************************************************************************************
- * SimpleSceneClass::Destroy_Iterator -- destroy an iterater of this scene                     *
+ * SimpleSceneClass::Destroy_Iterator -- destroy an iterator of this scene                     *
  *                                                                                             *
  * INPUT:                                                                                      *
  *                                                                                             *

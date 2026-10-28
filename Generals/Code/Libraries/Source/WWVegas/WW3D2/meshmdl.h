@@ -1,4 +1,4 @@
-/*
+﻿/*
 **	Command & Conquer Generals(tm)
 **	Copyright 2025 Electronic Arts Inc.
 **
@@ -22,13 +22,13 @@
  *                                                                                             *
  *                 Project Name : WW3D                                                         *
  *                                                                                             *
- *                     $Archive:: /VSS_Sync/ww3d2/meshmdl.h                                   $*
+ *                     $Archive:: /Commando/Code/ww3d2/meshmdl.h                              $*
  *                                                                                             *
  *                       Author:: Greg Hjelstrom                                               *
  *                                                                                             *
- *                     $Modtime:: 8/29/01 7:29p                                               $*
+ *                     $Modtime:: 11/24/01 6:17p                                              $*
  *                                                                                             *
- *                    $Revision:: 38                                                          $*
+ *                    $Revision:: 40                                                          $*
  *                                                                                             *
  *---------------------------------------------------------------------------------------------*
  * Functions:                                                                                  *
@@ -148,7 +148,6 @@ public:
 class MeshModelClass : public MeshGeometryClass
 {
 	W3DMPO_CODE(MeshModelClass)
-	GapFillerClass* GapFiller;
 
 public:
 
@@ -253,6 +252,25 @@ public:
 
 	bool							Has_Polygon_Renderers() { return !PolygonRendererList.Is_Empty(); }
 
+	/////////////////////////////////////////////////////////////////////////////////////
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): normal-map / tangent-space support.
+	// Pure render-side. Populated during load post-processing only when a companion
+	// "<diffuse>_nm" texture is present and the device supports dot3.
+	/////////////////////////////////////////////////////////////////////////////////////
+	bool						Uses_Normal_Map() const						{ return UsesNormalMap; }
+	const Vector3 *		Get_Vertex_Tangent_Array() const			{ return VertexTangent; }
+	const Vector3 *		Get_Vertex_Binormal_Array() const			{ return VertexBinormal; }
+
+	// Scan stage-0 diffuse texture names for a "_nm" companion; if found and dot3 is
+	// supported, compute the per-vertex tangent basis and mark this model normal-mapped.
+	void						Detect_And_Build_Normal_Map();
+
+	// GeneralsX @feature T3-0 P1: bone-deform positions, normals and the model-space tangent
+	// basis in one pass. Tangent/binormal are direction vectors: they use the same
+	// translation-free bone matrix as the normals. Destination arrays must fit all vertices;
+	// dst_tan/dst_bin may only be filled when a tangent basis exists (Uses_Normal_Map()).
+	void						Get_Deformed_TBN(Vector3* dst_vert, Vector3* dst_norm, Vector3* dst_tan, Vector3* dst_bin, const HTreeClass* htree);
+
 protected:
 
 	// MeshClass will set this for skins so that they can get the bone transforms
@@ -276,18 +294,6 @@ public: // Jani: I need to have an access to these for now...
 protected:
 
 	int Register_Type();
-
-	// functions to compute the deformed vertices of skins.
-	// Destination pointers MUST point to arrays large enough to hold all vertices
-	void get_deformed_vertices(Vector3 *dst_vert, Vector3 *dst_norm, const HTreeClass * htree);
-	void get_deformed_vertices(Vector3 *dst_vert, const HTreeClass * htree);
-	void get_deformed_screenspace_vertices(Vector4 *dst_vert,const RenderInfoClass & rinfo,const Matrix3D & mesh_tm,const HTreeClass * htree);
-	void compose_deformed_vertex_buffer(
-		VertexFormatXYZNDUV2* verts,
-		const Vector2* uv0,
-		const Vector2* uv1,
-		const unsigned* diffuse,
-		const HTreeClass * htree);
 
 	// loading
 	WW3DErrorType read_chunks(ChunkLoadClass & cload,MeshLoadContextClass * context);
@@ -320,10 +326,15 @@ protected:
 	unsigned int get_sort_flags(int pass) const;
 	unsigned int get_sort_flags() const;
 	void compute_static_sort_levels();
+	void modify_for_overbright();
 
 	// mat info support
 	void install_materials(MeshLoadContextClass * loadinfo);
 	void clone_materials(const MeshModelClass & srcmesh);
+
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): deep-copy the tangent-space basis
+	// (and normal-map flag) from a source model, sizing the arrays to the current vertex count.
+	void						Copy_Normal_Map_Data(const MeshModelClass & srcmesh);
 	void install_alternate_material_desc(MeshLoadContextClass * context);
 
 	// Material Descriptions
@@ -340,6 +351,16 @@ protected:
 	// DX8 Mesh rendering system data
 	DX8PolygonRendererList								PolygonRendererList;
 
+	// Jani: Adding this here temporarily... must fine better place
+	GapFillerClass *										GapFiller;
+	bool														HasBeenInUse;	// For debugging purposes!
+
+	// GeneralsX @feature Qoder 10/10/2026 T3-0 M2 (娈礑): tangent-space basis arrays (owned,
+	// one Vector3 per vertex) plus the flag consumed by DX8FVFCategoryContainer::Define_FVF.
+	bool														UsesNormalMap;
+	Vector3 *											VertexTangent;
+	Vector3 *											VertexBinormal;
+
 	friend class MeshClass;
 	friend class MeshDeformSetClass;
 	friend class MeshDeformClass;
@@ -348,35 +369,3 @@ protected:
 	friend class DX8MeshRendererClass;
 	friend class DX8PolygonRendererClass;
 };
-
-
-
-
-/*********************************************************************************************************
-**
-** MeshModelClass Inline Functions
-**
-*********************************************************************************************************/
-
-
-#if 0
-inline void	MeshModelClass::Apply_Deformation (float percent, bool additive)
-{
-	MeshDeformer.Apply (*this, percent, additive);
-}
-
-inline void	MeshModelClass::Apply_Deformation (int set_index, float percent, bool additive)
-{
-	MeshDeformer.Apply (*this, set_index, percent, additive);
-}
-
-inline void	MeshModelClass::Apply_Deformation (const Vector3 &point, float percent, bool additive)
-{
-	MeshDeformer.Apply (*this, point, percent, additive);
-}
-
-inline void	MeshModelClass::Apply_Deformation (const SphereClass &sphere, float percent, bool additive)
-{
-	MeshDeformer.Apply (*this, sphere, percent, additive);
-}
-#endif
